@@ -1,0 +1,303 @@
+"""
+Pydantic schemas for Daisy Risk Engine
+"""
+
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, validator
+from decimal import Decimal
+
+
+# Portfolio Schemas
+class PortfolioPositionBase(BaseModel):
+    """Base portfolio position schema with comprehensive validation"""
+    ticker: str = Field(..., min_length=1, max_length=20, description="Stock ticker symbol")
+    weight: float = Field(..., gt=0, le=1, description="Portfolio weight (0-1)")
+    quantity: float = Field(..., gt=0, description="Number of shares/units held - must be > 0")
+    buy_price: float = Field(..., gt=0, description="Price per share at time of purchase - must be > 0")
+    region: str = Field(default="US", description="Region code")
+    custom_name: Optional[str] = Field(default=None, max_length=100, description="Custom position name")
+    
+    @validator('ticker')
+    def ticker_must_be_uppercase(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Ticker cannot be empty')
+        return v.upper().strip()
+    
+    @validator('weight')
+    def weight_must_be_valid(cls, v):
+        if not (0 < v <= 1):
+            raise ValueError('Weight must be between 0 and 1 (exclusive of 0, inclusive of 1)')
+        return v
+    
+    @validator('quantity')
+    def quantity_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be greater than 0')
+        return v
+    
+    @validator('buy_price')
+    def buy_price_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Buy price must be greater than 0')
+        return v
+
+
+class PortfolioPositionCreate(PortfolioPositionBase):
+    """Schema for creating portfolio position"""
+    pass
+
+
+class PortfolioPositionUpdate(BaseModel):
+    """Schema for updating portfolio position"""
+    weight: Optional[float] = Field(None, gt=0, le=1)
+    quantity: Optional[float] = Field(None, gt=0)
+    buy_price: Optional[float] = Field(None, gt=0)
+    custom_name: Optional[str] = Field(None, max_length=100)
+
+
+class PortfolioPositionResponse(BaseModel):
+    """Schema for portfolio position response"""
+    id: int
+    ticker: str
+    weight: float
+    quantity: float
+    buy_price: float
+    last_price: float
+    market_value: float
+    sector: str
+    industry: str
+    custom_name: Optional[str]
+    added_on: datetime
+    updated_on: Optional[datetime] = None
+    # Calculated fields
+    total_cost: float
+    unrealized_gain_loss: float
+    unrealized_gain_loss_pct: float
+    current_value: float
+    
+    class Config:
+        from_attributes = True
+
+
+class PortfolioSummaryResponse(BaseModel):
+    """Schema for portfolio summary"""
+    positions: List[PortfolioPositionResponse]
+    total_value: float
+    total_positions: int
+    total_weight: float
+    sectors: Dict[str, float]
+
+
+# Stock Data Schemas
+class StockDataBase(BaseModel):
+    """Base stock data schema"""
+    ticker: str
+    date: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    adj_close: float
+    volume: int
+
+
+class StockDataResponse(StockDataBase):
+    """Schema for stock data response"""
+    pass
+
+
+class StockTimeseriesResponse(BaseModel):
+    """Schema for timeseries response matching instructions specification"""
+    ticker: str
+    data: List[StockDataResponse]
+    source: str
+    from_cache: bool
+    metadata: Dict[str, str] = {}
+    
+    class Config:
+        from_attributes = True
+
+
+class StockQuoteResponse(BaseModel):
+    """Schema for stock quote response"""
+    ticker: str
+    current_price: float
+    volume: int
+    market_cap: Optional[float] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    week_52_high: Optional[float] = None
+    week_52_low: Optional[float] = None
+    pe_ratio: Optional[float] = None
+    dividend_yield: Optional[float] = None
+
+
+class BatchStockDataRequest(BaseModel):
+    """Schema for batch stock data request"""
+    tickers: List[str] = Field(..., min_items=1)
+    start: Optional[str] = None
+    end: Optional[str] = None
+    force_refresh: bool = False
+
+
+class BatchStockDataResponse(BaseModel):
+    """Schema for batch stock data response"""
+    data: Dict[str, List[StockDataResponse]]
+    failed_tickers: List[str]
+
+
+class ValidateTickerRequest(BaseModel):
+    """Schema for ticker validation request"""
+    ticker: str = Field(..., min_length=1, max_length=10)
+
+
+class ValidateTickerResponse(BaseModel):
+    """Schema for ticker validation response"""
+    valid: bool
+    message: str
+
+
+# Analytics Schemas
+class RealizedRiskMetrics(BaseModel):
+    """Schema for realized risk metrics"""
+    annual_return: float
+    annual_volatility: float
+    sharpe_ratio: float
+    sortino_ratio: float
+    skewness: float
+    kurtosis: float
+    max_drawdown: float
+    var_95: float
+    cvar_95: float
+    hit_ratio: float
+    beta_vs_benchmark: Optional[float] = None
+    up_capture: Optional[float] = None
+    down_capture: Optional[float] = None
+
+
+class ForecastRiskMetrics(BaseModel):
+    """Schema for forecast risk metrics"""
+    model: str
+    horizon: int
+    volatility_forecast: float
+    var_forecast: float
+    cvar_forecast: float
+    confidence_interval: List[float]
+    model_params: Dict[str, Any]
+
+
+class FactorExposure(BaseModel):
+    """Schema for factor exposure"""
+    alpha: float
+    market: float
+    momentum: float
+    size: float
+    value: float
+    min_vol: float
+    quality: float
+    rates: float
+    volatility: float
+    meme: float
+    ai: float
+    r_squared: float
+    adjusted_r_squared: float
+
+
+class ConcentrationMetrics(BaseModel):
+    """Schema for concentration metrics"""
+    largest_position: float
+    top_3: float
+    top_5: float
+    top_10: float
+    herfindahl_index: float
+    effective_positions: float
+    diversification_ratio: float
+    by_sector: Dict[str, float]
+
+
+class LiquidityMetrics(BaseModel):
+    """Schema for liquidity metrics"""
+    overall_score: float
+    liquidation_time_days: str
+    risk_level: str
+    by_position: Dict[str, Dict[str, Any]]
+    volume_stats: Dict[str, Any]
+
+
+class RiskScore(BaseModel):
+    """Schema for risk score"""
+    overall_score: float
+    risk_level: str
+    change: int
+    components: Dict[str, float]
+    alerts: List[str]
+
+
+class StressTestRequest(BaseModel):
+    """Schema for stress test request"""
+    scenario: str
+    tickers: Optional[List[str]] = None
+
+
+class StressTestResponse(BaseModel):
+    """Schema for stress test response"""
+    scenario: str
+    max_drawdown: float
+    portfolio_impact: float
+    position_impacts: Dict[str, float]
+    recovery_time: Optional[int] = None
+
+
+class VolatilitySizingRequest(BaseModel):
+    """Schema for volatility sizing request"""
+    model: Optional[str] = "EWMA"
+    target_volatility: Optional[float] = 0.15
+
+
+class VolatilitySizingResponse(BaseModel):
+    """Schema for volatility sizing response"""
+    current_weights: Dict[str, float]
+    recommended_weights: Dict[str, float]
+    trades: Dict[str, Dict[str, Any]]
+    target_volatility: float
+
+
+# Error Response
+class ErrorResponse(BaseModel):
+    """Schema for error responses"""
+    error: str
+    message: str
+    status_code: int
+
+
+# Success Response
+class SuccessResponse(BaseModel):
+    """Schema for success responses"""
+    success: bool
+    message: str
+    data: Optional[Any] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+# Bulk Operations
+class BulkAddRequest(BaseModel):
+    """Schema for bulk portfolio add"""
+    positions: List[PortfolioPositionBase]
+    auto_normalize: bool = True
+
+
+class BulkAddResponse(BaseModel):
+    """Schema for bulk add response"""
+    added: int
+    failed: int
+    normalized: bool
+    positions: List[PortfolioPositionResponse]
+
+
+# API Configuration
+class APIConfigResponse(BaseModel):
+    """Schema for API configuration"""
+    primary_source: str
+    cache_ttl_minutes: int
+    enable_cache: bool

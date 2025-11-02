@@ -1,0 +1,662 @@
+"""
+Data service for fetching market data using yfinance as primary source
+"""
+
+import asyncio
+import time
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+import pandas as pd
+import numpy as np
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import yfinance as yf
+
+from app.utils.logger import setup_logger
+from app.services.cache_service import CacheService
+from app.models.database import StockTimeseries
+from app.config import settings
+
+logger = setup_logger(__name__)
+
+
+class DataService:
+    """Main data service for fetching market data"""
+    
+    def __init__(self, db_session: AsyncSession):
+        self.db = db_session
+        self.cache = CacheService(db_session, settings.cache_ttl_minutes)
+        self.yfinance_timeout = settings.yfinance_timeout
+    
+    async def fetch_historical_data(
+        self, 
+        ticker: str, 
+        start: str, 
+        end: str, 
+        force_refresh: bool = False
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch historical OHLCV data for a ticker
+        
+        Args:
+            ticker: Stock ticker symbol
+            start: Start date (YYYY-MM-DD)
+            end: End date (YYYY-MM-DD)
+            force_refresh: Force refresh from yfinance
+            
+        Returns:
+            DataFrame with OHLCV data or None if failed
+        """
+        try:
+            logger.info(f"Fetching historical data for {ticker} from {start} to {end}")
+            
+            # Check cache first (unless force refresh)
+            if not force_refresh:
+                cached_data = await self._get_cached_data(ticker, start, end)
+                if cached_data is not None:
+                    return cached_data
+            
+            # Attempt to fetch from yfinance
+            success = await self.cache.log_fetch_attempt(
+                ticker=ticker,
+                status="attempting",
+                primary_attempt=True
+            )
+            
+            # Download data with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    df = await self._download_with_timeout(ticker, start, end)
+                    
+                    if df is not None and not df.empty:
+                        # Handle yfinance multi-index columns (v0.2.51+)
+                        df = self._normalize_yfinance_data(df, ticker)
+                        
+                        # Store in database cache
+                        await self._store_timeseries_data(ticker, df)
+                        
+                        # Log successful fetch
+                        await self.cache.log_fetch_attempt(
+                            ticker=ticker,
+                            status="success",
+                            source_used="yfinance"
+                        )
+                        
+                        logger.info(f"Successfully fetched {len(df)} records for {ticker}")
+                        return df
+                    
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {e}")
+                    if attempt == max_retries - 1:
+                        # Log failed fetch
+                        await self.cache.log_fetch_attempt(
+                            ticker=ticker,
+                            status="failed",
+                            error_message=str(e),
+                            source_used="yfinance"
+                        )
+                    else:
+                        await asyncio.sleep(1)  # Brief pause before retry
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {ticker}: {e}")
+            return None
+    
+    async def fetch_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch latest quote and metadata for a ticker
+        
+        Returns:
+            Dictionary with quote data or None if failed
+        """
+        try:
+            logger.debug(f"Fetching quote for {ticker}")
+            
+            # Create yfinance ticker object
+            stock = yf.Ticker(ticker)
+            
+            # Get info and fast_info
+            info = stock.info
+            fast_info = getattr(stock, 'fast_info', {})
+            
+            # Get recent price data
+            hist = stock.history(period="2d")
+            
+            if hist.empty:
+                logger.warning(f"No price data available for {ticker}")
+                return None
+            
+            # Extract current price (last close)
+            current_price = hist['Close'].iloc[-1]
+            volume = hist['Volume'].iloc[-1] if len(hist) > 0 else 0
+            
+            # Build response
+            quote_data = {
+                "ticker": ticker.upper(),
+                "current_price": float(current_price),
+                "volume": int(volume),
+                "market_cap": info.get('marketCap'),
+                "sector": info.get('sector'),
+                "industry": info.get('industry'),
+                "52_week_high": info.get('fiftyTwoWeekHigh'),
+                "52_week_low": info.get('fiftyTwoWeekLow'),
+                "pe_ratio": info.get('trailingPE'),
+                "dividend_yield": info.get('dividendYield'),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            logger.debug(f"Successfully fetched quote for {ticker}: ${current_price:.2f}")
+            return quote_data
+            
+        except Exception as e:
+            logger.error(f"Error fetching quote for {ticker}: {e}")
+            return None
+    
+    async def fetch_ohlcv_batch(
+        self, 
+        tickers: List[str], 
+        days: int = 252
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch OHLCV data for multiple tickers efficiently
+        
+        Args:
+            tickers: List of ticker symbols
+            days: Number of days to fetch
+            
+        Returns:
+            Dictionary mapping ticker to DataFrame
+        """
+        logger.info(f"Fetching batch data for {len(tickers)} tickers")
+        
+        # Calculate date range
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        
+        results = {}
+        failed_tickers = []
+        
+        # Process tickers with rate limiting
+        for i, ticker in enumerate(tickers):
+            try:
+                # Add delay to respect rate limits
+                if i > 0:
+                    await asyncio.sleep(0.5)  # 500ms delay between requests
+                
+                df = await self.fetch_historical_data(ticker, start_date, end_date)
+                
+                if df is not None:
+                    results[ticker] = df
+                else:
+                    failed_tickers.append(ticker)
+                    
+            except Exception as e:
+                logger.error(f"Error in batch fetch for {ticker}: {e}")
+                failed_tickers.append(ticker)
+        
+        logger.info(f"Batch fetch completed: {len(results)} successful, {len(failed_tickers)} failed")
+        
+        return {
+            "data": results,
+            "failed_tickers": failed_tickers
+        }
+    
+    async def validate_ticker(self, ticker: str) -> bool:
+        """
+        Validate if a ticker exists and has data
+        
+        Args:
+            ticker: Ticker symbol to validate
+            
+        Returns:
+            True if ticker is valid, False otherwise
+        """
+        try:
+            logger.debug(f"Validating ticker: {ticker}")
+            
+            # Try to fetch recent data
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="5d")
+            
+            if not hist.empty:
+                logger.info(f"Ticker {ticker} is valid")
+                return True
+            else:
+                logger.warning(f"Ticker {ticker} has no data")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error validating ticker {ticker}: {e}")
+            return False
+    
+    async def get_corporate_actions(self, ticker: str) -> Dict[str, Any]:
+        """
+        Get corporate actions information (splits, dividends)
+        
+        Note: yfinance already adjusts for these in adj_close
+        """
+        try:
+            stock = yf.Ticker(ticker)
+            
+            # Get splits and dividends
+            splits = stock.splits
+            dividends = stock.dividends
+            
+            return {
+                "ticker": ticker.upper(),
+                "splits": splits.to_dict() if not splits.empty else {},
+                "dividends": dividends.to_dict() if not dividends.empty else {},
+                "note": "yfinance adj_close is already adjusted for splits and dividends"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting corporate actions for {ticker}: {e}")
+            return {"ticker": ticker.upper(), "splits": {}, "dividends": {}}
+    
+    async def _download_with_timeout(
+        self, 
+        ticker: str, 
+        start: str, 
+        end: str
+    ) -> Optional[pd.DataFrame]:
+        """Download data with timeout protection"""
+        try:
+            # Use asyncio to wrap the synchronous yfinance call
+            loop = asyncio.get_event_loop()
+            
+            def download():
+                return yf.download(
+                    ticker,
+                    start=start,
+                    end=end,
+                    progress=False,
+                    auto_adjust=False  # Keep original OHLCV
+                )
+            
+            # Run with timeout
+            df = await asyncio.wait_for(
+                loop.run_in_executor(None, download),
+                timeout=self.yfinance_timeout
+            )
+            
+            return df
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching data for {ticker}")
+            return None
+        except Exception as e:
+            logger.error(f"Download error for {ticker}: {e}")
+            return None
+    
+    def _normalize_yfinance_data(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """
+        Normalize yfinance data to handle multi-index columns
+        
+        yfinance v0.2.51+ returns multi-index columns for multiple tickers
+        For single ticker, we need to flatten the column names
+        """
+        try:
+            # Handle multi-index columns (new yfinance behavior)
+            if isinstance(df.columns, pd.MultiIndex):
+                # For single ticker, flatten to single level
+                df.columns = df.columns.get_level_values(0)
+            elif isinstance(df.columns, pd.Index):
+                # Column names are already strings
+                pass
+            else:
+                logger.warning(f"Unexpected column structure for {ticker}")
+            
+            # Ensure we have the required columns
+            required_columns = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                logger.warning(f"Missing columns for {ticker}: {missing_columns}")
+                return pd.DataFrame()  # Return empty DataFrame
+            
+            # Reset index to make Date a column
+            df = df.reset_index()
+            
+            # Rename columns for consistency
+            df = df.rename(columns={
+                'Date': 'date',
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Adj Close': 'adj_close',
+                'Volume': 'volume'
+            })
+            
+            # Ensure ticker column
+            df['ticker'] = ticker.upper()
+            
+            # Convert data types
+            numeric_columns = ['open', 'high', 'low', 'close', 'adj_close']
+            for col in numeric_columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # Remove rows with NaN values
+            df = df.dropna()
+            
+            logger.debug(f"Normalized data for {ticker}: {len(df)} records")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error normalizing data for {ticker}: {e}")
+            return pd.DataFrame()
+    
+    async def _get_cached_data(
+        self, 
+        ticker: str, 
+        start: str, 
+        end: str
+    ) -> Optional[pd.DataFrame]:
+        """Get cached timeseries data"""
+        try:
+            query = select(StockTimeseries).where(
+                StockTimeseries.ticker == ticker.upper(),
+                StockTimeseries.date >= start,
+                StockTimeseries.date <= end
+            ).order_by(StockTimeseries.date)
+            
+            result = await self.db.execute(query)
+            records = result.scalars().all()
+            
+            if not records:
+                return None
+            
+            # Convert to DataFrame
+            data = []
+            for record in records:
+                data.append({
+                    'date': record.date,
+                    'open': record.open,
+                    'high': record.high,
+                    'low': record.low,
+                    'close': record.close,
+                    'adj_close': record.adj_close,
+                    'volume': record.volume,
+                    'ticker': record.ticker
+                })
+            
+            df = pd.DataFrame(data)
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+            
+            logger.debug(f"Retrieved {len(df)} cached records for {ticker}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error getting cached data for {ticker}: {e}")
+            return None
+    
+    async def _store_timeseries_data(self, ticker: str, df: pd.DataFrame) -> None:
+        """Store timeseries data in database with upsert operations"""
+        try:
+            from sqlalchemy.dialects.sqlite import insert
+            from sqlalchemy import update
+            
+            logger.info(f"Storing {len(df)} records for {ticker} with upsert logic")
+            
+            # Validate data before storing
+            validation_errors = self._validate_timeseries_data(df)
+            if validation_errors:
+                logger.warning(f"Data validation warnings for {ticker}: {validation_errors}")
+            
+            # Convert DataFrame to list of StockTimeseries objects
+            records = []
+            for _, row in df.iterrows():
+                record_data = {
+                    'ticker': ticker.upper(),
+                    'date': row['date'],
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
+                    'adj_close': float(row['adj_close']),
+                    'volume': int(row['volume']),
+                    'source_used': 'yfinance',
+                    'fetch_status': 'fresh',
+                    'fetched_on': datetime.utcnow()
+                }
+                records.append(record_data)
+            
+            # Use SQLite INSERT OR REPLACE for atomic upsert
+            stored_count = 0
+            replaced_count = 0
+            
+            for record_data in records:
+                try:
+                    # First try to insert - if duplicate exists, it will be replaced
+                    result = await self.db.execute(
+                        insert(StockTimeseries.__table__).values(**record_data)
+                    )
+                    stored_count += 1
+                except Exception as insert_error:
+                    # If insert fails due to unique constraint, replace the existing record
+                    if "UNIQUE constraint failed" in str(insert_error):
+                        # Update existing record
+                        await self.db.execute(
+                            update(StockTimeseries.__table__)
+                            .where(
+                                StockTimeseries.ticker == record_data['ticker'],
+                                StockTimeseries.date == record_data['date']
+                            )
+                            .values(
+                                open=record_data['open'],
+                                high=record_data['high'],
+                                low=record_data['low'],
+                                close=record_data['close'],
+                                adj_close=record_data['adj_close'],
+                                volume=record_data['volume'],
+                                source_used=record_data['source_used'],
+                                fetch_status=record_data['fetch_status'],
+                                fetched_on=record_data['fetched_on']
+                            )
+                        )
+                        replaced_count += 1
+                    else:
+                        logger.error(f"Unexpected error storing record for {ticker} on {record_data['date']}: {insert_error}")
+            
+            await self.db.commit()
+            
+            logger.info(f"Successfully stored {stored_count} new records and replaced {replaced_count} existing records for {ticker}")
+            
+            # Log data integrity metrics
+            await self._log_storage_metrics(ticker, stored_count, replaced_count)
+            
+        except Exception as e:
+            logger.error(f"Error storing timeseries data for {ticker}: {e}")
+            await self.db.rollback()
+            # Try to identify the specific issue
+            self._analyze_storage_error(ticker, df, e)
+            
+    def _validate_timeseries_data(self, df: pd.DataFrame) -> List[str]:
+        """Validate timeseries data for integrity issues"""
+        errors = []
+        
+        try:
+            # Check for required columns
+            required_columns = ['open', 'high', 'low', 'close', 'adj_close', 'volume']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                errors.append(f"Missing required columns: {missing_columns}")
+            
+            # Check for negative values where they shouldn't exist
+            negative_checks = ['open', 'high', 'low', 'close', 'adj_close', 'volume']
+            for col in negative_checks:
+                if col in df.columns:
+                    negative_count = (df[col] < 0).sum()
+                    if negative_count > 0:
+                        errors.append(f"Found {negative_count} negative values in {col}")
+            
+            # Check for impossible OHLC relationships
+            if all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                invalid_ohlc = (
+                    (df['high'] < df['low']) |
+                    (df['high'] < df['open']) |
+                    (df['high'] < df['close']) |
+                    (df['low'] > df['open']) |
+                    (df['low'] > df['close'])
+                ).sum()
+                if invalid_ohlc > 0:
+                    errors.append(f"Found {invalid_ohlc} records with invalid OHLC relationships")
+            
+            # Check for extreme price movements (>50% in one day)
+            if 'close' in df.columns and len(df) > 1:
+                df_sorted = df.sort_values('date')
+                price_changes = df_sorted['close'].pct_change().abs()
+                extreme_movements = (price_changes > 0.5).sum()
+                if extreme_movements > 0:
+                    errors.append(f"Found {extreme_movements} records with extreme price movements (>50%)")
+            
+            # Check for duplicate dates in the DataFrame
+            if 'date' in df.columns:
+                duplicate_dates = df['date'].duplicated().sum()
+                if duplicate_dates > 0:
+                    errors.append(f"Found {duplicate_dates} duplicate dates in input DataFrame")
+            
+            # Check for null values
+            null_counts = df.isnull().sum()
+            null_columns = null_counts[null_counts > 0]
+            if not null_columns.empty:
+                errors.append(f"Found null values in columns: {null_columns.to_dict()}")
+                
+        except Exception as e:
+            errors.append(f"Validation error: {str(e)}")
+        
+        return errors
+    
+    async def _log_storage_metrics(self, ticker: str, stored_count: int, replaced_count: int) -> None:
+        """Log storage metrics for monitoring"""
+        try:
+            from app.models.database import FetchLog
+            
+            total_operations = stored_count + replaced_count
+            replacement_ratio = replaced_count / total_operations if total_operations > 0 else 0
+            
+            # Log high replacement ratio as warning
+            if replacement_ratio > 0.5:
+                logger.warning(f"High replacement ratio for {ticker}: {replacement_ratio:.2%} "
+                             f"({replaced_count}/{total_operations} operations)")
+            
+            # Create a log entry for this storage operation
+            log_entry = FetchLog(
+                ticker=ticker,
+                primary_attempt=True,
+                fallback_attempt=False,
+                status="success",
+                source_used="yfinance",
+                timestamp=datetime.utcnow()
+            )
+            self.db.add(log_entry)
+            
+        except Exception as e:
+            logger.error(f"Error logging storage metrics: {e}")
+    
+    def _analyze_storage_error(self, ticker: str, df: pd.DataFrame, error: Exception) -> None:
+        """Analyze storage errors to provide better debugging information"""
+        try:
+            logger.error(f"Storage error analysis for {ticker}:")
+            logger.error(f"  Error type: {type(error).__name__}")
+            logger.error(f"  Error message: {str(error)}")
+            logger.error(f"  DataFrame shape: {df.shape}")
+            logger.error(f"  DataFrame columns: {list(df.columns)}")
+            
+            # Check for specific data issues
+            if "UNIQUE constraint failed" in str(error):
+                logger.error(f"  Issue: Duplicate records attempted for {ticker}")
+                logger.error(f"  This might indicate data processing issues or race conditions")
+            elif "NOT NULL constraint failed" in str(error):
+                logger.error(f"  Issue: Missing required data in some records")
+                logger.error(f"  Check for null values in OHLCV data")
+            elif "CHECK constraint failed" in str(error):
+                logger.error(f"  Issue: Data validation failed (negative values, invalid ranges)")
+                logger.error(f"  Check for negative prices or volumes")
+            else:
+                logger.error(f"  Issue: Unexpected database error")
+                logger.error(f"  Please check data format and database connectivity")
+                
+        except Exception as analysis_error:
+            logger.error(f"Error in storage error analysis: {analysis_error}")
+            
+    async def check_data_integrity(self, ticker: str = None) -> Dict[str, Any]:
+        """Check data integrity for specified ticker or entire database"""
+        try:
+            from sqlalchemy import func, select
+            
+            if ticker:
+                # Check specific ticker
+                query = select(func.count()).select_from(StockTimeseries).where(
+                    StockTimeseries.ticker == ticker.upper()
+                )
+                result = await self.db.execute(query)
+                record_count = result.scalar()
+                
+                # Check for duplicates
+                duplicate_query = select(func.count()).select_from(
+                    StockTimeseries
+                ).where(
+                    StockTimeseries.ticker == ticker.upper()
+                ).group_by(
+                    StockTimeseries.ticker, StockTimeseries.date
+                ).having(func.count() > 1)
+                duplicate_result = await self.db.execute(duplicate_query)
+                duplicate_count = len(duplicate_result.fetchall())
+                
+                return {
+                    "ticker": ticker.upper(),
+                    "total_records": record_count,
+                    "duplicate_records": duplicate_count,
+                    "integrity_status": "GOOD" if duplicate_count == 0 else "ISSUES_FOUND",
+                    "recommendation": "No action needed" if duplicate_count == 0 else f"Clean up {duplicate_count} duplicate combinations"
+                }
+            else:
+                # Check entire database
+                total_query = select(func.count()).select_from(StockTimeseries)
+                total_result = await self.db.execute(total_query)
+                total_records = total_result.scalar()
+                
+                # Check for any duplicates
+                all_duplicates_query = select(
+                    StockTimeseries.ticker,
+                    StockTimeseries.date,
+                    func.count()
+                ).select_from(StockTimeseries).group_by(
+                    StockTimeseries.ticker, StockTimeseries.date
+                ).having(func.count() > 1)
+                duplicate_result = await self.db.execute(all_duplicates_query)
+                duplicates = duplicate_result.fetchall()
+                
+                return {
+                    "database_status": "GOOD" if len(duplicates) == 0 else "ISSUES_FOUND",
+                    "total_records": total_records,
+                    "duplicate_combinations": len(duplicates),
+                    "duplicate_details": [{"ticker": d[0], "date": d[1], "count": d[2]} for d in duplicates[:5]],
+                    "recommendation": "Database integrity is good" if len(duplicates) == 0 else f"Found {len(duplicates)} ticker/date combinations with duplicates"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error checking data integrity: {e}")
+            return {
+                "error": str(e),
+                "status": "CHECK_FAILED"
+            }
+
+
+# Global data service instance
+class GlobalDataService:
+    """Global data service for dependency injection"""
+    
+    def __init__(self, db_session: AsyncSession):
+        self._data_service = DataService(db_session)
+    
+    def get_service(self) -> DataService:
+        return self._data_service
