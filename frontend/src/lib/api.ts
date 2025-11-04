@@ -103,12 +103,17 @@ export interface ErrorResponse {
 
 // Portfolio API
 export const portfolioApi = {
-  // Get portfolio summary
+  // Get portfolio summary (defaults to INR currency for Indian market)
   async getPortfolio(params?: {
     region?: string;
     sector?: string;
+    currency?: string;  // Default to INR for Indian market
   }): Promise<any> {
-    const response = await apiClient.get('/portfolio', { params });
+    const defaultParams = {
+      currency: 'INR',  // Indian default
+      ...params
+    };
+    const response = await apiClient.get('/portfolio', { params: defaultParams });
     return response.data;
   },
 

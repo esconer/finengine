@@ -31,7 +31,7 @@ import {
 import { DashboardLayout } from '@/components/layout/DashboardLayout';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
-import { AddPositionModal } from '@/components/portfolio/AddPositionModal';
+import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { EditPositionModal } from '@/components/portfolio/EditPositionModal';
 import { analyticsApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -779,7 +779,7 @@ export default function PortfolioManagePage() {
                 )}
 
                 {/* Add Position Modal */}
-                <AddPositionModal
+                <AddPositionModalSimple
                     isOpen={showAddModal}
                     onClose={() => setShowAddModal(false)}
                     onAdd={handleAddPosition}

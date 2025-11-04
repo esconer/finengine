@@ -17,16 +17,30 @@ export function cn(...inputs: ClassValue[]) {
 /**
  * Format currency values
  * @param value - Numeric value to format
- * @param currency - Currency code (default: 'USD')
- * @returns Formatted currency string
+ * @param currency - Currency code (default: 'INR' for Indian market)
+ * @returns Formatted currency string with Indian formatting for INR
  */
-export function formatCurrency(value: number, currency: string = 'USD'): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value);
+export function formatCurrency(value: number, currency: string = 'INR'): string {
+  if (currency === 'INR') {
+    // Indian formatting for INR with ₹ symbol and Indian number system
+    const formatted = new Intl.NumberFormat('en-IN', {
+      style: 'currency',
+      currency: 'INR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+    
+    // Replace '₹' symbol and ensure proper formatting
+    return formatted.replace('₹', '₹').replace(',', ',');
+  } else {
+    // Default USD formatting
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+  }
 }
 
 /**

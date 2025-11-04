@@ -37,7 +37,7 @@ def get_data_service(db: AsyncSession = Depends(get_db_session)) -> DataService:
 async def get_portfolio(
     region: Optional[str] = Query(default=None, description="Filter by region"),
     sector: Optional[str] = Query(default=None, description="Filter by sector"),
-    currency: str = Query(default="USD", description="Target currency (USD or INR)"),
+    currency: str = Query(default="INR", description="Target currency (USD or INR)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service)
 ) -> PortfolioSummaryResponse:
@@ -106,8 +106,8 @@ async def get_portfolio(
             position_responses.append(pos_response)
             
             # Calculate totals (convert to target currency)
-            if currency != 'USD':
-                total_value += await currency_service.convert_amount(current_value, 'USD', currency)
+            if currency != 'INR':
+                total_value += await currency_service.convert_amount(current_value, 'INR', currency)
             else:
                 total_value += current_value
             
@@ -135,7 +135,7 @@ async def get_portfolio(
 @router.post("/add", response_model=PortfolioPositionResponse)
 async def add_portfolio_position(
     position: PortfolioPositionCreate,
-    currency: str = Query(default="USD", description="Target currency (USD or INR)"),
+    currency: str = Query(default="INR", description="Target currency (USD or INR)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service)
 ) -> PortfolioPositionResponse:
@@ -151,12 +151,26 @@ async def add_portfolio_position(
         logger.info(f"Currency: {currency}")
         logger.info(f"=== END REQUEST DATA ===")
         
-        # Validate ticker exists
+        # Validate ticker exists with enhanced error handling and suggestions
         if not await data_service.validate_ticker(position.ticker):
             logger.error(f"Ticker validation failed for {position.ticker}")
+            
+            # Generate helpful error message with suggestions
+            suggestions = _generate_ticker_suggestions(position.ticker)
+            if suggestions:
+                suggestion_text = f". Did you mean: {', '.join(suggestions)}?"
+            else:
+                suggestion_text = ""
+                
             raise HTTPException(
                 status_code=400,
-                detail=f"Ticker {position.ticker} is not valid or does not exist"
+                detail={
+                    "error": "INVALID_TICKER",
+                    "message": f"'{position.ticker}' is not a valid stock ticker symbol",
+                    "suggestions": suggestions,
+                    "help": f"Please enter a valid ticker symbol like AAPL, GOOGL, MSFT, TSLA, BRK.B{suggestion_text}",
+                    "ticker": position.ticker
+                }
             )
         
         # Check if ticker already exists in portfolio
@@ -539,7 +553,7 @@ async def get_portfolio_position(
 async def update_portfolio_position(
     ticker: str,
     updates: PortfolioPositionUpdate,
-    currency: str = Query(default="USD", description="Target currency (USD or INR)"),
+    currency: str = Query(default="INR", description="Target currency (USD or INR)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service)
 ) -> PortfolioPositionResponse:
@@ -754,6 +768,111 @@ async def normalize_portfolio_weights(
         logger.error(f"Error normalizing portfolio: {e}")
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+def _generate_ticker_suggestions(invalid_ticker: str) -> List[str]:
+    """
+    Generate helpful ticker suggestions based on common typos and similar tickers
+    
+    Args:
+        invalid_ticker: The invalid ticker entered by user
+        
+    Returns:
+        List of suggested ticker corrections
+    """
+    suggestions = []
+    
+    # Common ticker corrections and examples
+    common_corrections = {
+        # US Stocks
+        'APPL': ['AAPL'],
+        'GOOG': ['GOOGL'],
+        'MSFT': ['MSFT'],
+        'TSLA': ['TSLA'],
+        'AMZN': ['AMZN'],
+        'META': ['META'],
+        'NVDA': ['NVDA'],
+        'BRKB': ['BRK.B'],
+        'GOOGL': ['GOOG'],
+        # Popular Indian Stocks (NSE)
+        'RELIANCE': ['RELIANCE.NS'],
+        'TCS': ['TCS.NS'],
+        'INFY': ['INFY.NS'],
+        'HDFC': ['HDFCBANK.NS'],
+        'ITC': ['ITC.NS'],
+        'BHARTI': ['BHARTIARTL.NS'],
+        'LT': ['LT.NS'],
+        'KOTAK': ['KOTAKBANK.NS'],
+        'ASIAN': ['ASIANPAINT.NS'],
+        'MARUTI': ['MARUTI.NS'],
+        'HCL': ['HCLTECH.NS'],
+        'WIPRO': ['WIPRO.NS'],
+        'ULTRA': ['ULTRACEMCO.NS'],
+        'TATA': ['TATAMOTORS.NS'],
+        'NESTLE': ['NESTLEIND.NS'],
+        'BAJAJ': ['BAJFINANCE.NS'],
+        'HINDU': ['HINDUNILVR.NS'],
+        'POWER': ['POWERGRID.NS'],
+        'NTPC': ['NTPC.NS'],
+        'ONGC': ['ONGC.NS']
+    }
+    
+    # Check for exact matches with common corrections
+    if invalid_ticker.upper() in common_corrections:
+        suggestions.extend(common_corrections[invalid_ticker.upper()])
+    
+    # Common pattern corrections
+    ticker_upper = invalid_ticker.upper()
+    
+    # Check for missing letters (common typos)
+    common_tick = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN', 'META', 'NVDA', 'BRK.B']
+    for ticker in common_tick:
+        # Calculate edit distance
+        if _is_similar_ticker(ticker_upper, ticker):
+            suggestions.append(ticker)
+    
+    # Remove duplicates and limit to 3 suggestions
+    unique_suggestions = list(dict.fromkeys(suggestions))[:3]
+    
+    return unique_suggestions
+
+
+def _is_similar_ticker(ticker1: str, ticker2: str, max_distance: int = 2) -> bool:
+    """
+    Check if two tickers are similar within edit distance threshold
+    
+    Args:
+        ticker1: First ticker
+        ticker2: Second ticker
+        max_distance: Maximum allowed edit distance
+        
+    Returns:
+        True if tickers are similar, False otherwise
+    """
+    if len(ticker1) > 10 or len(ticker2) > 10:
+        return False
+        
+    # Simple edit distance calculation
+    distances = [[0] * (len(ticker2) + 1) for _ in range(len(ticker1) + 1)]
+    
+    for i in range(len(ticker1) + 1):
+        distances[i][0] = i
+    
+    for j in range(len(ticker2) + 1):
+        distances[0][j] = j
+    
+    for i in range(1, len(ticker1) + 1):
+        for j in range(1, len(ticker2) + 1):
+            if ticker1[i - 1] == ticker2[j - 1]:
+                distances[i][j] = distances[i - 1][j - 1]
+            else:
+                distances[i][j] = 1 + min(
+                    distances[i - 1][j],    # deletion
+                    distances[i][j - 1],    # insertion
+                    distances[i - 1][j - 1] # substitution
+                )
+    
+    return distances[len(ticker1)][len(ticker2)] <= max_distance
 
 
 async def _update_portfolio_prices(positions: List[PortfolioPosition], data_service: DataService) -> None:

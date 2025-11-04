@@ -4,7 +4,7 @@
 
 import React, { useEffect } from 'react';
 import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react';
-import { useNotifications } from '@/hooks/useRealTime';
+import { useNotifications, useEnhancedRealTimeAnalytics, useExportProgress } from '@/hooks/useRealTime';
 
 interface NotificationProps {
     id: string;
@@ -267,4 +267,3 @@ export const RefreshButton: React.FC<{
 };
 
 // Export progress hook
-import { useExportProgress } from '@/hooks/useRealTime';

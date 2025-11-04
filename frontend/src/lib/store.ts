@@ -1,11 +1,8 @@
-/**
- * Zustand store for Daisy Risk Engine state management
- */
-
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { portfolioApi, analyticsApi, dataApi } from './api';
 import { WebSocketClient } from './websocket';
+import { PortfolioCreateRequest, PortfolioUpdateRequest } from '@/types';
 
 // Types
 export interface PortfolioPosition {
@@ -34,17 +31,23 @@ export interface PortfolioStore {
     addPosition: (position: {
         ticker: string;
         weight: number;
+        quantity: number;
+        buy_price: number;
         region?: string;
         custom_name?: string;
     }) => Promise<void>;
     bulkAddPositions: (positions: Array<{
         ticker: string;
         weight: number;
+        quantity: number;
+        buy_price: number;
         region?: string;
         custom_name?: string;
     }>, autoNormalize?: boolean) => Promise<void>;
     updatePosition: (ticker: string, updates: {
         weight?: number;
+        quantity?: number;
+        buy_price?: number;
         custom_name?: string;
     }) => Promise<void>;
     removePosition: (ticker: string) => Promise<void>;
@@ -118,7 +121,12 @@ export const usePortfolioStore = create<PortfolioStore>()(
             addPosition: async (positionData) => {
                 set({ isLoading: true, error: null });
                 try {
-                    const newPosition = await portfolioApi.addPosition(positionData);
+                    // Ensure region has a default value if not provided
+                    const completePositionData = {
+                        ...positionData,
+                        region: positionData.region || 'US'
+                    };
+                    const newPosition = await portfolioApi.addPosition(completePositionData);
                     const currentPositions = get().positions;
                     set({
                         positions: [...currentPositions, newPosition],
@@ -137,8 +145,13 @@ export const usePortfolioStore = create<PortfolioStore>()(
             bulkAddPositions: async (positions, autoNormalize = true) => {
                 set({ isLoading: true, error: null });
                 try {
+                    // Ensure all positions have required region field
+                    const completePositions = positions.map(position => ({
+                        ...position,
+                        region: position.region || 'US'
+                    }));
                     const result = await portfolioApi.bulkAddPositions({
-                        positions,
+                        positions: completePositions,
                         auto_normalize: autoNormalize,
                     });
                     set({ isLoading: false });
@@ -223,14 +236,14 @@ export const useUIStore = create<UIStore>()(
             lastUpdated: null,
 
             toggleDarkMode: () => {
-              set((state) => {
-                const newDarkMode = !state.darkMode;
-                // Apply dark mode to document
-                if (typeof document !== 'undefined') {
-                  document.documentElement.classList.toggle('dark', newDarkMode);
-                }
-                return { darkMode: newDarkMode };
-              });
+                set((state) => {
+                    const newDarkMode = !state.darkMode;
+                    // Apply dark mode to document
+                    if (typeof document !== 'undefined') {
+                        document.documentElement.classList.toggle('dark', newDarkMode);
+                    }
+                    return { darkMode: newDarkMode };
+                });
             },
 
             toggleSidebar: () => {
@@ -306,7 +319,7 @@ export const useAnalyticsStore = create<AnalyticsStore>((set, get) => ({
 
     updateRealTimeData: (type, data) => {
         const currentRealTimeData = get().realTimeData;
-        
+
         switch (type) {
             case 'analytics':
                 set({
@@ -354,7 +367,7 @@ export const useAutoRefresh = (enabled: boolean = true, interval: number = 30000
     const { liveDataMode } = useUIStore();
     const { fetchPortfolio } = usePortfolioStore();
     const { updateRealTimeData } = useAnalyticsStore();
-    
+
     // This would be implemented with useEffect in a React component
     // For now, this is a placeholder for the hook structure
     return {

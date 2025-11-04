@@ -1,5 +1,6 @@
 """
 Data service for fetching market data using yfinance as primary source
+Configured with Indian market focus (.NS and .BO suffixes)
 """
 
 import asyncio
@@ -11,6 +12,7 @@ import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import yfinance as yf
+from zoneinfo import ZoneInfo
 
 from app.utils.logger import setup_logger
 from app.services.cache_service import CacheService
@@ -27,6 +29,43 @@ class DataService:
         self.db = db_session
         self.cache = CacheService(db_session, settings.cache_ttl_minutes)
         self.yfinance_timeout = settings.yfinance_timeout
+        
+        # Indian market defaults
+        self.default_region = 'IN'  # Default to India
+        self.indian_exchanges = ['.NS', '.BO']  # NSE and BSE
+        self.popular_indian_stocks = [
+            'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ITC.NS',
+            'BHARTIARTL.NS', 'LT.NS', 'KOTAKBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS',
+            'HCLTECH.NS', 'WIPRO.NS', 'ULTRACEMCO.NS', 'TATAMOTORS.NS', 'NESTLEIND.NS',
+            'BAJFINANCE.NS', 'HINDUNILVR.NS', 'POWERGRID.NS', 'NTPC.NS', 'ONGC.NS'
+        ]
+    
+    def _normalize_indian_ticker(self, ticker: str) -> str:
+        """
+        Normalize ticker to Indian format if it looks like an Indian stock
+        
+        Args:
+            ticker: Raw ticker symbol
+            
+        Returns:
+            Normalized ticker with proper exchange suffix
+        """
+        ticker = ticker.upper().strip()
+        
+        # If already has exchange suffix, return as is
+        if '.NS' in ticker or '.BO' in ticker:
+            return ticker
+            
+        # If it's a known Indian stock, add .NS suffix
+        if ticker in [t.replace('.NS', '') for t in self.popular_indian_stocks]:
+            return f"{ticker}.NS"
+            
+        # Default to NSE for Indian market
+        return f"{ticker}.NS"
+    
+    def _is_indian_ticker(self, ticker: str) -> bool:
+        """Check if ticker is an Indian stock"""
+        return '.NS' in ticker or '.BO' in ticker or ticker in [t.replace('.NS', '') for t in self.popular_indian_stocks]
     
     async def fetch_historical_data(
         self, 
@@ -48,17 +87,19 @@ class DataService:
             DataFrame with OHLCV data or None if failed
         """
         try:
-            logger.info(f"Fetching historical data for {ticker} from {start} to {end}")
+            # Normalize ticker for Indian market
+            normalized_ticker = self._normalize_indian_ticker(ticker)
+            logger.info(f"Fetching historical data for {ticker} -> {normalized_ticker} from {start} to {end}")
             
             # Check cache first (unless force refresh)
             if not force_refresh:
-                cached_data = await self._get_cached_data(ticker, start, end)
+                cached_data = await self._get_cached_data(normalized_ticker, start, end)
                 if cached_data is not None:
                     return cached_data
             
             # Attempt to fetch from yfinance
             success = await self.cache.log_fetch_attempt(
-                ticker=ticker,
+                ticker=normalized_ticker,
                 status="attempting",
                 primary_attempt=True
             )
@@ -67,31 +108,31 @@ class DataService:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    df = await self._download_with_timeout(ticker, start, end)
+                    df = await self._download_with_timeout(normalized_ticker, start, end)
                     
                     if df is not None and not df.empty:
                         # Handle yfinance multi-index columns (v0.2.51+)
-                        df = self._normalize_yfinance_data(df, ticker)
+                        df = self._normalize_yfinance_data(df, normalized_ticker)
                         
                         # Store in database cache
-                        await self._store_timeseries_data(ticker, df)
+                        await self._store_timeseries_data(normalized_ticker, df)
                         
                         # Log successful fetch
                         await self.cache.log_fetch_attempt(
-                            ticker=ticker,
+                            ticker=normalized_ticker,
                             status="success",
                             source_used="yfinance"
                         )
                         
-                        logger.info(f"Successfully fetched {len(df)} records for {ticker}")
+                        logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker}")
                         return df
                     
                 except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed for {ticker}: {e}")
+                    logger.warning(f"Attempt {attempt + 1} failed for {normalized_ticker}: {e}")
                     if attempt == max_retries - 1:
                         # Log failed fetch
                         await self.cache.log_fetch_attempt(
-                            ticker=ticker,
+                            ticker=normalized_ticker,
                             status="failed",
                             error_message=str(e),
                             source_used="yfinance"
@@ -109,14 +150,19 @@ class DataService:
         """
         Fetch latest quote and metadata for a ticker
         
+        Args:
+            ticker: Stock ticker symbol
+            
         Returns:
             Dictionary with quote data or None if failed
         """
         try:
-            logger.debug(f"Fetching quote for {ticker}")
+            # Normalize ticker for Indian market
+            normalized_ticker = self._normalize_indian_ticker(ticker)
+            logger.debug(f"Fetching quote for {ticker} -> {normalized_ticker}")
             
             # Create yfinance ticker object
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(normalized_ticker)
             
             # Get info and fast_info
             info = stock.info
@@ -126,16 +172,16 @@ class DataService:
             hist = stock.history(period="2d")
             
             if hist.empty:
-                logger.warning(f"No price data available for {ticker}")
+                logger.warning(f"No price data available for {normalized_ticker}")
                 return None
             
             # Extract current price (last close)
             current_price = hist['Close'].iloc[-1]
             volume = hist['Volume'].iloc[-1] if len(hist) > 0 else 0
             
-            # Build response
+            # Build response with Indian market context
             quote_data = {
-                "ticker": ticker.upper(),
+                "ticker": normalized_ticker.upper(),
                 "current_price": float(current_price),
                 "volume": int(volume),
                 "market_cap": info.get('marketCap'),
@@ -145,10 +191,13 @@ class DataService:
                 "52_week_low": info.get('fiftyTwoWeekLow'),
                 "pe_ratio": info.get('trailingPE'),
                 "dividend_yield": info.get('dividendYield'),
-                "timestamp": datetime.utcnow().isoformat()
+                "currency": "INR" if self._is_indian_ticker(normalized_ticker) else "USD",
+                "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
+                "is_indian": self._is_indian_ticker(normalized_ticker),
+                "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
             }
             
-            logger.debug(f"Successfully fetched quote for {ticker}: ${current_price:.2f}")
+            logger.debug(f"Successfully fetched quote for {normalized_ticker}: ₹{current_price:.2f}" if self._is_indian_ticker(normalized_ticker) else f"${current_price:.2f}")
             return quote_data
             
         except Exception as e:
@@ -215,17 +264,19 @@ class DataService:
             True if ticker is valid, False otherwise
         """
         try:
-            logger.debug(f"Validating ticker: {ticker}")
+            # Normalize ticker for Indian market
+            normalized_ticker = self._normalize_indian_ticker(ticker)
+            logger.debug(f"Validating ticker: {ticker} -> {normalized_ticker}")
             
             # Try to fetch recent data
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(normalized_ticker)
             hist = stock.history(period="5d")
             
             if not hist.empty:
-                logger.info(f"Ticker {ticker} is valid")
+                logger.info(f"Ticker {normalized_ticker} is valid")
                 return True
             else:
-                logger.warning(f"Ticker {ticker} has no data")
+                logger.warning(f"Ticker {normalized_ticker} has no data")
                 return False
                 
         except Exception as e:
@@ -239,22 +290,38 @@ class DataService:
         Note: yfinance already adjusts for these in adj_close
         """
         try:
-            stock = yf.Ticker(ticker)
+            # Normalize ticker for Indian market
+            normalized_ticker = self._normalize_indian_ticker(ticker)
+            stock = yf.Ticker(normalized_ticker)
             
             # Get splits and dividends
             splits = stock.splits
             dividends = stock.dividends
             
             return {
-                "ticker": ticker.upper(),
+                "ticker": normalized_ticker.upper(),
                 "splits": splits.to_dict() if not splits.empty else {},
                 "dividends": dividends.to_dict() if not dividends.empty else {},
+                "is_indian": self._is_indian_ticker(normalized_ticker),
                 "note": "yfinance adj_close is already adjusted for splits and dividends"
             }
             
         except Exception as e:
             logger.error(f"Error getting corporate actions for {ticker}: {e}")
-            return {"ticker": ticker.upper(), "splits": {}, "dividends": {}}
+            return {"ticker": ticker.upper(), "splits": {}, "dividends": {}, "is_indian": False}
+    
+    def get_popular_indian_stocks(self) -> List[str]:
+        """Get list of popular Indian stocks for suggestions"""
+        return self.popular_indian_stocks.copy()
+    
+    def get_market_info(self) -> Dict[str, Any]:
+        """Get information about the current market configuration"""
+        return {
+            "default_region": self.default_region,
+            "supported_exchanges": self.indian_exchanges,
+            "popular_indian_stocks": self.popular_indian_stocks,
+            "market_focus": "Indian (NSE/BSE)"
+        }
     
     async def _download_with_timeout(
         self, 

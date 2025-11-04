@@ -1,18 +1,13 @@
-/**
- * Dashboard Summary Page - Main portfolio overview
- * Shows comprehensive portfolio metrics, performance charts, and management features
- */
-
 'use client';
 
-import React, { useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
 import { PerformanceChart } from '@/components/charts/PerformanceChart';
 import { SectorAllocationChart } from '@/components/charts/SectorAllocationChart';
 import { RiskMetricsDisplay } from '@/components/charts/RiskMetricsDisplay';
-import { PortfolioManagement } from '@/components/charts/PortfolioManagement';
+import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
 import { usePortfolioAnalytics, usePerformanceData, useSectorAllocation } from '@/hooks/useAnalytics';
 import {
@@ -46,6 +41,7 @@ interface PortfolioPosition {
 export default function DashboardSummary() {
   const { positions, fetchPortfolio, isLoading, error, totalValue } = usePortfolioStore();
   const { updateLastUpdated } = useUIStore();
+  const [showAddModal, setShowAddModal] = useState(false);
   const { data: analyticsData, loading: analyticsLoading, refresh: refreshAnalytics } = usePortfolioAnalytics();
   const { performanceData, loading: performanceLoading } = usePerformanceData(90);
   const sectorData = useSectorAllocation();
@@ -142,15 +138,9 @@ export default function DashboardSummary() {
         const data = row.original || row;
         return (
           <div className="flex items-center space-x-2">
-            <PortfolioManagement
-              mode="edit"
-              position={data}
-              trigger={
-                <button className="p-1 text-gray-600 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400">
-                  <Edit className="w-4 h-4" />
-                </button>
-              }
-            />
+            <button className="p-1 text-gray-600 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400">
+              <Edit className="w-4 h-4" />
+            </button>
             <button className="p-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400">
               <Trash2 className="w-4 h-4" />
             </button>
@@ -159,6 +149,30 @@ export default function DashboardSummary() {
       },
     },
   ];
+
+  // Add position handler
+  const handleAddPosition = async (positionData: any) => {
+    try {
+      const response = await fetch('http://localhost:8000/api/v1/portfolio/add', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(positionData),
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Failed to add position');
+      }
+
+      // Refresh portfolio data
+      await fetchPortfolio();
+    } catch (error) {
+      console.error('Failed to add position:', error);
+      throw error;
+    }
+  };
 
   const handleExportCSV = async () => {
     try {
@@ -318,15 +332,13 @@ export default function DashboardSummary() {
                 <Download className="w-4 h-4 mr-1" />
                 Export
               </button>
-              <PortfolioManagement
-                mode="add"
-                trigger={
-                  <button className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors">
-                    <TrendingUp className="w-4 h-4 mr-2" />
-                    Add Position
-                  </button>
-                }
-              />
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              >
+                <TrendingUp className="w-4 h-4 mr-2" />
+                Add Position
+              </button>
             </div>
           </div>
         </div>
@@ -338,6 +350,14 @@ export default function DashboardSummary() {
           searchablePlaceholder="Search positions..."
           exportable={false}
         />
+
+        {/* Add Position Modal */}
+        <AddPositionModalSimple
+          isOpen={showAddModal}
+          onClose={() => setShowAddModal(false)}
+          onAdd={handleAddPosition}
+          currency="USD"
+        />
       </div>
 
       {/* Quick Actions */}
@@ -346,17 +366,15 @@ export default function DashboardSummary() {
           Quick Actions
         </h3>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <PortfolioManagement
-            mode="add"
-            trigger={
-              <button className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                <TrendingUp className="w-6 h-6 text-green-600 mb-2" />
-                <div className="text-sm font-medium text-gray-900 dark:text-white">
-                  Add Position
-                </div>
-              </button>
-            }
-          />
+          <button
+            onClick={() => setShowAddModal(true)}
+            className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+          >
+            <TrendingUp className="w-6 h-6 text-green-600 mb-2" />
+            <div className="text-sm font-medium text-gray-900 dark:text-white">
+              Add Position
+            </div>
+          </button>
 
           <button
             onClick={handleRefreshData}
@@ -369,17 +387,31 @@ export default function DashboardSummary() {
             </div>
           </button>
 
-          <PortfolioManagement
-            mode="rebalance"
-            trigger={
-              <button className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                <Target className="w-6 h-6 text-purple-600 mb-2" />
-                <div className="text-sm font-medium text-gray-900 dark:text-white">
-                  Rebalance
-                </div>
-              </button>
-            }
-          />
+          <button
+            onClick={async () => {
+              try {
+                const response = await fetch('http://localhost:8000/api/v1/portfolio/rebalance', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ method: 'proportional' })
+                });
+                if (response.ok) {
+                  await fetchPortfolio();
+                  alert('Portfolio rebalanced successfully');
+                } else {
+                  alert('Failed to rebalance portfolio');
+                }
+              } catch (error) {
+                alert('Error rebalancing portfolio');
+              }
+            }}
+            className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+          >
+            <Target className="w-6 h-6 text-purple-600 mb-2" />
+            <div className="text-sm font-medium text-gray-900 dark:text-white">
+              Rebalance
+            </div>
+          </button>
 
           <button
             onClick={() => window.location.href = '/dashboard/stress-testing'}

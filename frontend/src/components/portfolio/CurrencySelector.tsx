@@ -1,6 +1,7 @@
 /**
  * Currency Selector Component
  * Toggle between USD and INR currencies
+ * Defaults to Indian Rupee (₹) as primary
  */
 
 'use client';
@@ -17,8 +18,8 @@ interface CurrencySelectorProps {
 }
 
 const currencies: { code: Currency; name: string; symbol: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { code: 'USD', name: 'US Dollar', symbol: '$', icon: DollarSign },
-  { code: 'INR', name: 'Indian Rupee', symbol: '₹', icon: IndianRupee },
+  { code: 'INR', name: 'Indian Rupee', symbol: '₹', icon: IndianRupee },  // INR first (Indian default)
+  { code: 'USD', name: 'US Dollar', symbol: '$', icon: DollarSign },      // USD second
 ];
 
 export function CurrencySelector({ selectedCurrency, onCurrencyChange, className }: CurrencySelectorProps) {

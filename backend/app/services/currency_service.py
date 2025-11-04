@@ -1,6 +1,7 @@
 """
 Currency conversion service for portfolio management
 Supports conversion between USD and Indian Rupees (INR) with real-time exchange rates
+Configured with INR as the default currency for Indian market focus
 """
 
 import asyncio
@@ -83,10 +84,40 @@ class CurrencyConversionService:
         """
         if currency == 'INR':
             symbol = '₹'
-            return f"{symbol}{amount:,.2f}"
+            # Indian number formatting (lakhs, crores)
+            if amount >= 10000000:  # 1 crore or more
+                return f"{symbol}{amount/10000000:.2f} Cr"
+            elif amount >= 100000:  # 1 lakh or more
+                return f"{symbol}{amount/100000:.2f} L"
+            else:
+                return f"{symbol}{amount:,.2f}"
         else:  # USD
             symbol = '$'
             return f"{symbol}{amount:,.2f}"
+    
+    def format_currency_indian(self, amount: float, currency: str = 'INR') -> str:
+        """
+        Format currency using Indian numbering system
+        
+        Args:
+            amount: Amount to format
+            currency: Currency code
+            
+        Returns:
+            Formatted currency string with Indian abbreviations
+        """
+        if currency == 'INR':
+            symbol = '₹'
+            if amount >= 10000000:  # 1 crore
+                return f"{symbol}{(amount/10000000):.2f} Cr"
+            elif amount >= 100000:  # 1 lakh
+                return f"{symbol}{(amount/100000):.2f} L"
+            elif amount >= 1000:  # 1 thousand
+                return f"{symbol}{(amount/1000):.2f} K"
+            else:
+                return f"{symbol}{amount:,.2f}"
+        else:
+            return self.format_currency(amount, currency)
     
     def get_currency_symbol(self, currency: str) -> str:
         """Get currency symbol"""
@@ -170,8 +201,8 @@ class CurrencyServiceContext:
         pass
 
 
-# Convenience functions
-async def convert_portfolio_value(amount: float, target_currency: str = 'USD') -> float:
+# Convenience functions - NOW DEFAULT TO INR FOR INDIAN MARKET
+async def convert_portfolio_value(amount: float, target_currency: str = 'INR') -> float:
     """
     Convert portfolio value to target currency
     
@@ -183,11 +214,11 @@ async def convert_portfolio_value(amount: float, target_currency: str = 'USD') -
         Converted amount
     """
     async with CurrencyServiceContext() as service:
-        # Assume amounts are in USD by default
-        return await service.convert_amount(amount, 'USD', target_currency)
+        # Default to INR - assume amounts are in INR by default for Indian market
+        return await service.convert_amount(amount, 'INR', target_currency)
 
 
-async def format_portfolio_value(amount: float, currency: str = 'USD') -> str:
+async def format_portfolio_value(amount: float, currency: str = 'INR') -> str:
     """
     Format portfolio value with currency symbol
     
@@ -200,6 +231,21 @@ async def format_portfolio_value(amount: float, currency: str = 'USD') -> str:
     """
     async with CurrencyServiceContext() as service:
         return service.format_currency(amount, currency)
+
+
+async def format_portfolio_value_indian(amount: float, currency: str = 'INR') -> str:
+    """
+    Format portfolio value with Indian numbering system
+    
+    Args:
+        amount: Amount to format
+        currency: Currency code
+        
+    Returns:
+        Formatted currency string with Indian formatting
+    """
+    async with CurrencyServiceContext() as service:
+        return service.format_currency_indian(amount, currency)
 
 
 async def get_exchange_rate_usd_inr() -> float:

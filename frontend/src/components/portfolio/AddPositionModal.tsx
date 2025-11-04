@@ -30,7 +30,7 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
     weight: 0,
     quantity: 0,
     buy_price: 0,
-    region: 'US',
+    region: 'IN',  // Default to Indian region (IN)
     custom_name: ''
   });
   const [marketData, setMarketData] = useState<MarketData | null>(null);
@@ -39,13 +39,28 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [existingPositions, setExistingPositions] = useState<any[]>([]);
   const [isLoadingExisting, setIsLoadingExisting] = useState(false);
+  const [totalPortfolioValue, setTotalPortfolioValue] = useState(100000); // Default base portfolio value
 
   // Fetch existing positions when modal opens
   React.useEffect(() => {
     if (isOpen) {
       fetchExistingPositions();
+      fetchTotalPortfolioValue();
     }
   }, [isOpen]);
+
+  const fetchTotalPortfolioValue = async () => {
+    try {
+      const response = await fetch(`http://localhost:8000/api/v1/portfolio?currency=${currency}`);
+      if (response.ok) {
+        const data = await response.json();
+        setTotalPortfolioValue(data.total_value || 100000);
+      }
+    } catch (error) {
+      console.error('Failed to fetch portfolio total:', error);
+      setTotalPortfolioValue(100000); // Fallback to default
+    }
+  };
 
   const fetchExistingPositions = async () => {
     setIsLoadingExisting(true);
@@ -70,7 +85,7 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
         weight: 0,
         quantity: 0,
         buy_price: 0,
-        region: 'US',
+        region: 'IN',  // Default to Indian region (IN)
         custom_name: ''
       });
       setMarketData(null);
@@ -150,13 +165,13 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
 
   // Auto-calculate weight when quantity or buy price changes
   useEffect(() => {
-    if (formData.quantity > 0 && formData.buy_price > 0 && marketData?.current_price) {
-      const estimatedTotalCost = formData.quantity * formData.buy_price;
-      const estimatedMarketValue = formData.quantity * marketData.current_price;
-      const estimatedWeight = estimatedMarketValue / (estimatedMarketValue + 100000); // Assume base portfolio value
-      setFormData(prev => ({ ...prev, weight: Math.min(estimatedWeight, 0.5) })); // Cap at 50%
+    if (formData.quantity > 0 && formData.buy_price > 0) {
+      const positionValue = formData.quantity * formData.buy_price;
+      const newTotalValue = totalPortfolioValue + positionValue;
+      const estimatedWeight = positionValue / newTotalValue;
+      setFormData(prev => ({ ...prev, weight: estimatedWeight }));
     }
-  }, [formData.quantity, formData.buy_price, marketData?.current_price]);
+  }, [formData.quantity, formData.buy_price, totalPortfolioValue]);
 
   // Check for duplicate ticker
   const checkForDuplicate = () => {
@@ -181,7 +196,7 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
       if (checkForDuplicate()) {
         return;
       }
-      
+
       // Then validate with market data
       const timeoutId = setTimeout(() => validateTicker(formData.ticker), 500);
       return () => clearTimeout(timeoutId);
@@ -203,10 +218,6 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
       newErrors.ticker = 'Ticker not found or invalid';
     }
 
-    if (formData.weight <= 0 || formData.weight > 1) {
-      newErrors.weight = 'Weight must be between 0 and 1';
-    }
-
     if (formData.quantity <= 0) {
       newErrors.quantity = 'Quantity must be greater than 0';
     }
@@ -222,56 +233,97 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
   // Handle form submission
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     if (!validateForm()) return;
 
     try {
       setIsSubmitting(true);
       setErrors({}); // Clear any previous errors
-      
+
       console.log('🔄 Modal: Submitting position data:', formData);
       await onAdd(formData);
       console.log('✅ Modal: Position added successfully');
       onClose();
     } catch (error: any) {
       console.error('❌ Modal: Failed to add position:', error);
-      
-      // Handle specific error types
-      const errorMessage = error.message || 'Failed to add position. Please try again.';
-      
-      // Parse validation errors from backend
-      if (errorMessage.includes('validation') || errorMessage.includes('validation failed')) {
-        // Handle field-specific validation errors
-        const fieldErrors: Record<string, string> = {};
-        
-        if (errorMessage.includes('weight')) {
-          fieldErrors.weight = 'Weight must be between 0 and 1';
+
+      // Enhanced error parsing with structured error handling
+      let fieldErrors: Record<string, string> = {};
+      let submitError = '';
+
+      // Parse structured error response from backend
+      if (error.response?.data) {
+        const backendData = error.response.data;
+
+        // Handle structured error format from enhanced backend
+        if (backendData.error === 'INVALID_TICKER') {
+          const suggestions = backendData.suggestions || [];
+          let errorMessage = backendData.message || `Ticker '${formData.ticker}' is not valid`;
+
+          if (suggestions.length > 0) {
+            errorMessage += `. Did you mean: ${suggestions.join(', ')}?`;
+          }
+
+          errorMessage += `\n\n${backendData.help || 'Please enter a valid ticker symbol'}`;
+
+          fieldErrors.ticker = errorMessage;
+        } else if (backendData.detail) {
+          // Handle other structured error responses
+          if (typeof backendData.detail === 'object') {
+            if (backendData.detail.error === 'INVALID_TICKER') {
+              const suggestions = backendData.detail.suggestions || [];
+              let errorMessage = backendData.detail.message || `Ticker '${formData.ticker}' is not valid`;
+
+              if (suggestions.length > 0) {
+                errorMessage += `. Did you mean: ${suggestions.join(', ')}?`;
+              }
+
+              errorMessage += `\n\n${backendData.detail.help || 'Please enter a valid ticker symbol'}`;
+              fieldErrors.ticker = errorMessage;
+            }
+          } else {
+            // Handle string detail responses
+            submitError = backendData.detail;
+          }
         }
-        if (errorMessage.includes('quantity')) {
-          fieldErrors.quantity = 'Quantity must be greater than 0';
+      } else if (error.message) {
+        // Fallback to direct error message parsing
+        const errorMessage = error.message;
+
+        if (errorMessage.includes('validation') || errorMessage.includes('validation failed')) {
+          // Handle field-specific validation errors
+          if (errorMessage.includes('weight')) {
+            fieldErrors.weight = 'Weight must be between 0 and 1';
+          }
+          if (errorMessage.includes('quantity')) {
+            fieldErrors.quantity = 'Quantity must be greater than 0';
+          }
+          if (errorMessage.includes('buy_price')) {
+            fieldErrors.buy_price = 'Buy price must be greater than 0';
+          }
+          if (errorMessage.includes('ticker')) {
+            fieldErrors.ticker = 'Invalid ticker symbol';
+          }
+        } else if (errorMessage.includes('already exists') || errorMessage.includes('duplicate')) {
+          fieldErrors.ticker = `Ticker "${formData.ticker}" already exists in your portfolio`;
+        } else if (errorMessage.includes('not valid') || errorMessage.includes('does not exist')) {
+          fieldErrors.ticker = `Ticker '${formData.ticker}' is not valid. Please check the spelling and try again.`;
+        } else if (errorMessage.includes('409') || errorMessage.includes('Conflict')) {
+          fieldErrors.ticker = `Ticker "${formData.ticker}" already exists in your portfolio`;
+        } else {
+          submitError = errorMessage;
         }
-        if (errorMessage.includes('buy_price')) {
-          fieldErrors.buy_price = 'Buy price must be greater than 0';
-        }
-        if (errorMessage.includes('ticker')) {
-          fieldErrors.ticker = 'Invalid ticker symbol';
-        }
-        
-        setErrors(fieldErrors);
-      } else if (errorMessage.includes('already exists') || errorMessage.includes('duplicate')) {
-        // Enhanced duplicate ticker handling
-        setErrors({ 
-          ticker: `Ticker "${formData.ticker}" already exists in your portfolio` 
-        });
-      } else if (errorMessage.includes('not valid') || errorMessage.includes('does not exist')) {
-        setErrors({ ticker: 'Ticker not found or invalid' });
-      } else if (errorMessage.includes('409') || errorMessage.includes('Conflict')) {
-        // Handle 409 Conflict specifically
-        setErrors({ 
-          ticker: `Ticker "${formData.ticker}" already exists in your portfolio` 
-        });
       } else {
-        setErrors({ submit: errorMessage });
+        submitError = 'Failed to add position. Please try again.';
+      }
+
+      // Set the parsed errors
+      if (Object.keys(fieldErrors).length > 0) {
+        setErrors(fieldErrors);
+      } else if (submitError) {
+        setErrors({ submit: submitError });
+      } else {
+        setErrors({ submit: 'An unexpected error occurred. Please try again.' });
       }
     } finally {
       setIsSubmitting(false);
@@ -284,6 +336,67 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
     if (errors[field]) {
       setErrors(prev => ({ ...prev, [field]: '' }));
     }
+  };
+
+  // Frontend ticker suggestions for common typos
+  const _getTickerSuggestions = (invalidTicker: string): string[] => {
+    const suggestions: string[] = [];
+    const tickerUpper = invalidTicker.toUpperCase();
+    
+    // Common ticker corrections
+    const commonCorrections: Record<string, string[]> = {
+      'APPL': ['AAPL'],
+      'GOOG': ['GOOGL'],
+      'BRKB': ['BRK.B'],
+      'GOOGL': ['GOOG']
+    };
+    
+    // Check for exact matches with common corrections
+    if (commonCorrections[tickerUpper]) {
+      suggestions.push(...commonCorrections[tickerUpper]);
+    }
+    
+    // Simple similarity check for common tickers
+    const commonTickers = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN', 'META', 'NVDA', 'BRK.B'];
+    for (const ticker of commonTickers) {
+      if (ticker !== tickerUpper && _isSimilarTicker(tickerUpper, ticker)) {
+        suggestions.push(ticker);
+      }
+    }
+    
+    return [...new Set(suggestions)].slice(0, 3);
+  };
+
+  // Simple similarity check function
+  const _isSimilarTicker = (ticker1: string, ticker2: string, maxDistance: number = 2): boolean => {
+    if (ticker1.length > 10 || ticker2.length > 10) return false;
+
+    // Simple edit distance calculation
+    const matrix: number[][] = [];
+
+    for (let i = 0; i <= ticker2.length; i++) {
+      matrix[i] = [i];
+    }
+
+    for (let j = 0; j <= ticker1.length; j++) {
+      matrix[0][j] = j;
+    }
+
+    for (let i = 1; i <= ticker2.length; i++) {
+      for (let j = 1; j <= ticker1.length; j++) {
+        if (ticker2.charAt(i - 1) === ticker1.charAt(j - 1)) {
+          matrix[i][j] = matrix[i - 1][j - 1];
+        } else {
+          matrix[i][j] = Math.min(
+            matrix[i - 1][j - 1] + 1, // substitution
+            matrix[i][j - 1] + 1,     // insertion
+            matrix[i - 1][j] + 1      // deletion
+          );
+        }
+      }
+    }
+
+    return matrix[ticker2.length][ticker1.length] <= maxDistance;
   };
 
   // Calculate estimated values
@@ -337,11 +450,18 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
                     type="text"
                     value={formData.ticker}
                     onChange={(e) => handleInputChange('ticker', e.target.value.toUpperCase())}
-                    placeholder="AAPL or AAPL.NS"
+                    placeholder="RELIANCE.NS or TCS.NS"
                     className={cn(
                       "w-full pl-10 pr-12 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 transition-colors",
                       errors.ticker ? "border-red-300 dark:border-red-600" : "border-gray-300 dark:border-gray-600"
                     )}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && formData.ticker && !marketData?.is_valid) {
+                        // Trigger validation on Enter
+                        e.preventDefault();
+                        validateTicker(formData.ticker);
+                      }
+                    }}
                   />
                   {isValidatingTicker && (
                     <Loader className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 animate-spin" />
@@ -353,15 +473,58 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
                     <AlertCircle className="absolute right-3 top-1/2 transform -translate-y-1/2 text-red-500 w-4 h-4" />
                   )}
                 </div>
+
+                {/* Enhanced Error Display with Suggestions */}
                 {errors.ticker && (
-                  <p className="mt-2 text-sm text-red-600 dark:text-red-400">{errors.ticker}</p>
+                  <div className="mt-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                    <div className="flex items-start space-x-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1">
+                        <p className="text-sm text-red-700 dark:text-red-300 whitespace-pre-line">
+                          {errors.ticker}
+                        </p>
+
+                        {/* Ticker Suggestions */}
+                        {formData.ticker && (() => {
+                          const suggestions = _getTickerSuggestions(formData.ticker);
+                          if (suggestions.length > 0) {
+                            return (
+                              <div className="mt-2">
+                                <p className="text-xs text-red-600 dark:text-red-400 mb-1">Try these instead:</p>
+                                <div className="flex flex-wrap gap-1">
+                                  {suggestions.map((suggestion, index) => (
+                                    <button
+                                      key={index}
+                                      type="button"
+                                      onClick={() => handleInputChange('ticker', suggestion)}
+                                      className="px-2 py-1 text-xs bg-red-100 dark:bg-red-800 text-red-700 dark:text-red-300 rounded hover:bg-red-200 dark:hover:bg-red-700 transition-colors"
+                                    >
+                                      {suggestion}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          }
+                          return null;
+                        })()}
+                      </div>
+                    </div>
+                  </div>
                 )}
+
+                {/* Market Data Display */}
                 {marketData?.is_valid && marketData.current_price > 0 && (
                   <p className="mt-2 text-sm text-green-600 dark:text-green-400 flex items-center space-x-2">
                     <TrendingUp className="w-4 h-4" />
                     <span>Market Price: {currency} {marketData.current_price.toFixed(2)}</span>
                   </p>
                 )}
+
+                {/* Format Guidance */}
+                <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                  Format: For Indian stocks, use .NS (e.g., RELIANCE.NS, TCS.NS, INFY.NS). Popular Indian stocks default to NSE format.
+                </p>
               </div>
 
               {/* Market Data Display */}
@@ -450,38 +613,32 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
                 </div>
               </div>
 
-              {/* Portfolio Weight */}
+              {/* Portfolio Weight - READ ONLY */}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                  Portfolio Weight *
+                  Portfolio Weight (Auto-calculated)
                 </label>
-                <input
-                  type="number"
-                  value={formData.weight || ''}
-                  onChange={(e) => handleInputChange('weight', parseFloat(e.target.value) || 0)}
-                  placeholder="0.15"
-                  min="0"
-                  max="1"
-                  step="0.01"
-                  className={cn(
-                    "w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 transition-colors",
-                    errors.weight ? "border-red-300 dark:border-red-600" : "border-gray-300 dark:border-gray-600"
-                  )}
-                />
-                <div className="flex items-center justify-between mt-2">
-                  {errors.weight ? (
-                    <p className="text-sm text-red-600 dark:text-red-400">{errors.weight}</p>
-                  ) : (
-                    <p className="text-sm text-gray-500 dark:text-gray-400">
-                      Enter as decimal (0.15 = 15%)
-                    </p>
-                  )}
-                  {formData.weight > 0 && (
-                    <p className="text-sm text-blue-600 dark:text-blue-400 font-medium">
-                      {(formData.weight * 100).toFixed(1)}%
-                    </p>
-                  )}
+                <div className="relative">
+                  <input
+                    type="number"
+                    value={formData.weight ? (formData.weight * 100).toFixed(2) : ''}
+                    readOnly
+                    className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white cursor-not-allowed"
+                    placeholder="Auto-calculated"
+                  />
+                  <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+                    <span className="text-sm text-gray-500 dark:text-gray-400">%</span>
+                  </div>
                 </div>
+                <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
+                  Weight is automatically calculated based on position value vs total portfolio
+                </p>
+                {formData.quantity > 0 && formData.buy_price > 0 && (
+                  <p className="mt-1 text-sm text-blue-600 dark:text-blue-400">
+                    Position Value: {currency} {(formData.quantity * formData.buy_price).toLocaleString()} |
+                    Total Portfolio: {currency} {(totalPortfolioValue + (formData.quantity * formData.buy_price)).toLocaleString()}
+                  </p>
+                )}
               </div>
 
               {/* Custom Name */}
@@ -547,15 +704,29 @@ export function AddPositionModal({ isOpen, onClose, onAdd, currency }: AddPositi
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmitting || isValidatingTicker || !marketData?.is_valid}
-                  className="flex-1 flex items-center justify-center space-x-2 px-4 py-3 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  disabled={isSubmitting || isValidatingTicker || !marketData?.is_valid || Object.keys(errors).length > 0}
+                  className={cn(
+                    "flex-1 flex items-center justify-center space-x-2 px-4 py-3 text-sm font-medium border border-transparent rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors",
+                    isSubmitting || isValidatingTicker || !marketData?.is_valid || Object.keys(errors).length > 0
+                      ? "bg-gray-400 text-gray-200 cursor-not-allowed"
+                      : "text-white bg-blue-600 hover:bg-blue-700"
+                  )}
                 >
                   {isSubmitting ? (
                     <Loader className="w-4 h-4 animate-spin" />
+                  ) : !marketData?.is_valid && formData.ticker ? (
+                    <AlertCircle className="w-4 h-4" />
                   ) : (
                     <Plus className="w-4 h-4" />
                   )}
-                  <span>{isSubmitting ? 'Adding...' : 'Add Position'}</span>
+                  <span>
+                    {isSubmitting
+                      ? 'Adding...'
+                      : !marketData?.is_valid && formData.ticker
+                        ? 'Invalid Ticker'
+                        : 'Add Position'
+                    }
+                  </span>
                 </button>
               </div>
             </form>
