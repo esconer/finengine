@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from app.utils.logger import setup_logger
 from app.services.cache_service import CacheService
+from app.services.alpha_vantage_service import get_alpha_vantage_service
 from app.models.database import StockTimeseries
 from app.config import settings
 
@@ -139,7 +140,12 @@ class DataService:
                         )
                     else:
                         await asyncio.sleep(1)  # Brief pause before retry
-            
+
+            # All yfinance attempts exhausted -> Alpha Vantage fallback
+            fallback_df = await self._fetch_from_alpha_vantage(normalized_ticker, ticker, start, end)
+            if fallback_df is not None and not fallback_df.empty:
+                return fallback_df
+
             return None
             
         except Exception as e:
@@ -173,7 +179,7 @@ class DataService:
             
             if hist.empty:
                 logger.warning(f"No price data available for {normalized_ticker}")
-                return None
+                return await self._fallback_quote(ticker, normalized_ticker)
             
             # Extract current price (last close)
             current_price = hist['Close'].iloc[-1]
@@ -202,7 +208,7 @@ class DataService:
             
         except Exception as e:
             logger.error(f"Error fetching quote for {ticker}: {e}")
-            return None
+            return await self._fallback_quote(ticker, ticker.upper().strip())
     
     async def fetch_ohlcv_batch(
         self, 
@@ -357,6 +363,66 @@ class DataService:
         except Exception as e:
             logger.error(f"Download error for {ticker}: {e}")
             return None
+
+    async def _fetch_from_alpha_vantage(
+        self, normalized_ticker: str, original_ticker: str, start: str, end: str
+    ) -> Optional[pd.DataFrame]:
+        """Alpha Vantage fallback when yfinance retries are exhausted.
+
+        Keys rotate inside the service pool; a fully-exhausted pool or an
+        unconfigured key silently leaves yfinance as sole source.
+        """
+        av = get_alpha_vantage_service()
+        if not av.enabled:
+            return None
+        try:
+            df = await av.fetch_daily_ohlcv(normalized_ticker, start, end)
+        except Exception as e:
+            logger.warning(f"Alpha Vantage OHLCV fallback failed for {original_ticker}: {e}")
+            return None
+
+        if df is None or df.empty:
+            return None
+
+        await self.cache.log_fetch_attempt(
+            ticker=normalized_ticker,
+            status="success",
+            primary_attempt=False,
+            fallback_attempt=True,
+            source_used="alphavantage",
+        )
+        await self._store_timeseries_data(normalized_ticker, df, source_used="alphavantage")
+        logger.info(
+            f"Fallback succeeded via Alpha Vantage for {normalized_ticker}: {len(df)} records"
+        )
+        return df
+
+    async def _fallback_quote(self, original_ticker: str, normalized_ticker: str) -> Optional[Dict[str, Any]]:
+        """Partial-quote fallback via Alpha Vantage GLOBAL_QUOTE.
+
+        Supplies price/volume only; fundamentals fields stay None so callers
+        using .get() degrade gracefully.
+        """
+        av = get_alpha_vantage_service()
+        if not av.enabled:
+            return None
+        try:
+            q = await av.fetch_global_quote(normalized_ticker)
+        except Exception as e:
+            logger.warning(f"Alpha Vantage quote fallback failed for {original_ticker}: {e}")
+            return None
+        if not q:
+            return None
+
+        await self.cache.log_fetch_attempt(
+            ticker=normalized_ticker,
+            status="success",
+            primary_attempt=False,
+            fallback_attempt=True,
+            source_used="alphavantage",
+        )
+        q.setdefault("is_indian", ".BSE" in normalized_ticker.upper())
+        return q
     
     def _normalize_yfinance_data(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         """
@@ -464,7 +530,7 @@ class DataService:
             logger.error(f"Error getting cached data for {ticker}: {e}")
             return None
     
-    async def _store_timeseries_data(self, ticker: str, df: pd.DataFrame) -> None:
+    async def _store_timeseries_data(self, ticker: str, df: pd.DataFrame, source_used: str = "yfinance") -> None:
         """Store timeseries data in database with upsert operations"""
         try:
             from sqlalchemy.dialects.sqlite import insert
@@ -489,7 +555,7 @@ class DataService:
                     'close': float(row['close']),
                     'adj_close': float(row['adj_close']),
                     'volume': int(row['volume']),
-                    'source_used': 'yfinance',
+                    'source_used': source_used,
                     'fetch_status': 'fresh',
                     'fetched_on': datetime.utcnow()
                 }

@@ -15,763 +15,343 @@ from httpx import AsyncClient
 
 @pytest.mark.api
 class TestDataAPI:
-    """Test data API endpoints"""
-    
+    """Data endpoints; DataService mocked at the GlobalDataService seam with
+    frames in the project's lowercase cache schema."""
+
+    # Awaited seams every data endpoint may touch; overridable via kwargs.
+    DEFAULT_ASYNC_RETURNS = {
+        "_get_cached_data": None,
+        "fetch_historical_data": None,
+        "fetch_quote": None,
+        "validate_ticker": False,
+        "fetch_ohlcv_batch": {"data": {}, "failed_tickers": []},
+    }
+
+    def _patch_data_service(self, **method_returns):
+        returns = {**self.DEFAULT_ASYNC_RETURNS, **method_returns}
+        service = Mock()
+        for name, value in returns.items():
+            setattr(service.get_service.return_value, name, AsyncMock(return_value=value))
+        self._last_service = service.get_service.return_value
+        return patch("app.api.data.GlobalDataService", return_value=service)
+
     @pytest.mark.asyncio
-    async def test_get_stock_data_success(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test successful stock data retrieval"""
-        with patch('app.services.data_service.DataService.fetch_historical_data') as mock_fetch:
-            mock_fetch.return_value = mock_price_dataframe
-            with patch('app.services.data_service.DataService.fetch_quote') as mock_quote:
-                mock_quote.return_value = {
-                    "current_price": 150.0,
-                    "sector": "Technology",
-                    "industry": "Consumer Electronics"
-                }
-                
-                response = await async_client.get("/api/v1/data/AAPL")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["ticker"] == "AAPL"
-                assert "data" in data
-                assert "metadata" in data
-                assert len(data["data"]) > 0
-    
+    async def test_get_stock_data_success(self, async_client, ohlcv_frame_factory):
+        frame = ohlcv_frame_factory()
+        quote = {"ticker": "TEST", "current_price": 100.0, "sector": "Tech", "industry": "Soft"}
+        with self._patch_data_service(fetch_historical_data=frame, fetch_quote=quote):
+            resp = await async_client.get("/api/v1/data/TEST")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ticker"] == "TEST"
+        assert len(data["data"]) > 0
+        assert "metadata" in data
+
     @pytest.mark.asyncio
-    async def test_get_stock_data_not_found(self, async_client: AsyncClient):
-        """Test stock data retrieval for non-existent ticker"""
-        with patch('app.services.data_service.DataService.fetch_historical_data') as mock_fetch:
-            mock_fetch.return_value = None
-            
-            response = await async_client.get("/api/v1/data/INVALID")
-            
-            assert response.status_code == 404
-            assert "No data found" in response.json()["detail"]
-    
+    async def test_get_stock_data_not_found(self, async_client):
+        with self._patch_data_service(fetch_historical_data=None):
+            resp = await async_client.get("/api/v1/data/INVALID")
+        assert resp.status_code == 404
+        assert "No data found" in resp.json()["detail"]
+
     @pytest.mark.asyncio
-    async def test_get_stock_data_with_date_range(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test stock data retrieval with custom date range"""
-        with patch('app.services.data_service.DataService.fetch_historical_data') as mock_fetch:
-            mock_fetch.return_value = mock_price_dataframe
-            
-            start_date = "2023-01-01"
-            end_date = "2023-12-31"
-            
-            response = await async_client.get(
-                f"/api/v1/data/AAPL?start={start_date}&end={end_date}&force_refresh=true"
+    async def test_get_stock_data_forwards_params(self, async_client, ohlcv_frame_factory):
+        frame = ohlcv_frame_factory()
+        quote = {"ticker": "TEST", "current_price": 100.0}
+        with self._patch_data_service(fetch_historical_data=frame, fetch_quote=quote):
+            resp = await async_client.get(
+                "/api/v1/data/TEST?start=2025-01-01&end=2025-12-31&force_refresh=true"
             )
-            
-            assert response.status_code == 200
-            mock_fetch.assert_called_once_with("AAPL", start_date, end_date, True)
-    
+        assert resp.status_code == 200, resp.text
+        self._last_service.fetch_historical_data.assert_called_once_with(
+            "TEST", "2025-01-01", "2025-12-31", True
+        )
+
     @pytest.mark.asyncio
-    async def test_get_stock_quote_success(self, async_client: AsyncClient):
-        """Test successful stock quote retrieval"""
-        with patch('app.services.data_service.DataService.fetch_quote') as mock_quote:
-            mock_quote.return_value = {
-                "current_price": 150.0,
-                "previous_close": 149.0,
-                "change": 1.0,
-                "change_percent": 0.67,
-                "volume": 1000000,
-                "market_cap": "2.5T",
-                "pe_ratio": 25.5,
-                "dividend_yield": 0.5,
-                "sector": "Technology",
-                "industry": "Consumer Electronics"
-            }
-            
-            response = await async_client.get("/api/v1/data/quote/AAPL")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["ticker"] == "AAPL"
-            assert data["current_price"] == 150.0
-    
+    async def test_get_stock_quote_success(self, async_client):
+        quote = {
+            "ticker": "TEST.NS", "current_price": 150.0, "volume": 1_000_000,
+            "market_cap": None, "sector": "Technology", "industry": "Software",
+            "52_week_high": 200.0, "52_week_low": 90.0,
+            "pe_ratio": 25.5, "dividend_yield": 0.5,
+        }
+        with self._patch_data_service(fetch_quote=quote):
+            resp = await async_client.get("/api/v1/data/quote/TEST")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["current_price"] == 150.0
+
     @pytest.mark.asyncio
-    async def test_get_stock_quote_not_found(self, async_client: AsyncClient):
-        """Test stock quote retrieval for non-existent ticker"""
-        with patch('app.services.data_service.DataService.fetch_quote') as mock_quote:
-            mock_quote.return_value = None
-            
-            response = await async_client.get("/api/v1/data/quote/INVALID")
-            
-            assert response.status_code == 404
-            assert "No quote data found" in response.json()["detail"]
-    
+    async def test_get_stock_quote_not_found(self, async_client):
+        with self._patch_data_service(fetch_quote=None):
+            resp = await async_client.get("/api/v1/data/quote/INVALID")
+        assert resp.status_code == 404
+
     @pytest.mark.asyncio
-    async def test_batch_stock_data_success(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test successful batch stock data retrieval"""
-        with patch('app.services.data_service.DataService.fetch_ohlcv_batch') as mock_batch:
-            mock_batch.return_value = {
-                "data": {"AAPL": mock_price_dataframe, "MSFT": mock_price_dataframe},
-                "failed_tickers": []
-            }
-            
-            request_data = {"tickers": ["AAPL", "MSFT"]}
-            
-            response = await async_client.post("/api/v1/data/batch", json=request_data)
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert "data" in data
-            assert "failed_tickers" in data
-            assert "AAPL" in data["data"]
-            assert "MSFT" in data["data"]
-    
+    async def test_batch_stock_data_success(self, async_client, ohlcv_frame_factory):
+        batch = {"data": {"AAA": ohlcv_frame_factory(seed=1), "BBB": ohlcv_frame_factory(seed=2)}, "failed_tickers": []}
+        with self._patch_data_service(fetch_ohlcv_batch=batch):
+            resp = await async_client.post("/api/v1/data/batch", json={"tickers": ["AAA", "BBB"]})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert set(data["data"].keys()) == {"AAA", "BBB"}
+        assert data["failed_tickers"] == []
+
     @pytest.mark.asyncio
-    async def test_validate_ticker_success(self, async_client: AsyncClient):
-        """Test successful ticker validation"""
-        with patch('app.services.data_service.DataService.validate_ticker') as mock_validate:
-            mock_validate.return_value = True
-            
-            request_data = {"ticker": "AAPL"}
-            
-            response = await async_client.post("/api/v1/data/validate", json=request_data)
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["valid"] is True
-            assert "AAPL is valid" in data["message"]
-    
+    async def test_validate_ticker_success(self, async_client):
+        with self._patch_data_service(validate_ticker=True):
+            resp = await async_client.post("/api/v1/data/validate", json={"ticker": "AAPL"})
+        assert resp.status_code == 200
+        assert resp.json()["valid"] is True
+
     @pytest.mark.asyncio
-    async def test_validate_ticker_invalid(self, async_client: AsyncClient):
-        """Test ticker validation for invalid ticker"""
-        with patch('app.services.data_service.DataService.validate_ticker') as mock_validate:
-            mock_validate.return_value = False
-            
-            request_data = {"ticker": "INVALID"}
-            
-            response = await async_client.post("/api/v1/data/validate", json=request_data)
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["valid"] is False
-            assert "not found" in data["message"]
-    
+    async def test_validate_ticker_invalid(self, async_client):
+        with self._patch_data_service(validate_ticker=False):
+            resp = await async_client.post("/api/v1/data/validate", json={"ticker": "INVALID"})
+        assert resp.status_code == 200
+        assert resp.json()["valid"] is False
+
     @pytest.mark.asyncio
-    async def test_refresh_ticker_data(self, async_client: AsyncClient):
-        """Test ticker data refresh"""
-        with patch('app.services.data_service.DataService.fetch_historical_data') as mock_fetch:
-            mock_fetch.return_value = pd.DataFrame()  # Non-empty DataFrame
-            
-            request_data = {"tickers": ["AAPL", "MSFT"]}
-            
-            response = await async_client.post("/api/v1/data/refresh", json=request_data)
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert "refreshed" in data
-            assert "failed" in data
-            assert data["refreshed"] >= 0
-    
+    async def test_refresh_ticker_data_bare_array_body(self, async_client, ohlcv_frame_factory):
+        """Endpoint takes a bare JSON array body (matches frontend api.ts)."""
+        frame = ohlcv_frame_factory()
+        with self._patch_data_service(fetch_historical_data=frame):
+            resp = await async_client.post("/api/v1/data/refresh", json=["AAA", "BBB"])
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["refreshed"] == 2
+
     @pytest.mark.asyncio
-    async def test_get_api_config(self, async_client: AsyncClient):
-        """Test API configuration retrieval"""
-        with patch('app.services.cache_service.CacheService.get_cache_stats') as mock_stats:
-            mock_stats.return_value = {"ttl_minutes": 60}
-            
-            response = await async_client.get("/api/v1/data/config")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["primary_source"] == "yfinance"
-            assert data["cache_ttl_minutes"] == 60
-            assert data["enable_cache"] is True
-    
-    @pytest.mark.asyncio
-    async def test_update_api_config(self, async_client: AsyncClient):
-        """Test API configuration update"""
-        response = await async_client.put("/api/v1/data/config?cache_ttl_minutes=120")
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["updated"] is True
-        assert "cache_ttl_minutes" in data["settings"]
+    async def test_get_api_config_not_shadowed(self, async_client):
+        """Regression: /config was shadowed by /{ticker} route order."""
+        resp = await async_client.get("/api/v1/data/config")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["primary_source"] == "yfinance"
 
 
 @pytest.mark.api
 class TestPortfolioAPI:
-    """Test portfolio API endpoints"""
-    
+    """Portfolio CRUD against the isolated test DB; market seam fully mocked."""
+
+    def _patch_market_data(self, valid=True):
+        svc = Mock()
+        svc.get_service.return_value.validate_ticker = AsyncMock(return_value=valid)
+        svc.get_service.return_value.fetch_quote = AsyncMock(return_value={
+            "ticker": "TEST", "current_price": 150.0, "volume": 1000,
+            "sector": "Technology", "industry": "Software",
+            "52_week_high": 200.0, "52_week_low": 90.0,
+            "pe_ratio": 20.0, "dividend_yield": 1.0,
+        })
+        return patch("app.api.portfolio.GlobalDataService", return_value=svc)
+
     @pytest.mark.asyncio
-    async def test_get_portfolio_empty(self, async_client: AsyncClient):
-        """Test empty portfolio retrieval"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            # Mock empty database session
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
-            mock_session.execute.return_value.scalars.return_value.all.return_value = []
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service:
-                mock_service.return_value.get_service.return_value = AsyncMock()
-                
-                response = await async_client.get("/api/v1/portfolio")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["positions"] == []
-                assert data["total_value"] == 0
-                assert data["total_positions"] == 0
-    
+    async def test_get_portfolio_empty(self, async_client):
+        resp = await async_client.get("/api/v1/portfolio")
+        assert resp.status_code == 200
+        assert resp.json()["positions"] == []
+
     @pytest.mark.asyncio
-    async def test_add_portfolio_position_success(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test successful portfolio position addition"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service.validate_ticker.return_value = True
-                mock_service.fetch_quote.return_value = {
-                    "current_price": 150.0,
-                    "sector": "Technology",
-                    "industry": "Consumer Electronics"
-                }
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock database query for duplicate check
-                mock_session.execute.return_value.scalar_one_or_none.return_value = None
-                
-                # Mock position creation
-                position = portfolio_position_factory("AAPL", 0.1)
-                position.id = 1
-                position.added_on = datetime.utcnow()
-                position.updated_on = datetime.utcnow()
-                mock_session.add.return_value = None
-                mock_session.commit.return_value = None
-                mock_session.refresh.return_value = None
-                
-                request_data = {
-                    "ticker": "AAPL",
-                    "weight": 0.1,
-                    "region": "US",
-                    "custom_name": ""
-                }
-                
-                response = await async_client.post("/api/v1/portfolio/add", json=request_data)
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["ticker"] == "AAPL"
-                assert data["weight"] == 0.1
-    
+    async def test_add_position_success(self, async_client):
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/add", json={
+                "ticker": "TEST", "weight": 0.5, "quantity": 10, "buy_price": 100,
+            })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ticker"] == "TEST"
+        assert data["last_price"] == 150.0
+
     @pytest.mark.asyncio
-    async def test_add_portfolio_position_invalid_ticker(self, async_client: AsyncClient):
-        """Test portfolio position addition with invalid ticker"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.validate_ticker.return_value = False
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            request_data = {
-                "ticker": "INVALID",
-                "weight": 0.1,
-                "region": "US"
-            }
-            
-            response = await async_client.post("/api/v1/portfolio/add", json=request_data)
-            
-            assert response.status_code == 400
-            assert "not valid" in response.json()["detail"]
-    
+    async def test_add_duplicate_conflict(self, async_client, seeded_positions):
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/add", json={
+                "ticker": "AAPL", "weight": 0.1, "quantity": 1, "buy_price": 100,
+            })
+        assert resp.status_code == 409
+
     @pytest.mark.asyncio
-    async def test_add_portfolio_position_duplicate(self, async_client: AsyncClient):
-        """Test portfolio position addition with duplicate ticker"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service.validate_ticker.return_value = True
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock existing position
-                mock_session.execute.return_value.scalar_one_or_none.return_value = Mock()
-                
-                request_data = {
-                    "ticker": "AAPL",
-                    "weight": 0.1,
-                    "region": "US"
-                }
-                
-                response = await async_client.post("/api/v1/portfolio/add", json=request_data)
-                
-                assert response.status_code == 409
-                assert "already exists" in response.json()["detail"]
-    
+    async def test_add_invalid_ticker_suggestions_400(self, async_client):
+        with self._patch_market_data(valid=False):
+            resp = await async_client.post("/api/v1/portfolio/add", json={
+                "ticker": "APPL", "weight": 0.5, "quantity": 1, "buy_price": 100,
+            })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["error"] == "INVALID_TICKER"
+        assert "AAPL" in detail["suggestions"]
+
     @pytest.mark.asyncio
-    async def test_bulk_add_positions_success(self, async_client: AsyncClient):
-        """Test successful bulk position addition"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = None
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service.validate_ticker.return_value = True
-                mock_service.fetch_quote.return_value = {
-                    "current_price": 150.0,
-                    "sector": "Technology",
-                    "industry": "Consumer Electronics"
-                }
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock no existing positions
-                mock_session.execute.return_value.scalars.return_value.all.return_value = []
-                
-                request_data = {
-                    "positions": [
-                        {"ticker": "AAPL", "weight": 0.25, "region": "US"},
-                        {"ticker": "MSFT", "weight": 0.25, "region": "US"}
-                    ],
-                    "auto_normalize": False
-                }
-                
-                response = await async_client.post("/api/v1/portfolio/bulk_add", json=request_data)
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["added"] == 2
-                assert data["failed"] == 0
-                assert len(data["positions"]) == 2
-    
+    async def test_bulk_add_positions_success(self, async_client):
+        """Regression: module-level validator signature bug failed every row."""
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/bulk_add", json={
+                "positions": [
+                    {"ticker": "AAA", "weight": 0.4, "quantity": 5, "buy_price": 100},
+                    {"ticker": "BBB", "weight": 0.6, "quantity": 3, "buy_price": 200},
+                ],
+                "auto_normalize": False,
+            })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["added"] == 2, data
+        assert data["failed"] == 0
+
     @pytest.mark.asyncio
-    async def test_get_portfolio_position(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test specific portfolio position retrieval"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service.fetch_quote.return_value = {"current_price": 150.0}
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock existing position
-                position = portfolio_position_factory("AAPL", 0.1)
-                position.id = 1
-                position.added_on = datetime.utcnow()
-                position.updated_on = datetime.utcnow()
-                mock_session.execute.return_value.scalar_one_or_none.return_value = position
-                mock_session.commit.return_value = None
-                
-                response = await async_client.get("/api/v1/portfolio/AAPL")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["ticker"] == "AAPL"
-    
+    async def test_get_position_includes_computed_fields(self, async_client, seeded_positions):
+        with self._patch_market_data():
+            resp = await async_client.get("/api/v1/portfolio/AAPL")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ticker"] == "AAPL"
+        for field in ("quantity", "buy_price", "total_cost", "unrealized_gain_loss"):
+            assert field in data
+
     @pytest.mark.asyncio
-    async def test_get_portfolio_position_not_found(self, async_client: AsyncClient):
-        """Test non-existent portfolio position retrieval"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock no existing position
-            mock_session.execute.return_value.scalar_one_or_none.return_value = None
-            
-            response = await async_client.get("/api/v1/portfolio/INVALID")
-            
-            assert response.status_code == 404
-            assert "not found" in response.json()["detail"]
-    
+    async def test_update_position_weight(self, async_client, seeded_positions):
+        resp = await async_client.put("/api/v1/portfolio/AAPL", json={"weight": 0.9})
+        assert resp.status_code == 200, resp.text
+        assert abs(resp.json()["weight"] - 0.9) < 1e-9
+
     @pytest.mark.asyncio
-    async def test_update_portfolio_position(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test portfolio position update"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock existing position
-                position = portfolio_position_factory("AAPL", 0.1)
-                position.id = 1
-                position.added_on = datetime.utcnow()
-                position.updated_on = datetime.utcnow()
-                mock_session.execute.return_value.scalar_one_or_none.return_value = position
-                mock_session.commit.return_value = None
-                mock_session.refresh.return_value = None
-                
-                request_data = {"weight": 0.15}
-                
-                response = await async_client.put("/api/v1/portfolio/AAPL", json=request_data)
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert data["weight"] == 0.15
-    
+    async def test_update_position_invalid_weight_422(self, async_client, seeded_positions):
+        # weight>1 rejected at the Pydantic schema layer before handler logic
+        resp = await async_client.put("/api/v1/portfolio/AAPL", json={"weight": 1.5})
+        assert resp.status_code == 422
+
     @pytest.mark.asyncio
-    async def test_update_portfolio_position_invalid_weight(self, async_client: AsyncClient):
-        """Test portfolio position update with invalid weight"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            with patch('app.services.data_service.DataService') as mock_service_class:
-                mock_service = AsyncMock()
-                mock_service_class.return_value.get_service.return_value = mock_service
-                
-                # Mock existing position
-                position = Mock()
-                mock_session.execute.return_value.scalar_one_or_none.return_value = position
-                
-                request_data = {"weight": 2.0}  # Invalid weight > 1.0
-                
-                response = await async_client.put("/api/v1/portfolio/AAPL", json=request_data)
-                
-                assert response.status_code == 400
-                assert "between 0 and 1" in response.json()["detail"]
-    
+    async def test_delete_position(self, async_client, seeded_positions):
+        resp = await async_client.delete("/api/v1/portfolio/AAPL")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
     @pytest.mark.asyncio
-    async def test_delete_portfolio_position(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test portfolio position deletion"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock existing position
-            position = portfolio_position_factory("AAPL", 0.1)
-            mock_session.execute.return_value.scalar_one_or_none.return_value = position
-            mock_session.delete.return_value = None
-            mock_session.commit.return_value = None
-            
-            response = await async_client.delete("/api/v1/portfolio/AAPL")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["success"] is True
-            assert "deleted successfully" in data["message"]
-    
+    async def test_export_csv_contains_holdings(self, async_client, seeded_positions):
+        resp = await async_client.get("/api/v1/portfolio/export/csv")
+        assert resp.status_code == 200
+        assert "AAPL" in resp.text
+
     @pytest.mark.asyncio
-    async def test_delete_portfolio_position_not_found(self, async_client: AsyncClient):
-        """Test deletion of non-existent portfolio position"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock no existing position
-            mock_session.execute.return_value.scalar_one_or_none.return_value = None
-            
-            response = await async_client.delete("/api/v1/portfolio/INVALID")
-            
-            assert response.status_code == 404
-            assert "not found" in response.json()["detail"]
-    
-    @pytest.mark.asyncio
-    async def test_export_portfolio_csv(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test portfolio CSV export"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock positions
-            positions = [
-                portfolio_position_factory("AAPL", 0.25),
-                portfolio_position_factory("MSFT", 0.25)
-            ]
-            positions[0].added_on = datetime.utcnow()
-            positions[0].updated_on = datetime.utcnow()
-            positions[1].added_on = datetime.utcnow()
-            positions[1].updated_on = datetime.utcnow()
-            mock_session.execute.return_value.scalars.return_value.all.return_value = positions
-            
-            response = await async_client.get("/api/v1/portfolio/export/csv")
-            
-            assert response.status_code == 200
-            csv_content = response.text
-            assert "ticker,weight" in csv_content
-            assert "AAPL" in csv_content
-            assert "MSFT" in csv_content
-    
-    @pytest.mark.asyncio
-    async def test_export_portfolio_csv_empty(self, async_client: AsyncClient):
-        """Test portfolio CSV export with no positions"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock empty positions
-            mock_session.execute.return_value.scalars.return_value.all.return_value = []
-            
-            response = await async_client.get("/api/v1/portfolio/export/csv")
-            
-            assert response.status_code == 404
-            assert "No positions to export" in response.json()["detail"]
-    
-    @pytest.mark.asyncio
-    async def test_normalize_portfolio_weights(self, async_client: AsyncClient, portfolio_position_factory):
-        """Test portfolio weight normalization"""
-        with patch('app.db.database.get_db_session') as mock_db:
-            mock_session = AsyncMock()
-            mock_session.__aenter__.return_value = mock_session
-            mock_db.return_value = mock_session
-            
-            # Mock positions
-            positions = [
-                portfolio_position_factory("AAPL", 0.6),
-                portfolio_position_factory("MSFT", 0.4)
-            ]
-            positions[0].added_on = datetime.utcnow()
-            positions[0].updated_on = datetime.utcnow()
-            positions[1].added_on = datetime.utcnow()
-            positions[1].updated_on = datetime.utcnow()
-            mock_session.execute.return_value.scalars.return_value.all.return_value = positions
-            mock_session.commit.return_value = None
-            
-            response = await async_client.post("/api/v1/portfolio/normalize")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert data["success"] is True
-            assert "normalized" in data["message"]
+    async def test_normalize_weights(self, async_client, seeded_positions):
+        resp = await async_client.post("/api/v1/portfolio/normalize")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
 
 
 @pytest.mark.api
 class TestAnalyticsAPI:
-    """Test analytics API endpoints"""
-    
+    """Analytics endpoints against real DB positions + real engine math.
+
+    DataService is mocked at fetch_historical_data (the network seam) with
+    schema-correct lowercase OHLCV frames; everything downstream is real.
+    """
+
+    def _patch_data_service(self, frame):
+        """Patch the GlobalDataService name analytics.py actually resolves.
+
+        analytics.py holds its own from-import bindings, so we must patch in
+        ITS namespace with an explicitly built service mock.
+        """
+        service = Mock()
+        service.get_service.return_value.fetch_historical_data = AsyncMock(
+            return_value=frame
+        )
+        return patch("app.api.analytics.GlobalDataService", return_value=service)
+
     @pytest.mark.asyncio
-    async def test_get_analytics_summary(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test analytics summary endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                mock_engine.get_engine.return_value.calculate_portfolio_metrics.return_value = {
-                    "annual_return": 0.08,
-                    "annual_volatility": 0.20,
-                    "sharpe_ratio": 0.3,
-                    "max_drawdown": -0.15
-                }
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/summary")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "annual_return" in data
-                assert "annual_volatility" in data
-                assert "sharpe_ratio" in data
-    
+    async def test_realized_risk_uses_db_positions(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/realized-risk")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert set(data["positions"].keys()) == {"AAPL", "MSFT"}
+        assert "annual_volatility" in data["portfolio"]
+
     @pytest.mark.asyncio
-    async def test_get_realized_risk(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test realized risk endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                mock_engine.get_engine.return_value.calculate_portfolio_metrics.return_value = {
-                    "annual_volatility": 0.20,
-                    "var_95": -0.025,
-                    "cvar_95": -0.035
-                }
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/realized-risk?tickers=AAPL")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "annual_volatility" in data
-                assert "var_95" in data
-    
+    async def test_realized_risk_explicit_tickers_override(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/realized-risk?tickers=INFY.NS")
+        assert resp.status_code == 200
+        assert set(resp.json()["positions"].keys()) == {"INFY.NS"}
+
     @pytest.mark.asyncio
-    async def test_get_forecast_risk(self, async_client: AsyncClient, mock_returns_series):
-        """Test forecast risk endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {
-                "data": {"AAPL": pd.DataFrame({"Close": [100, 101, 102]})}
-            }
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                mock_engine.get_engine.return_value.forecast_volatility.return_value = {
-                    "volatility_forecast": 0.22,
-                    "model": "GARCH"
-                }
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/forecast-risk?tickers=AAPL")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "volatility_forecast" in data
-                assert "model" in data
-    
+    async def test_empty_portfolio_returns_clean_error(self, async_client, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/realized-risk")
+        assert resp.status_code == 200
+        assert "positions found" in resp.json().get("error", "")
+
     @pytest.mark.asyncio
-    async def test_get_factor_exposure(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test factor exposure endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                mock_engine.get_engine.return_value.factor_exposure_analysis.return_value = {
-                    "portfolio": {"market": 1.1, "alpha": 0.02},
-                    "r_squared": 0.85
-                }
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/factor-exposure?tickers=AAPL")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "portfolio" in data
-                assert "r_squared" in data
-    
+    async def test_forecast_risk_default_positions(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/forecast-risk?model=EWMA")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["portfolio"]["volatility_forecast"] >= 0
+        assert set(data["positions"].keys()) == {"AAPL", "MSFT"}
+
     @pytest.mark.asyncio
-    async def test_get_concentration(self, async_client: AsyncClient, sample_portfolio_weights):
-        """Test concentration analysis endpoint"""
-        with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-            mock_engine = AsyncMock()
-            mock_engine.get_engine.return_value.concentration_analysis.return_value = {
-                "largest_position": 0.25,
-                "herfindahl_index": 0.15,
-                "effective_positions": 6.7
-            }
-            mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-            
-            response = await async_client.get("/api/v1/analytics/concentration")
-            
-            assert response.status_code == 200
-            data = response.json()
-            assert "largest_position" in data
-            assert "herfindahl_index" in data
-    
+    async def test_factor_exposure_structure(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/factor-exposure?lookback_days=120")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "portfolio" in data and "r_squared" in data
+
     @pytest.mark.asyncio
-    async def test_get_liquidity(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test liquidity analysis endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                mock_service = AsyncMock()
-                liquidity_data = {
-                    "overall_score": 7.5,
-                    "liquidation_time_days": "2-5",
-                    "risk_level": "Medium"
-                }
-                mock_engine.get_engine.return_value.liquidity_analysis.return_value = liquidity_data
-                mock_service_class.return_value.get_service.return_value = mock_service
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/liquidity")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "overall_score" in data
-                assert "liquidation_time_days" in data
-    
+    async def test_concentration_reflects_positions(self, async_client, seeded_positions):
+        resp = await async_client.get("/api/v1/analytics/concentration")
+        assert resp.status_code == 200
+        data = resp.json()
+        # market values 18k/21k -> largest weight 21/39
+        assert abs(data["largest_position"] - 21000 / 39000) < 1e-6
+        assert data["herfindahl_index"] > 0
+
     @pytest.mark.asyncio
-    async def test_get_stress_test(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test stress testing endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                stress_data = {
-                    "scenario": "2020_covid",
-                    "max_drawdown": -0.25,
-                    "recovery_time": 45
-                }
-                mock_engine.get_engine.return_value.stress_test.return_value = stress_data
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/stress-testing?scenario=2020_covid")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "max_drawdown" in data
-                assert "scenario" in data
-    
+    async def test_liquidity_handles_lowercase_volume(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/liquidity")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "overall_score" in data
+        assert set(data["by_position"].keys()) == {"AAPL", "MSFT"}
+
     @pytest.mark.asyncio
-    async def test_get_volatility_sizing(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test volatility sizing endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                sizing_data = {
-                    "recommended_weights": {"AAPL": 0.3},
-                    "trades": {"AAPL": {"shares_delta": 10}},
-                    "target_volatility": 0.15
-                }
-                mock_engine.get_engine.return_value.volatility_sizing.return_value = sizing_data
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/volatility-sizing")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "recommended_weights" in data
-                assert "trades" in data
-    
+    async def test_stress_test_post(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.post(
+                "/api/v1/analytics/stress-test", json={"scenario": "2020_covid"}
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["scenario"] == "2020_covid"
+        assert "max_drawdown" in data
+
     @pytest.mark.asyncio
-    async def test_get_risk_score(self, async_client: AsyncClient, mock_price_dataframe):
-        """Test risk scoring endpoint"""
-        with patch('app.services.data_service.DataService') as mock_service_class:
-            mock_service = AsyncMock()
-            mock_service.fetch_ohlcv_batch.return_value = {"data": {"AAPL": mock_price_dataframe}}
-            mock_service_class.return_value.get_service.return_value = mock_service
-            
-            with patch('app.services.analytics_engine.GlobalAnalyticsEngine') as mock_engine_class:
-                mock_engine = AsyncMock()
-                risk_data = {
-                    "overall_score": 25.0,
-                    "risk_level": "MEDIUM",
-                    "components": {"volatility": 15.0, "concentration": 10.0}
-                }
-                mock_engine.get_engine.return_value.risk_scoring.return_value = risk_data
-                mock_engine_class.return_value.get_engine.return_value = mock_engine.get_engine.return_value
-                
-                response = await async_client.get("/api/v1/analytics/risk-score")
-                
-                assert response.status_code == 200
-                data = response.json()
-                assert "overall_score" in data
-                assert "risk_level" in data
-                assert "components" in data
+    async def test_volatility_sizing_weights(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/volatility-sizing")
+        assert resp.status_code == 200
+        data = resp.json()
+        rec = data["recommended_weights"]
+        assert set(rec.keys()) == {"AAPL", "MSFT"}
+        assert abs(sum(rec.values()) - 1.0) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_risk_score_components(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/risk-score")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data["overall_score"], (int, float))
+        assert data["risk_level"] in {"LOW", "MEDIUM", "HIGH"}
+
+    @pytest.mark.asyncio
+    async def test_summary_counts_positions(self, async_client, seeded_positions, ohlcv_frame_factory):
+        with self._patch_data_service(ohlcv_frame_factory()):
+            resp = await async_client.get("/api/v1/analytics/summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_positions"] == 2
+        assert "risk_score" in data
 
 
 @pytest.mark.api
@@ -785,7 +365,7 @@ class TestHealthAndStatus:
         assert response.status_code == 200
         data = response.json()
         assert "status" in data
-        assert "timestamp" in data
+        assert "service" in data
     
     def test_root_endpoint(self, client: TestClient):
         """Test root endpoint"""

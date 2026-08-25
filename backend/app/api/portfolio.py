@@ -472,8 +472,12 @@ async def bulk_add_positions(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-def _validate_portfolio_position(self, position: PortfolioPosition) -> bool:
-    """Validate portfolio position data integrity"""
+def _validate_portfolio_position(position: PortfolioPosition) -> bool:
+    """Validate portfolio position data integrity.
+
+    Module-level helper (the stray ``self`` parameter previously made every
+    bulk-add call raise TypeError, silently failing each position).
+    """
     try:
         # Business rule validations
         if not position.ticker or len(position.ticker) > 10:
@@ -528,18 +532,33 @@ async def get_portfolio_position(
             position.last_price = quote_data["current_price"]
             position.market_value = 100000 * position.weight  # Assuming $100k base
             await db.commit()
-        
+
+        # Reload eagerly: on-update server columns (updated_on) are otherwise
+        # unfetched on fresh rows and lazy-load with sync IO outside greenlet.
+        await db.refresh(position)
+
+        total_cost = position.quantity * position.buy_price
+        current_value = position.quantity * position.last_price
+        unrealized_gain_loss = current_value - total_cost
+        unrealized_gain_loss_pct = (unrealized_gain_loss / total_cost * 100) if total_cost > 0 else 0.0
+
         return PortfolioPositionResponse(
             id=position.id,
             ticker=position.ticker,
             weight=position.weight,
+            quantity=position.quantity,
+            buy_price=position.buy_price,
             last_price=position.last_price,
             market_value=position.market_value,
             sector=position.sector,
             industry=position.industry,
             custom_name=position.custom_name,
             added_on=position.added_on,
-            updated_on=position.updated_on
+            updated_on=position.updated_on,
+            total_cost=total_cost,
+            unrealized_gain_loss=unrealized_gain_loss,
+            unrealized_gain_loss_pct=unrealized_gain_loss_pct,
+            current_value=current_value
         )
         
     except HTTPException:
@@ -712,7 +731,8 @@ async def export_portfolio_csv(
                 position.industry,
                 position.custom_name or '',
                 position.added_on.isoformat(),
-                position.updated_on.isoformat()
+                # fresh rows have NULL updated_on until first update
+                (position.updated_on or position.added_on).isoformat()
             ])
         
         # Return CSV content

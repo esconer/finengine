@@ -6,9 +6,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 import pandas as pd
 
 from app.db.database import get_db_session
+from app.models.database import PortfolioPosition
 from app.services.data_service import GlobalDataService, DataService
 from app.services.cache_service import GlobalCacheService, CacheService
 from app.services.analytics_engine import GlobalAnalyticsEngine, AnalyticsEngine
@@ -41,11 +43,77 @@ def get_analytics_engine() -> AnalyticsEngine:
     return GlobalAnalyticsEngine().get_engine()
 
 
+def _price_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    """Extract the close-price series indexed by DATE from any DataService shape.
+
+    Fresh yfinance fetches carry 'date' as a column (integer row index);
+    cache hits return a DatetimeIndex. Stress scenarios filter returns by
+    date, so every analytics consumer must receive a date-indexed series.
+    """
+    if df is None or df.empty:
+        return None
+    price_col = next(
+        (c for c in ("adj_close", "close", "Adj Close", "Close") if c in df.columns),
+        None,
+    )
+    if price_col is None:
+        return None
+    values = df[price_col]
+    for dcol in ("date", "Date"):
+        if dcol in df.columns:
+            idx = pd.to_datetime(df[dcol], errors="coerce")
+            return pd.Series(values.values, index=idx, name=price_col).dropna()
+    if isinstance(df.index, pd.DatetimeIndex):
+        out = values.copy()
+        out.index = pd.to_datetime(df.index)
+        return out
+    return pd.Series(values.values, index=pd.RangeIndex(len(values)), name=price_col)
+
+
+def _assign_price(store: Dict[str, pd.Series], ticker: str, df: pd.DataFrame) -> None:
+    series = _price_series(df)
+    if series is not None:
+        store[ticker] = series
+
+
+async def _load_portfolio_allocation(db: AsyncSession) -> Optional[Dict[str, float]]:
+    """
+    Load {ticker: weight} from actual portfolio positions.
+
+    Prefers market-value-derived weights (quantity x last_price); falls back to the
+    stored weight column, then equal weights. Returns None when the portfolio is empty.
+    """
+    result = await db.execute(select(PortfolioPosition))
+    positions = result.scalars().all()
+    if not positions:
+        return None
+
+    mv_weights = {}
+    total_mv = 0.0
+    for pos in positions:
+        mv = pos.market_value or 0.0
+        if mv <= 0:
+            mv = (pos.quantity or 0.0) * (pos.last_price or 0.0)
+        mv_weights[pos.ticker] = mv
+        total_mv += mv
+
+    if total_mv > 0:
+        return {t: v / total_mv for t, v in mv_weights.items()}
+
+    total_weight = sum(pos.weight or 0.0 for pos in positions)
+    if total_weight > 0:
+        return {pos.ticker: (pos.weight or 0.0) / total_weight for pos in positions}
+
+    n = len(positions)
+    return {pos.ticker: 1.0 / n for pos in positions}
+
+
 @router.get("/realized-risk")
 async def get_realized_risk(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or 'portfolio'"),
     start: Optional[str] = Query(default=None, description="Start date (YYYY-MM-DD)"),
     end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     cache_service: CacheService = Depends(get_cache_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
@@ -59,26 +127,40 @@ async def get_realized_risk(
             end = datetime.now().strftime('%Y-%m-%d')
         if not start:
             start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
-        
-        # Parse tickers
-        if not tickers:
-            # Default to portfolio positions if available
-            tickers = "AAPL,MSFT,GOOGL,AMZN"  # Fallback default
-        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-        
+
+        # Resolve tickers + weights: explicit param wins, else actual DB positions
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            equal_weight = 1.0 / len(ticker_list)
+            weights = {ticker: equal_weight for ticker in ticker_list}
+        else:
+            weights = await _load_portfolio_allocation(db)
+            if not weights:
+                return {
+                    "portfolio": {
+                        "annual_return": 0.0,
+                        "annual_volatility": 0.20,
+                        "sharpe_ratio": 0.0,
+                        "sortino_ratio": 0.0,
+                        "skewness": 0.0,
+                        "kurtosis": 3.0,
+                        "max_drawdown": 0.0,
+                        "var_95": -0.032,
+                        "cvar_95": -0.047,
+                        "hit_ratio": 0.5
+                    },
+                    "positions": {},
+                    "error": "No portfolio positions found"
+                }
+            ticker_list = list(weights.keys())
+
         # Fetch price data for all tickers
         price_data_dict = {}
-        weights = {}
-        
-        # Calculate equal weights for demo portfolio
-        equal_weight = 1.0 / len(ticker_list)
-        
         for ticker in ticker_list:
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
-                weights[ticker] = equal_weight
-        
+                _assign_price(price_data_dict, ticker, df)
+
         if not price_data_dict:
             logger.warning("No price data available for tickers")
             return {
@@ -147,6 +229,7 @@ async def get_forecast_risk(
     model: str = Query(default="GARCH", description="Risk model: EWMA, GARCH, or EGARCH"),
     horizon: int = Query(default=1, ge=1, le=30, description="Forecast horizon in days"),
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     cache_service: CacheService = Depends(get_cache_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
@@ -155,10 +238,26 @@ async def get_forecast_risk(
     Get forecast risk metrics using specified model
     """
     try:
-        # Default tickers if none provided
-        if not tickers:
-            tickers = "AAPL,MSFT,GOOGL,AMZN"  # Fallback default
-        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        # Resolve tickers: explicit param wins, else actual DB positions
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        else:
+            allocation = await _load_portfolio_allocation(db)
+            if not allocation:
+                return {
+                    "model": model,
+                    "horizon": horizon,
+                    "portfolio": {
+                        "volatility_forecast": 0.22,
+                        "var_forecast": -0.028,
+                        "cvar_forecast": -0.041,
+                        "confidence_interval": [0.18, 0.26]
+                    },
+                    "positions": {},
+                    "model_params": {"p": 1, "q": 1, "type": model},
+                    "error": "No portfolio positions found"
+                }
+            ticker_list = list(allocation.keys())
         
         # Default date range for sufficient historical data
         end = datetime.now().strftime('%Y-%m-%d')
@@ -169,7 +268,7 @@ async def get_forecast_risk(
         for ticker in ticker_list:
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {
@@ -234,6 +333,7 @@ async def get_forecast_risk(
 async def get_factor_exposure(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
     lookback_days: int = Query(default=252, ge=30, le=756, description="Lookback period in days"),
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -241,10 +341,32 @@ async def get_factor_exposure(
     Get factor exposure analysis
     """
     try:
-        # Default tickers if none provided
-        if not tickers:
-            tickers = "AAPL,MSFT,GOOGL,AMZN"  # Fallback default
-        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        # Resolve tickers: explicit param wins, else actual DB positions
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        else:
+            allocation = await _load_portfolio_allocation(db)
+            if not allocation:
+                return {
+                    "portfolio": {
+                        "alpha": 0,
+                        "market": 1,
+                        "momentum": 0,
+                        "size": 0,
+                        "value": 0,
+                        "min_vol": 0,
+                        "quality": 0,
+                        "rates": 0,
+                        "volatility": 0,
+                        "meme": 0,
+                        "ai": 0
+                    },
+                    "positions": {},
+                    "r_squared": 0.5,
+                    "adjusted_r_squared": 0.48,
+                    "error": "No portfolio positions found"
+                }
+            ticker_list = list(allocation.keys())
         
         # Calculate date range
         end = datetime.now().strftime('%Y-%m-%d')
@@ -255,7 +377,7 @@ async def get_factor_exposure(
         for ticker in ticker_list:
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {
@@ -301,6 +423,7 @@ async def get_factor_exposure(
 
 @router.get("/concentration")
 async def get_concentration_metrics(
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -308,20 +431,35 @@ async def get_concentration_metrics(
     Get portfolio concentration metrics
     """
     try:
-        # Default portfolio weights for demo
-        weights = {"AAPL": 0.25, "MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25}
+        # Actual DB positions
+        weights = await _load_portfolio_allocation(db)
+        if not weights:
+            return {
+                "largest_position": 0.0,
+                "top_3": 0.0,
+                "top_5": 0.0,
+                "top_10": 0.0,
+                "herfindahl_index": 0.0,
+                "effective_positions": 0.0,
+                "diversification_ratio": 1.0,
+                "by_weight": {},
+                "by_sector": {},
+                "error": "No portfolio positions found"
+            }
         
         # Calculate concentration metrics using analytics engine
         concentration_result = await analytics_engine.concentration_analysis(weights)
         
-        # Add sector information (simplified)
-        by_sector = {
-            "Technology": 1.0,  # All demo assets are in technology
-            "Communication_Services": 0.0,
-            "Finance": 0.0,
-            "Healthcare": 0.0,
-            "Other": 0.0
-        }
+        # Sector allocation from actual position metadata
+        sector_result = await db.execute(select(PortfolioPosition))
+        positions = sector_result.scalars().all()
+        total_position_weight = sum(pos.weight or 0.0 for pos in positions) or 1.0
+        by_sector = {}
+        for pos in positions:
+            sector = pos.sector or "Unknown"
+            by_sector[sector] = round(
+                by_sector.get(sector, 0.0) + (pos.weight or 0.0) / total_position_weight, 4
+            )
         
         return {
             "largest_position": concentration_result.get("largest_position", 0.25),
@@ -343,6 +481,7 @@ async def get_concentration_metrics(
 
 @router.get("/liquidity")
 async def get_liquidity_metrics(
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -350,8 +489,18 @@ async def get_liquidity_metrics(
     Get portfolio liquidity analysis
     """
     try:
-        # Default portfolio
-        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN"]
+        # Actual DB positions
+        allocation = await _load_portfolio_allocation(db)
+        if not allocation:
+            return {
+                "overall_score": 5.0,
+                "liquidation_time_days": "5-10",
+                "risk_level": "Medium",
+                "by_position": {},
+                "volume_stats": {"avg_volume": 0, "total_portfolio_volume": 0, "high_volume_pct": 0, "medium_volume_pct": 0, "low_volume_pct": 100},
+                "error": "No portfolio positions found"
+            }
+        tickers = list(allocation.keys())
         
         # Fetch price and volume data for liquidity analysis
         end = datetime.now().strftime('%Y-%m-%d')
@@ -363,11 +512,12 @@ async def get_liquidity_metrics(
             if df is not None and not df.empty:
                 # Include volume data for liquidity analysis
                 price_col = 'adj_close' if 'adj_close' in df.columns else 'close'
-                if 'Volume' in df.columns and price_col in df.columns:
-                    price_data_dict[ticker] = df[[price_col, 'Volume']]
+                vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
+                if vol_col and price_col in df.columns:
+                    price_data_dict[ticker] = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
                 else:
                     # Fallback: just price data if volume not available
-                    price_data_dict[ticker] = df[[price_col]]
+                    price_data_dict[ticker] = df[[price_col]].rename(columns={price_col: 'Close'})
         
         if not price_data_dict:
             return {
@@ -399,6 +549,7 @@ async def get_liquidity_metrics(
 @router.post("/stress-test")
 async def run_stress_test(
     request: StressTestRequest,
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -406,8 +557,17 @@ async def run_stress_test(
     Run stress test on portfolio
     """
     try:
-        # Default portfolio weights
-        weights = {"AAPL": 0.25, "MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25}
+        # Actual DB positions (request-level tickers override)
+        weights = await _load_portfolio_allocation(db)
+        if not weights:
+            return {
+                "scenario": request.scenario,
+                "max_drawdown": -0.20,
+                "portfolio_impact": -0.17,
+                "position_impacts": {},
+                "recovery_time": 30,
+                "error": "No portfolio positions found for stress testing"
+            }
         
         # Fetch price data for stress testing
         end = datetime.now().strftime('%Y-%m-%d')
@@ -417,7 +577,7 @@ async def run_stress_test(
         for ticker in weights.keys():
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {
@@ -446,6 +606,7 @@ async def run_stress_test(
 async def get_volatility_sizing(
     model: str = Query(default="EWMA", description="Volatility model"),
     target_volatility: float = Query(default=0.15, gt=0, lt=1, description="Target volatility"),
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -453,8 +614,16 @@ async def get_volatility_sizing(
     Get volatility-adjusted position sizing recommendations
     """
     try:
-        # Default portfolio weights
-        weights = {"AAPL": 0.25, "MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25}
+        # Actual DB positions
+        weights = await _load_portfolio_allocation(db)
+        if not weights:
+            return {
+                "current_weights": {},
+                "recommended_weights": {},
+                "trades": {},
+                "target_volatility": target_volatility,
+                "error": "No portfolio positions found for volatility sizing"
+            }
         
         # Fetch price data for volatility sizing
         end = datetime.now().strftime('%Y-%m-%d')
@@ -464,7 +633,7 @@ async def get_volatility_sizing(
         for ticker in weights.keys():
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {
@@ -490,6 +659,7 @@ async def get_volatility_sizing(
 
 @router.get("/risk-score")
 async def get_risk_score(
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -497,8 +667,17 @@ async def get_risk_score(
     Get overall portfolio risk score
     """
     try:
-        # Default portfolio weights
-        weights = {"AAPL": 0.25, "MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25}
+        # Actual DB positions
+        weights = await _load_portfolio_allocation(db)
+        if not weights:
+            return {
+                "overall_score": 25.0,
+                "risk_level": "MEDIUM",
+                "change": 0,
+                "components": {"concentration": 15.0, "volatility": 15.0, "correlation": 10.0, "factor_risk": 20.0, "market_risk": 10.0},
+                "alerts": ["No portfolio positions found for risk scoring"],
+                "error": "No portfolio positions found"
+            }
         
         # Fetch price data for risk scoring
         end = datetime.now().strftime('%Y-%m-%d')
@@ -508,7 +687,7 @@ async def get_risk_score(
         for ticker in weights.keys():
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {
@@ -535,6 +714,7 @@ async def get_risk_score(
 
 @router.get("/summary")
 async def get_analytics_summary(
+    db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
@@ -542,8 +722,23 @@ async def get_analytics_summary(
     Get analytics summary for dashboard
     """
     try:
-        # Default portfolio weights
-        weights = {"AAPL": 0.25, "MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25}
+        # Actual DB positions
+        weights = await _load_portfolio_allocation(db)
+        if not weights:
+            return {
+                "portfolio_value": 100000.0,
+                "total_positions": 0,
+                "realized_volatility": 0.20,
+                "forecast_volatility": 0.22,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "risk_score": 25.0,
+                "risk_level": "MEDIUM",
+                "liquidity_score": 5.0,
+                "concentration_score": 15.0,
+                "last_updated": datetime.utcnow().isoformat(),
+                "error": "No portfolio positions found for summary"
+            }
         
         # Fetch price data for summary
         end = datetime.now().strftime('%Y-%m-%d')
@@ -553,7 +748,7 @@ async def get_analytics_summary(
         for ticker in weights.keys():
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                price_data_dict[ticker] = df['adj_close'] if 'adj_close' in df.columns else df['close']
+                _assign_price(price_data_dict, ticker, df)
         
         if not price_data_dict:
             return {

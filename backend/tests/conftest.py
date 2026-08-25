@@ -15,7 +15,7 @@ import os
 
 # FastAPI and testing
 from fastapi.testclient import TestClient
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import MetaData, create_engine
 from sqlalchemy.pool import StaticPool
@@ -94,6 +94,52 @@ def mock_returns_series():
     return returns
 
 
+# ---- Daisy schema fixtures -------------------------------------------------
+
+@pytest.fixture
+def ohlcv_frame_factory():
+    """OHLCV frames in the project's lowercase cache schema (DataService shape)."""
+    def _make(days: int = 260, seed: int = 7, start: str = "2025-01-01", ticker: str = "TEST"):
+        dates = pd.date_range(start=start, periods=days, freq="B")
+        rng = np.random.default_rng(seed)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.015, days)))
+        return pd.DataFrame({
+            "date": dates,
+            "open": close * (1 + rng.normal(0, 0.004, days)),
+            "high": close * 1.008,
+            "low": close * 0.992,
+            "close": close,
+            "adj_close": close,
+            "volume": rng.integers(100_000, 1_000_000, days).astype(float),
+            "ticker": ticker,
+        })
+    return _make
+
+
+@pytest_asyncio.fixture
+async def seeded_positions(test_db: AsyncSession):
+    """Two real PortfolioPosition rows; cleaned up afterwards."""
+    positions = [
+        PortfolioPosition(
+            ticker="AAPL", weight=0.4, quantity=100, buy_price=150.0,
+            last_price=180.0, market_value=18_000.0,
+            sector="Technology", industry="Hardware",
+        ),
+        PortfolioPosition(
+            ticker="MSFT", weight=0.6, quantity=50, buy_price=300.0,
+            last_price=420.0, market_value=21_000.0,
+            sector="Technology", industry="Software",
+        ),
+    ]
+    test_db.add_all(positions)
+    await test_db.commit()
+    for pos in positions:
+        await test_db.refresh(pos)
+    yield positions
+    await test_db.execute(PortfolioPosition.__table__.delete())
+    await test_db.commit()
+
+
 # Database fixtures
 @pytest_asyncio.fixture
 async def test_db():
@@ -161,11 +207,20 @@ async def mock_cache_service(test_db: AsyncSession):
 
 
 # Application fixtures
+def _override_get_db(session: AsyncSession):
+    async def _gen():
+        yield session
+    return _gen
+
+
 @pytest_asyncio.fixture
-async def async_client() -> AsyncGenerator[AsyncClient, None]:
-    """Create async test client"""
-    async with AsyncClient(app=app, base_url="http://test") as client:
+async def async_client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """Async test client bound to the ISOLATED test database (never daisy.db)."""
+    app.dependency_overrides[get_db_session] = _override_get_db(test_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+    app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture

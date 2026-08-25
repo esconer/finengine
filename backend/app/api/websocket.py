@@ -69,24 +69,21 @@ manager = ConnectionManager()
 update_task = None
 
 async def background_updates():
-    """Background task for sending periodic updates"""
-    data_service = GlobalDataService()
-    analytics_engine = GlobalAnalyticsEngine()
-    
+    """Background task for sending periodic updates."""
     while True:
         try:
             # Send periodic portfolio updates
             await send_portfolio_update()
-            
+
             # Send periodic analytics updates
             await send_analytics_update()
-            
+
             # Send market data updates
             await send_market_data_update()
-            
+
             # Wait 30 seconds between updates
             await asyncio.sleep(30)
-            
+
         except Exception as e:
             logger.error(f"Error in background updates: {e}")
             await asyncio.sleep(5)  # Wait before retry

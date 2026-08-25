@@ -452,11 +452,14 @@ class AnalyticsEngine:
             current_volatilities = np.array([volatilities.get(ticker, 0.02) for ticker in returns.columns])
             
             if len(correlation_matrix) > 0:
-                portfolio_variance = np.dot(current_weights, np.dot(
-                    np.diag(current_volatilities), np.dot(
-                        correlation_matrix.values, np.diag(current_volatilities)
-                    )
-                ))
+                # Quadratic form w' (D C D) w — the original expression stopped
+                # at the row vector w' M, so `if portfolio_volatility > 0`
+                # raised on array truthiness and every request degraded to the
+                # empty fallback. Bug surfaced by ticket-01 test suite.
+                cov_matrix = correlation_matrix.values * np.outer(
+                    current_volatilities, current_volatilities
+                )
+                portfolio_variance = float(current_weights @ cov_matrix @ current_weights)
                 portfolio_volatility = np.sqrt(portfolio_variance) * np.sqrt(252)  # Annualized
             else:
                 portfolio_volatility = 0.20  # Default

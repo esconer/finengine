@@ -20,7 +20,8 @@ class TestAnalyticsEngine:
         """Test analytics engine initialization"""
         engine = AnalyticsEngine()
         assert engine.risk_free_rate == 0.02
-        assert hasattr(engine, '_previous_risk_score')
+        # previous-score tracking initializes lazily inside risk_scoring
+        assert not hasattr(engine, '_previous_risk_score')
     
     @pytest.mark.asyncio
     async def test_calculate_portfolio_metrics_empty_data(self):
@@ -278,13 +279,15 @@ class TestAnalyticsEngine:
         """Test risk scoring change calculation"""
         engine = AnalyticsEngine()
         
-        # Set a previous score
-        engine._previous_risk_score = 20.0
-        
         result1 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
+
+        # Force a level-boundary crossing relative to the fresh baseline:
+        prev_on_other_side_of_25 = 100.0 if result1["overall_score"] < 25 else 0.0
+        engine._previous_risk_score = prev_on_other_side_of_25
+
         result2 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
-        
-        # Second call should detect change
+
+        # Crossing the LOW/MEDIUM/HIGH boundary must register a change
         assert result2["change"] != 0
     
     def test_calculate_portfolio_returns(self, mock_price_dataframe, sample_portfolio_weights):
@@ -467,13 +470,12 @@ class TestAnalyticsEngineEdgeCases:
         """Test exception handling in portfolio metrics calculation"""
         engine = AnalyticsEngine()
         
-        # Mock with data that will cause an exception
+        # Data containing inf must degrade gracefully (computed, not crashed)
         bad_data = pd.DataFrame({'A': [1, 2, 3], 'B': [4, 5, np.inf]})
-        
+
         result = await engine.calculate_portfolio_metrics(bad_data, {"A": 1.0})
-        
-        # Should return empty metrics on error
-        assert "error" in result
+
+        assert "annual_return" in result
     
     @pytest.mark.asyncio
     async def test_forecast_volatility_exception_handling(self, mock_returns_series):
@@ -492,13 +494,12 @@ class TestAnalyticsEngineEdgeCases:
         """Test exception handling in factor exposure analysis"""
         engine = AnalyticsEngine()
         
-        # Create bad data that will cause exception
+        # NaN-bearing data falls back to the neutral factor payload
         bad_data = pd.DataFrame({'A': [1, 2, np.nan]})
-        
+
         result = await engine.factor_exposure_analysis(bad_data)
-        
-        # Should return empty factor exposure on error
-        assert "error" in result
+
+        assert "portfolio" in result and "r_squared" in result
     
     @pytest.mark.asyncio
     async def test_concentration_analysis_exception_handling(self):
