@@ -59,24 +59,6 @@ export default function LiquidityPage() {
 
   const { positions } = usePortfolioStore();
 
-  // Generate realistic liquidity scores based on ticker
-  const generateLiquidityScore = (ticker: string): number => {
-    // Use ticker hash for consistent but deterministic scoring
-    const tickerCodes = {
-      'AAPL': 8.5, 'MSFT': 8.2, 'GOOGL': 8.0, 'AMZN': 7.8, 'TSLA': 7.5,
-      'META': 8.1, 'NVDA': 8.7, 'NFLX': 7.2, 'CRM': 6.8, 'ORCL': 6.5,
-      'JPM': 7.9, 'BAC': 7.1, 'WMT': 7.6, 'V': 8.3, 'MA': 8.4
-    };
-
-    if (tickerCodes[ticker as keyof typeof tickerCodes]) {
-      return tickerCodes[ticker as keyof typeof tickerCodes];
-    }
-
-    // Generate consistent score for unknown tickers
-    const hash = ticker.split('').reduce((a, b) => a + b.charCodeAt(0), 0);
-    return 4.5 + (hash % 45) / 10; // Range 4.5-9.0
-  };
-
   const fetchLiquidityData = async () => {
     setLoading(true);
     setError(null);
@@ -85,7 +67,7 @@ export default function LiquidityPage() {
       const data = await analyticsApi.getLiquidityMetrics();
       setLiquidityData(data);
 
-      // Convert by_position data for table - handle both API and fallback data
+      // Convert by_position data for table
       const positionsList: PositionLiquidity[] = [];
 
       // Process API data if available
@@ -96,49 +78,9 @@ export default function LiquidityPage() {
             score: posData.score || 0,
             category: posData.category || 'Medium',
             liquidation_days: posData.liquidation_days || '2-5',
-            volume_30d: Math.random() * 10000000 + 1000000, // Mock data for volume
-            market_cap: Math.random() * 1000000000 + 100000000, // Mock data for market cap
-            bid_ask_spread: Math.random() * 0.5 + 0.1, // Mock data for spread
-          });
-        });
-      }
-
-      // Add positions from portfolio store if they don't exist in API data
-      positions.forEach(pos => {
-        if (!positionsList.find(p => p.ticker === pos.ticker)) {
-          // Generate realistic liquidity scores based on ticker
-          const score = generateLiquidityScore(pos.ticker);
-          const category = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low';
-          const liquidationDays = score >= 8 ? '1-2' : score >= 6 ? '2-5' : '5-10';
-
-          positionsList.push({
-            ticker: pos.ticker,
-            score,
-            category: category as 'High' | 'Medium' | 'Low',
-            liquidation_days: liquidationDays,
-            volume_30d: Math.random() * 10000000 + 1000000,
-            market_cap: Math.random() * 1000000000 + 100000000,
-            bid_ask_spread: Math.random() * 0.3 + 0.1,
-          });
-        }
-      });
-
-      // If no data available, create demo data
-      if (positionsList.length === 0) {
-        const demoTickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META'];
-        demoTickers.forEach(ticker => {
-          const score = generateLiquidityScore(ticker);
-          const category = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low';
-          const liquidationDays = score >= 8 ? '1-2' : score >= 6 ? '2-5' : '5-10';
-
-          positionsList.push({
-            ticker,
-            score,
-            category,
-            liquidation_days: liquidationDays,
-            volume_30d: Math.random() * 10000000 + 1000000,
-            market_cap: Math.random() * 1000000000 + 100000000,
-            bid_ask_spread: Math.random() * 0.3 + 0.1,
+            volume_30d: posData.avg_volume || 0,
+            market_cap: 0,
+            bid_ask_spread: posData.spread || 0.001,
           });
         });
       }
@@ -366,32 +308,24 @@ export default function LiquidityPage() {
           <MetricCard
             title="Overall Liquidity Score"
             value={formatScore(overallScore)}
-            change={0.3}
-            changeType="positive"
             icon={Droplets}
             loading={loading}
           />
           <MetricCard
             title="Avg. Days to Liquidate"
             value={liquidityData?.liquidation_time_days || 'N/A'}
-            change={-0.4}
-            changeType="positive"
             icon={Clock}
             loading={loading}
           />
           <MetricCard
             title="Liquidity Risk"
             value={liquidityData?.risk_level || 'Unknown'}
-            change={0}
-            changeType={liquidityData?.risk_level === 'Low' ? 'positive' : 'neutral'}
             icon={AlertTriangle}
             loading={loading}
           />
           <MetricCard
             title="High Liquidity Positions"
             value={`${highVolumeCount} (${positionData.length > 0 ? formatPercentage((highVolumeCount / positionData.length) * 100) : '0%'})`}
-            change={5}
-            changeType="positive"
             icon={TrendingDown}
             loading={loading}
           />

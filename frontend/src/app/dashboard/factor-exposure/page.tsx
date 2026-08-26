@@ -146,13 +146,9 @@ export default function FactorExposurePage() {
 
   // Factor metrics for the main display
   const factorMetrics: FactorMetric[] = [
-    { name: 'Market', portfolio_value: factorData?.portfolio?.market || 0, interpretation: 'Market beta exposure', risk_level: 'Medium' as const, color_class: 'bg-blue-500' },
-    { name: 'Value', portfolio_value: factorData?.portfolio?.value || 0, interpretation: 'Value factor tilt', risk_level: 'Low' as const, color_class: 'bg-green-500' },
-    { name: 'Momentum', portfolio_value: factorData?.portfolio?.momentum || 0, interpretation: 'Momentum exposure', risk_level: 'Medium' as const, color_class: 'bg-purple-500' },
-    { name: 'Quality', portfolio_value: factorData?.portfolio?.quality || 0, interpretation: 'Quality bias', risk_level: 'Low' as const, color_class: 'bg-orange-500' },
-    { name: 'Size', portfolio_value: factorData?.portfolio?.size || 0, interpretation: 'Size factor exposure', risk_level: 'Low' as const, color_class: 'bg-teal-500' },
-    { name: 'Rates', portfolio_value: factorData?.portfolio?.rates || 0, interpretation: 'Interest rate sensitivity', risk_level: 'Low' as const, color_class: 'bg-indigo-500' },
-  ].filter(metric => Math.abs(metric.portfolio_value) > 0.01); // Filter out near-zero exposures
+    { name: 'Market Beta', portfolio_value: factorData?.portfolio?.market ?? 1.0, interpretation: 'Sensitivity to NIFTY benchmark', risk_level: 'Medium' as const, color_class: 'bg-blue-500' },
+    { name: "Jensen's Alpha", portfolio_value: factorData?.portfolio?.alpha ?? 0.0, interpretation: 'Excess return over benchmark', risk_level: 'Low' as const, color_class: 'bg-green-500' },
+  ];
 
   // Position-level factor table columns
   const positionColumns = [
@@ -166,61 +162,22 @@ export default function FactorExposurePage() {
       ),
     },
     {
-      header: 'Market',
+      header: 'Market Beta (β)',
       accessorKey: 'market',
       cell: ({ row }: any) => (
         <div className={getRiskColor(row.market)}>
-          {formatFactor(row.market)}
+          {formatFactor(row.market ?? 1.0)}
         </div>
       ),
     },
     {
-      header: 'Value',
-      accessorKey: 'value',
+      header: "Jensen's Alpha (α)",
+      accessorKey: 'alpha',
       cell: ({ row }: any) => (
-        <div className={getRiskColor(row.value)}>
-          {formatFactor(row.value)}
+        <div className={row.alpha >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
+          {formatFactor(row.alpha ?? 0.0, 4)}
         </div>
       ),
-    },
-    {
-      header: 'Momentum',
-      accessorKey: 'momentum',
-      cell: ({ row }: any) => (
-        <div className={getRiskColor(row.momentum)}>
-          {formatFactor(row.momentum)}
-        </div>
-      ),
-    },
-    {
-      header: 'Quality',
-      accessorKey: 'quality',
-      cell: ({ row }: any) => (
-        <div className={getRiskColor(row.quality)}>
-          {formatFactor(row.quality)}
-        </div>
-      ),
-    },
-    {
-      header: 'Size',
-      accessorKey: 'size',
-      cell: ({ row }: any) => (
-        <div className={getRiskColor(row.size)}>
-          {formatFactor(row.size)}
-        </div>
-      ),
-    },
-    {
-      header: 'R² Contribution',
-      accessorKey: 'r_squared',
-      cell: ({ row }: any) => {
-        const r2Contribution = Math.abs(row.market) * 0.5 + Math.abs(row.value) * 0.2 + Math.abs(row.momentum) * 0.2;
-        return (
-          <div className={`${r2Contribution > 0.7 ? 'text-red-600' : r2Contribution > 0.4 ? 'text-yellow-600' : 'text-green-600'}`}>
-            {r2Contribution.toFixed(3)}
-          </div>
-        );
-      },
     },
   ];
 
@@ -232,7 +189,7 @@ export default function FactorExposurePage() {
           <div>
             <h1 className="text-3xl font-bold mb-2">Factor Exposure</h1>
             <p className="text-green-100">
-              Multi-factor risk analysis and exposure metrics
+              Statistical factor model with market benchmark regression
             </p>
             <div className="flex items-center mt-2 space-x-4">
               <div className="text-green-200 text-sm">
@@ -266,35 +223,35 @@ export default function FactorExposurePage() {
       {/* Key Factor Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
-          title="Market Beta"
-          value={factorData?.portfolio?.market ? formatFactor(factorData.portfolio.market) : 'N/A'}
-          change={0.03}
+          title="Market Beta (β)"
+          value={factorData?.portfolio?.market ? formatFactor(factorData.portfolio.market) : '1.000'}
+          change={0}
           changeType="neutral"
           icon={Target}
           loading={loading}
         />
         <MetricCard
-          title="Value Factor"
-          value={factorData?.portfolio?.value ? formatFactor(factorData.portfolio.value) : 'N/A'}
-          change={-0.12}
-          changeType={factorData?.portfolio?.value && factorData.portfolio.value < 0 ? "negative" : "positive"}
+          title="Jensen's Alpha (α)"
+          value={factorData?.portfolio?.alpha !== undefined ? formatFactor(factorData.portfolio.alpha, 4) : '0.0000'}
+          change={0}
+          changeType={factorData?.portfolio?.alpha && factorData.portfolio.alpha > 0 ? "positive" : "neutral"}
           icon={TrendingUp}
           loading={loading}
         />
         <MetricCard
-          title="Momentum Factor"
-          value={factorData?.portfolio?.momentum ? formatFactor(factorData.portfolio.momentum) : 'N/A'}
-          change={0.08}
-          changeType="positive"
-          icon={Activity}
+          title="R-Squared (R²)"
+          value={factorData?.r_squared !== undefined ? factorData.r_squared.toFixed(3) : 'N/A'}
+          change={0}
+          changeType="neutral"
+          icon={BarChart3}
           loading={loading}
         />
         <MetricCard
-          title="Quality Factor"
-          value={factorData?.portfolio?.quality ? formatFactor(factorData.portfolio.quality) : 'N/A'}
-          change={0.05}
-          changeType="positive"
-          icon={BarChart3}
+          title="Adjusted R²"
+          value={factorData?.adjusted_r_squared !== undefined ? factorData.adjusted_r_squared.toFixed(3) : 'N/A'}
+          change={0}
+          changeType="neutral"
+          icon={Activity}
           loading={loading}
         />
       </div>

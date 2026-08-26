@@ -147,7 +147,7 @@ class CurrencyConversionService:
     
     async def _fetch_exchange_rate(self, from_currency: str, to_currency: str) -> float:
         """
-        Fetch exchange rate from external API or return fallback rate
+        Fetch exchange rate from yfinance (USDINR=X) or return fallback rate
         
         Args:
             from_currency: Source currency
@@ -156,18 +156,36 @@ class CurrencyConversionService:
         Returns:
             Exchange rate
         """
-        # For USD to INR, use a reasonable fallback rate
-        # In production, you would integrate with a real API like:
-        # - exchangerate-api.com
-        # - fixer.io
-        # - currencylayer.com
-        
-        if from_currency == 'USD' and to_currency == 'INR':
-            # Fallback rate (should be updated regularly in production)
-            # Approximate rate as of late 2024
-            return 83.0
-        elif from_currency == 'INR' and to_currency == 'USD':
-            return 1.0 / 83.0
+        if (from_currency == 'USD' and to_currency == 'INR') or (from_currency == 'INR' and to_currency == 'USD'):
+            def _get_live_rate() -> Optional[float]:
+                try:
+                    import yfinance as yf
+                    t = yf.Ticker("USDINR=X")
+                    if hasattr(t, "fast_info") and t.fast_info:
+                        price = getattr(t.fast_info, "last_price", None) or getattr(t.fast_info, "regular_market_price", None)
+                        if price and price > 0:
+                            return float(price)
+                    hist = t.history(period="5d")
+                    if not hist.empty and "Close" in hist.columns:
+                        closes = hist["Close"].dropna()
+                        if not closes.empty and closes.iloc[-1] > 0:
+                            return float(closes.iloc[-1])
+                except Exception as e:
+                    logger.warning(f"Failed to fetch live USDINR=X from yfinance: {e}")
+                return None
+
+            try:
+                live_usd_inr = await asyncio.to_thread(_get_live_rate)
+            except Exception as e:
+                logger.warning(f"Error in async thread for USDINR rate: {e}")
+                live_usd_inr = None
+
+            rate = live_usd_inr if live_usd_inr and live_usd_inr > 0 else 83.0
+
+            if from_currency == 'USD' and to_currency == 'INR':
+                return rate
+            else:
+                return 1.0 / rate
         else:
             # For other currency pairs, return 1.0 (no conversion)
             logger.warning(f"No exchange rate configured for {from_currency} to {to_currency}")

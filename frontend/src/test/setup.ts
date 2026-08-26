@@ -1,10 +1,7 @@
 // Test setup file for Vitest
 import { expect, afterEach, vi, describe, it, beforeEach } from 'vitest'
 import { cleanup } from '@testing-library/react'
-import * as matchers from '@testing-library/jest-dom/matchers'
-
-// extends Vitest's expect with jest-dom matchers
-expect.extend(matchers)
+import '@testing-library/jest-dom'
 
 // runs a cleanup after each test case
 afterEach(() => {
@@ -12,13 +9,18 @@ afterEach(() => {
 })
 
 // Mock WebSocket
-global.WebSocket = vi.fn().mockImplementation(() => ({
+const MockWebSocket = vi.fn().mockImplementation(() => ({
     send: vi.fn(),
     close: vi.fn(),
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
     readyState: 1, // OPEN
-}))
+})) as any
+MockWebSocket.CONNECTING = 0
+MockWebSocket.OPEN = 1
+MockWebSocket.CLOSING = 2
+MockWebSocket.CLOSED = 3
+global.WebSocket = MockWebSocket
 
 // Mock fetch
 global.fetch = vi.fn()

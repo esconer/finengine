@@ -8,6 +8,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Plus, Loader } from 'lucide-react';
 import { PortfolioCreateRequest, Currency } from '@/types';
+import { portfolioApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface AddPositionModalProps {
@@ -30,8 +31,6 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [totalPortfolioValue, setTotalPortfolioValue] = useState(100000);
 
-  console.log('🔥 SimpleModal: Component rendered, isOpen:', isOpen);
-
   // Fetch total portfolio value
   useEffect(() => {
     if (isOpen) {
@@ -41,11 +40,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
   const fetchTotalPortfolioValue = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/api/v1/portfolio?currency=${currency}`);
-      if (response.ok) {
-        const data = await response.json();
-        setTotalPortfolioValue(data.total_value || 100000);
-      }
+      const data = await portfolioApi.getPortfolio({ currency });
+      setTotalPortfolioValue(data.total_value || 100000);
     } catch (error) {
       console.error('Failed to fetch portfolio total:', error);
       setTotalPortfolioValue(100000);
@@ -55,7 +51,6 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   // Reset form when modal opens
   useEffect(() => {
     if (isOpen) {
-      console.log('🔥 SimpleModal: Modal opened, resetting form');
       setFormData({
         ticker: '',
         weight: 0,
@@ -108,23 +103,17 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   // Handle form submission
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    console.log('🔥 SimpleModal: Form submitted', formData);
     
     if (!validateForm()) {
-      console.log('🔥 SimpleModal: Validation failed');
       return;
     }
 
     try {
       setIsSubmitting(true);
       setErrors({});
-      
-      console.log('🔥 SimpleModal: Calling onAdd...');
       await onAdd(formData);
-      console.log('🔥 SimpleModal: Position added successfully');
       onClose();
     } catch (error: any) {
-      console.error('🔥 SimpleModal: Failed to add position:', error);
       setErrors({ submit: error.message || 'Failed to add position. Please try again.' });
     } finally {
       setIsSubmitting(false);
@@ -133,7 +122,6 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
   // Handle input change
   const handleInputChange = (field: keyof PortfolioCreateRequest, value: string | number) => {
-    console.log('🔥 SimpleModal: Input change', field, value);
     setFormData(prev => ({ ...prev, [field]: value }));
     if (errors[field]) {
       setErrors(prev => ({ ...prev, [field]: '' }));
@@ -141,11 +129,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   };
 
   if (!isOpen) {
-    console.log('🔥 SimpleModal: Not open, returning null');
     return null;
   }
-
-  console.log('🔥 SimpleModal: Rendering modal content...');
 
   return (
     <div

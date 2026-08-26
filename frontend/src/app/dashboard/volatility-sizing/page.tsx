@@ -30,9 +30,17 @@ interface VolatilitySizingData {
     amount: number;
   }>;
   target_volatility: number;
-  model_params: Record<string, any>;
+  current_volatility?: number;
+  volatilities?: Record<string, number>;
+  model_params?: Record<string, any>;
   methodology?: string;
 }
+
+const MODELS = [
+  { id: 'EWMA', name: 'EWMA', description: 'Exponentially weighted moving average volatility' },
+  { id: 'GARCH', name: 'GARCH', description: 'Generalized autoregressive conditional heteroskedasticity' },
+  { id: 'EGARCH', name: 'EGARCH', description: 'Exponential GARCH with asymmetric leverage effects' },
+];
 
 interface PositionSizing {
   ticker: string;
@@ -77,7 +85,7 @@ export default function VolatilitySizingPage() {
           current_weight: currentWeight,
           target_weight: targetWeight,
           recommended_weight: recommendedWeight,
-          volatility: Math.random() * 0.3 + 0.1, // Mock volatility data
+          volatility: data.volatilities?.[pos.ticker] ? data.volatilities[pos.ticker] * Math.sqrt(252) : 0.20,
           weight_change: weightChange,
           shares_delta: sharesDelta,
           amount_delta: amountDelta,
@@ -217,34 +225,26 @@ export default function VolatilitySizingPage() {
   const sellCount = positionData.filter(pos => pos.weight_change < -0.01).length;
   const holdCount = positionData.filter(pos => Math.abs(pos.weight_change) <= 0.01).length;
 
-  const models = [
-    { name: 'Risk Parity', description: 'Equal risk contribution across positions', volatility: '15.0%', actual: '14.2%' },
-    { name: 'Volatility Targeting', description: 'Target specific portfolio volatility', volatility: '12.0%', actual: '13.8%' },
-    { name: 'Equal Risk', description: 'Conservative risk distribution', volatility: '10.0%', actual: '11.2%' },
-  ];
-
   return (
     <div className="space-y-6">
       {/* Hero Section */}
-      <div className="bg-gradient-to-r from-yellow-600 to-orange-600 rounded-lg p-6 text-white">
+      <div className="bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg p-6 text-white">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold mb-2">Volatility Sizing</h1>
-            <p className="text-yellow-100">
-              Dynamic position sizing based on volatility models
+            <p className="text-teal-100">
+              Volatility-adjusted position sizing and risk parity recommendations
             </p>
             <div className="flex items-center mt-2 space-x-4">
-              <div className="text-yellow-200 text-sm">
-                Model: {selectedModel}
-              </div>
-              <div className="text-yellow-200 text-sm">
+              <div className="text-teal-200 text-sm">
                 Target Vol: {formatPercentage(targetVolatility)}
               </div>
-              {sizingData && (
-                <div className="text-yellow-200 text-sm">
-                  Est. Portfolio Vol: {formatPercentage(0.142)} {/* Mock current volatility */}
-                </div>
-              )}
+              <div className="text-teal-200 text-sm">
+                Model: {selectedModel}
+              </div>
+              <div className="text-teal-200 text-sm">
+                Positions: {positions.length}
+              </div>
             </div>
           </div>
           <div className="hidden md:flex items-center space-x-2">
@@ -255,7 +255,7 @@ export default function VolatilitySizingPage() {
             >
               <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
             </button>
-            <Zap className="w-16 h-16 text-yellow-200" />
+            <Target className="w-16 h-16 text-teal-200" />
           </div>
         </div>
       </div>
@@ -265,32 +265,24 @@ export default function VolatilitySizingPage() {
         <MetricCard
           title="Target Volatility"
           value={formatPercentage(targetVolatility)}
-          change={0}
-          changeType="neutral"
           icon={Target}
           loading={loading}
         />
         <MetricCard
-          title="Current Portfolio Vol"
-          value="14.2%"
-          change={-0.3}
-          changeType="positive"
+          title="Estimated Portfolio Vol"
+          value={sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : 'N/A'}
           icon={Activity}
           loading={loading}
         />
         <MetricCard
-          title="Vol-Adj Sharpe"
-          value="1.24"
-          change={0.08}
-          changeType="positive"
+          title="Model"
+          value={selectedModel}
           icon={TrendingUp}
           loading={loading}
         />
         <MetricCard
-          title="Sizing Efficiency"
-          value="94.7%"
-          change={1.2}
-          changeType="positive"
+          title="Total Positions"
+          value={positions.length}
           icon={Zap}
           loading={loading}
         />
@@ -303,38 +295,35 @@ export default function VolatilitySizingPage() {
             Volatility Models
           </h3>
           <div className="space-y-3">
-            {models.map((model) => (
+            {MODELS.map((model) => (
               <div
-                key={model.name}
+                key={model.id}
                 className={`p-4 border-2 rounded-lg cursor-pointer transition-colors ${
-                  selectedModel === model.name
-                    ? 'border-yellow-200 dark:border-yellow-800 bg-yellow-50 dark:bg-yellow-900/20'
+                  selectedModel === model.id
+                    ? 'border-teal-400 dark:border-teal-500 bg-teal-50 dark:bg-teal-900/20'
                     : 'border-gray-200 dark:border-gray-600 hover:border-gray-300 dark:hover:border-gray-500'
                 }`}
-                onClick={() => handleModelChange(model.name.replace(' ', '').toUpperCase())}
+                onClick={() => handleModelChange(model.id)}
               >
                 <div className="flex items-center justify-between">
                   <h4 className={`font-medium ${
-                    selectedModel === model.name
-                      ? 'text-yellow-900 dark:text-yellow-300'
+                    selectedModel === model.id
+                      ? 'text-teal-900 dark:text-teal-300'
                       : 'text-gray-900 dark:text-white'
                   }`}>
                     {model.name}
                   </h4>
-                  {selectedModel === model.name.replace(' ', '').toUpperCase() && (
-                    <div className="w-4 h-4 bg-yellow-600 rounded-full"></div>
+                  {selectedModel === model.id && (
+                    <div className="w-4 h-4 bg-teal-600 rounded-full"></div>
                   )}
                 </div>
                 <p className={`text-sm mt-1 ${
-                  selectedModel === model.name
-                    ? 'text-yellow-700 dark:text-yellow-400'
+                  selectedModel === model.id
+                    ? 'text-teal-700 dark:text-teal-400'
                     : 'text-gray-600 dark:text-gray-400'
                 }`}>
                   {model.description}
                 </p>
-                <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                  Target Vol: {model.volatility} | Est. Vol: {model.actual}
-                </div>
               </div>
             ))}
           </div>

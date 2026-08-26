@@ -60,7 +60,7 @@ async def resolve_allocation(
     """Shared allocation resolution: explicit tickers (equal weight) or DB positions."""
     if tickers_param:
         ticker_list = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
-        eq = 1.0 / len(ticker_list)
+        eq = 1.0 / len(ticker_list) if ticker_list else 1.0
         return ticker_list, {t: eq for t in ticker_list}
     weights = await _load_portfolio_allocation(db)
     if not weights:
@@ -168,7 +168,7 @@ async def get_realized_risk(
         # Resolve tickers + weights: explicit param wins, else actual DB positions
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-            equal_weight = 1.0 / len(ticker_list)
+            equal_weight = 1.0 / len(ticker_list) if ticker_list else 1.0
             weights = {ticker: equal_weight for ticker in ticker_list}
         else:
             weights = await _load_portfolio_allocation(db)
@@ -278,6 +278,7 @@ async def get_forecast_risk(
         # Resolve tickers: explicit param wins, else actual DB positions
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            allocation = {t: 1.0 / len(ticker_list) for t in ticker_list}
         else:
             allocation = await _load_portfolio_allocation(db)
             if not allocation:
@@ -350,7 +351,7 @@ async def get_forecast_risk(
                     "volatility_forecast": ticker_forecast.get("volatility_forecast", 0.25),
                     "var_forecast": ticker_forecast.get("var_forecast", -0.032)
                 }
-            except:
+            except Exception:
                 positions[ticker] = {
                     "volatility_forecast": 0.25,
                     "var_forecast": -0.032
@@ -382,6 +383,7 @@ async def get_factor_exposure(
     lookback_days: int = Query(default=252, ge=30, le=756, description="Lookback period in days"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
+    benchmark_service: BenchmarkService = Depends(get_benchmark_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
     """
@@ -391,26 +393,19 @@ async def get_factor_exposure(
         # Resolve tickers: explicit param wins, else actual DB positions
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            eq = 1.0 / len(ticker_list) if ticker_list else 1.0
+            allocation = {t: eq for t in ticker_list}
         else:
             allocation = await _load_portfolio_allocation(db)
             if not allocation:
                 return {
                     "portfolio": {
-                        "alpha": 0,
-                        "market": 1,
-                        "momentum": 0,
-                        "size": 0,
-                        "value": 0,
-                        "min_vol": 0,
-                        "quality": 0,
-                        "rates": 0,
-                        "volatility": 0,
-                        "meme": 0,
-                        "ai": 0
+                        "alpha": 0.0,
+                        "market": 1.0
                     },
                     "positions": {},
-                    "r_squared": 0.5,
-                    "adjusted_r_squared": 0.48,
+                    "r_squared": 0.0,
+                    "adjusted_r_squared": 0.0,
                     "error": "No portfolio positions found"
                 }
             ticker_list = list(allocation.keys())
@@ -429,35 +424,37 @@ async def get_factor_exposure(
         if not price_data_dict:
             return {
                 "portfolio": {
-                    "alpha": 0,
-                    "market": 1,
-                    "momentum": 0,
-                    "size": 0,
-                    "value": 0,
-                    "min_vol": 0,
-                    "quality": 0,
-                    "rates": 0,
-                    "volatility": 0,
-                    "meme": 0,
-                    "ai": 0
+                    "alpha": 0.0,
+                    "market": 1.0
                 },
                 "positions": {},
-                "r_squared": 0.5,
-                "adjusted_r_squared": 0.48,
+                "r_squared": 0.0,
+                "adjusted_r_squared": 0.0,
                 "error": "No price data available for factor analysis"
             }
         
         # Combine price data
         price_data = pd.DataFrame(price_data_dict)
         
+        # Fetch benchmark returns via BenchmarkService (^NSEI)
+        benchmark_returns = None
+        try:
+            benchmark_returns = await benchmark_service.get_returns(start=start, end=end)
+        except Exception as be:
+            logger.warning(f"Could not load benchmark returns for factor exposure: {be}")
+        
         # Perform factor exposure analysis using analytics engine
-        factor_result = await analytics_engine.factor_exposure_analysis(price_data)
+        factor_result = await analytics_engine.factor_exposure_analysis(
+            price_data, 
+            benchmark_data=benchmark_returns,
+            weights=allocation
+        )
         
         return {
             "portfolio": factor_result.get("portfolio", {}),
             "positions": factor_result.get("positions", {}),
-            "r_squared": factor_result.get("r_squared", 0.5),
-            "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.48),
+            "r_squared": factor_result.get("r_squared", 0.0),
+            "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
             "data_range": {"start": start, "end": end},
             "lookback_days": lookback_days,
             "methodology": "Statistical factor model with market benchmark regression"
@@ -557,13 +554,11 @@ async def get_liquidity_metrics(
         for ticker in tickers:
             df = await data_service.fetch_historical_data(ticker, start, end)
             if df is not None and not df.empty:
-                # Include volume data for liquidity analysis
                 price_col = 'adj_close' if 'adj_close' in df.columns else 'close'
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
                 if vol_col and price_col in df.columns:
                     price_data_dict[ticker] = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
                 else:
-                    # Fallback: just price data if volume not available
                     price_data_dict[ticker] = df[[price_col]].rename(columns={price_col: 'Close'})
         
         if not price_data_dict:
@@ -773,7 +768,7 @@ async def get_analytics_summary(
         weights = await _load_portfolio_allocation(db)
         if not weights:
             return {
-                "portfolio_value": 100000.0,
+                "portfolio_value": 0.0,
                 "total_positions": 0,
                 "realized_volatility": 0.20,
                 "forecast_volatility": 0.22,
@@ -797,10 +792,18 @@ async def get_analytics_summary(
             if df is not None and not df.empty:
                 _assign_price(price_data_dict, ticker, df)
         
+        # Compute real portfolio value from DB positions
+        pos_result = await db.execute(select(PortfolioPosition))
+        positions_list = pos_result.scalars().all()
+        portfolio_value = sum(
+            (p.market_value if (p.market_value and p.market_value > 0) else (p.quantity or 0.0) * (p.last_price or 0.0))
+            for p in positions_list
+        )
+        
         if not price_data_dict:
             return {
-                "portfolio_value": 100000.0,
-                "total_positions": 4,
+                "portfolio_value": round(portfolio_value, 2),
+                "total_positions": len(weights),
                 "realized_volatility": 0.20,
                 "forecast_volatility": 0.22,
                 "sharpe_ratio": 0.0,
@@ -823,15 +826,15 @@ async def get_analytics_summary(
         
         # Generate summary
         summary = {
-            "portfolio_value": 100000.0,  # Simplified portfolio value
+            "portfolio_value": round(portfolio_value, 2),
             "total_positions": len(weights),
             "realized_volatility": metrics.get("annual_volatility", 0.20),
-            "forecast_volatility": 0.22,  # Simplified forecast
+            "forecast_volatility": 0.22,
             "sharpe_ratio": metrics.get("sharpe_ratio", 0),
             "max_drawdown": metrics.get("max_drawdown", 0),
             "risk_score": risk_result.get("overall_score", 25.0),
             "risk_level": risk_result.get("risk_level", "MEDIUM"),
-            "liquidity_score": 7.8,  # Simplified liquidity score
+            "liquidity_score": 7.8,
             "concentration_score": concentration_result.get("herfindahl_index", 0.25) * 100,
             "last_updated": datetime.utcnow().isoformat(),
             "methodology": "Real-time portfolio analytics summary with multi-factor risk assessment"
@@ -842,6 +845,94 @@ async def get_analytics_summary(
     except Exception as e:
         logger.error(f"Error in get_analytics_summary: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/performance-history")
+async def get_performance_history(
+    days: int = Query(default=90, ge=7, le=1825, description="Lookback window in days"),
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+    benchmark_service: BenchmarkService = Depends(get_benchmark_service),
+) -> List[Dict[str, Any]]:
+    """
+    Historical portfolio value series (price x quantity) over time from cached OHLCV.
+    """
+    try:
+        # Resolve positions & quantities
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            quantities = {t: 1.0 for t in ticker_list}
+        else:
+            result = await db.execute(select(PortfolioPosition))
+            db_positions = result.scalars().all()
+            if not db_positions:
+                return []
+            quantities = {}
+            for p in db_positions:
+                q = p.quantity if (p.quantity and p.quantity > 0) else 0.0
+                if q == 0.0 and p.market_value and p.last_price and p.last_price > 0:
+                    q = p.market_value / p.last_price
+                quantities[p.ticker] = q if q > 0 else 1.0
+            ticker_list = list(quantities.keys())
+
+        end = datetime.now().strftime('%Y-%m-%d')
+        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        price_data_dict: Dict[str, pd.Series] = {}
+        for ticker in ticker_list:
+            df = await data_service.fetch_historical_data(ticker, start, end)
+            if df is not None and not df.empty:
+                _assign_price(price_data_dict, ticker, df)
+
+        if not price_data_dict:
+            return []
+
+        price_df = pd.DataFrame(price_data_dict).ffill().bfill().dropna(how="all")
+        if price_df.empty:
+            return []
+
+        # Vectorized portfolio value: sum of (price * quantity)
+        q_series = pd.Series({t: quantities.get(t, 1.0) for t in price_df.columns})
+        portfolio_series = price_df.mul(q_series, axis=1).sum(axis=1)
+
+        # Returns
+        daily_returns = portfolio_series.pct_change().fillna(0.0)
+
+        # Benchmark comparison
+        bench_val_series = None
+        try:
+            bench_ret = await benchmark_service.get_returns(start=start, end=end, days=days)
+            if bench_ret is not None and not bench_ret.empty:
+                common_dates = portfolio_series.index.intersection(bench_ret.index)
+                if not common_dates.empty:
+                    initial_val = float(portfolio_series.loc[common_dates[0]])
+                    cum_bench = (1.0 + bench_ret.loc[common_dates]).cumprod()
+                    bench_val_series = initial_val * cum_bench
+        except Exception as be:
+            logger.debug(f"Benchmark returns unavailable for performance history: {be}")
+
+        output = []
+        for date_idx in portfolio_series.index:
+            date_str = str(date_idx)[:10]
+            val = float(portfolio_series.loc[date_idx])
+            ret = float(daily_returns.loc[date_idx])
+            item = {
+                "date": date_str,
+                "portfolio_value": round(val, 2),
+                "return": round(ret, 6),
+            }
+            if bench_val_series is not None and date_idx in bench_val_series.index:
+                item["benchmark_value"] = round(float(bench_val_series.loc[date_idx]), 2)
+            output.append(item)
+
+        return output
+
+    except Exception as e:
+        logger.error(f"Error in get_performance_history: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 # ---------------------------------------------------------------------------
 # Phase 1+2 endpoints: tear-sheet, risk contribution, optimizer, regime
 # ---------------------------------------------------------------------------
@@ -1122,7 +1213,7 @@ async def get_regime(
                 start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
                 _, port_ret = await _build_wide_returns(list(weights.keys()), weights, start, end, data_service)
             except (ValueError, HTTPException):
-                port_ret = None  # regime itself still works without holdings
+                port_ret = None
 
         result = await detect_regime(db, lookback_days=lookback_days, portfolio_returns=port_ret)
         return result

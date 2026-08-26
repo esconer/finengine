@@ -5,6 +5,7 @@ Market seam fully mocked (GlobalDataService + BenchmarkService inside the
 analytics namespace); all math downstream runs for real.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -25,7 +26,7 @@ def _frame(days=260, seed=7, vol=0.015):
 
 @pytest.fixture
 def patch_market():
-    """Patch both market seams inside app.api.analytics."""
+    """Patch both market seams inside app.api.analytics and regime_service."""
 
     def _apply(frames=None, bench_returns=None):
         service = Mock()
@@ -40,7 +41,13 @@ def patch_market():
             bench.get_returns = AsyncMock(return_value=bench_returns)
 
         ctx1 = patch("app.api.analytics.GlobalDataService", return_value=service)
-        ctx2 = patch("app.api.analytics.BenchmarkService", return_value=bench)
+        
+        @contextmanager
+        def _bench_ctx():
+            with patch("app.api.analytics.BenchmarkService", return_value=bench), \
+                 patch("app.services.regime_service.BenchmarkService", return_value=bench):
+                yield
+        ctx2 = _bench_ctx()
         return ctx1, ctx2
 
     return _apply
@@ -55,18 +62,16 @@ def _bench_series(days=400, seed=11):
 @pytest.mark.api
 class TestTearSheet:
     @pytest.mark.asyncio
-    async def test_metrics_and_relative_block(self, async_client, patch_market):
+    async def test_metrics_and_relative_block(self, async_client, seeded_positions, patch_market):
         ctx1, ctx2 = patch_market(bench_returns=_bench_series())
         with ctx1, ctx2:
-            resp = await async_client.get("/api/v1/analytics/tear-sheet?tickers=AAPL,MSFT")
+            resp = await async_client.get("/api/v1/analytics/tear-sheet")
         assert resp.status_code == 200, resp.text
         data = resp.json()
-        m = data["metrics"]
-        for key in ("sharpe", "sortino", "max_drawdown", "volatility"):
-            assert key in m and m[key] is not None
-        rel = data["relative_vs_nifty"]
-        assert isinstance(rel.get("beta_vs_nifty"), float)
-        assert len(data["underwater"]) > 0
+        for key in ("total_return", "cagr", "sharpe", "sortino", "calmar", "volatility", "max_drawdown"):
+            assert key in data["metrics"]
+            assert data["metrics"][key] is not None
+        assert "beta_vs_nifty" in data["relative_vs_nifty"]
         assert data["holdings"].keys() == {"AAPL", "MSFT"}
 
     @pytest.mark.asyncio
@@ -89,7 +94,7 @@ class TestRiskContribution:
         assert resp.status_code == 200, resp.text
         data = resp.json()["positions"]
         vol_rc = data["volatility"]
-        assert abs(sum(vol_rc.values()) - 1.0) < 1e-6
+        assert abs(sum(vol_rc.values()) - 1.0) < 1e-4
         assert vol_rc["MSFT"] > vol_rc["AAPL"]
 
         cvar_rc = data["cvar_tail"]

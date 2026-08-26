@@ -96,41 +96,37 @@ export const usePerformanceData = (days: number = 90) => {
   const { positions } = usePortfolioStore();
 
   useEffect(() => {
-    const generateMockPerformanceData = () => {
+    let isMounted = true;
+    const fetchPerformanceData = async () => {
       if (positions.length === 0) {
         setPerformanceData([]);
         setLoading(false);
         return;
       }
 
-      // Generate mock performance data for the last N days
-      const data = [];
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - days);
-      
-      let portfolioValue = 100000; // Starting value
-      const tickers = positions.map(p => p.ticker);
-      
-      for (let i = 0; i < days; i++) {
-        const date = new Date(startDate);
-        date.setDate(date.getDate() + i);
-        
-        // Mock daily returns with some volatility
-        const dailyReturn = (Math.random() - 0.48) * 0.02; // Slight positive bias
-        portfolioValue *= (1 + dailyReturn);
-        
-        data.push({
-          date: date.toISOString().split('T')[0],
-          portfolio_value: portfolioValue,
-          return: dailyReturn,
-        });
+      setLoading(true);
+      try {
+        const tickers = positions.map(p => p.ticker).join(',');
+        const data = await analyticsApi.getPerformanceHistory({ days, tickers });
+        if (isMounted) {
+          setPerformanceData(Array.isArray(data) ? data : []);
+        }
+      } catch (err) {
+        console.error('Failed to fetch performance history:', err);
+        if (isMounted) {
+          setPerformanceData([]);
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+        }
       }
-      
-      setPerformanceData(data);
-      setLoading(false);
     };
 
-    generateMockPerformanceData();
+    fetchPerformanceData();
+    return () => {
+      isMounted = false;
+    };
   }, [positions, days]);
 
   return { performanceData, loading };

@@ -10,8 +10,12 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
 import logging
 
-from app.services.data_service import GlobalDataService
-from app.services.analytics_engine import GlobalAnalyticsEngine
+from sqlalchemy import select
+import pandas as pd
+
+from app.db.database import SessionLocal
+from app.models.database import PortfolioPosition, StockTimeseries
+from app.services.analytics_engine import AnalyticsEngine
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -89,75 +93,130 @@ async def background_updates():
             await asyncio.sleep(5)  # Wait before retry
 
 async def send_portfolio_update():
-    """Send portfolio data update"""
+    """Send portfolio data update from database"""
     try:
-        # Mock portfolio update data
-        update_data = {
-            "type": "portfolio_update",
-            "timestamp": datetime.utcnow().isoformat(),
-            "data": {
-                "total_value": 100000 + (hash(str(datetime.now())) % 10000),
-                "positions": [
-                    {"ticker": "AAPL", "weight": 0.25, "value": 25000 + (hash("AAPL") % 1000)},
-                    {"ticker": "MSFT", "weight": 0.25, "value": 25000 + (hash("MSFT") % 1000)},
-                    {"ticker": "GOOGL", "weight": 0.25, "value": 25000 + (hash("GOOGL") % 1000)},
-                    {"ticker": "AMZN", "weight": 0.25, "value": 25000 + (hash("AMZN") % 1000)}
-                ]
+        async with SessionLocal() as db:
+            result = await db.execute(select(PortfolioPosition))
+            positions = result.scalars().all()
+            
+            total_value = 0.0
+            pos_list = []
+            for p in positions:
+                mv = p.market_value or ((p.quantity or 0.0) * (p.last_price or 0.0))
+                total_value += mv
+                pos_list.append({
+                    "ticker": p.ticker,
+                    "weight": round(float(p.weight or 0.0), 4),
+                    "value": round(float(mv), 2),
+                    "quantity": p.quantity or 0.0,
+                    "last_price": p.last_price or 0.0,
+                })
+            
+            update_data = {
+                "type": "portfolio_update",
+                "timestamp": datetime.utcnow().isoformat(),
+                "data": {
+                    "total_value": round(float(total_value), 2),
+                    "positions": pos_list
+                }
             }
-        }
-        await manager.broadcast(update_data, "portfolio")
+            await manager.broadcast(update_data, "portfolio")
     except Exception as e:
         logger.error(f"Error sending portfolio update: {e}")
 
 async def send_analytics_update():
-    """Send analytics data update"""
+    """Send analytics data update from database"""
     try:
-        # Mock analytics update data
-        update_data = {
-            "type": "analytics_update",
-            "timestamp": datetime.utcnow().isoformat(),
-            "data": {
-                "realized_volatility": 0.20 + (hash(str(datetime.now())) % 100 / 1000),
-                "sharpe_ratio": 0.5 + (hash("sharpe") % 100 / 1000),
-                "max_drawdown": -0.15 + (hash("drawdown") % 100 / 1000),
-                "risk_score": 25 + (hash("risk") % 100 / 10)
+        async with SessionLocal() as db:
+            result = await db.execute(select(PortfolioPosition))
+            positions = result.scalars().all()
+            if not positions:
+                return
+
+            tickers = [p.ticker for p in positions]
+            weights = {p.ticker: (p.weight or 0.0) for p in positions}
+            w_sum = sum(weights.values())
+            if w_sum > 0:
+                weights = {k: v / w_sum for k, v in weights.items()}
+            else:
+                weights = {t: 1.0 / len(tickers) for t in tickers}
+
+            t_res = await db.execute(
+                select(StockTimeseries)
+                .where(StockTimeseries.ticker.in_(tickers))
+                .order_by(StockTimeseries.date.asc())
+            )
+            rows = t_res.scalars().all()
+
+            realized_vol = 0.0
+            sharpe = 0.0
+            max_dd = 0.0
+
+            if rows:
+                data_dict = {}
+                for r in rows:
+                    data_dict.setdefault(r.ticker, {})[r.date] = r.adj_close or r.close
+                price_df = pd.DataFrame(data_dict).dropna()
+                if not price_df.empty and len(price_df) > 5:
+                    engine = AnalyticsEngine()
+                    metrics = await engine.calculate_portfolio_metrics(price_df, weights)
+                    realized_vol = metrics.get("annual_volatility", 0.0)
+                    sharpe = metrics.get("sharpe_ratio", 0.0)
+                    max_dd = metrics.get("max_drawdown", 0.0)
+
+            update_data = {
+                "type": "analytics_update",
+                "timestamp": datetime.utcnow().isoformat(),
+                "data": {
+                    "realized_volatility": round(float(realized_vol), 4),
+                    "sharpe_ratio": round(float(sharpe), 4),
+                    "max_drawdown": round(float(max_dd), 4),
+                    "positions_count": len(positions)
+                }
             }
-        }
-        await manager.broadcast(update_data, "analytics")
+            await manager.broadcast(update_data, "analytics")
     except Exception as e:
         logger.error(f"Error sending analytics update: {e}")
 
 async def send_market_data_update():
-    """Send market data update"""
+    """Send market data update from database"""
     try:
-        # Mock market data update
-        update_data = {
-            "type": "market_data_update",
-            "timestamp": datetime.utcnow().isoformat(),
-            "data": {
-                "AAPL": {
-                    "price": 150 + (hash("AAPL_price") % 100) / 10,
-                    "change": (hash("AAPL_change") % 200 - 100) / 100,
-                    "volume": 1000000 + (hash("AAPL_vol") % 100000)
-                },
-                "MSFT": {
-                    "price": 250 + (hash("MSFT_price") % 100) / 10,
-                    "change": (hash("MSFT_change") % 200 - 100) / 100,
-                    "volume": 800000 + (hash("MSFT_vol") % 100000)
-                },
-                "GOOGL": {
-                    "price": 100 + (hash("GOOGL_price") % 100) / 10,
-                    "change": (hash("GOOGL_change") % 200 - 100) / 100,
-                    "volume": 600000 + (hash("GOOGL_vol") % 100000)
-                },
-                "AMZN": {
-                    "price": 80 + (hash("AMZN_price") % 100) / 10,
-                    "change": (hash("AMZN_change") % 200 - 100) / 100,
-                    "volume": 700000 + (hash("AMZN_vol") % 100000)
+        async with SessionLocal() as db:
+            result = await db.execute(select(PortfolioPosition))
+            positions = result.scalars().all()
+            if not positions:
+                return
+
+            market_dict = {}
+            for p in positions:
+                t_res = await db.execute(
+                    select(StockTimeseries)
+                    .where(StockTimeseries.ticker == p.ticker)
+                    .order_by(StockTimeseries.date.desc())
+                    .limit(2)
+                )
+                ts_rows = t_res.scalars().all()
+                price = p.last_price or 0.0
+                change = 0.0
+                volume = 0
+                if ts_rows:
+                    price = ts_rows[0].close
+                    volume = ts_rows[0].volume
+                    if len(ts_rows) > 1 and ts_rows[1].close:
+                        change = (ts_rows[0].close - ts_rows[1].close) / ts_rows[1].close * 100.0
+
+                market_dict[p.ticker] = {
+                    "price": round(float(price), 2),
+                    "change": round(float(change), 2),
+                    "volume": int(volume)
                 }
+
+            update_data = {
+                "type": "market_data_update",
+                "timestamp": datetime.utcnow().isoformat(),
+                "data": market_dict
             }
-        }
-        await manager.broadcast(update_data, "market_data")
+            await manager.broadcast(update_data, "market_data")
     except Exception as e:
         logger.error(f"Error sending market data update: {e}")
 

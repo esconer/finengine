@@ -265,32 +265,24 @@ export default function ConcentrationPage() {
         <MetricCard
           title="Largest Position"
           value={concentrationData?.largest_position ? formatPercentage(concentrationData.largest_position) : 'N/A'}
-          change={concentrationData?.largest_position ? -0.4 : 0}
-          changeType="positive"
           icon={Target}
           loading={loading}
         />
         <MetricCard
           title="Top 3 Holdings"
           value={concentrationData?.top_3 ? formatPercentage(concentrationData.top_3) : 'N/A'}
-          change={concentrationData?.top_3 ? -1.2 : 0}
-          changeType="positive"
           icon={BarChart3}
           loading={loading}
         />
         <MetricCard
           title="Herfindahl Index"
           value={concentrationData?.herfindahl_index ? formatRatio(concentrationData.herfindahl_index) : 'N/A'}
-          change={concentrationData?.herfindahl_index ? -0.005 : 0}
-          changeType="positive"
           icon={AlertTriangle}
           loading={loading}
         />
         <MetricCard
           title="Effective Positions"
           value={concentrationData?.effective_positions ? formatRatio(concentrationData.effective_positions) : 'N/A'}
-          change={0}
-          changeType="neutral"
           icon={TrendingUp}
           loading={loading}
         />

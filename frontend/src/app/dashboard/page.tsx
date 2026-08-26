@@ -272,32 +272,24 @@ export default function DashboardSummary() {
           title="Total Portfolio Value"
           value={portfolioMetrics.totalValue}
           icon={DollarSign}
-          change={2.4}
-          changeType="positive"
           loading={isOverallLoading}
         />
         <MetricCard
           title="Number of Positions"
           value={portfolioMetrics.positionsCount}
           icon={Target}
-          change={positions.length > 0 ? 1 : 0}
-          changeType={positions.length > 0 ? 'positive' : 'neutral'}
           loading={isOverallLoading}
         />
         <MetricCard
           title="Risk Score"
           value={portfolioMetrics.riskScore.toFixed(1)}
           icon={Shield}
-          change={portfolioMetrics.riskScore > 0 ? -2.3 : 0}
-          changeType={portfolioMetrics.riskScore <= 25 ? 'positive' : 'negative'}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Sharpe Ratio"
           value={portfolioMetrics.sharpeRatio.toFixed(2)}
           icon={TrendingUp}
-          change={portfolioMetrics.sharpeRatio > 0 ? 0.15 : 0}
-          changeType={portfolioMetrics.sharpeRatio > 1 ? 'positive' : 'negative'}
           loading={analyticsLoading}
         />
       </div>

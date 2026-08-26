@@ -130,38 +130,57 @@ class AnalyticsEngine:
     async def factor_exposure_analysis(
         self, 
         price_data: pd.DataFrame, 
-        benchmark_data: Optional[pd.Series] = None
+        benchmark_data: Optional[pd.Series] = None,
+        weights: Optional[Dict[str, float]] = None
     ) -> Dict[str, Any]:
         """
         Perform factor exposure analysis
         
         Args:
             price_data: Price data for assets
-            benchmark_data: Benchmark returns for comparison
+            benchmark_data: Benchmark returns (or prices) for comparison
+            weights: Portfolio weights dictionary
             
         Returns:
-            Dictionary with factor exposures
+            Dictionary with factor exposures (alpha, market beta, r_squared)
         """
         try:
             if price_data.empty or len(price_data.columns) == 0:
                 return self._empty_factor_exposure()
             
-            returns = price_data.pct_change().dropna()
+            returns = price_data.pct_change(fill_method=None).dropna()
             if returns.empty:
                 return self._empty_factor_exposure()
+
+            if weights is None:
+                eq = 1.0 / len(returns.columns)
+                weights = {col: eq for col in returns.columns}
+            else:
+                w_sum = sum(weights.values())
+                if w_sum > 0:
+                    weights = {k: v / w_sum for k, v in weights.items()}
+                else:
+                    eq = 1.0 / len(returns.columns)
+                    weights = {col: eq for col in returns.columns}
             
-            # Use SPY as default benchmark if none provided
-            if benchmark_data is None:
-                # Fetch SPY data for benchmark (simplified)
-                # In practice, you'd get this from your data service
+            # Benchmark returns
+            if benchmark_data is None or benchmark_data.empty:
                 benchmark_returns = pd.Series(dtype=float)
             else:
-                benchmark_returns = benchmark_data.pct_change().dropna()
+                if (benchmark_data.abs() > 1.0).any():
+                    benchmark_returns = benchmark_data.pct_change(fill_method=None).dropna()
+                else:
+                    benchmark_returns = benchmark_data.dropna()
             
+            exposures_result = self._calculate_factor_exposures(returns, benchmark_returns, weights)
+            r2 = self._calculate_r_squared(returns, benchmark_returns, weights)
+            adj_r2 = self._calculate_adjusted_r_squared(returns, benchmark_returns, weights)
+
             results = {
-                'portfolio': self._calculate_factor_exposures(returns, benchmark_returns),
-                'r_squared': self._calculate_r_squared(returns, benchmark_returns),
-                'adjusted_r_squared': self._calculate_adjusted_r_squared(returns, benchmark_returns)
+                'portfolio': exposures_result.get('portfolio', {'alpha': 0.0, 'market': 1.0}),
+                'positions': exposures_result.get('positions', {}),
+                'r_squared': r2,
+                'adjusted_r_squared': adj_r2
             }
             
             return results
@@ -829,76 +848,72 @@ class AnalyticsEngine:
             logger.error(f"EWMA forecast error: {e}")
             return self._empty_forecast()
     
-    def _calculate_factor_exposures(self, returns: pd.DataFrame, benchmark_returns: pd.Series) -> Dict[str, float]:
-        """Calculate factor exposures using regression"""
+    def _calculate_factor_exposures(
+        self, 
+        returns: pd.DataFrame, 
+        benchmark_returns: pd.Series, 
+        weights: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Calculate factor exposures using OLS regression against market benchmark"""
         try:
             if returns.empty:
-                return {}
-            
-            # Simplified factor model - just market beta for now
-            # In practice, you'd have a multi-factor model
-            
+                return {'portfolio': {'alpha': 0.0, 'market': 1.0}, 'positions': {}}
+
+            positions_exp = {}
             if not benchmark_returns.empty and len(benchmark_returns) > 10:
-                # Align data
                 common_dates = returns.index.intersection(benchmark_returns.index)
                 if len(common_dates) > 10:
                     aligned_returns = returns.loc[common_dates]
                     aligned_benchmark = benchmark_returns.loc[common_dates]
-                    
-                    exposures = {}
+
                     for ticker in aligned_returns.columns:
                         try:
-                            # Simple regression
                             X = sm.add_constant(aligned_benchmark)
                             y = aligned_returns[ticker]
                             model = sm.OLS(y, X).fit()
-                            
-                            exposures[ticker] = {
-                                'alpha': model.params[0] if len(model.params) > 0 else 0,
-                                'market': model.params[1] if len(model.params) > 1 else 1
+                            alpha = float(model.params.iloc[0]) if len(model.params) > 0 else 0.0
+                            beta = float(model.params.iloc[1]) if len(model.params) > 1 else 1.0
+                            positions_exp[ticker] = {
+                                'alpha': round(alpha, 6),
+                                'market': round(beta, 4)
                             }
-                        except:
-                            exposures[ticker] = {'alpha': 0, 'market': 1}
-                    
-                    # Portfolio exposures (weighted average)
-                    portfolio_exposures = {}
-                    if exposures:
-                        # This would require portfolio weights - simplified for now
-                        portfolio_exposures['market'] = np.mean([exp['market'] for exp in exposures.values()])
-                        portfolio_exposures['alpha'] = np.mean([exp['alpha'] for exp in exposures.values()])
-                        portfolio_exposures['momentum'] = 0.1  # Placeholder
-                        portfolio_exposures['size'] = -0.1  # Placeholder
-                        portfolio_exposures['value'] = 0.05  # Placeholder
-                        portfolio_exposures['min_vol'] = -0.2  # Placeholder
-                        portfolio_exposures['quality'] = 0.1  # Placeholder
-                        portfolio_exposures['rates'] = 0.15  # Placeholder
-                        portfolio_exposures['volatility'] = -0.1  # Placeholder
-                        portfolio_exposures['meme'] = 0.05  # Placeholder
-                        portfolio_exposures['ai'] = 0.02  # Placeholder
-                    
-                    return portfolio_exposures
-            
-            # Fallback: return market-neutral portfolio
+                        except Exception:
+                            positions_exp[ticker] = {'alpha': 0.0, 'market': 1.0}
+
+                    port_returns = self._calculate_portfolio_returns(aligned_returns, weights)
+                    if not port_returns.empty:
+                        try:
+                            X_port = sm.add_constant(aligned_benchmark)
+                            port_model = sm.OLS(port_returns, X_port).fit()
+                            port_alpha = float(port_model.params.iloc[0]) if len(port_model.params) > 0 else 0.0
+                            port_beta = float(port_model.params.iloc[1]) if len(port_model.params) > 1 else 1.0
+                            return {
+                                'portfolio': {
+                                    'alpha': round(port_alpha, 6),
+                                    'market': round(port_beta, 4)
+                                },
+                                'positions': positions_exp
+                            }
+                        except Exception:
+                            pass
+
+            for ticker in returns.columns:
+                positions_exp[ticker] = {'alpha': 0.0, 'market': 1.0}
             return {
-                'alpha': 0,
-                'market': 1,
-                'momentum': 0,
-                'size': 0,
-                'value': 0,
-                'min_vol': 0,
-                'quality': 0,
-                'rates': 0,
-                'volatility': 0,
-                'meme': 0,
-                'ai': 0
+                'portfolio': {'alpha': 0.0, 'market': 1.0},
+                'positions': positions_exp
             }
-            
         except Exception as e:
             logger.error(f"Factor exposure calculation error: {e}")
-            return {}
-    
-    def _calculate_r_squared(self, returns: pd.DataFrame, benchmark_returns: pd.Series) -> float:
-        """Calculate R-squared"""
+            return {'portfolio': {'alpha': 0.0, 'market': 1.0}, 'positions': {}}
+
+    def _calculate_r_squared(
+        self, 
+        returns: pd.DataFrame, 
+        benchmark_returns: pd.Series, 
+        weights: Dict[str, float]
+    ) -> float:
+        """Calculate portfolio R-squared against benchmark"""
         try:
             if not benchmark_returns.empty and len(benchmark_returns) > 10:
                 common_dates = returns.index.intersection(benchmark_returns.index)
@@ -906,30 +921,37 @@ class AnalyticsEngine:
                     aligned_returns = returns.loc[common_dates]
                     aligned_benchmark = benchmark_returns.loc[common_dates]
                     
-                    # Calculate portfolio R-squared with benchmark
-                    portfolio_returns = self._calculate_portfolio_returns(aligned_returns, {})
+                    portfolio_returns = self._calculate_portfolio_returns(aligned_returns, weights)
                     if not portfolio_returns.empty:
-                        correlation = portfolio_returns.corr(aligned_benchmark)
-                        return correlation ** 2 if not pd.isna(correlation) else 0.5
-            
-            return 0.5  # Default R-squared
-        except:
-            return 0.5
-    
-    def _calculate_adjusted_r_squared(self, returns: pd.DataFrame, benchmark_returns: pd.Series) -> float:
-        """Calculate adjusted R-squared"""
+                        X = sm.add_constant(aligned_benchmark)
+                        model = sm.OLS(portfolio_returns, X).fit()
+                        return round(float(model.rsquared), 4)
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _calculate_adjusted_r_squared(
+        self, 
+        returns: pd.DataFrame, 
+        benchmark_returns: pd.Series, 
+        weights: Dict[str, float]
+    ) -> float:
+        """Calculate adjusted R-squared against benchmark"""
         try:
-            r_squared = self._calculate_r_squared(returns, benchmark_returns)
-            n = min(len(returns), len(benchmark_returns))
-            k = 1  # Number of predictors (just market)
-            
-            if n > k + 1:
-                adjusted_r_squared = 1 - (1 - r_squared) * (n - 1) / (n - k - 1)
-                return max(0, adjusted_r_squared)
-            else:
-                return r_squared
-        except:
-            return 0.5
+            if not benchmark_returns.empty and len(benchmark_returns) > 10:
+                common_dates = returns.index.intersection(benchmark_returns.index)
+                if len(common_dates) > 10:
+                    aligned_returns = returns.loc[common_dates]
+                    aligned_benchmark = benchmark_returns.loc[common_dates]
+                    
+                    portfolio_returns = self._calculate_portfolio_returns(aligned_returns, weights)
+                    if not portfolio_returns.empty:
+                        X = sm.add_constant(aligned_benchmark)
+                        model = sm.OLS(portfolio_returns, X).fit()
+                        return round(float(max(0.0, model.rsquared_adj)), 4)
+            return 0.0
+        except Exception:
+            return 0.0
     
     def _calculate_max_drawdown(self, cumulative_returns: pd.Series) -> float:
         """Calculate maximum drawdown"""
@@ -1016,21 +1038,12 @@ class AnalyticsEngine:
     def _empty_factor_exposure(self) -> Dict[str, Any]:
         return {
             "portfolio": {
-                "alpha": 0,
-                "market": 1,
-                "momentum": 0,
-                "size": 0,
-                "value": 0,
-                "min_vol": 0,
-                "quality": 0,
-                "rates": 0,
-                "volatility": 0,
-                "meme": 0,
-                "ai": 0
+                "alpha": 0.0,
+                "market": 1.0
             },
             "positions": {},
-            "r_squared": 0.5,
-            "adjusted_r_squared": 0.48,
+            "r_squared": 0.0,
+            "adjusted_r_squared": 0.0,
             "error": "Insufficient data for factor analysis"
         }
     

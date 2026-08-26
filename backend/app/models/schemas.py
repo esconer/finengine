@@ -191,15 +191,6 @@ class FactorExposure(BaseModel):
     """Schema for factor exposure"""
     alpha: float
     market: float
-    momentum: float
-    size: float
-    value: float
-    min_vol: float
-    quality: float
-    rates: float
-    volatility: float
-    meme: float
-    ai: float
     r_squared: float
     adjusted_r_squared: float
 

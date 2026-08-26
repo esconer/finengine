@@ -127,8 +127,6 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
           title="Risk Score"
           value={metrics.risk_score.toFixed(1)}
           icon={Shield}
-          change={metrics.risk_score > 0 ? -5.2 : 0}
-          changeType={getRiskScoreChangeType(metrics.risk_score)}
           loading={loading}
         />
 
@@ -136,8 +134,6 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
           title="Volatility Forecast"
           value={metrics.forecast_volatility ? formatPercentage(metrics.forecast_volatility) : 'N/A'}
           icon={Activity}
-          change={metrics.forecast_volatility && metrics.forecast_volatility > 0 ? -0.8 : 0}
-          changeType={getVolatilityChangeType(metrics.forecast_volatility || 0.2)}
           loading={loading}
         />
 
@@ -145,8 +141,6 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
           title="VaR Forecast"
           value={metrics.forecast_var ? formatPercentage(metrics.forecast_var) : 'N/A'}
           icon={TrendingDown}
-          change={metrics.forecast_var && Math.abs(metrics.forecast_var) > 0.02 ? -2.3 : 0}
-          changeType={Math.abs(metrics.forecast_var || 0) <= 0.02 ? 'positive' : 'negative'}
           loading={loading}
         />
 
@@ -154,8 +148,6 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
           title="Sharpe Ratio"
           value={metrics.sharpe_ratio.toFixed(2)}
           icon={Target}
-          change={metrics.sharpe_ratio > 0 ? 0.15 : 0}
-          changeType={metrics.sharpe_ratio > 0.5 ? 'positive' : 'negative'}
           loading={loading}
         />
       </div>

@@ -301,6 +301,15 @@ export const analyticsApi = {
     return response.data;
   },
 
+  // Get historical performance
+  async getPerformanceHistory(params?: {
+    days?: number;
+    tickers?: string;
+  }): Promise<any> {
+    const response = await apiClient.get('/analytics/performance-history', { params });
+    return response.data;
+  },
+
   // Get quantstats tear-sheet vs NIFTY
   async getTearSheet(params?: {
     tickers?: string;

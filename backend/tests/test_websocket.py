@@ -178,3 +178,77 @@ class TestBackgroundWorker:
 
         assert all(s.await_count == 1 for s in senders)
         assert sleeps == [30]
+
+    async def test_send_portfolio_update_real(self, monkeypatch):
+        import app.api.websocket as ws_mod
+        from app.models.database import PortfolioPosition
+
+        p1 = PortfolioPosition(ticker="TCS.NS", weight=0.6, quantity=10, last_price=3000.0, market_value=30000.0)
+        p2 = PortfolioPosition(ticker="INFY.NS", weight=0.4, quantity=20, last_price=1000.0, market_value=20000.0)
+
+        mock_broadcast = AsyncMock()
+        monkeypatch.setattr(ws_mod.manager, "broadcast", mock_broadcast)
+
+        # Mock SessionLocal context manager
+        from unittest.mock import MagicMock
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [p1, p2]
+        mock_session.execute.return_value = mock_result
+
+        class MockSessionContext:
+            async def __aenter__(self):
+                return mock_session
+            async def __aexit__(self, exc_type, exc, tb):
+                pass
+
+        monkeypatch.setattr(ws_mod, "SessionLocal", lambda: MockSessionContext())
+
+        await ws_mod.send_portfolio_update()
+        assert mock_broadcast.await_count == 1
+        call_args = mock_broadcast.await_args.args
+        assert call_args[1] == "portfolio"
+        assert call_args[0]["type"] == "portfolio_update"
+        assert call_args[0]["data"]["total_value"] == 50000.0
+        assert len(call_args[0]["data"]["positions"]) == 2
+
+    async def test_send_market_data_update_real(self, monkeypatch):
+        import app.api.websocket as ws_mod
+        from app.models.database import PortfolioPosition, StockTimeseries
+        from datetime import datetime
+
+        p1 = PortfolioPosition(ticker="TCS.NS", weight=1.0, quantity=10, last_price=3000.0, market_value=30000.0)
+        ts1 = StockTimeseries(ticker="TCS.NS", date=datetime(2026, 8, 25), close=3050.0, volume=15000)
+        ts2 = StockTimeseries(ticker="TCS.NS", date=datetime(2026, 8, 24), close=3000.0, volume=12000)
+
+        mock_broadcast = AsyncMock()
+        monkeypatch.setattr(ws_mod.manager, "broadcast", mock_broadcast)
+
+        from unittest.mock import MagicMock
+        mock_session = AsyncMock()
+        
+        # 1st query: positions -> [p1]
+        # 2nd query: timeseries -> [ts1, ts2]
+        pos_result = MagicMock()
+        pos_result.scalars.return_value.all.return_value = [p1]
+        ts_result = MagicMock()
+        ts_result.scalars.return_value.all.return_value = [ts1, ts2]
+
+        mock_session.execute.side_effect = [pos_result, ts_result]
+
+        class MockSessionContext:
+            async def __aenter__(self):
+                return mock_session
+            async def __aexit__(self, exc_type, exc, tb):
+                pass
+
+        monkeypatch.setattr(ws_mod, "SessionLocal", lambda: MockSessionContext())
+
+        await ws_mod.send_market_data_update()
+        assert mock_broadcast.await_count == 1
+        call_args = mock_broadcast.await_args.args
+        assert call_args[1] == "market_data"
+        assert "TCS.NS" in call_args[0]["data"]
+        assert call_args[0]["data"]["TCS.NS"]["price"] == 3050.0
+        assert pytest.approx(call_args[0]["data"]["TCS.NS"]["change"], 0.01) == 1.67
+

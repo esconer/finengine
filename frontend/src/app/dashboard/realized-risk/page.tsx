@@ -212,32 +212,24 @@ export default function RealizedRiskPage() {
           <MetricCard
             title="Annual Return"
             value={realizedRisk?.portfolio?.annual_return ? formatPercentage(realizedRisk.portfolio.annual_return) : 'N/A'}
-            change={realizedRisk?.portfolio?.annual_return ? 2.1 : 0}
-            changeType={realizedRisk?.portfolio?.annual_return >= 0 ? "positive" : "negative"}
             icon={TrendingUp}
             loading={analyticsLoading}
           />
           <MetricCard
             title="Annual Volatility"
             value={realizedRisk?.portfolio?.annual_volatility ? formatPercentage(realizedRisk.portfolio.annual_volatility) : 'N/A'}
-            change={realizedRisk?.portfolio?.annual_volatility ? -0.8 : 0}
-            changeType="neutral"
             icon={Activity}
             loading={analyticsLoading}
           />
           <MetricCard
             title="Sharpe Ratio"
             value={realizedRisk?.portfolio?.sharpe_ratio ? formatRatio(realizedRisk.portfolio.sharpe_ratio) : 'N/A'}
-            change={realizedRisk?.portfolio?.sharpe_ratio ? 0.12 : 0}
-            changeType={realizedRisk?.portfolio?.sharpe_ratio >= 1 ? "positive" : "negative"}
             icon={TrendingUp}
             loading={analyticsLoading}
           />
           <MetricCard
             title="Max Drawdown"
             value={realizedRisk?.portfolio?.max_drawdown ? formatPercentage(realizedRisk.portfolio.max_drawdown) : 'N/A'}
-            change={realizedRisk?.portfolio?.max_drawdown ? 1.3 : 0}
-            changeType="negative"
             icon={TrendingDown}
             loading={analyticsLoading}
           />
@@ -262,32 +254,24 @@ export default function RealizedRiskPage() {
           <MetricCard
             title="Sortino Ratio"
             value={realizedRisk?.portfolio?.sortino_ratio ? formatRatio(realizedRisk.portfolio.sortino_ratio) : 'N/A'}
-            change={0}
-            changeType="neutral"
             icon={BarChart3}
             loading={analyticsLoading}
           />
           <MetricCard
             title="VaR (95%)"
             value={realizedRisk?.portfolio?.var_95 ? formatPercentage(realizedRisk.portfolio.var_95) : 'N/A'}
-            change={0}
-            changeType="negative"
             icon={AlertTriangle}
             loading={analyticsLoading}
           />
           <MetricCard
             title="CVaR (95%)"
             value={realizedRisk?.portfolio?.cvar_95 ? formatPercentage(realizedRisk.portfolio.cvar_95) : 'N/A'}
-            change={0}
-            changeType="negative"
             icon={AlertTriangle}
             loading={analyticsLoading}
           />
           <MetricCard
             title="Hit Ratio"
             value={realizedRisk?.portfolio?.hit_ratio ? formatPercentage(realizedRisk.portfolio.hit_ratio) : 'N/A'}
-            change={0}
-            changeType="neutral"
             icon={Activity}
             loading={analyticsLoading}
           />

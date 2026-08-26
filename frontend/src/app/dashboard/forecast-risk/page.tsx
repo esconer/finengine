@@ -238,24 +238,18 @@ export default function ForecastRiskPage() {
         <MetricCard
           title={`${forecastHorizon}-Day VaR (95%)`}
           value={formatPercentage(forecastData?.portfolio?.var_forecast)}
-          change={!loading && forecastData?.portfolio?.var_forecast ? -2.3 : 0}
-          changeType="positive"
           icon={Calculator}
           loading={loading}
         />
         <MetricCard
           title={`${forecastHorizon}-Day CVaR (95%)`}
           value={formatPercentage(forecastData?.portfolio?.cvar_forecast)}
-          change={!loading && forecastData?.portfolio?.cvar_forecast ? -1.8 : 0}
-          changeType="positive"
           icon={Calculator}
           loading={loading}
         />
         <MetricCard
           title="Volatility Forecast"
           value={formatPercentage(forecastData?.portfolio?.volatility_forecast)}
-          change={0}
-          changeType="neutral"
           icon={Activity}
           loading={loading}
         />
@@ -263,8 +257,6 @@ export default function ForecastRiskPage() {
           title="Confidence Interval"
           value={forecastData?.portfolio?.confidence_interval ?
             `${formatPercentage(forecastData.portfolio.confidence_interval[0])} - ${formatPercentage(forecastData.portfolio.confidence_interval[1])}` : 'N/A'}
-          change={0}
-          changeType="neutral"
           icon={Target}
           loading={loading}
         />

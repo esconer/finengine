@@ -80,15 +80,6 @@ export interface ForecastRiskMetrics {
 export interface FactorExposure {
   alpha: number;
   market: number;
-  momentum: number;
-  size: number;
-  value: number;
-  min_vol: number;
-  quality: number;
-  rates: number;
-  volatility: number;
-  meme: number;
-  ai: number;
   r_squared: number;
   adjusted_r_squared: number;
 }

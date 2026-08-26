@@ -59,10 +59,8 @@ function FanChart({ fan, target }: { fan: MonteCarloResult['fan']; target: numbe
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-56" role="img" aria-label="Outcome fan chart">
-      {[fan[0].p50, target].includes(target) ? null : (
-        <line x1={PAD} x2={W - PAD} y1={y(target)} y2={y(target)}
-          stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6 4" />
-      )}
+      <line x1={PAD} x2={W - PAD} y1={y(target)} y2={y(target)}
+        stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6 4" />
       <path d={band('p5', 'p95')} fill="rgba(16,185,129,0.14)" />
       <path d={band('p25', 'p75')} fill="rgba(16,185,129,0.28)" />
       <path
@@ -79,7 +77,7 @@ function FanChart({ fan, target }: { fan: MonteCarloResult['fan']; target: numbe
 export default function MonteCarloPage() {
   const [targetInput, setTargetInput] = useState('200000');
   const [horizon, setHorizon] = useState(5);
-  const [method, setMethod] = useState<string>('student_t');
+  const [method, setMethod] = useState<'gbm' | 'student_t' | 'bootstrap'>('student_t');
   const [result, setResult] = useState<MonteCarloResult | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
