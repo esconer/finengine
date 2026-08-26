@@ -103,13 +103,17 @@ app.add_middleware(SecurityHeadersMiddleware)
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
+    """Global exception handler. Must return a Response (never a plain dict),
+    otherwise Starlette raises a secondary failure while handling the error."""
     logger.error(f"Global exception: {exc}", exc_info=True)
-    return {
-        "error": "Internal server error",
-        "message": "An unexpected error occurred",
-        "status_code": 500
-    }
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "message": "An unexpected error occurred",
+            "status_code": 500,
+        },
+    )
 
 # Include routers
 app.include_router(

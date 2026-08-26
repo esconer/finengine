@@ -324,12 +324,22 @@ async def get_forecast_risk(
         
         # Combine price data
         price_data = pd.DataFrame(price_data_dict)
-        
+
         # Calculate portfolio returns
         returns = price_data.pct_change().dropna()
-        
+
+        # Weight asset returns by the DB allocation when positions were resolved;
+        # explicit-ticker requests have no weights and stay equal-weighted.
+        portfolio_returns = returns.mean(axis=1)
+        if not tickers:
+            matched = {t: w for t, w in (allocation or {}).items() if t in returns.columns}
+            total_w = sum(matched.values())
+            if matched and total_w > 0:
+                norm = pd.Series({t: w / total_w for t, w in matched.items()})
+                portfolio_returns = returns[norm.index].mul(norm, axis=1).sum(axis=1)
+
         # Calculate portfolio volatility forecast using analytics engine
-        forecast_result = await analytics_engine.forecast_volatility(returns.mean(axis=1), model, horizon)
+        forecast_result = await analytics_engine.forecast_volatility(portfolio_returns, model, horizon)
         
         # Position-level forecasts
         positions = {}

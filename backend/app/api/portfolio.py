@@ -115,9 +115,22 @@ async def get_portfolio(
             sector_key = position.sector or "Unknown"
             sectors[sector_key] = sectors.get(sector_key, 0.0) + position.weight
         
-        # Normalize sectors (convert weights to percentages)
-        total_weight = sum(pos.weight for pos in positions)
-        normalized_sectors = {k: v/total_weight for k, v in sectors.items()}
+        # Normalize sector shares. Weights may carry no information (all zero);
+        # fall back to market-value shares so the response stays well-formed.
+        total_weight = sum(pos.weight or 0.0 for pos in positions)
+        if total_weight > 0:
+            normalized_sectors = {k: v / total_weight for k, v in sectors.items()}
+        else:
+            mv_by_sector = {}
+            total_mv = 0.0
+            for position in positions:
+                mv = (position.quantity or 0) * (position.last_price or 0)
+                key = position.sector or "Unknown"
+                mv_by_sector[key] = mv_by_sector.get(key, 0.0) + mv
+                total_mv += mv
+            normalized_sectors = (
+                {k: v / total_mv for k, v in mv_by_sector.items()} if total_mv > 0 else {}
+            )
         
         return PortfolioSummaryResponse(
             positions=position_responses,
@@ -526,11 +539,12 @@ async def get_portfolio_position(
                 detail=f"Position for ticker {ticker} not found"
             )
         
-        # Update price
+        # Update price; market_value always derives from quantity x last_price.
         quote_data = await data_service.fetch_quote(ticker)
         if quote_data:
             position.last_price = quote_data["current_price"]
-            position.market_value = 100000 * position.weight  # Assuming $100k base
+            position.market_value = (position.quantity or 0) * position.last_price
+            position.updated_on = datetime.utcnow()
             await db.commit()
 
         # Reload eagerly: on-update server columns (updated_on) are otherwise
@@ -768,11 +782,10 @@ async def normalize_portfolio_weights(
         if total_weight <= 0:
             raise HTTPException(status_code=400, detail="Total weight must be positive")
         
-        # Normalize weights
+        # Normalize weights only — market values are quantity x price and are
+        # owned by the price-refresh path, not by weight bookkeeping.
         for position in positions:
-            normalized_weight = position.weight / total_weight
-            position.weight = normalized_weight
-            position.market_value = 100000 * normalized_weight
+            position.weight = position.weight / total_weight
             position.updated_on = datetime.utcnow()
         
         await db.commit()
@@ -901,17 +914,10 @@ async def _update_portfolio_prices(positions: List[PortfolioPosition], data_serv
         try:
             quote_data = await data_service.fetch_quote(position.ticker)
             if quote_data:
-                # Update only the price
-                old_price = position.last_price
+                # Quantity is the share-count source of truth; never infer it
+                # from a possibly-stale stored market value.
                 position.last_price = quote_data["current_price"]
-                
-                # Recalculate market value based on shares * new price
-                # shares = existing_market_value / old_price
-                # new_market_value = shares * new_price
-                if old_price and old_price > 0 and position.market_value and position.market_value > 0:
-                    shares = position.market_value / old_price
-                    position.market_value = shares * position.last_price
-                
+                position.market_value = (position.quantity or 0) * position.last_price
                 position.updated_on = datetime.utcnow()
         except Exception as e:
             logger.error(f"Error updating price for {position.ticker}: {e}")
