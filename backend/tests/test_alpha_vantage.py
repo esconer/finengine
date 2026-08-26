@@ -65,27 +65,29 @@ def test_symbol_bridge():
     assert to_av_symbol("AAPL") == "AAPL"
 
 
-def test_rotation_on_daily_limit(calls):
+@pytest.mark.asyncio
+async def test_rotation_on_daily_limit(calls):
     calls["rates"]["KEY_A"] = RATE_DAILY
     svc = AlphaVantageService()
     svc.pool = KeyPool(["KEY_A", "KEY_B"], daily_limit=25, minute_limit=5)
 
-    df = asyncio.run(svc.fetch_daily_ohlcv("RELIANCE.NS", "2026-08-20", "2026-08-25"))
+    df = await svc.fetch_daily_ohlcv("RELIANCE.NS", "2026-08-20", "2026-08-25")
 
     assert [k for _, k in calls["recorded"]] == ["KEY_A", "KEY_B"]
     assert len(df) == 1 and df.iloc[0]["close"] == 10.5
     assert "adj_close" in df.columns  # unadjusted source mirrored
 
 
-def test_retired_key_not_retried_same_day(calls):
+@pytest.mark.asyncio
+async def test_retired_key_not_retried_same_day(calls):
     calls["rates"]["KEY_A"] = RATE_DAILY
     svc = AlphaVantageService()
     svc.pool = KeyPool(["KEY_A", "KEY_B", "KEY_C"], 25, 5)
 
-    asyncio.run(svc.fetch_daily_ohlcv("AAPL", "2026-08-20", "2026-08-25"))
+    await svc.fetch_daily_ohlcv("AAPL", "2026-08-20", "2026-08-25")
     calls["recorded"].clear()
 
-    quote = asyncio.run(svc.fetch_global_quote("AAPL"))
+    quote = await svc.fetch_global_quote("AAPL")
     used = {k for _, k in calls["recorded"]}
     assert quote is not None and quote["current_price"] == 2500.55
     assert "KEY_A" not in used  # retired -> never contacted again today
@@ -111,13 +113,14 @@ def test_frequency_limit_cooldown_then_reuse():
     assert svc.pool.acquire().key == "K1"
 
 
-def test_budget_guard_blocks_without_network(calls):
+@pytest.mark.asyncio
+async def test_budget_guard_blocks_without_network(calls):
     tiny = AlphaVantageService()
     tiny.pool = KeyPool(["ONLY"], daily_limit=1, minute_limit=5)
 
-    asyncio.run(tiny._make_request("GLOBAL_QUOTE", {"symbol": "AAPL"}))
+    await tiny._make_request("GLOBAL_QUOTE", {"symbol": "AAPL"})
     with pytest.raises(AlphaVantageRateLimitError):
-        asyncio.run(tiny._make_request("GLOBAL_QUOTE", {"symbol": "MSFT"}))
+        await tiny._make_request("GLOBAL_QUOTE", {"symbol": "MSFT"})
     # second call must have been blocked locally: exactly one request total
     assert len(calls["recorded"]) == 1
 

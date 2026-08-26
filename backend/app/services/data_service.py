@@ -52,7 +52,12 @@ class DataService:
             Normalized ticker with proper exchange suffix
         """
         ticker = ticker.upper().strip()
-        
+
+        # Yahoo-native symbols (^NSEI indices, INR=X fx) pass through untouched;
+        # appending .NS to an index would fabricate a nonexistent ticker.
+        if ticker.startswith("^") or ticker.endswith("=X"):
+            return ticker
+
         # If already has exchange suffix, return as is
         if '.NS' in ticker or '.BO' in ticker:
             return ticker

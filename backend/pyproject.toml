@@ -33,10 +33,11 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "scikit-learn>=1.7.2",
     "ipython>=9.6.0",
-    "riskfolio-lib>=7.0.1",
+    "riskfolio-lib==7.0.1",
     "quantlib>=1.40",
     "pyportfolioopt>=1.5.6",
     "stockstats>=0.6.8",
+    "hmmlearn>=0.3.3",
 ]
 
 [project.optional-dependencies]
@@ -95,6 +96,6 @@ exclude_lines = [
     "raise NotImplementedError",
     "if 0:",
     "if __name__ == .__main__.:",
-    "class .*\\\\bProtocol\\\\):",
-    "@(abc\\\\.)?abstractmethod",
+    'class .*\bProtocol\):',
+    '@(abc\.)?abstractmethod',
 ]

@@ -3,14 +3,19 @@ Analytics API endpoints for risk calculations and portfolio analytics
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import numpy as np
 import pandas as pd
 
 from app.db.database import get_db_session
 from app.models.database import PortfolioPosition
+from app.services.benchmark_service import BenchmarkService
+from app.services.optimization_service import STRATEGIES, optimize
+from app.services.regime_service import detect_regime
+from app.services.monte_carlo_service import simulate_goal
 from app.services.data_service import GlobalDataService, DataService
 from app.services.cache_service import GlobalCacheService, CacheService
 from app.services.analytics_engine import GlobalAnalyticsEngine, AnalyticsEngine
@@ -41,6 +46,38 @@ def get_cache_service(db: AsyncSession = Depends(get_db_session)) -> CacheServic
 def get_analytics_engine() -> AnalyticsEngine:
     """Get analytics engine instance"""
     return GlobalAnalyticsEngine().get_engine()
+
+
+def get_benchmark_service(db: AsyncSession = Depends(get_db_session)) -> BenchmarkService:
+    """Get NIFTY benchmark service instance"""
+    return BenchmarkService(db)
+
+
+async def resolve_allocation(
+    tickers_param: Optional[str],
+    db: AsyncSession,
+) -> tuple[List[str], Dict[str, float]]:
+    """Shared allocation resolution: explicit tickers (equal weight) or DB positions."""
+    if tickers_param:
+        ticker_list = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
+        eq = 1.0 / len(ticker_list)
+        return ticker_list, {t: eq for t in ticker_list}
+    weights = await _load_portfolio_allocation(db)
+    if not weights:
+        raise ValueError("No portfolio positions found")
+    return list(weights.keys()), weights
+
+
+def _q(metric_fn, *args, **kwargs):
+    """Guard a single quantstats metric call; API drift must not kill the sheet."""
+    try:
+        val = metric_fn(*args, **kwargs)
+        if hasattr(val, "item"):
+            val = val.item()
+        return round(float(val), 6)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"quantstats metric unavailable ({metric_fn.__name__}): {e}")
+        return None
 
 
 def _price_series(df: pd.DataFrame) -> Optional[pd.Series]:
@@ -794,4 +831,362 @@ async def get_analytics_summary(
         
     except Exception as e:
         logger.error(f"Error in get_analytics_summary: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+# ---------------------------------------------------------------------------
+# Phase 1+2 endpoints: tear-sheet, risk contribution, optimizer, regime
+# ---------------------------------------------------------------------------
+
+
+async def _build_wide_returns(
+    ticker_list: List[str],
+    weights: Dict[str, float],
+    start: str,
+    end: str,
+    data_service: DataService,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Wide per-asset returns frame + weighted portfolio return series."""
+    price_data_dict: Dict[str, pd.Series] = {}
+    for ticker in ticker_list:
+        df = await data_service.fetch_historical_data(ticker, start, end)
+        if df is not None and not df.empty:
+            _assign_price(price_data_dict, ticker, df)
+    if not price_data_dict:
+        raise ValueError("No price data available for the requested window")
+    prices = pd.DataFrame(price_data_dict).dropna(how="all")
+    returns_df = prices.pct_change().dropna(how="all")
+    portfolio_returns = (returns_df.fillna(0.0) * pd.Series(weights)).sum(axis=1)
+    return returns_df, portfolio_returns
+
+
+@router.get("/tear-sheet")
+async def get_tear_sheet(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+    benchmark: BenchmarkService = Depends(get_benchmark_service),
+) -> Dict:
+    """
+    Pro-style performance tear-sheet for the real holdings vs NIFTY.
+    Metrics via quantstats; every metric degrades to null independently.
+    """
+    import quantstats as qs
+
+    try:
+        if not end:
+            end = datetime.now().strftime("%Y-%m-%d")
+        if not start:
+            start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        returns_df, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+
+        bench_ret = await benchmark.get_returns(start=start, end=end, days=756)
+
+        metrics = {
+            "total_return": _q(qs.stats.comp, port_ret),
+            "cagr": _q(qs.stats.cagr, port_ret),
+            "sharpe": _q(qs.stats.sharpe, port_ret, rf=0.02),
+            "sortino": _q(qs.stats.sortino, port_ret, rf=0.02),
+            "calmar": _q(qs.stats.calmar, port_ret),
+            "omega": _q(qs.stats.omega, port_ret),
+            "tail_ratio": _q(qs.stats.tail_ratio, port_ret),
+            "volatility": _q(qs.stats.volatility, port_ret),
+            "max_drawdown": _q(qs.stats.max_drawdown, port_ret),
+            "skew": _q(qs.stats.skew, port_ret),
+            "kurtosis": _q(qs.stats.kurtosis, port_ret),
+        }
+
+        relative: Dict[str, Any] = {}
+        if bench_ret is not None and len(bench_ret) > 20:
+            common = port_ret.index.intersection(bench_ret.index)
+            p, b = port_ret.loc[common], bench_ret.loc[common]
+            var_b = float(b.var())
+            beta = float(p.cov(b) / var_b) if var_b > 0 else None
+            alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
+            relative = {
+                "beta_vs_nifty": round(beta, 4) if beta is not None else None,
+                "alpha_annualized": round(alpha_ann, 4) if alpha_ann is not None else None,
+                "benchmark_sharpe": _q(qs.stats.sharpe, b, rf=0.02),
+                "benchmark_volatility": _q(qs.stats.volatility, b),
+                "benchmark_max_drawdown": _q(qs.stats.max_drawdown, b),
+                "benchmark_total_return": _q(qs.stats.comp, b),
+            }
+
+        monthly: Dict[str, Dict[str, float]] = {}
+        try:
+            mdf = qs.stats.monthly_returns(port_ret)
+            monthly = {
+                str(year): {str(m): round(float(v), 6) for m, v in row.items() if pd.notna(v)}
+                for year, row in mdf.iterrows()
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"monthly_returns unavailable: {e}")
+
+        underwater = []
+        try:
+            dd = qs.stats.to_drawdown_series(port_ret)
+            for ts, val in list(dd.items())[-250:]:
+                underwater.append({"date": str(ts)[:10], "drawdown": round(float(val), 6)})
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"drawdown series unavailable: {e}")
+
+        return {
+            "window": {"start": start, "end": end},
+            "holdings": weights,
+            "metrics": metrics,
+            "relative_vs_nifty": relative,
+            "monthly_returns": monthly,
+            "underwater": underwater,
+            "methodology": "quantstats metric suite over cached OHLCV adj-close returns",
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error building tear-sheet: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/risk-contribution")
+async def get_risk_contribution(
+    tickers: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> Dict:
+    """
+    Euler decomposition of portfolio risk per position.
+
+    volatility model : RC_i = w_i * (Sigma w)_i / sigma_p   (exact, analytic)
+    cvar model       : mean asset loss on the portfolio's worst-5% days,
+                       scaled by weight and normalized to 100%.
+    """
+    try:
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        returns_df, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+        assets = list(returns_df.columns)
+        w = np.array([weights.get(a, 0.0) for a in assets])
+
+        cov = returns_df.cov() * 252
+        sigma_p = float(np.sqrt(max(0.0, w @ cov.values @ w)))
+        vol_rc = {}
+        if sigma_p > 0:
+            mrc = cov.values @ w
+            contrib = w * mrc / sigma_p
+            contrib = contrib / contrib.sum()
+            vol_rc = {a: round(float(c), 6) for a, c in zip(assets, contrib)}
+
+        var_95 = float(np.percentile(port_ret, 5))
+        tail = port_ret <= var_95
+        cvar_rc = {}
+        if tail.any():
+            comp = []
+            for a in assets:
+                comp_es = float(returns_df.loc[tail, a].fillna(0.0).mean()) * w[assets.index(a)]
+                comp.append(comp_es)
+            total = sum(abs(c) for c in comp)
+            # comp values are negative (tail-day losses); normalize to positive loss-shares
+            cvar_rc = {a: round(float(-c) / total, 6) for a, c in zip(assets, comp)} if total > 0 else {}
+
+        sector_rollup: Dict[str, Dict[str, float]] = {"volatility": {}, "cvar": {}}
+        result = await db.execute(select(PortfolioPosition))
+        sector_map = {p.ticker: (p.sector or "Unknown") for p in result.scalars().all()}
+        if sector_map:
+            for model_name, contribs in (("volatility", vol_rc), ("cvar", cvar_rc)):
+                roll: Dict[str, float] = {}
+                for a, c in contribs.items():
+                    roll[sector_map.get(a, "Unknown")] = round(
+                        roll.get(sector_map.get(a, "Unknown"), 0.0) + c, 6
+                    )
+                sector_rollup[model_name] = roll
+
+        return {
+            "window": {"start": start, "end": end},
+            "positions": {
+                "volatility": vol_rc,
+                "cvar_tail": cvar_rc,
+            },
+            "sector_rollup": sector_rollup,
+            "portfolio_volatility_annualized": round(sigma_p, 4),
+            "portfolio_var_95_daily": round(var_95, 6),
+            "portfolio_cvar_95_daily": round(float(port_ret[tail].mean()), 6) if tail.any() else None,
+            "methodology": "Euler decomposition (volatility) + historical tail attribution (CVaR)",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in risk-contribution: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.post("/optimize/run")
+async def run_optimization(
+    body: Dict = Body(default={}),
+    tickers: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> Dict:
+    """
+    Optimize allocations across the user's universe (default: current holdings).
+
+    Strategies: hrp | min_vol | max_sharpe | min_cvar
+    (numpy/cvxpy implementations - see services/optimization_service.py header
+    for why riskfolio/pypfopt are bypassed on this dependency stack).
+    """
+    try:
+        strategy = str(body.get("strategy", "hrp")).lower()
+        rf = float(body.get("risk_free_rate", 0.02))
+
+        requested = body.get("tickers") or tickers
+        requested_csv = ",".join(requested) if isinstance(requested, list) else requested
+        try:
+            ticker_list, current_weights = await resolve_allocation(requested_csv, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        returns_df, _ = await _build_wide_returns(ticker_list, current_weights, start, end, data_service)
+
+        result = optimize(returns_df, strategy=strategy, risk_free_rate=rf)
+
+        recommended = result["weights"]
+        trades = {}
+        for t in ticker_list:
+            cur = float(current_weights.get(t, 0.0))
+            rec = float(recommended.get(t, 0.0))
+            if abs(rec - cur) > 1e-6:
+                trades[t] = {
+                    "current_weight": round(cur, 4),
+                    "recommended_weight": round(rec, 4),
+                    "weight_delta": round(rec - cur, 4),
+                }
+
+        return {
+            **result,
+            "universe": ticker_list,
+            "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
+            "trades_required": dict(sorted(trades.items(), key=lambda kv: abs(kv[1]["weight_delta"]), reverse=True)),
+            "disclaimer": "Educational optimization output; not investment advice.",
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in optimize/run: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/regime")
+async def get_regime(
+    lookback_days: int = Query(default=1100, ge=300, le=3000),
+    with_portfolio: bool = Query(default=True, description="Include conditional portfolio stats"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+    benchmark: BenchmarkService = Depends(get_benchmark_service),
+) -> Dict:
+    """
+    HMM market-regime classification (calm/volatile/crisis) over NIFTY returns,
+    plus the portfolio's historical behavior inside the CURRENT regime.
+    """
+    try:
+        port_ret: Optional[pd.Series] = None
+        if with_portfolio:
+            try:
+                _, weights = await resolve_allocation(None, db)
+                end = datetime.now().strftime("%Y-%m-%d")
+                start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+                _, port_ret = await _build_wide_returns(list(weights.keys()), weights, start, end, data_service)
+            except (ValueError, HTTPException):
+                port_ret = None  # regime itself still works without holdings
+
+        result = await detect_regime(db, lookback_days=lookback_days, portfolio_returns=port_ret)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error detecting regime: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.post("/monte-carlo")
+async def run_monte_carlo(
+    body: Dict = Body(...),
+    tickers: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> Dict:
+    """
+    Goal-probability simulation over the user's portfolio return history.
+
+    body: {
+      target_value: float (required),
+      horizon_years: int (required, 1-40),
+      initial_value: float (optional; defaults to current DB market value),
+      method: "gbm" | "student_t" | "bootstrap" (default gbm),
+      num_paths: int (default 2000, cap 20000),
+      seed: int (optional, for reproducibility)
+    }
+    """
+    try:
+        try:
+            target_value = float(body["target_value"])
+            horizon_years = int(body["horizon_years"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise HTTPException(
+                status_code=422,
+                detail="target_value and horizon_years are required numbers",
+            ) from e
+
+        initial_value = body.get("initial_value")
+        if initial_value is not None:
+            initial_value = float(initial_value)
+        else:
+            result = await db.execute(select(PortfolioPosition))
+            positions = result.scalars().all()
+            initial_value = sum(float(p.market_value or 0.0) for p in positions)
+            if initial_value <= 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Portfolio has no market value yet; pass initial_value explicitly",
+                )
+
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+        _, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+
+        return simulate_goal(
+            portfolio_returns=port_ret,
+            initial_value=initial_value,
+            target_value=target_value,
+            horizon_years=horizon_years,
+            method=str(body.get("method", "gbm")).lower(),
+            num_paths=int(body.get("num_paths", 2000)),
+            seed=body.get("seed"),
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in monte-carlo: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

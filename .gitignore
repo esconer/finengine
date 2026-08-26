@@ -53,3 +53,12 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# session artifacts
+*.log
+.coverage
+htmlcov/
+.impeccable/
+_shot_*.png
+frontend/test-results.xml
+backend/_diag_rc.py
+

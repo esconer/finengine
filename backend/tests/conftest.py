@@ -32,12 +32,8 @@ from app.models.database import PortfolioPosition, StockTimeseries, AnalyticsCac
 TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create event loop for async tests"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# NOTE: no session-scoped event_loop fixture — pytest-asyncio 0.24 auto mode
+# provides function-scoped loops; a shared loop broke after asyncio.run() use.
 
 
 @pytest.fixture
