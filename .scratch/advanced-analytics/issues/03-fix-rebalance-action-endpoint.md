@@ -1,6 +1,6 @@
 # 03 — Point dashboard Rebalance at /portfolio/normalize
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - Rebalance now calls portfolioApi.normalizeWeights(); dead /portfolio/rebalance call deleted.
 Type: task
 Blocked by: —
 

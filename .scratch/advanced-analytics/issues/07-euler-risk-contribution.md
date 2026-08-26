@@ -1,6 +1,6 @@
 # 07 — Euler risk contribution endpoint + UI
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - GET /analytics/risk-contribution: Euler vol decomposition + CVaR tail attribution (positive loss-shares) + sector rollups. Live: TCS=68% vol share at equal weights. Tests: sum-to-1 + dominance ranking.
 Type: task
 Blocked by: 01
 

@@ -1,6 +1,6 @@
 # 05 — Benchmark ingestion service (^NSEI cached)
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - app/services/benchmark_service.py; ^NSEI via shared cache (492 days live-verified); Yahoo-native symbol passthrough added to _normalize_indian_ticker.
 Type: task
 Blocked by: —
 

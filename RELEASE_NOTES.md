@@ -94,3 +94,59 @@ fallback vendor.
   optimizer studio → regime/Monte-Carlo/tails → NSE flows dashboard → PDF review (tickets 03–20).
 
 [TauricResearch/TradingAgents]: https://github.com/TauricResearch/TradingAgents
+
+---
+
+## 2026-08-26 — Quant core goes visible: 5 new pages, Monte Carlo engine, test floor raised
+
+Phase-1/2 backend capabilities get their UI, and the goal engine lands library-first.
+
+### New dashboard pages (all live-verified on real NSE holdings)
+
+| Page | What it shows |
+|------|---------------|
+| `/dashboard/tear-sheet` | quantstats suite vs NIFTY: beta/alpha/Sharpe/Sortino, monthly-returns heatmap, underwater curve, weights used |
+| `/dashboard/risk-contribution` | Euler volatility decomposition + CVaR tail attribution bars + sector rollup + divergence insight |
+| `/dashboard/optimize` | Optimizer Studio: HRP / MinVol / MaxSharpe / MinCVaR selector, run button, current-vs-recommended weights with delta badges, trades-required list, solver label, disclaimer |
+| `/dashboard/regime` | HMM market state (calm/volatile/crisis), stability %, 3-state table, 120-day regime timeline, portfolio behavior inside current regime |
+| `/dashboard/monte-carlo` | Goal Probability: target + horizon + engine (GBM / Student-t / Bootstrap), P(success), SVG percentile fan chart, tail-df diagnostic |
+
+Plus dashboard-home widgets: regime banner strip and top risk drivers, both silent-degrading.
+
+### Monte Carlo engine (t11) — library-first
+
+- `app/services/monte_carlo_service.py`: **arch.bootstrap.StationaryBootstrap**
+  (Politis-Romano; arch already a GARCH dependency) replaces hand-rolled block sampling;
+  **scipy.stats.t** fit powers the Student-t engine with analytic-moment innovations,
+  winsorized z, and a fitted-df tail diagnostic; GBM stays numpy (canonical formula).
+- `POST /analytics/monte-carlo` with seeded determinism; initial value defaults to DB
+  market value.
+- Numeric property audit (all pass): weights sum/long-only across 4 optimizer strategies,
+  min_vol ≤ equal-weight vol, max_sharpe ≥ equal-weight Sharpe, HRP intra-cluster spread,
+  Euler contributions sum exactly to portfolio vol, P(goal) monotonic in target, GBM median
+  vs Itō-corrected closed form.
+
+### Fixes found by verification
+
+| Bug | Fix |
+|-----|-----|
+| `main.py` CORS still bypassed settings via `os.getenv` (port 3001 blocked) | uses `settings.allowed_origins`; header verified |
+| risk-contribution page crashed: `Activity` icon used but not imported | import fixed; all pages icon-audited |
+| Tear-sheet metrics missing % suffix on fraction-based fields | all 6 call sites patched |
+| Student-t engine could produce NaN paths near Cauchy fits (`log1p` warning) | analytic t-moments + winsorized innovations + return floor; regression test added |
+| `pyproject.toml` coverage regexes double-escaped (`ConfigError`) | TOML literal strings |
+| Optimizer page violet gradient (detector: AI-palette tell) | deliberate slate/zinc identity |
+
+### Test floor
+
+- Backend **128 passed** (was 97): +16 Monte Carlo, +15 indicators/company-data service tests.
+  Coverage 56% → 62%+ (indicators 23%→90%, company_data 18%→69%, monte_carlo 99%).
+- Frontend **35 passed**.
+- The 80% coverage gate is intentionally left in place; closing the remainder (data_service
+  vendor paths, portfolio API bodies) is tracked follow-up work.
+
+### Tickets
+
+- t09 resolved (constraints + frontier chart deferred, noted in ticket)
+- t11 resolved
+- t23 (portfolio importer) designed, deprioritized by owner

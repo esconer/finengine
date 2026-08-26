@@ -77,6 +77,7 @@ how much can I actually own, what is smart money doing.*
 | F11 | Liquidity limits: days-to-liquidate @ 10/20% ADV participation, Amihud illiquidity score | "How much of X can I actually own?" | position size caps |
 | F12 | India flows dashboard: delivery % anomalies, FII/DII daily flows, bulk/block deals, quarterly shareholding deltas (promoter pledge!) | "What is smart money doing in MY names?" | conviction check / early exits |
 | F13 | One-click PDF portfolio review (front-end jsPDF already installed) | "Summarize all of the above" | actual review ritual |
+| F14 | Portfolio importer: CSV/XLSX upload (`ticker,weight,quantity,buy_price`) → bulk_add; Upload button on manage page; flows straight into Optimizer | "How do I get MY real book in without typing?" | makes F4 usable on day one |
 
 ## 4. Backend shape (new modules, same patterns)
 
@@ -115,7 +116,7 @@ Delete on sight: mock websocket broadcasts, fake MetricCard deltas, mock `usePer
 
 | Phase | Scope | Est. sessions | Exit proof |
 |---|---|---|---|
-| **P0 Truth pass** | current-state.md §8: wire analytics to DB positions, fix bulk_add validator, rebalance→normalize, consolidate HTTP client | 1 | every existing page reflects real holdings |
+| **P0 Truth pass** | current-state.md §8: wire analytics to DB positions, fix bulk_add validator, rebalance→normalize, consolidate HTTP client, **portfolio importer (F14)** | 1 | every existing page reflects real holdings; user can upload their book |
 | **P1 Foundation** | benchmark ingestion + quantstats tear-sheet + Euler risk contribution (F1,F2,F3) | 2 | tear-sheet page renders for real portfolio vs NIFTY |
 | **P2 Optimizer** | riskfolio integration + constraints + frontier + trade list (F4) | 2 | "rebalance" button opens evidence-backed suggestion |
 | **P3 Uncertainty** | HMM regime + Monte Carlo goals + vol cone (F5,6,9) | 2-3 | regime banner live; P(goal) slider works |

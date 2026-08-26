@@ -1,6 +1,6 @@
 # 10 — Regime engine (HMM on NIFTY)
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - regime_service.py (hmmlearn 3-state HMM on ^NSEI ret+vol21, seeded) + GET /analytics/regime with portfolio-conditional stats. Labels ordered by mean-variance composite. Live: stability 97.4%. Frontend banner deferred to polish pass.
 Type: task
 Blocked by: 05
 

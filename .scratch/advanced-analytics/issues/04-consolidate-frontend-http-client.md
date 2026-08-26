@@ -1,6 +1,6 @@
 # 04 — Consolidate frontend HTTP through lib/api.ts
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - all raw fetch('http://localhost:8000/...') removed from dashboard + manage pages; routed through lib/api.ts; updatePosition extended with quantity/buy_price.
 Type: task
 Blocked by: —
 

@@ -1,6 +1,6 @@
 # 06 — Quantstats tear-sheet endpoint + page
 
-Status: ready-for-agent
+Status: resolved (2026-08-25) - GET /analytics/tear-sheet: quantstats suite vs NIFTY incl beta+alpha, monthly heatmap, underwater series; per-metric null degradation. Live: beta=0.9888 maxdd=-24.4%.
 Type: task
 Blocked by: 01, 05
 

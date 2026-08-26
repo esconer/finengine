@@ -1,6 +1,6 @@
 # 08 — Optimization service wrapping riskfolio-lib
 
-Status: ready-for-agent
+Status: resolved-with-caveat (2026-08-25) - implemented on numpy/cvxpy directly, NOT riskfolio/pypfopt (both broken on scipy 1.16+; repro in Resolution).
 Type: task
 Blocked by: 05
 
