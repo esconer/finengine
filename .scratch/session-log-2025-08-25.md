@@ -240,6 +240,10 @@ this file.
 12. Payload rounding (6dp) ⇒ sum-to-1 checks need ~1e-4 tolerance, not 1e-6.
 
 ### Uncommitted (since 374a… push)
-Everything from §10 plus Phase-1/2 backend, CORS fix, vitest fixes, tickets 09/11 resolved,
-RELEASE_NOTES 2026-08-26 section, this file's §10. Commit + push pending user go-ahead.
+PUSHED 2026-08-26 as: `b015e6e` feat(analytics) MC engine + services + CORS + 128 tests ·
+`bb92155` feat(dashboard) 5 pages + widgets · `34254d6` docs release notes/tickets/session log/
+impeccable skill. Working tree clean except pre-existing untracked frontend assets
+(assets/, bg.png, favicon.*, html.meta.json.gz) left alone deliberately.
+.gitignore now also excludes: *.log, .coverage, htmlcov/, .impeccable/, _shot_*.png,
+test-results.xml, _diag_rc.py.
 
