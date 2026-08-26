@@ -87,8 +87,8 @@ describe('MetricCard', () => {
 
             // Check for loading animation elements
             expect(screen.getByTestId('metric-card')).toBeInTheDocument()
-            const loadingElements = screen.getAllByText('1')
-            expect(loadingElements.length).toBeGreaterThan(0)
+            const pulse = screen.getByTestId('metric-card').querySelector('.animate-pulse')
+            expect(pulse).not.toBeNull()
         })
 
         it('should not render change when change is undefined', () => {
@@ -344,7 +344,7 @@ describe('MetricCard', () => {
             })
             render(<MetricCard {...props} />)
 
-            expect(screen.getByText('')).toBeInTheDocument()
+            expect(screen.getByText('N/A')).toBeInTheDocument()
         })
     })
 

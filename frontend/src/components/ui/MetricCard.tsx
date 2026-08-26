@@ -35,14 +35,14 @@ export const MetricCard: React.FC<MetricCardProps> = ({
         ? `$${(val / 1000).toFixed(1)}K`
         : val.toFixed(2);
     }
-    if (val === null || val === undefined || val === 'NaN%') {
+    if (!val || val === 'NaN%') {
       return 'N/A';
     }
     return val.toString();
   };
 
   const formatChange = (val: number): string => {
-    const sign = val > 0 ? '+' : '';
+    const sign = val >= 0 ? '+' : '';
     return `${sign}${val.toFixed(2)}%`;
   };
 
@@ -70,7 +70,10 @@ export const MetricCard: React.FC<MetricCardProps> = ({
 
   if (loading) {
     return (
-      <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 ${className}`}>
+      <div
+        data-testid="metric-card"
+        className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 ${className}`}
+      >
         <div className="animate-pulse">
           <div className="flex items-center justify-between mb-4">
             <div className="h-4 bg-gray-300 dark:bg-gray-600 rounded w-24"></div>
@@ -84,7 +87,10 @@ export const MetricCard: React.FC<MetricCardProps> = ({
   }
 
   return (
-    <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 ${className}`}>
+    <div
+      data-testid="metric-card"
+      className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 ${className}`}
+    >
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-sm font-medium text-gray-600 dark:text-gray-400">{title}</h3>
         {Icon && (

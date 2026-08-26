@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import Link from 'next/link';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
@@ -9,6 +10,7 @@ import { SectorAllocationChart } from '@/components/charts/SectorAllocationChart
 import { RiskMetricsDisplay } from '@/components/charts/RiskMetricsDisplay';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
+import { portfolioApi, analyticsApi } from '@/lib/api';
 import { usePortfolioAnalytics, usePerformanceData, useSectorAllocation } from '@/hooks/useAnalytics';
 import {
   TrendingUp,
@@ -22,8 +24,16 @@ import {
   RefreshCw,
   Edit,
   Trash2,
-  Download
+  Download,
+  Radar,
+  PieChart
 } from 'lucide-react';
+
+const REGIME_CHIP: Record<string, string> = {
+  calm: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300',
+  volatile: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
+  crisis: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+};
 
 interface PortfolioPosition {
   id: number;
@@ -45,10 +55,28 @@ export default function DashboardSummary() {
   const { data: analyticsData, loading: analyticsLoading, refresh: refreshAnalytics } = usePortfolioAnalytics();
   const { performanceData, loading: performanceLoading } = usePerformanceData(90);
   const sectorData = useSectorAllocation();
+  const [regimeInfo, setRegimeInfo] = useState<{ current_regime: string; stability_pct: number } | null>(null);
+  const [riskDrivers, setRiskDrivers] = useState<[string, number][] | null>(null);
 
   useEffect(() => {
     fetchPortfolio();
   }, [fetchPortfolio]);
+
+  // Supplementary widgets: regime + risk drivers load quietly and never block the page
+  useEffect(() => {
+    analyticsApi
+      .getRegime({ with_portfolio: false })
+      .then((r) => setRegimeInfo({ current_regime: r.current_regime, stability_pct: r.stability_pct }))
+      .catch(() => setRegimeInfo(null));
+    analyticsApi
+      .getRiskContribution()
+      .then((r) => {
+        const entries = Object.entries(r.positions?.volatility ?? {}) as [string, number][];
+        entries.sort(([, a], [, b]) => b - a);
+        setRiskDrivers(entries.slice(0, 3));
+      })
+      .catch(() => setRiskDrivers(null));
+  }, []);
 
   useEffect(() => {
     if (!isLoading && !error && positions.length > 0) {
@@ -153,19 +181,7 @@ export default function DashboardSummary() {
   // Add position handler
   const handleAddPosition = async (positionData: any) => {
     try {
-      const response = await fetch('http://localhost:8000/api/v1/portfolio/add', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(positionData),
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || 'Failed to add position');
-      }
-
+      await portfolioApi.addPosition(positionData);
       // Refresh portfolio data
       await fetchPortfolio();
     } catch (error) {
@@ -286,6 +302,81 @@ export default function DashboardSummary() {
         />
       </div>
 
+      {/* Market Regime + Top Risk Drivers */}
+      {(regimeInfo || (riskDrivers && riskDrivers.length > 0)) && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {regimeInfo && (
+            <Link
+              href="/dashboard/regime"
+              className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 border border-gray-200 dark:border-gray-700 flex items-center justify-between hover:border-blue-300 dark:hover:border-blue-600 transition-colors"
+            >
+              <div className="flex items-center space-x-4">
+                <Radar className="w-8 h-8 text-blue-500" />
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                    Market Regime
+                  </p>
+                  <div className="flex items-center mt-1">
+                    <span
+                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-semibold ${
+                        REGIME_CHIP[regimeInfo.current_regime.toLowerCase()] ??
+                        'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'
+                      }`}
+                    >
+                      {regimeInfo.current_regime.charAt(0).toUpperCase() +
+                        regimeInfo.current_regime.slice(1)}
+                    </span>
+                    <span className="text-xs text-gray-500 dark:text-gray-400 ml-3 tabular-nums">
+                      {regimeInfo.stability_pct.toFixed(0)}% stability
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <span className="text-xs text-blue-600 dark:text-blue-400 font-medium">
+                Details →
+              </span>
+            </Link>
+          )}
+
+          {riskDrivers && riskDrivers.length > 0 && (
+            <Link
+              href="/dashboard/risk-contribution"
+              className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 border border-gray-200 dark:border-gray-700 hover:border-orange-300 dark:hover:border-orange-600 transition-colors"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center space-x-3">
+                  <PieChart className="w-6 h-6 text-orange-500" />
+                  <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                    Top Risk Drivers
+                  </p>
+                </div>
+                <span className="text-xs text-orange-600 dark:text-orange-400 font-medium">
+                  Details →
+                </span>
+              </div>
+              <div className="space-y-1.5 mt-3">
+                {riskDrivers.map(([ticker, share]) => (
+                  <div key={ticker} className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-700 dark:text-gray-300 w-20 truncate">
+                      {ticker}
+                    </span>
+                    <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+                      <div
+                        className="h-1.5 rounded-full bg-orange-500"
+                        style={{ width: `${share * 100}%` }}
+                      />
+                    </div>
+                    <span className="text-xs text-gray-600 dark:text-gray-400 w-10 text-right tabular-nums">
+                      {(share * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Link>
+          )}
+        </div>
+      )}
+
       {/* Risk Metrics Display */}
       <RiskMetricsDisplay
         data={{
@@ -390,19 +481,12 @@ export default function DashboardSummary() {
           <button
             onClick={async () => {
               try {
-                const response = await fetch('http://localhost:8000/api/v1/portfolio/rebalance', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ method: 'proportional' })
-                });
-                if (response.ok) {
-                  await fetchPortfolio();
-                  alert('Portfolio rebalanced successfully');
-                } else {
-                  alert('Failed to rebalance portfolio');
-                }
+                await portfolioApi.normalizeWeights();
+                await fetchPortfolio();
+                alert('Portfolio rebalanced successfully');
               } catch (error) {
-                alert('Error rebalancing portfolio');
+                console.error('Failed to rebalance portfolio:', error);
+                alert('Failed to rebalance portfolio');
               }
             }}
             className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"

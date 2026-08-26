@@ -142,6 +142,8 @@ export const portfolioApi = {
   // Update position
   async updatePosition(ticker: string, data: {
     weight?: number;
+    quantity?: number;
+    buy_price?: number;
     custom_name?: string;
   }): Promise<any> {
     const response = await apiClient.put(`/portfolio/${ticker}`, data);
@@ -296,6 +298,56 @@ export const analyticsApi = {
   // Get analytics summary
   async getSummary(): Promise<any> {
     const response = await apiClient.get('/analytics/summary');
+    return response.data;
+  },
+
+  // Get quantstats tear-sheet vs NIFTY
+  async getTearSheet(params?: {
+    tickers?: string;
+    start?: string;
+    end?: string;
+  }): Promise<any> {
+    const response = await apiClient.get('/analytics/tear-sheet', { params });
+    return response.data;
+  },
+
+  // Euler risk decomposition per position
+  async getRiskContribution(params?: {
+    tickers?: string;
+  }): Promise<any> {
+    const response = await apiClient.get('/analytics/risk-contribution', { params });
+    return response.data;
+  },
+
+  // Portfolio optimization (hrp | min_vol | max_sharpe | min_cvar)
+  async runOptimization(data: {
+    strategy?: string;
+    risk_free_rate?: number;
+    tickers?: string[];
+  }): Promise<any> {
+    const response = await apiClient.post('/analytics/optimize/run', data);
+    return response.data;
+  },
+
+  // HMM market-regime classification
+  async getRegime(params?: {
+    lookback_days?: number;
+    with_portfolio?: boolean;
+  }): Promise<any> {
+    const response = await apiClient.get('/analytics/regime', { params });
+    return response.data;
+  },
+
+  // Monte Carlo goal-probability simulation
+  async runMonteCarlo(data: {
+    target_value: number;
+    horizon_years: number;
+    initial_value?: number;
+    method?: 'gbm' | 'student_t' | 'bootstrap';
+    num_paths?: number;
+    seed?: number;
+  }): Promise<any> {
+    const response = await apiClient.post('/analytics/monte-carlo', data);
     return response.data;
   },
 };

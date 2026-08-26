@@ -52,6 +52,26 @@ const routeTitles: Record<string, { title: string; subtitle?: string }> = {
     title: 'Volatility Sizing',
     subtitle: 'Dynamic position sizing based on volatility models'
   },
+  '/dashboard/tear-sheet': {
+    title: 'Performance Tear-Sheet',
+    subtitle: 'Your portfolio against NIFTY 50 via the quantstats suite'
+  },
+  '/dashboard/risk-contribution': {
+    title: 'Risk Contribution',
+    subtitle: 'Euler decomposition of risk per position and tail attribution'
+  },
+  '/dashboard/optimize': {
+    title: 'Portfolio Optimizer',
+    subtitle: 'Rebalance within your holdings across four strategies'
+  },
+  '/dashboard/regime': {
+    title: 'Market Regime',
+    subtitle: 'Hidden-Markov state of NIFTY and your portfolio inside it'
+  },
+  '/dashboard/monte-carlo': {
+    title: 'Goal Probability',
+    subtitle: 'Monte Carlo odds of hitting a target from your own return history'
+  },
   '/dashboard/settings': {
     title: 'Settings',
     subtitle: 'Configure dashboard preferences and data sources'

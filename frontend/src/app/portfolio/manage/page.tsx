@@ -33,7 +33,7 @@ import { LoadingState } from '@/components/ui/LoadingState';
 import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { EditPositionModal } from '@/components/portfolio/EditPositionModal';
-import { analyticsApi } from '@/lib/api';
+import { analyticsApi, portfolioApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 // Simple position type for our table
@@ -144,12 +144,7 @@ export default function PortfolioManagePage() {
             setIsLoading(true);
             setError(null);
 
-            const response = await fetch(`http://localhost:8000/api/v1/portfolio?currency=${currency}`);
-            if (!response.ok) {
-                throw new Error('Failed to fetch portfolio');
-            }
-
-            const data = await response.json();
+            const data = await portfolioApi.getPortfolio({ currency });
 
             // Transform data to include calculated fields
             const transformedPositions = data.positions.map((pos: any) => ({
@@ -192,19 +187,7 @@ export default function PortfolioManagePage() {
     // Add new position
     const handleAddPosition = async (positionData: PortfolioCreateRequest) => {
         try {
-            const response = await fetch('http://localhost:8000/api/v1/portfolio/add', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(positionData),
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.detail || 'Failed to add position');
-            }
-
+            await portfolioApi.addPosition(positionData);
             // Refresh portfolio data
             await fetchPortfolio();
         } catch (error) {
@@ -219,18 +202,7 @@ export default function PortfolioManagePage() {
             const position = positions.find(p => p.id === id);
             if (!position) throw new Error('Position not found');
 
-            const response = await fetch(`http://localhost:8000/api/v1/portfolio/${position.ticker}`, {
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(updates),
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.detail || 'Failed to update position');
-            }
+            await portfolioApi.updatePosition(position.ticker, updates);
 
             // Refresh portfolio data
             await fetchPortfolio();
@@ -243,14 +215,7 @@ export default function PortfolioManagePage() {
     // Delete position
     const handleDeletePosition = async (ticker: string) => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/portfolio/${ticker}`, {
-                method: 'DELETE',
-            });
-
-            if (!response.ok) {
-                const error = await response.json();
-                throw new Error(error.detail || 'Failed to delete position');
-            }
+            await portfolioApi.deletePosition(ticker);
 
             // Refresh portfolio data
             await fetchPortfolio();

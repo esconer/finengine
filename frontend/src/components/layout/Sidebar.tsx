@@ -19,8 +19,13 @@ import {
     Zap,
     ChevronLeft,
     ChevronRight,
-    Settings
+    Settings,
+    Newspaper,
+    PieChart,
+    SlidersHorizontal,
+    Radar
 } from 'lucide-react';
+
 import { cn } from '@/lib/utils';
 
 interface NavigationItem {
@@ -78,6 +83,36 @@ const navigation: NavigationItem[] = [
         href: '/dashboard/volatility-sizing',
         icon: Zap,
         description: 'Dynamic position sizing based on volatility'
+    },
+    {
+        name: 'Tear-Sheet',
+        href: '/dashboard/tear-sheet',
+        icon: Newspaper,
+        description: 'Full performance suite vs NIFTY 50'
+    },
+    {
+        name: 'Risk Contribution',
+        href: '/dashboard/risk-contribution',
+        icon: PieChart,
+        description: 'Which positions drive your risk'
+    },
+    {
+        name: 'Optimizer',
+        href: '/dashboard/optimize',
+        icon: SlidersHorizontal,
+        description: 'Rebalance within your holdings'
+    },
+    {
+        name: 'Market Regime',
+        href: '/dashboard/regime',
+        icon: Radar,
+        description: 'HMM state of NIFTY and your book'
+    },
+    {
+        name: 'Goal Probability',
+        href: '/dashboard/monte-carlo',
+        icon: Target,
+        description: 'Monte Carlo odds of hitting a target'
     },
     {
         name: 'Portfolio Management',
