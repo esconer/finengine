@@ -72,6 +72,14 @@ const routeTitles: Record<string, { title: string; subtitle?: string }> = {
     title: 'Goal Probability',
     subtitle: 'Monte Carlo odds of hitting a target from your own return history'
   },
+  '/dashboard/pairs': {
+    title: 'Cointegration & Pairs Scanner',
+    subtitle: 'Engle-Granger & Johansen rank tests with OU half-life estimates'
+  },
+  '/dashboard/india-flows': {
+    title: 'India Flows & Microstructure',
+    subtitle: 'NSE delivery % spikes, institutional cash flows, and ADV limits'
+  },
   '/dashboard/settings': {
     title: 'Settings',
     subtitle: 'Configure dashboard preferences and data sources'

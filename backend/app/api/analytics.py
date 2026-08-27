@@ -1428,4 +1428,112 @@ async def get_cointegration_pairs(
     except Exception as e:
         logger.error(f"Error in coint scanner: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+@router.get("/india-flows")
+async def get_india_institutional_flows(
+    lookback_days: int = Query(default=30, ge=5, le=365, description="Lookback window for FII/DII flows"),
+    db: AsyncSession = Depends(get_db_session)
+) -> Dict[str, Any]:
+    """
+    Retrieve daily FII / DII institutional net cash flows across the last N trading sessions.
+    """
+    try:
+        from app.services.india_data_service import IndiaDataService
+        india_svc = IndiaDataService(db=db)
+        flows = await india_svc.get_institutional_flows(lookback_days=lookback_days)
+        return {
+            "lookback_days": lookback_days,
+            "flows": flows,
+            "count": len(flows)
+        }
+    except Exception as e:
+        logger.error(f"Error getting institutional flows: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+
+@router.get("/delivery-anomalies")
+async def get_delivery_anomalies(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    lookback_days: int = Query(default=20, ge=5, le=60, description="Rolling baseline window"),
+    sigma_threshold: float = Query(default=2.0, ge=1.0, le=5.0, description="Z-score threshold for anomaly flag"),
+    db: AsyncSession = Depends(get_db_session)
+) -> Dict[str, Any]:
+    """
+    Detect delivery percentage spikes (> N sigma over 20-day mean) across portfolio holdings.
+    """
+    try:
+        if tickers:
+            symbol_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        else:
+            allocation = await _load_portfolio_allocation(db)
+            symbol_list = list(allocation.keys())
+
+        if not symbol_list:
+            return {"anomalies": [], "count": 0, "message": "No tickers found"}
+
+        from app.services.india_data_service import IndiaDataService
+        india_svc = IndiaDataService(db=db)
+        anomalies = await india_svc.get_delivery_anomalies(
+            symbols=symbol_list,
+            lookback_days=lookback_days,
+            sigma_threshold=sigma_threshold
+        )
+        return {
+            "lookback_days": lookback_days,
+            "sigma_threshold": sigma_threshold,
+            "anomalies": anomalies,
+            "count": len(anomalies)
+        }
+    except Exception as e:
+        logger.error(f"Error getting delivery anomalies: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/liquidity-limits")
+async def get_liquidity_limits(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service)
+) -> Dict[str, Any]:
+    """
+    Compute participation-based liquidation limits (days-to-liquidate @ 10% & 20% ADV),
+    Amihud illiquidity metric, and maximum sane position sizing.
+    """
+    try:
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+            positions = [
+                PortfolioPosition(ticker=t, weight=1.0 / len(ticker_list), quantity=100.0, buy_price=100.0, last_price=100.0, market_value=10000.0)
+                for t in ticker_list
+            ]
+        else:
+            result = await db.execute(select(PortfolioPosition))
+            positions = result.scalars().all()
+
+        if not positions:
+            return {
+                "portfolio_value": 0.0,
+                "portfolio_weighted_days_to_liquidate_10pct": 0.0,
+                "portfolio_weighted_days_to_liquidate_20pct": 0.0,
+                "portfolio_amihud_score": 0.0,
+                "positions": [],
+                "message": "No positions found"
+            }
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+
+        price_dfs = {}
+        for p in positions:
+            df = await data_service.fetch_historical_data(p.ticker, start, end)
+            if df is not None and not df.empty:
+                price_dfs[p.ticker] = df
+
+        from app.services.india_data_service import IndiaDataService
+        india_svc = IndiaDataService(db=db)
+        return await india_svc.calculate_portfolio_liquidity_limits(
+            positions=positions,
+            price_history=price_dfs
+        )
+    except Exception as e:
+        logger.error(f"Error getting liquidity limits: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

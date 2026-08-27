@@ -115,6 +115,18 @@ const navigation: NavigationItem[] = [
         description: 'Monte Carlo odds of hitting a target'
     },
     {
+        name: 'Pairs Scanner',
+        href: '/dashboard/pairs',
+        icon: Radar,
+        description: 'Cointegration & statistical arbitrage scanner'
+    },
+    {
+        name: 'India Microstructure',
+        href: '/dashboard/india-flows',
+        icon: Zap,
+        description: 'NSE delivery spikes & institutional flows'
+    },
+    {
         name: 'Portfolio Management',
         href: '/portfolio/manage',
         icon: BarChart3,
