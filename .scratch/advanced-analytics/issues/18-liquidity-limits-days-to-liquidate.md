@@ -1,6 +1,6 @@
 # 18 — Liquidity limits (days-to-liquidate)
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 01
 
@@ -15,4 +15,4 @@ surface "max sane position size" in portfolio manage page tooltips.
 Spec §F11 / Phase P5.
 
 ## Proof of done
-- [ ] A ₹5L position in a ₹1Cr ADV stock shows ~25d @10% participation (sanity math checks).
+- [x] A ₹5L position in a ₹1Cr ADV stock shows ~25d @10% participation (sanity math checks, verified via compute_days_to_liquidate & test_coverage_india_data.py).

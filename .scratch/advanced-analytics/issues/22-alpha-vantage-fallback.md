@@ -1,6 +1,6 @@
 # 22 — Alpha Vantage as fallback data vendor
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: —
 

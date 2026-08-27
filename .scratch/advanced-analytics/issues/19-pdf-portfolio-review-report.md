@@ -1,6 +1,6 @@
 # 19 — PDF portfolio review report
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 06, 10, 11
 

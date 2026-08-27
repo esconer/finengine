@@ -1,6 +1,6 @@
 # 23 — Portfolio importer (CSV/XLSX upload)
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: —
 

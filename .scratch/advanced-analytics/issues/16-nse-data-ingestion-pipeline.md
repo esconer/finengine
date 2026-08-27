@@ -1,6 +1,6 @@
 # 16 — NSE data ingestion pipeline
 
-Status: needs-info
+Status: closed
 Type: task
 Blocked by: —
 
@@ -22,5 +22,5 @@ The India microstructure edge — delivery % and FII/DII flows are public but po
 anywhere free. Spec §F12 / Phase P5.
 
 ## Proof of done
-- [ ] One command ingests today's bhavcopy + delivery % into SQLite.
-- [ ] Re-running same day is a no-op.
+- [x] One command ingests today's bhavcopy + delivery % into SQLite.
+- [x] Re-running same day is a no-op (verified via IndiaDataService & test_coverage_india_data.py).

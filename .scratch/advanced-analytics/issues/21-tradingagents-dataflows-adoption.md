@@ -1,6 +1,6 @@
 # 21 — Adopt TradingAgents dataflows components
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: —
 

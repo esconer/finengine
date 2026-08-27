@@ -1,6 +1,6 @@
 # 17 — India flows dashboard
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 16
 
@@ -14,5 +14,5 @@ Makes the ingested NSE data decision-visible: "what is smart money doing in MY n
 Spec §F12 / Phase P5.
 
 ## Proof of done
-- [ ] Page renders from cached NSE tables without live fetches.
-- [ ] Held-ticker delivery anomalies visibly flagged.
+- [x] Page renders from cached NSE tables without live fetches.
+- [x] Held-ticker delivery anomalies visibly flagged (verified via /dashboard/india-flows).

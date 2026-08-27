@@ -1,6 +1,6 @@
 # 20 — Mock purge + WebSocket worker decision
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 06, 09, 17
 
