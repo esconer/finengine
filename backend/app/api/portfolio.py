@@ -71,11 +71,12 @@ async def get_portfolio(
         await _update_portfolio_prices(positions, data_service)
         await db.commit()
         
-        # Build response
+        # Build response with live market-value weights
         position_responses = []
         total_value = 0.0
         currency_service = get_currency_service()
         sectors = {}
+        total_mv_inr = sum((p.quantity or 0.0) * (p.last_price or 0.0) for p in positions)
         
         for position in positions:
             # Calculate portfolio metrics
@@ -83,12 +84,13 @@ async def get_portfolio(
             current_value = position.quantity * position.last_price
             unrealized_gain_loss = current_value - total_cost
             unrealized_gain_loss_pct = (unrealized_gain_loss / total_cost * 100) if total_cost > 0 else 0.0
+            live_weight = (current_value / total_mv_inr) if total_mv_inr > 0 else (position.weight or 0.0)
             
             # Convert to response model
             pos_response = PortfolioPositionResponse(
                 id=position.id,
                 ticker=position.ticker,
-                weight=position.weight,
+                weight=live_weight,
                 quantity=position.quantity,
                 buy_price=position.buy_price,
                 last_price=position.last_price,
@@ -111,26 +113,15 @@ async def get_portfolio(
             else:
                 total_value += current_value
             
-            # Track sector allocation
+            # Track sector allocation by market value
             sector_key = position.sector or "Unknown"
-            sectors[sector_key] = sectors.get(sector_key, 0.0) + position.weight
+            sectors[sector_key] = sectors.get(sector_key, 0.0) + current_value
         
-        # Normalize sector shares. Weights may carry no information (all zero);
-        # fall back to market-value shares so the response stays well-formed.
-        total_weight = sum(pos.weight or 0.0 for pos in positions)
-        if total_weight > 0:
-            normalized_sectors = {k: v / total_weight for k, v in sectors.items()}
+        # Normalize sector shares by total market value
+        if total_mv_inr > 0:
+            normalized_sectors = {k: v / total_mv_inr for k, v in sectors.items()}
         else:
-            mv_by_sector = {}
-            total_mv = 0.0
-            for position in positions:
-                mv = (position.quantity or 0) * (position.last_price or 0)
-                key = position.sector or "Unknown"
-                mv_by_sector[key] = mv_by_sector.get(key, 0.0) + mv
-                total_mv += mv
-            normalized_sectors = (
-                {k: v / total_mv for k, v in mv_by_sector.items()} if total_mv > 0 else {}
-            )
+            normalized_sectors = {}
         
         return PortfolioSummaryResponse(
             positions=position_responses,

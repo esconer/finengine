@@ -142,20 +142,23 @@ export const useSectorAllocation = () => {
       return;
     }
 
-    // Calculate sector allocation from portfolio positions
+    // Calculate sector allocation from live portfolio market values
+    const totalMv = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
     const sectorMap = new Map<string, number>();
     
     positions.forEach(position => {
       const sector = position.sector || 'Unknown';
-      const currentWeight = sectorMap.get(sector) || 0;
-      sectorMap.set(sector, currentWeight + position.weight);
+      const mv = position.market_value || 0;
+      const currentShare = sectorMap.get(sector) || 0;
+      const weight = totalMv > 0 ? (mv / totalMv) : (position.weight || 0);
+      sectorMap.set(sector, currentShare + weight);
     });
 
     // Convert to array format for charts
     const sectorArray = Array.from(sectorMap.entries()).map(([name, value]) => ({
       name,
       value,
-      percentage: value, // Already normalized weights
+      percentage: value, // Normalized live market-value weights
     }));
 
     setSectorData(sectorArray);

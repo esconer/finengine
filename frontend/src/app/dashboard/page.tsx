@@ -116,9 +116,12 @@ export default function DashboardSummary() {
       accessorKey: 'weight' as keyof PortfolioPosition,
       cell: ({ row }: any) => {
         const data = row.original || row;
+        const liveWeight = (totalValue && totalValue > 0 && data.market_value)
+          ? (data.market_value / totalValue)
+          : (data.weight || 0);
         return (
-          <div className="text-gray-900 dark:text-white">
-            {data.weight ? `${(data.weight * 100).toFixed(2)}%` : '0.00%'}
+          <div className="text-gray-900 dark:text-white font-medium">
+            {`${(liveWeight * 100).toFixed(2)}%`}
           </div>
         );
       },

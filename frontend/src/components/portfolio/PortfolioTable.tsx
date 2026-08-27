@@ -86,6 +86,11 @@ export function PortfolioTable({
     );
   }
 
+  const totalPortfolioValue = positions.reduce(
+    (sum, p) => sum + (p.current_value || (p.quantity * (p.last_price || 0)) || 0),
+    0
+  );
+
   return (
     <div className="overflow-x-auto">
       <table className="w-full">
@@ -230,8 +235,10 @@ export function PortfolioTable({
                   {formatPercentage(position.unrealized_gain_loss_pct)}
                 </span>
               </td>
-              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                {(position.weight * 100).toFixed(2)}%
+              <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
+                {totalPortfolioValue > 0
+                  ? `${(((position.current_value || (position.quantity * (position.last_price || 0))) / totalPortfolioValue) * 100).toFixed(2)}%`
+                  : `${((position.weight || 0) * 100).toFixed(2)}%`}
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                 <div className="flex items-center justify-end space-x-2">
