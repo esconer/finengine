@@ -721,8 +721,13 @@ async def run_stress_test(
         # Combine price data
         price_data = pd.DataFrame(price_data_dict)
         
-        # Run stress test using analytics engine
-        stress_result = await analytics_engine.stress_test(price_data, weights, request.scenario)
+        # Query position sectors from DB
+        pos_res = await db.execute(select(PortfolioPosition))
+        positions_db = pos_res.scalars().all()
+        sectors = {p.ticker: (p.sector or "Exchange Traded Fund") for p in positions_db}
+        
+        # Run multi-factor sector-elastic stress test using analytics engine
+        stress_result = await analytics_engine.stress_test(price_data, weights, request.scenario, sectors=sectors)
         
         return stress_result
         

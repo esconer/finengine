@@ -495,10 +495,7 @@ export default function StressTestingPage() {
 
   useEffect(() => {
     if (positions.length > 0 && Object.keys(stressResults).length === 0) {
-      // Auto-run first 2 scenarios on initial load
-      scenarios.slice(0, 2).forEach(scenario => {
-        runStressTest(scenario.name);
-      });
+      runAllScenarios();
     }
   }, [positions]);
 

@@ -347,15 +347,17 @@ class AnalyticsEngine:
         self, 
         price_data: pd.DataFrame, 
         weights: Dict[str, float], 
-        scenario: str
+        scenario: str,
+        sectors: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
-        Run stress test scenario
+        Run multi-factor sector-elastic stress test scenario
         
         Args:
             price_data: Historical price data
             weights: Portfolio weights
             scenario: Stress scenario name
+            sectors: Optional dictionary mapping ticker to sector
             
         Returns:
             Dictionary with stress test results
@@ -366,15 +368,78 @@ class AnalyticsEngine:
             
             scenario_key = (scenario or "").lower().strip().replace(" ", "_").replace("-", "_")
 
-            # Standard institutional stress test scenarios
+            # Multi-Factor Macro & Sector Elasticity Matrix
             scenarios_config = {
-                "market_crash": {"market_shock": -0.35, "recovery_months": 24, "description": "Global Financial Crisis / Severe Market Crash (-35% NIFTY shock)"},
-                "interest_rate_shock": {"market_shock": -0.15, "recovery_months": 9, "description": "300bp RBI / Global Central Bank Interest Rate Hike (-15% shock)"},
-                "volatility_spike": {"market_shock": -0.22, "recovery_months": 5, "description": "COVID-19 style VIX > 40 Sudden Volatility Spike (-22% shock)"},
-                "tech_sector_correction": {"market_shock": -0.18, "recovery_months": 12, "description": "Broad Tech & Growth Multiple De-rating (-18% shock)"},
-                "2020_covid": {"market_shock": -0.28, "recovery_months": 6, "description": "March 2020 COVID Market Crash"},
-                "2022_inflation": {"market_shock": -0.16, "recovery_months": 10, "description": "2022 Global Inflationary Tightening"},
-                "2018_q4": {"market_shock": -0.14, "recovery_months": 7, "description": "Q4 2018 Market Correction"},
+                "market_crash": {
+                    "market_shock": -0.35, 
+                    "recovery_months": 24, 
+                    "description": "Global Financial Crisis / Severe Market Crash (-35% NIFTY shock)",
+                    "sectors": {
+                        "Healthcare": 0.55, "Utilities": 0.50, "Technology": 1.10,
+                        "Financial Services": 1.45, "Consumer Cyclical": 1.55, "Industrials": 1.40,
+                        "Exchange Traded Fund": 1.00
+                    }
+                },
+                "interest_rate_shock": {
+                    "market_shock": -0.15, 
+                    "recovery_months": 9, 
+                    "description": "300bp RBI / Global Central Bank Interest Rate Hike (-15% shock)",
+                    "sectors": {
+                        "Healthcare": 0.50, "Utilities": 0.70, "Technology": 1.10,
+                        "Financial Services": 1.50, "Consumer Cyclical": 1.35, "Industrials": 1.40,
+                        "Exchange Traded Fund": 1.00
+                    }
+                },
+                "volatility_spike": {
+                    "market_shock": -0.22, 
+                    "recovery_months": 5, 
+                    "description": "COVID-19 style VIX > 40 Sudden Volatility Spike (-22% shock)",
+                    "sectors": {
+                        "Healthcare": 0.40, "Utilities": 0.55, "Technology": 0.95,
+                        "Financial Services": 1.30, "Consumer Cyclical": 1.50, "Industrials": 1.45,
+                        "Exchange Traded Fund": 1.05
+                    }
+                },
+                "tech_sector_correction": {
+                    "market_shock": -0.18, 
+                    "recovery_months": 12, 
+                    "description": "Broad Tech & Growth Multiple De-rating (-18% shock)",
+                    "sectors": {
+                        "Healthcare": 0.25, "Utilities": 0.20, "Technology": 1.80,
+                        "Financial Services": 0.50, "Consumer Cyclical": 0.60, "Industrials": 0.45,
+                        "Exchange Traded Fund": 0.60
+                    }
+                },
+                "2020_covid": {
+                    "market_shock": -0.28, 
+                    "recovery_months": 6, 
+                    "description": "March 2020 COVID Market Crash",
+                    "sectors": {
+                        "Healthcare": 0.45, "Utilities": 0.60, "Technology": 0.90,
+                        "Financial Services": 1.40, "Consumer Cyclical": 1.50, "Industrials": 1.45,
+                        "Exchange Traded Fund": 1.05
+                    }
+                },
+                "2022_inflation": {
+                    "market_shock": -0.16, 
+                    "recovery_months": 10, 
+                    "description": "2022 Global Inflationary Tightening",
+                    "sectors": {
+                        "Healthcare": 0.60, "Utilities": 0.80, "Technology": 1.50,
+                        "Financial Services": 1.10, "Consumer Cyclical": 1.20, "Industrials": 1.10,
+                        "Exchange Traded Fund": 1.00
+                    }
+                },
+                "2018_q4": {
+                    "market_shock": -0.14, 
+                    "recovery_months": 7, 
+                    "description": "Q4 2018 Market Correction",
+                    "sectors": {
+                        "Healthcare": 0.70, "Utilities": 0.50, "Technology": 1.40,
+                        "Financial Services": 1.20, "Consumer Cyclical": 1.10, "Industrials": 1.00,
+                        "Exchange Traded Fund": 1.00
+                    }
+                },
             }
 
             matched_scenario = None
@@ -384,48 +449,55 @@ class AnalyticsEngine:
                     break
             
             if not matched_scenario:
-                # Check for custom shock if present in scenario string (e.g. -25)
+                # Custom shock if present in scenario string
                 matched_scenario = ("custom_stress", {
                     "market_shock": -0.20,
                     "recovery_months": 12,
-                    "description": scenario or "Custom Scenario Shock"
+                    "description": scenario or "Custom Scenario Shock",
+                    "sectors": {}
                 })
 
             sc_name, sc_cfg = matched_scenario
             market_shock = sc_cfg["market_shock"]
             recovery_months = sc_cfg["recovery_months"]
             description = sc_cfg["description"]
+            sector_table = sc_cfg.get("sectors", {})
 
-            # Calculate asset-level beta vs market or volatility scaling
+            # Clean and calculate asset returns
             cleaned_prices = price_data.sort_index().ffill().bfill()
             returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
             if returns.empty or len(returns) < 2:
                 return self._empty_stress_test()
             returns = returns.iloc[1:]
+            
             position_impacts: Dict[str, float] = {}
             weighted_impact = 0.0
+            sectors_map = sectors or {}
 
             for ticker, weight in weights.items():
+                sec = sectors_map.get(ticker, "Exchange Traded Fund")
+                sec_mult = sector_table.get(sec, 1.0)
+                
+                # Special instrument sensitivity
+                if ticker == "MAFANG.NS" and sc_name == "tech_sector_correction":
+                    sec_mult = 2.0
+                elif ticker == "MIDCAPIETF.NS" and sc_name in ["market_crash", "volatility_spike"]:
+                    sec_mult = 1.30
+                elif ticker == "SELECTIPO.NS":
+                    sec_mult = 1.15
+
+                # Idiosyncratic volatility factor adjustment (bounded between 0.85 and 1.25)
+                vol_adj = 1.0
                 if ticker in returns.columns:
                     s = returns[ticker]
-                    # Filter active non-zero returns and clip corporate action outliers to NSE daily circuit band [-20%, +20%]
                     non_zero = s[s != 0.0].clip(lower=-0.20, upper=0.20)
                     if len(non_zero) >= 20:
                         ticker_vol = float(non_zero.std() * np.sqrt(252))
-                        # Benchmark base equity volatility standard = 22% (Indian equity market average)
-                        vol_factor = max(0.50, min(1.75, ticker_vol / 0.22)) if ticker_vol > 0 else 1.0
-                        ticker_impact = float(market_shock * vol_factor)
-                    elif len(non_zero) > 0:
-                        ticker_vol = float(non_zero.std() * np.sqrt(252)) if len(non_zero) > 1 else 0.20
-                        vol_factor = max(0.60, min(1.50, ticker_vol / 0.22)) if ticker_vol > 0 else 1.0
-                        ticker_impact = float(market_shock * vol_factor)
-                    else:
-                        ticker_impact = float(market_shock)
-                else:
-                    ticker_impact = float(market_shock)
+                        vol_adj = max(0.85, min(1.25, ticker_vol / 0.22)) if ticker_vol > 0 else 1.0
+
+                ticker_impact = float(market_shock * sec_mult * vol_adj)
+                ticker_impact = max(-0.75, min(-0.02, ticker_impact)) if market_shock < 0 else ticker_impact
                 
-                # Cap constituent drawdown between -75% and -5% to prevent unphysical liquidation numbers
-                ticker_impact = max(-0.75, min(-0.05, ticker_impact)) if market_shock < 0 else ticker_impact
                 position_impacts[ticker] = round(ticker_impact, 4)
                 weighted_impact += ticker_impact * weight
 
