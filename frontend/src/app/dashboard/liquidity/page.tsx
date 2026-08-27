@@ -57,7 +57,7 @@ export default function LiquidityPage() {
   const [error, setError] = useState<string | null>(null);
   const [positionData, setPositionData] = useState<PositionLiquidity[]>([]);
 
-  const { positions } = usePortfolioStore();
+  const { positions, fetchPortfolio } = usePortfolioStore();
 
   const fetchLiquidityData = async () => {
     setLoading(true);
@@ -119,6 +119,11 @@ export default function LiquidityPage() {
   };
 
   useEffect(() => {
+    fetchPortfolio();
+    fetchLiquidityData();
+  }, []);
+
+  useEffect(() => {
     if (positions.length > 0) {
       fetchLiquidityData();
     }
@@ -156,11 +161,12 @@ export default function LiquidityPage() {
     return value.toLocaleString('en-IN');
   };
 
-  const formatPercentage = (value: number | undefined | null, decimals = 2) => {
+  const formatPercentage = (value: number | undefined | null, decimals = 1) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '0.00%';
+      return '0.0%';
     }
-    return `${(value * 100).toFixed(decimals)}%`;
+    const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
+    return `${scaled.toFixed(decimals)}%`;
   };
 
   const getScoreColor = (score: number): string => {
@@ -362,7 +368,7 @@ export default function LiquidityPage() {
           />
           <MetricCard
             title="High Liquidity Positions"
-            value={`${highVolumeCount} (${positionData.length > 0 ? formatPercentage((highVolumeCount / positionData.length) * 100) : '0%'})`}
+            value={`${highVolumeCount} (${positionData.length > 0 ? formatPercentage(highVolumeCount / positionData.length) : '0.0%'})`}
             icon={TrendingDown}
             loading={loading}
           />

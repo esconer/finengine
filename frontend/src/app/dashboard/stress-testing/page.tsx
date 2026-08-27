@@ -94,7 +94,7 @@ export default function StressTestingPage() {
   const [loading, setLoading] = useState(false);
   const [positionData, setPositionData] = useState<any[]>([]);
 
-  const { positions } = usePortfolioStore();
+  const { positions, fetchPortfolio } = usePortfolioStore();
 
   const runStressTest = async (scenarioName: string) => {
     setLoading(true);
@@ -162,6 +162,10 @@ export default function StressTestingPage() {
 
   // Run stress tests on component mount for predefined scenarios
   useEffect(() => {
+    fetchPortfolio();
+  }, []);
+
+  useEffect(() => {
     if (positions.length > 0) {
       // Run a few stress tests on load
       scenarios.slice(0, 2).forEach(scenario => {
@@ -174,13 +178,15 @@ export default function StressTestingPage() {
     if (value === undefined || value === null || isNaN(value)) {
       return 'N/A';
     }
-    return `${value.toFixed(decimals)}%`;
+    const pct = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
+    return `${pct.toFixed(decimals)}%`;
   };
 
   const getImpactColor = (impact: number): string => {
-    if (impact < -15) return 'text-red-600 dark:text-red-400';
-    if (impact < -10) return 'text-orange-600 dark:text-orange-400';
-    if (impact < -5) return 'text-yellow-600 dark:text-yellow-400';
+    const pct = Math.abs(impact) <= 1.0 && impact !== 0 ? impact * 100 : impact;
+    if (pct < -15) return 'text-red-600 dark:text-red-400';
+    if (pct < -10) return 'text-orange-600 dark:text-orange-400';
+    if (pct < -5) return 'text-yellow-600 dark:text-yellow-400';
     return 'text-green-600 dark:text-green-400';
   };
 
@@ -222,8 +228,9 @@ export default function StressTestingPage() {
       accessorKey: 'severity_level',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const impactVal = data.impact ?? 0;
-        const severity = impactVal < -15 ? 'Critical' : impactVal < -10 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
+        const rawImpact = data.impact ?? 0;
+        const impactVal = Math.abs(rawImpact) <= 1.0 && rawImpact !== 0 ? rawImpact * 100 : rawImpact;
+        const severity = impactVal < -25 ? 'Critical' : impactVal < -15 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
         const colorClass = severity === 'Critical' ? 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300' :
                           severity === 'High' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-300' :
                           severity === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300' :
@@ -237,11 +244,26 @@ export default function StressTestingPage() {
     },
   ];
 
+  const handleExportCSV = () => {
+    if (!positionData || positionData.length === 0) return;
+    const headers = 'Ticker,Impact,Severity\n';
+    const rows = positionData
+      .map(p => `${p.ticker},${(p.impact * 100).toFixed(2)}%,${Math.abs(p.impact) > 0.25 ? 'High' : Math.abs(p.impact) > 0.15 ? 'Medium' : 'Low'}`)
+      .join('\n');
+    const blob = new Blob([headers + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `stress-impact-analysis.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Calculate summary metrics
   const stressTestResults = Object.values(stressResults);
   const worstCase = stressTestResults.length > 0 ? Math.min(...stressTestResults.map(r => r.portfolio_impact)) : 0;
   const bestCase = stressTestResults.length > 0 ? Math.max(...stressTestResults.map(r => r.portfolio_impact)) : 0;
-  const avgImpact = stressTestResults.length > 0 ? stressTestResults.reduce((sum, r) => sum + r.portfolio_impact, 0) / stressTestResults.length : 0;
+  const avgImpact = stressTestResults.length > 0 ? (stressTestResults.reduce((sum: number, r: StressTestResult) => sum + r.portfolio_impact, 0) / stressTestResults.length) : 0;
 
   return (
     <div className="space-y-6">
@@ -347,32 +369,24 @@ export default function StressTestingPage() {
         <MetricCard
           title="Worst Case Scenario"
           value={worstCase !== 0 ? formatPercentage(worstCase) : 'N/A'}
-          change={0}
-          changeType="negative"
           icon={AlertTriangle}
           loading={loading && stressTestResults.length === 0}
         />
         <MetricCard
           title="Best Case Scenario"
           value={bestCase !== 0 ? formatPercentage(bestCase) : 'N/A'}
-          change={0}
-          changeType="positive"
           icon={TrendingDown}
           loading={loading && stressTestResults.length === 0}
         />
         <MetricCard
           title="Average Impact"
           value={avgImpact !== 0 ? formatPercentage(avgImpact) : 'N/A'}
-          change={0}
-          changeType="negative"
           icon={Activity}
           loading={loading && stressTestResults.length === 0}
         />
         <MetricCard
           title="Scenarios Tested"
           value={`${stressTestResults.length} of ${scenarios.length}`}
-          change={0}
-          changeType="neutral"
           icon={TestTube}
           loading={loading}
         />
@@ -464,7 +478,10 @@ export default function StressTestingPage() {
                 Position-Level Impact Analysis
               </h3>
               <div className="flex items-center space-x-2">
-                <button className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-500 transition-colors">
+                <button
+                  onClick={handleExportCSV}
+                  className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-500 transition-colors"
+                >
                   <Download className="w-4 h-4 mr-1" />
                   Export
                 </button>

@@ -128,6 +128,7 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
   // Calculate top sectors for summary
   const sortedData = [...dataWithColors].sort((a, b) => b.value - a.value);
   const topSector = sortedData[0];
+  const topCount = Math.min(3, sortedData.length);
   const top3Allocation = sortedData.slice(0, 3).reduce((sum, item) => sum + item.percentage, 0);
 
   return (
@@ -142,7 +143,9 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
             {topSector?.name || 'N/A'}
           </div>
           <div className="text-sm text-gray-500 dark:text-gray-400">
-            Top 3: {formatPercentage(top3Allocation)}
+            {sortedData.length === 1
+              ? '100.0% Allocation'
+              : `Top ${topCount}: ${formatPercentage(top3Allocation)}`}
           </div>
         </div>
       </div>

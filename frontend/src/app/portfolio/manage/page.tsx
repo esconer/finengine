@@ -53,7 +53,7 @@ export default function PortfolioManagePage() {
     const [isLoading, setIsLoading] = useState(true);
     const [isLoadingForecast, setIsLoadingForecast] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [currency, setCurrency] = useState<Currency>('USD');
+    const [currency, setCurrency] = useState<Currency>('INR');
 
     // Modal states
     const [showAddModal, setShowAddModal] = useState(false);

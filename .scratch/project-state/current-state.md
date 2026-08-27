@@ -122,20 +122,18 @@ yfinance (NSE/BSE tickers auto-suffixed .NS/.BO)
 - Reached 85.36% coverage (243 tests) per session log
 
 ### Current working tree (2026-08-27)
-- 22 modified + 5 untracked files uncommitted
-- `uv run pytest --no-cov` yields 148 tests (146 pass, 2 fail)
-- Note: test count discrepancy (148 vs session-log's 243) suggests some test files
-  may have been modified or the working tree is in a transitional state
+- `uv run pytest --no-cov` yields 249 tests (all 249 pass, 0 fail).
+- `bun test:run` yields 60 tests (all 60 pass, 0 fail).
+- Resolved dashboard timeout bug by introducing non-blocking quote fetches, staleness checks on `GET /portfolio`, and concurrent multi-ticker batch processing.
+- Resolved memory and CPU spikes (QH-14): analytical GARCH forecasting, idle WebSocket gates, in-memory DataFrame TTL caching, Turbopack package import tree-shaking, and production static build workflow.
+- Resolved dashboard visual & quantitative audit (Audit Issue 09): return alignment for short-history assets (NIFTYIETF.NS), performance history chart holding-quantity scaling, metric card deduplication, and single-header DataTable.
 
 ---
 
 ## 6. Test & quality status
 
-- **Backend**: 148 tests (146 pass, 2 fail). Coverage ~62% (when run from current state).
-  Failing tests have identified root causes (see QH-01):
-  - `test_no_positions_404`: conftest dependency_overrides leak (no try/finally)
-  - `test_contributions_sum_to_one_and_ranking`: rounding tolerance 1e-6 too tight
-- **Frontend**: 35 tests pass (only MetricCard.test.tsx). Zero page/hook/store coverage.
+- **Backend**: 249 tests (249 pass, 0 fail).
+- **Frontend**: 60 tests pass across 6 test files.
 - **CI**: Backend: ruff/mypy/pytest. Frontend steps missing. Deploy references nonexistent k8s/.
 
 ---

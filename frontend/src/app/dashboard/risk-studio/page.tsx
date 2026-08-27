@@ -78,15 +78,18 @@ export default function RiskStudioPage() {
     }
 
     // Format helpers
-    const fmtPct = (val: number | undefined | null) =>
-        val !== undefined && val !== null ? `${(val * 100).toFixed(2)}%` : '—';
+    const fmtPct = (val: number | undefined | null) => {
+        if (val === undefined || val === null || isNaN(val)) return '—';
+        const scaled = Math.abs(val) <= 1.0 && val !== 0 ? val * 100 : val;
+        return `${scaled.toFixed(2)}%`;
+    };
 
     // Prepare Euler Chart Data
     const eulerPositions = riskContribution?.positions?.volatility
         ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
               ticker,
               vol_contrib: +((volShare || 0) * 100).toFixed(1),
-              cvar_contrib: +(((riskContribution.positions.cvar_tail?.[ticker] || 0)) * 100).toFixed(1)
+              cvar_contrib: +(((riskContribution.positions.cvar_tail?.[ticker] ?? volShare ?? 0)) * 100).toFixed(1)
           }))
         : (riskContribution?.positions
             ? Object.entries(riskContribution.positions).map(([ticker, data]: [string, any]) => ({
@@ -97,23 +100,42 @@ export default function RiskStudioPage() {
             : []);
 
     const sectorRollup = riskContribution?.sector_rollup?.volatility || riskContribution?.sector_vol_shares;
-    const copulaTickers: string[] = tailRisk?.tail_dependence_matrix?.tickers || tailRisk?.tickers || [];
-    const copulaMatrix: number[][] = tailRisk?.tail_dependence_matrix?.matrix || tailRisk?.matrix || [];
+    const copulaTickers: string[] = Array.isArray(tailRisk?.tail_dependence_matrix?.tickers)
+        ? tailRisk.tail_dependence_matrix.tickers
+        : Array.isArray(tailRisk?.tickers)
+            ? tailRisk.tickers
+            : [];
+    const copulaMatrix: number[][] = Array.isArray(tailRisk?.tail_dependence_matrix?.matrix)
+        ? tailRisk.tail_dependence_matrix.matrix
+        : Array.isArray(tailRisk?.matrix)
+            ? tailRisk.matrix
+            : [];
 
     // Prepare Vol Cone Chart Data
     const coneWindows = [10, 21, 63, 126, 252];
-    const coneChartData = coneWindows.map(w => {
-        const q = volCone?.quantiles?.[String(w)] || {};
-        return {
-            window: `${w}D`,
-            p10: +(q.p10 * 100 || 0).toFixed(1),
-            p25: +(q.p25 * 100 || 0).toFixed(1),
-            p50: +(q.p50 * 100 || 0).toFixed(1),
-            p75: +(q.p75 * 100 || 0).toFixed(1),
-            p90: +(q.p90 * 100 || 0).toFixed(1),
+    const coneChartData = Array.isArray(volCone?.windows)
+        ? volCone.windows.map((w: any) => ({
+            window: `${w.window_days}D`,
+            p10: +(w.min * 100 || 0).toFixed(1),
+            p25: +(w.p25 * 100 || 0).toFixed(1),
+            p50: +(w.median * 100 || 0).toFixed(1),
+            p75: +(w.p75 * 100 || 0).toFixed(1),
+            p90: +(w.max * 100 || 0).toFixed(1),
+            realized: +(w.current_realized * 100 || 0).toFixed(1),
             garch: volCone?.garch_forecast_vol ? +(volCone.garch_forecast_vol * 100).toFixed(1) : undefined
-        };
-    });
+        }))
+        : coneWindows.map(w => {
+            const q = volCone?.quantiles?.[String(w)] || {};
+            return {
+                window: `${w}D`,
+                p10: +(q.p10 * 100 || 0).toFixed(1),
+                p25: +(q.p25 * 100 || 0).toFixed(1),
+                p50: +(q.p50 * 100 || 0).toFixed(1),
+                p75: +(q.p75 * 100 || 0).toFixed(1),
+                p90: +(q.p90 * 100 || 0).toFixed(1),
+                garch: volCone?.garch_forecast_vol ? +(volCone.garch_forecast_vol * 100).toFixed(1) : undefined
+            };
+        });
 
     return (
         <div className="space-y-6 pb-12">

@@ -9,6 +9,8 @@ export interface PortfolioPosition {
     id: number;
     ticker: string;
     weight: number;
+    quantity?: number;
+    buy_price?: number;
     last_price: number;
     market_value: number;
     sector: string;

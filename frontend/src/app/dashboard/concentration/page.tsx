@@ -4,10 +4,20 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  Legend,
+} from 'recharts';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import {
@@ -48,7 +58,44 @@ export default function ConcentrationPage() {
   const [loading, setLoading] = useState(false);
   const [positionData, setPositionData] = useState<any[]>([]);
 
-  const { positions } = usePortfolioStore();
+  const { positions, fetchPortfolio } = usePortfolioStore();
+
+  // Compute Lorenz Inequality Curve
+  const lorenzCurveData = useMemo(() => {
+    if (!positionData || positionData.length === 0) {
+      return [{ assetPct: '0%', portfolioCumPct: 0, equalWeightPct: 0 }, { assetPct: '100%', portfolioCumPct: 100, equalWeightPct: 100 }];
+    }
+    const n = positionData.length;
+    // Rank weights ascending for true Lorenz curve
+    const sortedWeights = [...positionData].map(p => p.weight).sort((a, b) => a - b);
+    const points = [{ assetPct: '0%', portfolioCumPct: 0, equalWeightPct: 0 }];
+    let cumSum = 0;
+    for (let i = 0; i < n; i++) {
+      cumSum += sortedWeights[i];
+      const assetPctNum = Math.round(((i + 1) / n) * 100);
+      points.push({
+        assetPct: `${assetPctNum}%`,
+        portfolioCumPct: Number((cumSum * 100).toFixed(1)),
+        equalWeightPct: assetPctNum,
+      });
+    }
+    return points;
+  }, [positionData]);
+
+  const handleExportCSV = () => {
+    if (!positionData || positionData.length === 0) return;
+    const headers = 'Ticker,Weight,Cumulative Weight,Sector\n';
+    const rows = positionData
+      .map(p => `${p.ticker},${(p.weight * 100).toFixed(2)}%,${(p.cumulative_weight * 100).toFixed(2)}%,${p.sector}`)
+      .join('\n');
+    const blob = new Blob([headers + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `concentration-holdings.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const fetchConcentrationData = async () => {
     setLoading(true);
@@ -76,6 +123,11 @@ export default function ConcentrationPage() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    fetchPortfolio();
+    fetchConcentrationData();
+  }, []);
 
   useEffect(() => {
     if (positions.length > 0) {
@@ -307,79 +359,71 @@ export default function ConcentrationPage() {
         />
       </div>
 
-      {/* Detailed Concentration Analysis */}
+      {/* Detailed Concentration Analysis & Lorenz Curve */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Lorenz Inequality Curve */}
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-              Position Concentration
-            </h3>
-            <Target className="w-5 h-5 text-gray-500" />
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                Lorenz Concentration Curve
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Cumulative portfolio capital vs equal-weight benchmark
+              </p>
+            </div>
+            <TrendingUp className="w-5 h-5 text-blue-500" />
           </div>
-          <div className="space-y-4">
-            {concentrationMetrics.map((metric) => (
-              <div key={metric.name} className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    {metric.name}
-                  </span>
-                  <span className={`text-sm font-medium ${getStatusColor(metric.status)}`}>
-                    {formatPercentage(metric.value)}
-                  </span>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                    <div
-                      className={`h-2 rounded-full ${metric.color_class}`}
-                      style={{ width: `${Math.min(metric.value * 400, 100)}%` }}
-                    />
-                  </div>
-                  <span className={`px-2 py-1 text-xs rounded-full font-medium ${getStatusBgColor(metric.status)}`}>
-                    {metric.status}
-                  </span>
-                </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400">
-                  {metric.description}
-                </p>
-              </div>
-            ))}
+          <div className="h-64">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={lorenzCurveData}>
+                <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                <XAxis dataKey="assetPct" tick={{ fontSize: 11 }} />
+                <YAxis unit="%" domain={[0, 100]} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(value: any, name: any) => [`${value}%`, name === 'portfolioCumPct' ? 'Actual Portfolio Weight' : 'Equal-Weight Benchmark']} />
+                <Legend verticalAlign="top" height={36} wrapperStyle={{ fontSize: '12px' }} />
+                <Line type="monotone" dataKey="equalWeightPct" stroke="#9ca3af" strokeDasharray="4 4" strokeWidth={1.5} dot={false} name="Equal-Weight" />
+                <Line type="monotone" dataKey="portfolioCumPct" stroke="#3b82f6" strokeWidth={2.5} dot={{ r: 3 }} name="Portfolio Concentration" />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
         </div>
 
+        {/* Sector Concentration Distribution */}
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-              Sector Concentration
-            </h3>
-            <PieChart className="w-5 h-5 text-gray-500" />
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                Sector Concentration
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Industry exposure distribution</p>
+            </div>
+            <PieChart className="w-5 h-5 text-indigo-500" />
           </div>
           {sectorData.length > 0 ? (
-            <div className="space-y-3">
-              {sectorData.slice(0, 5).map((sector) => (
-                <div key={sector.sector} className="space-y-1">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+            <div className="space-y-4 pt-2">
+              {sectorData.slice(0, 6).map((sector) => (
+                <div key={sector.sector} className="space-y-1.5">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-gray-700 dark:text-gray-300">
                       {sector.sector}
                     </span>
-                    <span className="text-sm text-gray-600 dark:text-gray-400">
+                    <span className="font-semibold text-gray-900 dark:text-white">
                       {sector.percentage}
                     </span>
                   </div>
-                  <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                  <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
                     <div
-                      className="h-2 rounded-full bg-indigo-500"
-                      style={{ width: `${sector.weight * 100}%` }}
+                      className="h-2.5 rounded-full bg-indigo-500"
+                      style={{ width: `${Math.min(sector.weight * 100, 100)}%` }}
                     />
                   </div>
                 </div>
               ))}
             </div>
           ) : (
-            <div className="h-32 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center">
-              <div className="text-center text-gray-500 dark:text-gray-400">
-                <PieChart className="w-8 h-8 mx-auto mb-2" />
-                <p>Sector concentration chart will be implemented</p>
-              </div>
+            <div className="h-64 flex items-center justify-center text-gray-400 text-sm">
+              No sector concentration data available
             </div>
           )}
         </div>
@@ -394,7 +438,10 @@ export default function ConcentrationPage() {
                 Position Concentration Details
               </h3>
               <div className="flex items-center space-x-2">
-                <button className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-500 transition-colors">
+                <button
+                  onClick={handleExportCSV}
+                  className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-500 transition-colors"
+                >
                   <Download className="w-4 h-4 mr-1" />
                   Export
                 </button>

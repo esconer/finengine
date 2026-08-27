@@ -74,6 +74,8 @@ class DataService:
         """Check if ticker is an Indian stock"""
         return '.NS' in ticker or '.BO' in ticker or ticker in [t.replace('.NS', '') for t in self.popular_indian_stocks]
     
+    _in_memory_df_cache: Dict[str, Any] = {}
+
     async def fetch_historical_data(
         self, 
         ticker: str, 
@@ -96,12 +98,22 @@ class DataService:
         try:
             # Normalize ticker for Indian market
             normalized_ticker = self._normalize_indian_ticker(ticker)
+            cache_key = f"{normalized_ticker}:{start}:{end}"
+            now_ts = time.time()
+
+            # Check fast in-memory cache first
+            if not force_refresh and cache_key in self._in_memory_df_cache:
+                cached_ts, cached_df = self._in_memory_df_cache[cache_key]
+                if now_ts - cached_ts < 300 and cached_df is not None:  # 5 min in-memory TTL
+                    return cached_df.copy()
+
             logger.info(f"Fetching historical data for {ticker} -> {normalized_ticker} from {start} to {end}")
             
-            # Check cache first (unless force refresh)
+            # Check SQLite database cache
             if not force_refresh:
                 cached_data = await self._get_cached_data(normalized_ticker, start, end)
                 if cached_data is not None:
+                    self._in_memory_df_cache[cache_key] = (now_ts, cached_data)
                     return cached_data
             
             # Attempt to fetch from yfinance
@@ -132,6 +144,7 @@ class DataService:
                         )
                         
                         logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker}")
+                        self._in_memory_df_cache[cache_key] = (now_ts, df)
                         return df
                     
                 except Exception as e:
@@ -171,46 +184,85 @@ class DataService:
         try:
             # Normalize ticker for Indian market
             normalized_ticker = self._normalize_indian_ticker(ticker)
+            is_indian = self._is_indian_ticker(normalized_ticker)
             logger.debug(f"Fetching quote for {ticker} -> {normalized_ticker}")
-            
-            # Create yfinance ticker object
-            stock = yf.Ticker(normalized_ticker)
-            
-            # Get info and fast_info
-            info = stock.info
-            fast_info = getattr(stock, 'fast_info', {})
-            
-            # Get recent price data
-            hist = stock.history(period="2d")
-            
-            if hist.empty:
-                logger.warning(f"No price data available for {normalized_ticker}")
-                return await self._fallback_quote(ticker, normalized_ticker)
-            
-            # Extract current price (last close)
-            current_price = hist['Close'].iloc[-1]
-            volume = hist['Volume'].iloc[-1] if len(hist) > 0 else 0
-            
-            # Build response with Indian market context
-            quote_data = {
-                "ticker": normalized_ticker.upper(),
-                "current_price": float(current_price),
-                "volume": int(volume),
-                "market_cap": info.get('marketCap'),
-                "sector": info.get('sector'),
-                "industry": info.get('industry'),
-                "52_week_high": info.get('fiftyTwoWeekHigh'),
-                "52_week_low": info.get('fiftyTwoWeekLow'),
-                "pe_ratio": info.get('trailingPE'),
-                "dividend_yield": info.get('dividendYield'),
-                "currency": "INR" if self._is_indian_ticker(normalized_ticker) else "USD",
-                "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
-                "is_indian": self._is_indian_ticker(normalized_ticker),
-                "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
-            }
-            
-            logger.debug(f"Successfully fetched quote for {normalized_ticker}: ₹{current_price:.2f}" if self._is_indian_ticker(normalized_ticker) else f"${current_price:.2f}")
-            return quote_data
+
+            def _sync_fetch() -> Optional[Dict[str, Any]]:
+                stock = yf.Ticker(normalized_ticker)
+                current_price = None
+                market_cap = None
+                high_52 = None
+                low_52 = None
+                volume = 0
+
+                # Try fast_info first (non-scraping)
+                try:
+                    fast_info = getattr(stock, 'fast_info', None)
+                    if fast_info:
+                        current_price = getattr(fast_info, 'last_price', None) or getattr(fast_info, 'regular_market_price', None)
+                        market_cap = getattr(fast_info, 'market_cap', None)
+                        high_52 = getattr(fast_info, 'year_high', None)
+                        low_52 = getattr(fast_info, 'year_low', None)
+                        volume = getattr(fast_info, 'last_volume', 0) or 0
+                except Exception:
+                    pass
+
+                # Fallback to history for price
+                if current_price is None or current_price <= 0:
+                    try:
+                        hist = stock.history(period="2d")
+                        if not hist.empty:
+                            current_price = float(hist['Close'].iloc[-1])
+                            volume = int(hist['Volume'].iloc[-1]) if len(hist) > 0 else 0
+                    except Exception:
+                        pass
+
+                if current_price is None or current_price <= 0:
+                    return None
+
+                sector = None
+                industry = None
+                pe_ratio = None
+                dividend_yield = None
+                try:
+                    info = getattr(stock, 'info', {}) or {}
+                    if isinstance(info, dict):
+                        sector = info.get('sector')
+                        industry = info.get('industry')
+                        pe_ratio = info.get('trailingPE')
+                        dividend_yield = info.get('dividendYield')
+                        if not market_cap:
+                            market_cap = info.get('marketCap')
+                        if not high_52:
+                            high_52 = info.get('fiftyTwoWeekHigh')
+                        if not low_52:
+                            low_52 = info.get('fiftyTwoWeekLow')
+                except Exception:
+                    pass
+
+                return {
+                    "ticker": normalized_ticker.upper(),
+                    "current_price": float(current_price),
+                    "volume": int(volume),
+                    "market_cap": market_cap,
+                    "sector": sector,
+                    "industry": industry,
+                    "52_week_high": high_52,
+                    "52_week_low": low_52,
+                    "pe_ratio": pe_ratio,
+                    "dividend_yield": dividend_yield,
+                    "currency": "INR" if is_indian else "USD",
+                    "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
+                    "is_indian": is_indian,
+                    "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
+                }
+
+            quote_data = await asyncio.to_thread(_sync_fetch)
+            if quote_data:
+                logger.debug(f"Successfully fetched quote for {normalized_ticker}: {quote_data['current_price']}")
+                return quote_data
+
+            return await self._fallback_quote(ticker, normalized_ticker)
             
         except Exception as e:
             logger.error(f"Error fetching quote for {ticker}: {e}")
@@ -518,6 +570,22 @@ class DataService:
             
             if not records:
                 return None
+            
+            # Check if cached data covers the requested start date
+            req_start = pd.to_datetime(start)
+            req_end = pd.to_datetime(end)
+            req_days = (req_end - req_start).days
+            earliest_cached = pd.to_datetime(records[0].date)
+            # If caller requested >60 days but cached data starts more than 30 days after requested start,
+            # or if cached count is too sparse for requested window, check if we fetched recently (within 1 hour)
+            if req_days > 60:
+                if (earliest_cached - req_start).days > 30 or len(records) < min(30, int(req_days * 0.3)):
+                    latest_fetched = max((r.fetched_on for r in records if r.fetched_on), default=None)
+                    if latest_fetched and (datetime.utcnow() - latest_fetched).total_seconds() < 3600:
+                        logger.debug(f"Using recent partial cache for {ticker} ({len(records)} records)")
+                    else:
+                        logger.info(f"Cache miss for {ticker}: cached has {len(records)} records from {earliest_cached.date()}, requested from {req_start.date()}")
+                        return None
             
             # Convert to DataFrame
             data = []

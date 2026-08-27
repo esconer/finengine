@@ -36,18 +36,7 @@ const REGIME_CHIP: Record<string, string> = {
   crisis: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
 };
 
-interface PortfolioPosition {
-  id: number;
-  ticker: string;
-  weight: number;
-  last_price: number;
-  market_value: number;
-  sector: string;
-  industry: string;
-  custom_name?: string;
-  added_on: string;
-  updated_on: string;
-}
+import { PortfolioPosition } from '@/types';
 
 export default function DashboardSummary() {
   const router = useRouter();
@@ -103,9 +92,22 @@ export default function DashboardSummary() {
     return Math.round(positionScore * sectorMultiplier);
   }, [positions, totalValue, sectorData]);
 
+  const totalCost = useMemo(() => {
+    return positions.reduce((sum, p) => {
+      const q = (p as any).quantity || 0;
+      const bp = (p as any).buy_price || 0;
+      return sum + (q > 0 && bp > 0 ? q * bp : (p.market_value || 0));
+    }, 0);
+  }, [positions]);
+
+  const totalGainLoss = (totalValue || 0) - totalCost;
+  const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
+
   // Calculate enhanced portfolio metrics
   const portfolioMetrics = {
     totalValue: totalValue || 0,
+    totalGainLoss,
+    totalGainLossPct,
     positionsCount: positions.length,
     totalWeight: positions.reduce((sum, pos) => sum + pos.weight, 0),
     averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
@@ -289,30 +291,33 @@ export default function DashboardSummary() {
         </div>
       </div>
 
-      {/* Enhanced Key Metrics */}
+      {/* Key Portfolio Summary Metrics (Deduplicated) */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Total Portfolio Value"
           value={portfolioMetrics.totalValue}
-          icon={DollarSign}
+          prefix="₹"
+          icon={TrendingUp}
           loading={isOverallLoading}
         />
         <MetricCard
-          title="Number of Positions"
-          value={portfolioMetrics.positionsCount}
-          icon={Target}
+          title="Unrealized P&L"
+          value={`${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+          change={portfolioMetrics.totalGainLossPct}
+          changeType={portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
+          icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
           loading={isOverallLoading}
         />
         <MetricCard
-          title="Risk Score"
-          value={portfolioMetrics.riskScore.toFixed(1)}
-          icon={Shield}
+          title="Annual Volatility"
+          value={`${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
+          icon={Activity}
           loading={analyticsLoading}
         />
         <MetricCard
-          title="Sharpe Ratio"
-          value={portfolioMetrics.sharpeRatio.toFixed(2)}
-          icon={TrendingUp}
+          title="Diversification Score"
+          value={`${portfolioMetrics.diversificationScore}%`}
+          icon={Shield}
           loading={analyticsLoading}
         />
       </div>
@@ -323,19 +328,18 @@ export default function DashboardSummary() {
           {regimeInfo && (
             <Link
               href="/dashboard/regime"
-              className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 border border-gray-200 dark:border-gray-700 flex items-center justify-between hover:border-blue-300 dark:hover:border-blue-600 transition-colors"
+              className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-5 border border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600 transition-colors"
             >
-              <div className="flex items-center space-x-4">
-                <Radar className="w-8 h-8 text-blue-500" />
+              <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                  <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
                     Market Regime
                   </p>
                   <div className="flex items-center mt-1">
                     <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-semibold ${
-                        REGIME_CHIP[regimeInfo.current_regime.toLowerCase()] ??
-                        'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'
+                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${
+                        REGIME_CHIP[regimeInfo.current_regime] ??
+                        'bg-gray-100 text-gray-800'
                       }`}
                     >
                       {regimeInfo.current_regime.charAt(0).toUpperCase() +
@@ -372,16 +376,16 @@ export default function DashboardSummary() {
               <div className="space-y-1.5 mt-3">
                 {riskDrivers.map(([ticker, share]) => (
                   <div key={ticker} className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-gray-700 dark:text-gray-300 w-20 truncate">
+                    <span className="text-xs font-medium text-gray-700 dark:text-gray-300 w-24 truncate">
                       {ticker}
                     </span>
-                    <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+                    <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 overflow-hidden">
                       <div
-                        className="h-1.5 rounded-full bg-orange-500"
-                        style={{ width: `${share * 100}%` }}
+                        className="h-1.5 rounded-full bg-orange-500 transition-all duration-300"
+                        style={{ width: `${Math.min(100, Math.max(0, share * 100))}%` }}
                       />
                     </div>
-                    <span className="text-xs text-gray-600 dark:text-gray-400 w-10 text-right tabular-nums">
+                    <span className="text-xs text-gray-600 dark:text-gray-400 w-12 text-right tabular-nums font-mono">
                       {(share * 100).toFixed(0)}%
                     </span>
                   </div>
@@ -416,6 +420,7 @@ export default function DashboardSummary() {
           data={performanceData}
           loading={performanceLoading}
           showBenchmark={false}
+          currency="INR"
         />
         <SectorAllocationChart
           data={sectorData}
@@ -424,37 +429,31 @@ export default function DashboardSummary() {
       </div>
 
       {/* Portfolio Positions Table with Management */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
-        <div className="p-4 border-b border-gray-200 dark:border-gray-700">
-          <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-              Portfolio Positions ({positions.length})
-            </h3>
-            <div className="flex items-center space-x-2">
-              <button
-                onClick={handleExportCSV}
-                className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-500 transition-colors"
-              >
-                <Download className="w-4 h-4 mr-1" />
-                Export
-              </button>
-              <button
-                onClick={() => setShowAddModal(true)}
-                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
-              >
-                <TrendingUp className="w-4 h-4 mr-2" />
-                Add Position
-              </button>
-            </div>
-          </div>
-        </div>
-
+      <div>
         <DataTable
           data={positions}
           columns={positionColumns}
           loading={isOverallLoading}
           searchablePlaceholder="Search positions..."
           exportable={false}
+          actions={
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={handleExportCSV}
+                className="flex items-center px-3 py-2 text-sm bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+              >
+                <Download className="w-4 h-4 mr-1" />
+                Export
+              </button>
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
+              >
+                <TrendingUp className="w-4 h-4 mr-2" />
+                Add Position
+              </button>
+            </div>
+          }
         />
 
         {/* Add Position Modal */}

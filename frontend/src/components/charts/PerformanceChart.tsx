@@ -26,6 +26,7 @@ interface PerformanceChartProps {
   loading?: boolean;
   showBenchmark?: boolean;
   className?: string;
+  currency?: string;
 }
 
 export const PerformanceChart: React.FC<PerformanceChartProps> = ({
@@ -33,11 +34,13 @@ export const PerformanceChart: React.FC<PerformanceChartProps> = ({
   loading = false,
   showBenchmark = false,
   className = '',
+  currency = 'INR',
 }) => {
   const formatCurrency = (value: number): string => {
-    return new Intl.NumberFormat('en-US', {
+    const isINR = currency === 'INR';
+    return new Intl.NumberFormat(isINR ? 'en-IN' : 'en-US', {
       style: 'currency',
-      currency: 'USD',
+      currency: currency || 'INR',
       minimumFractionDigits: 0,
       maximumFractionDigits: 0,
     }).format(value);

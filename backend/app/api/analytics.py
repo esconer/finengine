@@ -2,6 +2,7 @@
 Analytics API endpoints for risk calculations and portfolio analytics
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -117,6 +118,36 @@ def _assign_price(store: Dict[str, pd.Series], ticker: str, df: pd.DataFrame) ->
         store[ticker] = series
 
 
+async def _fetch_price_series_dict(
+    data_service: DataService,
+    ticker_list: List[str],
+    start: str,
+    end: str
+) -> Dict[str, pd.Series]:
+    """Fetch historical prices for multiple tickers concurrently."""
+    sem = asyncio.Semaphore(5)
+
+    async def fetch_one(ticker: str):
+        async with sem:
+            try:
+                res = data_service.fetch_historical_data(ticker, start, end)
+                if asyncio.iscoroutine(res):
+                    df = await res
+                else:
+                    df = res
+                return ticker, df
+            except Exception as e:
+                logger.error(f"Error fetching historical data for {ticker}: {e}")
+                return ticker, None
+
+    results = await asyncio.gather(*[fetch_one(t) for t in ticker_list])
+    price_data_dict: Dict[str, pd.Series] = {}
+    for ticker, df in results:
+        if df is not None and not df.empty:
+            _assign_price(price_data_dict, ticker, df)
+    return price_data_dict
+
+
 async def _load_portfolio_allocation(db: AsyncSession) -> Optional[Dict[str, float]]:
     """
     Load {ticker: weight} from actual portfolio positions.
@@ -195,12 +226,8 @@ async def get_realized_risk(
                 }
             ticker_list = list(weights.keys())
 
-        # Fetch price data for all tickers
-        price_data_dict = {}
-        for ticker in ticker_list:
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        # Fetch price data for all tickers concurrently
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
 
         if not price_data_dict:
             logger.warning("No price data available for tickers")
@@ -305,12 +332,8 @@ async def get_forecast_risk(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
         
-        # Fetch price data for all tickers
-        price_data_dict = {}
-        for ticker in ticker_list:
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        # Fetch price data for all tickers concurrently
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
         
         if not price_data_dict:
             return {
@@ -418,12 +441,8 @@ async def get_factor_exposure(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
         
-        # Fetch price data for all tickers
-        price_data_dict = {}
-        for ticker in ticker_list:
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        # Fetch price data for all tickers concurrently
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
         
         if not price_data_dict:
             return {
@@ -550,19 +569,33 @@ async def get_liquidity_metrics(
             }
         tickers = list(allocation.keys())
         
-        # Fetch price and volume data for liquidity analysis
+        # Fetch price and volume data for liquidity analysis concurrently
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
+        sem = asyncio.Semaphore(5)
+        async def fetch_liq(ticker: str):
+            async with sem:
+                try:
+                    res = data_service.fetch_historical_data(ticker, start, end)
+                    if asyncio.iscoroutine(res):
+                        df = await res
+                    else:
+                        df = res
+                    return ticker, df
+                except Exception as e:
+                    logger.error(f"Error in liquidity fetch for {ticker}: {e}")
+                    return ticker, None
+
+        liq_results = await asyncio.gather(*[fetch_liq(t) for t in tickers])
         price_data_dict = {}
-        for ticker in tickers:
-            df = await data_service.fetch_historical_data(ticker, start, end)
+        for ticker, df in liq_results:
             if df is not None and not df.empty:
                 price_col = 'adj_close' if 'adj_close' in df.columns else 'close'
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
                 if vol_col and price_col in df.columns:
                     price_data_dict[ticker] = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
-                else:
+                elif price_col in df.columns:
                     price_data_dict[ticker] = df[[price_col]].rename(columns={price_col: 'Close'})
         
         if not price_data_dict:
@@ -615,15 +648,11 @@ async def run_stress_test(
                 "error": "No portfolio positions found for stress testing"
             }
         
-        # Fetch price data for stress testing
+        # Fetch price data for stress testing concurrently
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=756)).strftime('%Y-%m-%d')  # 3 years for stress testing
         
-        price_data_dict = {}
-        for ticker in weights.keys():
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        price_data_dict = await _fetch_price_series_dict(data_service, list(weights.keys()), start, end)
         
         if not price_data_dict:
             return {
@@ -684,15 +713,11 @@ async def get_volatility_sizing(
             if resolved_pv <= 0:
                 resolved_pv = 100000.0
         
-        # Fetch price data for volatility sizing
+        # Fetch price data for volatility sizing concurrently
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')  # 1 year
         
-        price_data_dict = {}
-        for ticker in weights.keys():
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        price_data_dict = await _fetch_price_series_dict(data_service, list(weights.keys()), start, end)
         
         if not price_data_dict:
             return {
@@ -805,15 +830,11 @@ async def get_analytics_summary(
                 "error": "No portfolio positions found for summary"
             }
         
-        # Fetch price data for summary
+        # Fetch price data for summary concurrently
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')  # 1 year
         
-        price_data_dict = {}
-        for ticker in weights.keys():
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        price_data_dict = await _fetch_price_series_dict(data_service, list(weights.keys()), start, end)
         
         # Compute real portfolio value from DB positions
         pos_result = await db.execute(select(PortfolioPosition))
@@ -883,30 +904,33 @@ async def get_performance_history(
     """
     try:
         # Resolve positions & quantities
+        result = await db.execute(select(PortfolioPosition))
+        db_positions = {p.ticker: p for p in result.scalars().all()}
+
         if tickers:
             ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-            quantities = {t: 1.0 for t in ticker_list}
         else:
-            result = await db.execute(select(PortfolioPosition))
-            db_positions = result.scalars().all()
-            if not db_positions:
-                return []
-            quantities = {}
-            for p in db_positions:
+            ticker_list = list(db_positions.keys())
+
+        if not ticker_list:
+            return []
+
+        quantities = {}
+        for t in ticker_list:
+            p = db_positions.get(t)
+            if p:
                 q = p.quantity if (p.quantity and p.quantity > 0) else 0.0
                 if q == 0.0 and p.market_value and p.last_price and p.last_price > 0:
                     q = p.market_value / p.last_price
-                quantities[p.ticker] = q if q > 0 else 1.0
-            ticker_list = list(quantities.keys())
+                quantities[t] = q if q > 0 else 1.0
+            else:
+                quantities[t] = 1.0
 
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-        price_data_dict: Dict[str, pd.Series] = {}
-        for ticker in ticker_list:
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        # Fetch price data concurrently
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
 
         if not price_data_dict:
             return []
@@ -969,15 +993,13 @@ async def _build_wide_returns(
     data_service: DataService,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Wide per-asset returns frame + weighted portfolio return series."""
-    price_data_dict: Dict[str, pd.Series] = {}
-    for ticker in ticker_list:
-        df = await data_service.fetch_historical_data(ticker, start, end)
-        if df is not None and not df.empty:
-            _assign_price(price_data_dict, ticker, df)
+    price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
     if not price_data_dict:
         raise ValueError("No price data available for the requested window")
-    prices = pd.DataFrame(price_data_dict).sort_index().ffill().dropna()
-    returns_df = prices.pct_change().dropna()
+    prices = pd.DataFrame(price_data_dict).sort_index().ffill().bfill()
+    returns_df = prices.pct_change(fill_method=None).fillna(0.0)
+    if len(returns_df) > 1:
+        returns_df = returns_df.iloc[1:]
     portfolio_returns = (returns_df * pd.Series(weights)).sum(axis=1)
     return returns_df, portfolio_returns
 
@@ -1492,11 +1514,8 @@ async def get_cointegration_pairs(
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
-        price_data_dict: Dict[str, pd.Series] = {}
-        for ticker in ticker_list:
-            df = await data_service.fetch_historical_data(ticker, start, end)
-            if df is not None and not df.empty:
-                _assign_price(price_data_dict, ticker, df)
+        # Fetch price data concurrently
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
 
         if len(price_data_dict) < 2:
             raise HTTPException(

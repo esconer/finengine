@@ -60,7 +60,7 @@ export default function VolatilitySizingPage() {
   const [loading, setLoading] = useState(false);
   const [positionData, setPositionData] = useState<PositionSizing[]>([]);
 
-  const { positions } = usePortfolioStore();
+  const { positions, fetchPortfolio } = usePortfolioStore();
 
   const fetchSizingData = async () => {
     setLoading(true);
@@ -101,6 +101,11 @@ export default function VolatilitySizingPage() {
   };
 
   useEffect(() => {
+    fetchPortfolio();
+    fetchSizingData();
+  }, []);
+
+  useEffect(() => {
     if (positions.length > 0) {
       fetchSizingData();
     }
@@ -124,14 +129,22 @@ export default function VolatilitySizingPage() {
   };
 
   // Format metrics for display
-  const formatPercentage = (value: number, decimals = 2) => {
-    return `${(value * 100).toFixed(decimals)}%`;
+  const formatPercentage = (value: number | undefined | null, decimals = 1) => {
+    if (value === undefined || value === null || isNaN(value)) {
+      return '0.0%';
+    }
+    const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
+    return `${scaled.toFixed(decimals)}%`;
   };
 
-  const formatCurrency = (value: number) => {
-    if (Math.abs(value) >= 1000000) return `$${(value / 1000000).toFixed(1)}M`;
-    if (Math.abs(value) >= 1000) return `$${(value / 1000).toFixed(1)}K`;
-    return `$${value.toLocaleString()}`;
+  const formatCurrency = (value: number | undefined | null) => {
+    if (value === undefined || value === null || isNaN(value)) {
+      return '₹0';
+    }
+    if (Math.abs(value) >= 10000000) return `₹${(value / 10000000).toFixed(2)} Cr`;
+    if (Math.abs(value) >= 100000) return `₹${(value / 100000).toFixed(2)} L`;
+    if (Math.abs(value) >= 1000) return `₹${(value / 1000).toFixed(1)}K`;
+    return `₹${value.toLocaleString('en-IN')}`;
   };
 
   const getChangeColor = (change: number): string => {
@@ -450,15 +463,46 @@ export default function VolatilitySizingPage() {
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-              Volatility Forecast
+              Volatility Forecast & Parity Targets
             </h3>
-            <Activity className="w-5 h-5 text-gray-500" />
+            <Activity className="w-5 h-5 text-teal-500" />
           </div>
-          <div className="h-64 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center">
-            <div className="text-center text-gray-500 dark:text-gray-400">
-              <Zap className="w-12 h-12 mx-auto mb-2" />
-              <p>Volatility forecast chart will be implemented</p>
-              <p className="text-xs mt-1">Showing volatility projections and position sizing impact</p>
+          <div className="space-y-4">
+            <div className="p-3 bg-teal-50 dark:bg-teal-900/20 rounded-lg border border-teal-200 dark:border-teal-800 flex items-center justify-between">
+              <div>
+                <span className="text-xs text-teal-700 dark:text-teal-300 font-medium">Model Calibration</span>
+                <p className="text-sm font-semibold text-teal-900 dark:text-white">{selectedModel} Inverse-Vol Parity</p>
+              </div>
+              <div className="text-right">
+                <span className="text-xs text-teal-700 dark:text-teal-300 font-medium">Target Volatility</span>
+                <p className="text-sm font-semibold text-teal-900 dark:text-white">{formatPercentage(targetVolatility)}</p>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {positionData.map((pos) => {
+                const isUnderTarget = pos.volatility <= targetVolatility;
+                return (
+                  <div key={pos.ticker} className="p-2.5 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                    <div className="flex items-center justify-between text-xs mb-1.5">
+                      <span className="font-medium text-gray-900 dark:text-white">{pos.ticker}</span>
+                      <span className={`font-mono px-1.5 py-0.5 rounded text-[11px] ${
+                        isUnderTarget
+                          ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300'
+                          : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+                      }`}>
+                        σ = {formatPercentage(pos.volatility)} {isUnderTarget ? '(Within Target)' : '(Elevated)'}
+                      </span>
+                    </div>
+                    <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-1.5 overflow-hidden">
+                      <div
+                        className={`h-1.5 rounded-full ${isUnderTarget ? 'bg-emerald-500' : 'bg-amber-500'}`}
+                        style={{ width: `${Math.min(pos.volatility / 0.50 * 100, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>

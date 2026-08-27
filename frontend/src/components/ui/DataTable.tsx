@@ -17,6 +17,8 @@ import {
 interface DataTableProps<T> {
   data: T[];
   columns: ColumnDef<T, any>[];
+  title?: string;
+  actions?: React.ReactNode;
   loading?: boolean;
   searchable?: boolean;
   exportable?: boolean;
@@ -29,6 +31,8 @@ interface DataTableProps<T> {
 export function DataTable<T>({
   data,
   columns,
+  title,
+  actions,
   loading = false,
   searchable = true,
   exportable = false,
@@ -127,14 +131,14 @@ export function DataTable<T>({
 
   return (
     <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 ${className}`}>
-      {/* Header with search and export */}
+      {/* Header with search, title and custom action buttons */}
       <div className="p-4 border-b border-gray-200 dark:border-gray-700">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-            Portfolio Positions ({data.length})
+            {title ? `${title} (${data.length})` : `Portfolio Positions (${data.length})`}
           </h3>
           
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             {searchable && (
               <input
                 type="text"
@@ -142,16 +146,18 @@ export function DataTable<T>({
                 value={globalFilter ?? ''}
                 onChange={(e) => setGlobalFilter(e.target.value)}
                 className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
-                         bg-white dark:bg-gray-700 text-gray-900 dark:text-white
+                         bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm
                          focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             )}
             
+            {actions}
+
             {exportable && onExport && (
               <button
                 onClick={onExport}
                 className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md 
-                         transition-colors duration-200 focus:outline-none focus:ring-2 
+                         transition-colors duration-200 text-sm font-medium focus:outline-none focus:ring-2 
                          focus:ring-blue-500 focus:ring-offset-2"
               >
                 Export CSV
@@ -175,18 +181,13 @@ export function DataTable<T>({
                              hover:bg-gray-100 dark:hover:bg-gray-600"
                     onClick={header.column.getToggleSortingHandler()}
                   >
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center space-x-1.5 select-none">
                       <span>
                         {flexRender(header.column.columnDef.header, header.getContext())}
                       </span>
-                      <div className="flex flex-col">
-                        <span className={`text-xs ${sorting[0]?.id === header.column.id && sorting[0]?.desc === false ? 'text-blue-600' : 'text-gray-400'}`}>
-                          ↑
-                        </span>
-                        <span className={`text-xs ${sorting[0]?.id === header.column.id && sorting[0]?.desc === true ? 'text-blue-600' : 'text-gray-400'}`}>
-                          ↓
-                        </span>
-                      </div>
+                      <span className="text-xs text-blue-500 font-bold">
+                        {header.column.getIsSorted() === 'asc' ? ' ↑' : header.column.getIsSorted() === 'desc' ? ' ↓' : ''}
+                      </span>
                     </div>
                   </th>
                 ))}

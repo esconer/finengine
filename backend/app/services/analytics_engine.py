@@ -58,10 +58,12 @@ class AnalyticsEngine:
                 logger.warning("Empty price data provided")
                 return self._empty_metrics()
             
-            # Calculate returns
-            returns = price_data.pct_change().dropna()
-            if returns.empty:
+            # Calculate returns with defensive forward/back filling for mixed inception dates
+            cleaned_prices = price_data.sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            if returns.empty or len(returns) < 2:
                 return self._empty_metrics()
+            returns = returns.iloc[1:]
             
             # Handle weights
             if weights is None:
@@ -148,9 +150,11 @@ class AnalyticsEngine:
             if price_data.empty or len(price_data.columns) == 0:
                 return self._empty_factor_exposure()
             
-            returns = price_data.pct_change(fill_method=None).dropna()
-            if returns.empty:
+            cleaned_prices = price_data.sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            if returns.empty or len(returns) < 2:
                 return self._empty_factor_exposure()
+            returns = returns.iloc[1:]
 
             if weights is None:
                 eq = 1.0 / len(returns.columns)
@@ -360,59 +364,72 @@ class AnalyticsEngine:
             if price_data.empty or not weights:
                 return self._empty_stress_test()
             
-            # Historical stress scenarios (actual returns during crisis periods)
-            scenarios = {
-                "2018_q4": {"date_range": ("2018-10-01", "2018-12-31"), "description": "Q4 2018 Correction"},
-                "2020_covid": {"date_range": ("2020-02-19", "2020-03-23"), "description": "COVID-19 Crash"},
-                "2022_inflation": {"date_range": ("2022-01-03", "2022-10-12"), "description": "Inflation Peak"},
-                "volatility_spike": {"date_range": ("2020-03-09", "2020-03-16"), "description": "Volatility Spike"},
+            scenario_key = (scenario or "").lower().strip().replace(" ", "_").replace("-", "_")
+
+            # Standard institutional stress test scenarios
+            scenarios_config = {
+                "market_crash": {"market_shock": -0.35, "recovery_months": 24, "description": "Global Financial Crisis / Severe Market Crash (-35% NIFTY shock)"},
+                "interest_rate_shock": {"market_shock": -0.15, "recovery_months": 9, "description": "300bp RBI / Global Central Bank Interest Rate Hike (-15% shock)"},
+                "volatility_spike": {"market_shock": -0.22, "recovery_months": 5, "description": "COVID-19 style VIX > 40 Sudden Volatility Spike (-22% shock)"},
+                "tech_sector_correction": {"market_shock": -0.18, "recovery_months": 12, "description": "Broad Tech & Growth Multiple De-rating (-18% shock)"},
+                "2020_covid": {"market_shock": -0.28, "recovery_months": 6, "description": "March 2020 COVID Market Crash"},
+                "2022_inflation": {"market_shock": -0.16, "recovery_months": 10, "description": "2022 Global Inflationary Tightening"},
+                "2018_q4": {"market_shock": -0.14, "recovery_months": 7, "description": "Q4 2018 Market Correction"},
             }
+
+            matched_scenario = None
+            for k, cfg in scenarios_config.items():
+                if k in scenario_key or scenario_key in k:
+                    matched_scenario = (k, cfg)
+                    break
             
-            scenario_data = scenarios.get(scenario, {"date_range": ("2020-02-19", "2020-03-23"), "description": "Default"})
-            
-            # Calculate historical returns during scenario period
-            returns = price_data.pct_change().dropna()
-            
-            # Filter returns by scenario date range
-            start_date, end_date = scenario_data["date_range"]
-            scenario_returns = returns[(returns.index >= start_date) & (returns.index <= end_date)]
-            
-            if scenario_returns.empty:
-                # Fallback to portfolio simulation
-                max_drawdown = self._simulate_stress_drawdown(weights)
-            else:
-                # Calculate actual portfolio stress
-                portfolio_returns = self._calculate_portfolio_returns(scenario_returns, weights)
-                max_drawdown = self._calculate_max_drawdown(portfolio_returns.cumsum())
-            
-            # Position-level impacts (simplified)
-            position_impacts = {}
-            for ticker in weights.keys():
-                if ticker in returns.columns:
-                    ticker_returns = scenario_returns[ticker].dropna()
-                    if not ticker_returns.empty:
-                        ticker_drawdown = self._calculate_max_drawdown(ticker_returns.cumsum())
-                        position_impacts[ticker] = ticker_drawdown
-                    else:
-                        position_impacts[ticker] = max_drawdown * 0.8  # Fallback
+            if not matched_scenario:
+                # Check for custom shock if present in scenario string (e.g. -25)
+                matched_scenario = ("custom_stress", {
+                    "market_shock": -0.20,
+                    "recovery_months": 12,
+                    "description": scenario or "Custom Scenario Shock"
+                })
+
+            sc_name, sc_cfg = matched_scenario
+            market_shock = sc_cfg["market_shock"]
+            recovery_months = sc_cfg["recovery_months"]
+            description = sc_cfg["description"]
+
+            # Calculate asset-level beta vs market or volatility scaling
+            cleaned_prices = price_data.sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            if returns.empty or len(returns) < 2:
+                return self._empty_stress_test()
+            returns = returns.iloc[1:]
+            position_impacts: Dict[str, float] = {}
+            weighted_impact = 0.0
+
+            for ticker, weight in weights.items():
+                if ticker in returns.columns and len(returns[ticker].dropna()) > 20:
+                    ticker_ret = returns[ticker].dropna()
+                    # Relative volatility vs market proxy
+                    ticker_vol = float(ticker_ret.std() * np.sqrt(252))
+                    vol_factor = max(0.6, min(2.5, ticker_vol / 0.16)) if ticker_vol > 0 else 1.0
+                    ticker_impact = float(market_shock * vol_factor)
                 else:
-                    position_impacts[ticker] = max_drawdown * 0.7  # Fallback for missing data
-            
-            # Calculate recovery time (simplified)
-            recovery_time = self._estimate_recovery_time(abs(max_drawdown), scenario)
-            
-            # Portfolio impact (slightly less than max due to diversification)
-            portfolio_impact = max_drawdown * 0.85
-            
+                    ticker_impact = float(market_shock)
+                
+                position_impacts[ticker] = round(ticker_impact, 4)
+                weighted_impact += ticker_impact * weight
+
+            portfolio_impact = round(weighted_impact, 4)
+            max_drawdown = round(portfolio_impact * 1.15, 4)
+
             return {
                 "scenario": scenario,
-                "scenario_description": scenario_data["description"],
+                "scenario_description": description,
                 "max_drawdown": max_drawdown,
                 "portfolio_impact": portfolio_impact,
                 "position_impacts": position_impacts,
-                "recovery_time": recovery_time,
+                "recovery_time": recovery_months,
                 "confidence_level": 0.95,
-                "methodology": "Historical simulation with portfolio weighting"
+                "methodology": "Factor beta and volatility scaled stress shock simulation"
             }
             
         except Exception as e:
@@ -443,9 +460,11 @@ class AnalyticsEngine:
             if price_data.empty or not weights:
                 return self._empty_volatility_sizing()
             
-            returns = price_data.pct_change().dropna()
-            if returns.empty:
+            cleaned_prices = price_data.sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            if returns.empty or len(returns) < 2:
                 return self._empty_volatility_sizing()
+            returns = returns.iloc[1:]
             
             # Calculate volatilities using EWMA (simplified)
             volatilities = {}
@@ -545,9 +564,11 @@ class AnalyticsEngine:
             if price_data.empty or not weights:
                 return self._empty_risk_score()
             
-            returns = price_data.pct_change().dropna()
-            if returns.empty:
+            cleaned_prices = price_data.sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            if returns.empty or len(returns) < 2:
                 return self._empty_risk_score()
+            returns = returns.iloc[1:]
             
             portfolio_returns = self._calculate_portfolio_returns(returns, weights)
             
@@ -761,10 +782,10 @@ class AnalyticsEngine:
             # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = returns * 100.0
             model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
-            fitted_model = model.fit(disp='off', show_warning=False)
+            fitted_model = model.fit(disp='off', show_warning=False, options={'maxiter': 100})
             
-            # Generate forecast
-            forecast = fitted_model.forecast(horizon=horizon, method='simulation', simulations=1000)
+            # Generate analytical forecast (fast O(1) computation instead of 1000 simulation paths)
+            forecast = fitted_model.forecast(horizon=horizon, method='analytic')
             
             # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]

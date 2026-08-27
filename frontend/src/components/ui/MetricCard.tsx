@@ -13,6 +13,8 @@ export interface MetricCardProps {
   icon?: LucideIcon;
   loading?: boolean;
   className?: string;
+  prefix?: string;
+  suffix?: string;
 }
 
 export const MetricCard: React.FC<MetricCardProps> = ({
@@ -23,22 +25,33 @@ export const MetricCard: React.FC<MetricCardProps> = ({
   icon: Icon,
   loading = false,
   className = '',
+  prefix,
+  suffix = '',
 }) => {
   const formatValue = (val: number | string): string => {
     if (typeof val === 'number') {
       if (isNaN(val) || val === null || val === undefined) {
         return 'N/A';
       }
-      return val >= 1000000
-        ? `$${(val / 1000000).toFixed(1)}M`
-        : val >= 1000
-        ? `$${(val / 1000).toFixed(1)}K`
-        : val.toFixed(2);
+      const sym = prefix !== undefined ? prefix : '$';
+      const numStr =
+        prefix === '₹' && val >= 10000000
+          ? `${sym}${(val / 10000000).toFixed(2)}Cr`
+          : prefix === '₹' && val >= 100000
+          ? `${sym}${(val / 100000).toFixed(2)}L`
+          : val >= 1000000
+          ? `${sym}${(val / 1000000).toFixed(1)}M`
+          : val >= 1000
+          ? `${sym}${(val / 1000).toFixed(1)}K`
+          : prefix !== undefined
+          ? `${sym}${val.toFixed(2)}`
+          : val.toFixed(2);
+      return `${numStr}${suffix}`;
     }
     if (!val || val === 'NaN%') {
       return 'N/A';
     }
-    return val.toString();
+    return `${val}${suffix}`;
   };
 
   const formatChange = (val: number): string => {

@@ -3,7 +3,7 @@ Portfolio API endpoints for portfolio management operations
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +39,7 @@ async def get_portfolio(
     region: Optional[str] = Query(default=None, description="Filter by region"),
     sector: Optional[str] = Query(default=None, description="Filter by sector"),
     currency: str = Query(default="INR", description="Target currency (USD or INR)"),
+    force_refresh: bool = Query(default=False, description="Force refresh prices from upstream"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service)
 ) -> PortfolioSummaryResponse:
@@ -50,9 +51,9 @@ async def get_portfolio(
         query = select(PortfolioPosition)
         
         # Apply filters
-        if region:
+        if region and isinstance(region, str):
             query = query.where(PortfolioPosition.region == region)
-        if sector:
+        if sector and isinstance(sector, str):
             query = query.where(PortfolioPosition.sector == sector)
         
         # Execute query
@@ -68,8 +69,8 @@ async def get_portfolio(
                 sectors={}
             )
         
-        # Update prices and market values
-        await _update_portfolio_prices(positions, data_service)
+        # Update prices and market values (only stale/empty unless force_refresh)
+        await _update_portfolio_prices(positions, data_service, force=force_refresh)
         await db.commit()
         
         # Build response with live market-value weights
@@ -929,16 +930,38 @@ def _is_similar_ticker(ticker1: str, ticker2: str, max_distance: int = 2) -> boo
     return distances[len(ticker1)][len(ticker2)] <= max_distance
 
 
-async def _update_portfolio_prices(positions: List[PortfolioPosition], data_service: DataService) -> None:
-    """Update portfolio position prices"""
-    for position in positions:
-        try:
-            quote_data = await data_service.fetch_quote(position.ticker)
-            if quote_data:
-                # Quantity is the share-count source of truth; never infer it
-                # from a possibly-stale stored market value.
-                position.last_price = quote_data["current_price"]
-                position.market_value = (position.quantity or 0) * position.last_price
-                position.updated_on = datetime.utcnow()
-        except Exception as e:
-            logger.error(f"Error updating price for {position.ticker}: {e}")
+async def _update_portfolio_prices(
+    positions: List[PortfolioPosition], 
+    data_service: DataService,
+    force: bool = False
+) -> None:
+    """Update portfolio position prices concurrently if stale or forced"""
+    now = datetime.utcnow()
+    stale_cutoff = now - timedelta(minutes=15)
+
+    positions_to_update = [
+        p for p in positions
+        if force or not p.last_price or p.last_price <= 0 or not p.updated_on or p.updated_on < stale_cutoff
+    ]
+
+    if not positions_to_update:
+        return
+
+    sem = asyncio.Semaphore(5)
+
+    async def update_one(position: PortfolioPosition):
+        async with sem:
+            try:
+                quote_data = await data_service.fetch_quote(position.ticker)
+                if quote_data and quote_data.get("current_price"):
+                    position.last_price = quote_data["current_price"]
+                    position.market_value = (position.quantity or 0) * position.last_price
+                    if quote_data.get("sector") and not position.sector:
+                        position.sector = quote_data["sector"]
+                    if quote_data.get("industry") and not position.industry:
+                        position.industry = quote_data["industry"]
+                    position.updated_on = datetime.utcnow()
+            except Exception as e:
+                logger.error(f"Error updating price for {position.ticker}: {e}")
+
+    await asyncio.gather(*[update_one(p) for p in positions_to_update])

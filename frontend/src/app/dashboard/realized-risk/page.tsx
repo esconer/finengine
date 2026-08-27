@@ -9,8 +9,19 @@ import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
 import { RiskMetricsDisplay } from '@/components/charts/RiskMetricsDisplay';
-import { usePortfolioAnalytics } from '@/hooks/useAnalytics';
+import { usePortfolioAnalytics, usePerformanceData } from '@/hooks/useAnalytics';
 import { usePortfolioStore } from '@/lib/store';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from 'recharts';
 import {
   TrendingDown,
   TrendingUp,
@@ -53,9 +64,50 @@ export default function RealizedRiskPage() {
   const [positionData, setPositionData] = useState<any[]>([]);
 
   const { data: analyticsData, loading: analyticsLoading, refresh } = usePortfolioAnalytics();
+  const { performanceData, loading: perfLoading } = usePerformanceData(252);
   const { positions } = usePortfolioStore();
 
   const realizedRisk = analyticsData.realizedRisk;
+
+  // Compute live rolling volatility and underwater drawdown series from performance data
+  const { drawdownSeries, rollingVolSeries } = React.useMemo(() => {
+    if (!performanceData || performanceData.length < 2) {
+      return { drawdownSeries: [], rollingVolSeries: [] };
+    }
+    let peak = -Infinity;
+    const dd: { date: string; drawdown: number }[] = [];
+    const returns: number[] = [];
+    const vol: { date: string; volatility: number }[] = [];
+
+    for (let i = 0; i < performanceData.length; i++) {
+      const p = performanceData[i];
+      const val = p.portfolio_value || 0;
+      if (val > peak) peak = val;
+      const drawdown = peak > 0 ? (val - peak) / peak : 0;
+      dd.push({
+        date: p.date,
+        drawdown: Number((drawdown * 100).toFixed(2)),
+      });
+
+      if (i > 0) {
+        const prev = performanceData[i - 1].portfolio_value || 1;
+        returns.push((val - prev) / prev);
+      }
+      if (returns.length >= 10) {
+        const windowRet = returns.slice(-21);
+        const mean = windowRet.reduce((a, b) => a + b, 0) / windowRet.length;
+        const variance =
+          windowRet.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) /
+          Math.max(1, windowRet.length - 1);
+        const annVol = Math.sqrt(variance * 252) * 100;
+        vol.push({
+          date: p.date,
+          volatility: Number(annVol.toFixed(2)),
+        });
+      }
+    }
+    return { drawdownSeries: dd, rollingVolSeries: vol };
+  }, [performanceData]);
 
   // Generate position risk data for table
   useEffect(() => {
@@ -258,13 +310,16 @@ export default function RealizedRiskPage() {
         {/* Risk Metrics Display */}
         <RiskMetricsDisplay
           data={{
-            risk_score: 0, // Will be calculated from other metrics
-            risk_level: 'Unknown',
+            risk_score: analyticsData.riskScore?.overall_score || 0,
+            risk_level: analyticsData.riskScore?.risk_level || 'Medium',
             annual_volatility: realizedRisk?.portfolio?.annual_volatility || 0,
             sharpe_ratio: realizedRisk?.portfolio?.sharpe_ratio || 0,
             max_drawdown: realizedRisk?.portfolio?.max_drawdown || 0,
             var_95: realizedRisk?.portfolio?.var_95 || 0,
             cvar_95: realizedRisk?.portfolio?.cvar_95 || 0,
+            forecast_volatility: analyticsData.forecastRisk?.portfolio?.volatility_forecast || null,
+            forecast_var: analyticsData.forecastRisk?.portfolio?.var_forecast || null,
+            realized_volatility: realizedRisk?.portfolio?.annual_volatility || 0,
           }}
           loading={analyticsLoading}
         />
@@ -301,33 +356,59 @@ export default function RealizedRiskPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-                Risk Metrics Over Time
-              </h3>
-              <Calendar className="w-5 h-5 text-gray-500" />
-            </div>
-            <div className="h-64 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center">
-              <div className="text-center text-gray-500 dark:text-gray-400">
-                <Activity className="w-12 h-12 mx-auto mb-2" />
-                <p>Risk metrics chart will be implemented in future step</p>
-                <p className="text-xs mt-1">Showing rolling volatility and VaR over time</p>
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                  Rolling 21-Day Volatility (%)
+                </h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Annualized historical realized volatility trend</p>
               </div>
+              <Activity className="w-5 h-5 text-blue-500" />
+            </div>
+            <div className="h-64">
+              {rollingVolSeries.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={rollingVolSeries}>
+                    <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                    <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 11 }} unit="%" domain={['auto', 'auto']} />
+                    <Tooltip formatter={(value: any) => [`${value}%`, 'Rolling Volatility']} />
+                    <Line type="monotone" dataKey="volatility" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-400 text-sm">
+                  Loading volatility history...
+                </div>
+              )}
             </div>
           </div>
 
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-                Drawdown Analysis
-              </h3>
-              <TrendingDown className="w-5 h-5 text-gray-500" />
-            </div>
-            <div className="h-64 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center">
-              <div className="text-center text-gray-500 dark:text-gray-400">
-                <TrendingDown className="w-12 h-12 mx-auto mb-2" />
-                <p>Drawdown chart will be implemented in future step</p>
-                <p className="text-xs mt-1">Historical drawdown periods and recovery analysis</p>
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                  Underwater Drawdown (%)
+                </h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Peak-to-trough portfolio wealth drawdown</p>
               </div>
+              <TrendingDown className="w-5 h-5 text-red-500" />
+            </div>
+            <div className="h-64">
+              {drawdownSeries.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={drawdownSeries}>
+                    <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                    <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 11 }} unit="%" domain={['auto', 0]} />
+                    <Tooltip formatter={(value: any) => [`${value}%`, 'Drawdown']} />
+                    <Area type="monotone" dataKey="drawdown" stroke="#ef4444" fill="#ef4444" fillOpacity={0.2} strokeWidth={1.5} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-400 text-sm">
+                  Loading drawdown history...
+                </div>
+              )}
             </div>
           </div>
         </div>

@@ -83,13 +83,15 @@ export const usePortfolioAnalytics = () => {
     }
   };
 
+  const tickerKey = positions.map(p => `${p.ticker}:${p.weight}:${p.last_price}`).join(',');
+
   useEffect(() => {
     if (positions.length > 0) {
       fetchAnalyticsData();
     } else {
       setLoading(false);
     }
-  }, [positions]);
+  }, [tickerKey]);
 
   return {
     data,
@@ -103,6 +105,7 @@ export const usePerformanceData = (days: number = 90) => {
   const [performanceData, setPerformanceData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const { positions } = usePortfolioStore();
+  const tickerKey = positions.map(p => `${p.ticker}:${p.quantity || 0}`).join(',');
 
   useEffect(() => {
     let isMounted = true;
@@ -136,7 +139,7 @@ export const usePerformanceData = (days: number = 90) => {
     return () => {
       isMounted = false;
     };
-  }, [positions, days]);
+  }, [tickerKey, days]);
 
   return { performanceData, loading };
 };
@@ -144,6 +147,7 @@ export const usePerformanceData = (days: number = 90) => {
 export const useSectorAllocation = () => {
   const [sectorData, setSectorData] = useState<any[]>([]);
   const { positions } = usePortfolioStore();
+  const tickerKey = positions.map(p => `${p.ticker}:${p.sector || ''}:${p.market_value || 0}`).join(',');
 
   useEffect(() => {
     if (positions.length === 0) {
@@ -171,7 +175,7 @@ export const useSectorAllocation = () => {
     }));
 
     setSectorData(sectorArray);
-  }, [positions]);
+  }, [tickerKey]);
 
   return sectorData;
 };

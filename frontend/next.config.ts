@@ -3,6 +3,19 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   /* config options here */
   reactCompiler: false, // Disabled for stability
+  compress: true,
+  poweredByHeader: false,
+  experimental: {
+    optimizePackageImports: [
+      'lucide-react',
+      'recharts',
+      'date-fns',
+      '@tanstack/react-table',
+      '@tanstack/react-query',
+      'clsx',
+      'tailwind-merge',
+    ],
+  },
   // API proxy for FastAPI backend
   async rewrites() {
     return [
