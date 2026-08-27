@@ -374,6 +374,31 @@ class TestPortfolioAPIEndpoints:
             assert resp_del.status_code == 200
             assert resp_del.json()["success"] is True
 
+        # Test QH-02: Auto-normalize remaining position weights on delete
+        await test_db.execute(delete(PortfolioPosition))
+        p1 = PortfolioPosition(ticker="P1.NS", weight=0.2, quantity=10.0, buy_price=100.0, last_price=100.0, market_value=1000.0)
+        p2 = PortfolioPosition(ticker="P2.NS", weight=0.3, quantity=10.0, buy_price=100.0, last_price=100.0, market_value=1000.0)
+        p3 = PortfolioPosition(ticker="P3.NS", weight=0.5, quantity=10.0, buy_price=100.0, last_price=100.0, market_value=1000.0)
+        test_db.add_all([p1, p2, p3])
+        await test_db.commit()
+
+        # Delete P3 (0.5 weight)
+        resp_del_p3 = await async_client.delete("/api/v1/portfolio/P3.NS")
+        assert resp_del_p3.status_code == 200
+        assert resp_del_p3.json()["data"]["weights_renormalized"] is True
+
+        # Remaining P1 and P2 should sum to 1.0 (0.2/0.5 = 0.4, 0.3/0.5 = 0.6)
+        rem_res = await test_db.execute(select(PortfolioPosition))
+        remaining = rem_res.scalars().all()
+        assert len(remaining) == 2
+        assert abs(sum(p.weight for p in remaining) - 1.0) < 1e-4
+        weights_by_ticker = {p.ticker: p.weight for p in remaining}
+        assert abs(weights_by_ticker["P1.NS"] - 0.4) < 1e-4
+        assert abs(weights_by_ticker["P2.NS"] - 0.6) < 1e-4
+
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
     @pytest.mark.asyncio
     async def test_export_csv_and_normalize(self, async_client, test_db: AsyncSession):
         # Empty export -> 404

@@ -758,26 +758,27 @@ class AnalyticsEngine:
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """GARCH volatility forecast"""
         try:
-            # Fit GARCH(1,1) model
-            model = arch_model(returns, vol='Garch', p=1, q=1, dist='normal')
-            fitted_model = model.fit(disp='off')
+            # Scale returns by 100 for arch optimizer numerical convergence stability
+            scaled_returns = returns * 100.0
+            model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
+            fitted_model = model.fit(disp='off', show_warning=False)
             
             # Generate forecast
             forecast = fitted_model.forecast(horizon=horizon, method='simulation', simulations=1000)
             
-            # Extract volatility forecast
+            # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
-            volatility_forecast = np.sqrt(variance_forecast * 252)  # Annualized
+            volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
             
             return {
                 "model": "GARCH",
                 "horizon": horizon,
-                "volatility_forecast": volatility_forecast[-1] if len(volatility_forecast) > 0 else 0.22,
-                "var_forecast": -volatility_forecast[-1] * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.028,
-                "cvar_forecast": -volatility_forecast[-1] * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.041,
+                "volatility_forecast": float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.22,
+                "var_forecast": -float(volatility_forecast[-1]) * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.028,
+                "cvar_forecast": -float(volatility_forecast[-1]) * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.041,
                 "confidence_interval": [
-                    max(0, volatility_forecast[-1] * 0.8) if len(volatility_forecast) > 0 else 0.18,
-                    volatility_forecast[-1] * 1.2 if len(volatility_forecast) > 0 else 0.26
+                    max(0, float(volatility_forecast[-1]) * 0.8) if len(volatility_forecast) > 0 else 0.18,
+                    float(volatility_forecast[-1]) * 1.2 if len(volatility_forecast) > 0 else 0.26
                 ],
                 "model_params": {"p": 1, "q": 1, "type": "GARCH"}
             }
@@ -788,26 +789,27 @@ class AnalyticsEngine:
     async def _egarch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EGARCH volatility forecast"""
         try:
-            # Fit EGARCH(1,1) model
-            model = arch_model(returns, vol='EGARCH', p=1, q=1, dist='normal')
-            fitted_model = model.fit(disp='off')
+            # Scale returns by 100 for arch optimizer numerical convergence stability
+            scaled_returns = returns * 100.0
+            model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
+            fitted_model = model.fit(disp='off', show_warning=False)
             
             # Generate forecast
             forecast = fitted_model.forecast(horizon=horizon)
             
-            # Extract volatility forecast
+            # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
-            volatility_forecast = np.sqrt(variance_forecast * 252)  # Annualized
+            volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
             
             return {
                 "model": "EGARCH",
                 "horizon": horizon,
-                "volatility_forecast": volatility_forecast[-1] if len(volatility_forecast) > 0 else 0.24,
-                "var_forecast": -volatility_forecast[-1] * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.031,
-                "cvar_forecast": -volatility_forecast[-1] * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.045,
+                "volatility_forecast": float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.24,
+                "var_forecast": -float(volatility_forecast[-1]) * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.031,
+                "cvar_forecast": -float(volatility_forecast[-1]) * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.045,
                 "confidence_interval": [
-                    max(0, volatility_forecast[-1] * 0.8) if len(volatility_forecast) > 0 else 0.19,
-                    volatility_forecast[-1] * 1.2 if len(volatility_forecast) > 0 else 0.29
+                    max(0, float(volatility_forecast[-1]) * 0.8) if len(volatility_forecast) > 0 else 0.19,
+                    float(volatility_forecast[-1]) * 1.2 if len(volatility_forecast) > 0 else 0.29
                 ],
                 "model_params": {"p": 1, "q": 1, "type": "EGARCH"}
             }

@@ -1,6 +1,6 @@
 # 30 — Black-Litterman Bayesian Portfolio Optimization
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: 08
 

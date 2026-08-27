@@ -5,7 +5,7 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
     Plus,
     DollarSign,
@@ -285,31 +285,33 @@ export default function PortfolioManagePage() {
     };
 
     // Filter and sort positions
-    const filteredPositions = positions
-        .filter(pos => {
-            const matchesSearch = !searchQuery ||
-                pos.ticker.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                (pos.custom_name && pos.custom_name.toLowerCase().includes(searchQuery.toLowerCase())) ||
-                pos.sector.toLowerCase().includes(searchQuery.toLowerCase());
+    const filteredPositions = useMemo(() => {
+        return positions
+            .filter(pos => {
+                const matchesSearch = !searchQuery ||
+                    pos.ticker.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                    (pos.custom_name && pos.custom_name.toLowerCase().includes(searchQuery.toLowerCase())) ||
+                    pos.sector.toLowerCase().includes(searchQuery.toLowerCase());
 
-            return matchesSearch;
-        })
-        .sort((a, b) => {
-            const aVal = a[sortBy];
-            const bVal = b[sortBy];
+                return matchesSearch;
+            })
+            .sort((a, b) => {
+                const aVal = a[sortBy];
+                const bVal = b[sortBy];
 
-            if (typeof aVal === 'string' && typeof bVal === 'string') {
-                return sortDirection === 'asc'
-                    ? aVal.localeCompare(bVal)
-                    : bVal.localeCompare(aVal);
-            }
+                if (typeof aVal === 'string' && typeof bVal === 'string') {
+                    return sortDirection === 'asc'
+                        ? aVal.localeCompare(bVal)
+                        : bVal.localeCompare(aVal);
+                }
 
-            if (typeof aVal === 'number' && typeof bVal === 'number') {
-                return sortDirection === 'asc' ? aVal - bVal : bVal - aVal;
-            }
+                if (typeof aVal === 'number' && typeof bVal === 'number') {
+                    return sortDirection === 'asc' ? aVal - bVal : bVal - aVal;
+                }
 
-            return 0;
-        });
+                return 0;
+            });
+    }, [positions, searchQuery, sortBy, sortDirection]);
 
     // Calculate total portfolio metrics
     const totalGainLoss = positions.reduce((sum, pos) => sum + pos.unrealized_gain_loss, 0);

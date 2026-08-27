@@ -4,7 +4,27 @@
  */
 
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
-import { PortfolioCreateRequest, PortfolioUpdateRequest, PortfolioBulkAddRequest } from '@/types';
+import {
+  PortfolioPosition,
+  PortfolioSummary,
+  PortfolioCreateRequest,
+  PortfolioUpdateRequest,
+  PortfolioBulkAddRequest,
+  StockData,
+  RealizedRiskMetrics,
+  ForecastRiskResponse,
+  FactorExposureResponse,
+  ConcentrationMetrics,
+  LiquidityResponse,
+  RiskScore,
+  StressTestResponse,
+  VolatilitySizingResponse,
+  TearSheetResponse,
+  RiskContributionResponse,
+  OptimizationResponse,
+  RegimeResponse,
+  MonteCarloResponse,
+} from '@/types';
 
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
@@ -100,7 +120,7 @@ export const portfolioApi = {
     region?: string;
     sector?: string;
     currency?: string;  // Default to INR for Indian market
-  }): Promise<any> {
+  }): Promise<PortfolioSummary> {
     const defaultParams = {
       currency: 'INR',  // Indian default
       ...params
@@ -110,19 +130,25 @@ export const portfolioApi = {
   },
 
   // Add position
-  async addPosition(data: PortfolioCreateRequest): Promise<any> {
+  async addPosition(data: PortfolioCreateRequest): Promise<PortfolioPosition> {
     const response = await apiClient.post('/portfolio/add', data);
     return response.data;
   },
 
   // Bulk add positions
-  async bulkAddPositions(data: PortfolioBulkAddRequest): Promise<any> {
+  async bulkAddPositions(data: PortfolioBulkAddRequest): Promise<{
+    success: boolean;
+    added: number;
+    failed: number;
+    normalized: boolean;
+    positions: PortfolioPosition[];
+  }> {
     const response = await apiClient.post('/portfolio/bulk_add', data);
     return response.data;
   },
 
   // Get position
-  async getPosition(ticker: string): Promise<any> {
+  async getPosition(ticker: string): Promise<PortfolioPosition> {
     const response = await apiClient.get(`/portfolio/${ticker}`);
     return response.data;
   },
@@ -133,13 +159,13 @@ export const portfolioApi = {
     quantity?: number;
     buy_price?: number;
     custom_name?: string;
-  }): Promise<any> {
+  }): Promise<PortfolioPosition> {
     const response = await apiClient.put(`/portfolio/${ticker}`, data);
     return response.data;
   },
 
   // Delete position
-  async deletePosition(ticker: string): Promise<any> {
+  async deletePosition(ticker: string): Promise<{ success: boolean; message: string; data?: { weights_renormalized: boolean } }> {
     const response = await apiClient.delete(`/portfolio/${ticker}`);
     return response.data;
   },
@@ -151,7 +177,7 @@ export const portfolioApi = {
   },
 
   // Normalize weights
-  async normalizeWeights(method = 'proportional'): Promise<any> {
+  async normalizeWeights(method = 'proportional'): Promise<{ success: boolean; message: string; method: string }> {
     const response = await apiClient.post('/portfolio/normalize', null, {
       params: { method },
     });
@@ -166,13 +192,13 @@ export const dataApi = {
     start?: string;
     end?: string;
     force_refresh?: boolean;
-  }): Promise<any> {
+  }): Promise<StockData[]> {
     const response = await apiClient.get(`/data/${ticker}`, { params });
     return response.data;
   },
 
   // Get stock quote
-  async getStockQuote(ticker: string): Promise<any> {
+  async getStockQuote(ticker: string): Promise<{ current_price: number; sector?: string; industry?: string; company_name?: string }> {
     const response = await apiClient.get(`/data/quote/${ticker}`);
     return response.data;
   },
@@ -183,25 +209,25 @@ export const dataApi = {
     start?: string;
     end?: string;
     force_refresh?: boolean;
-  }): Promise<any> {
+  }): Promise<{ data: Record<string, StockData[]>; failed_tickers: string[] }> {
     const response = await apiClient.post('/data/batch', data);
     return response.data;
   },
 
   // Validate ticker
-  async validateTicker(ticker: string): Promise<any> {
+  async validateTicker(ticker: string): Promise<{ valid: boolean; symbol?: string; name?: string }> {
     const response = await apiClient.post('/data/validate', { ticker });
     return response.data;
   },
 
   // Refresh data
-  async refreshData(tickers: string[]): Promise<any> {
+  async refreshData(tickers: string[]): Promise<{ refreshed: string[]; failed: string[] }> {
     const response = await apiClient.post('/data/refresh', tickers);
     return response.data;
   },
 
   // Get API config
-  async getConfig(): Promise<any> {
+  async getConfig(): Promise<{ cache_ttl_minutes: number; enable_cache: boolean }> {
     const response = await apiClient.get('/data/config');
     return response.data;
   },
@@ -210,7 +236,7 @@ export const dataApi = {
   async updateConfig(data: {
     cache_ttl_minutes?: number;
     enable_cache?: boolean;
-  }): Promise<any> {
+  }): Promise<{ cache_ttl_minutes: number; enable_cache: boolean }> {
     const response = await apiClient.put('/data/config', null, { params: data });
     return response.data;
   },
@@ -223,7 +249,7 @@ export const analyticsApi = {
     tickers?: string;
     start?: string;
     end?: string;
-  }): Promise<any> {
+  }): Promise<RealizedRiskMetrics & { by_position?: Record<string, RealizedRiskMetrics> }> {
     const response = await apiClient.get('/analytics/realized-risk', { params });
     return response.data;
   },
@@ -233,7 +259,7 @@ export const analyticsApi = {
     model?: string;
     horizon?: number;
     tickers?: string;
-  }): Promise<any> {
+  }): Promise<ForecastRiskResponse> {
     const response = await apiClient.get('/analytics/forecast-risk', { params });
     return response.data;
   },
@@ -242,25 +268,25 @@ export const analyticsApi = {
   async getFactorExposure(params?: {
     tickers?: string;
     lookback_days?: number;
-  }): Promise<any> {
+  }): Promise<FactorExposureResponse> {
     const response = await apiClient.get('/analytics/factor-exposure', { params });
     return response.data;
   },
 
   // Get concentration metrics
-  async getConcentrationMetrics(): Promise<any> {
+  async getConcentrationMetrics(): Promise<ConcentrationMetrics> {
     const response = await apiClient.get('/analytics/concentration');
     return response.data;
   },
 
   // Get liquidity metrics
-  async getLiquidityMetrics(): Promise<any> {
+  async getLiquidityMetrics(): Promise<LiquidityResponse> {
     const response = await apiClient.get('/analytics/liquidity');
     return response.data;
   },
 
   // Get risk score
-  async getRiskScore(): Promise<any> {
+  async getRiskScore(): Promise<RiskScore> {
     const response = await apiClient.get('/analytics/risk-score');
     return response.data;
   },
@@ -269,7 +295,7 @@ export const analyticsApi = {
   async runStressTest(data: {
     scenario: string;
     tickers?: string[];
-  }): Promise<any> {
+  }): Promise<StressTestResponse> {
     const response = await apiClient.post('/analytics/stress-test', data);
     return response.data;
   },
@@ -279,13 +305,13 @@ export const analyticsApi = {
     model?: string;
     target_volatility?: number;
     portfolio_value?: number;
-  }): Promise<any> {
+  }): Promise<VolatilitySizingResponse> {
     const response = await apiClient.get('/analytics/volatility-sizing', { params });
     return response.data;
   },
 
   // Get analytics summary
-  async getSummary(): Promise<any> {
+  async getSummary(): Promise<Record<string, unknown>> {
     const response = await apiClient.get('/analytics/summary');
     return response.data;
   },
@@ -294,7 +320,7 @@ export const analyticsApi = {
   async getPerformanceHistory(params?: {
     days?: number;
     tickers?: string;
-  }): Promise<any> {
+  }): Promise<Array<{ date: string; value: number; benchmark?: number }>> {
     const response = await apiClient.get('/analytics/performance-history', { params });
     return response.data;
   },
@@ -304,7 +330,7 @@ export const analyticsApi = {
     tickers?: string;
     start?: string;
     end?: string;
-  }): Promise<any> {
+  }): Promise<TearSheetResponse> {
     const response = await apiClient.get('/analytics/tear-sheet', { params });
     return response.data;
   },
@@ -312,7 +338,7 @@ export const analyticsApi = {
   // Euler risk decomposition per position
   async getRiskContribution(params?: {
     tickers?: string;
-  }): Promise<any> {
+  }): Promise<RiskContributionResponse> {
     const response = await apiClient.get('/analytics/risk-contribution', { params });
     return response.data;
   },
@@ -322,7 +348,7 @@ export const analyticsApi = {
     strategy?: string;
     risk_free_rate?: number;
     tickers?: string[];
-  }): Promise<any> {
+  }): Promise<OptimizationResponse> {
     const response = await apiClient.post('/analytics/optimize/run', data);
     return response.data;
   },
@@ -331,7 +357,7 @@ export const analyticsApi = {
   async getRegime(params?: {
     lookback_days?: number;
     with_portfolio?: boolean;
-  }): Promise<any> {
+  }): Promise<RegimeResponse> {
     const response = await apiClient.get('/analytics/regime', { params });
     return response.data;
   },
@@ -344,7 +370,7 @@ export const analyticsApi = {
     method?: 'gbm' | 'student_t' | 'bootstrap';
     num_paths?: number;
     seed?: number;
-  }): Promise<any> {
+  }): Promise<MonteCarloResponse> {
     const response = await apiClient.post('/analytics/monte-carlo', data);
     return response.data;
   },
@@ -352,7 +378,7 @@ export const analyticsApi = {
 
 // Health check
 export const healthApi = {
-  async check(): Promise<any> {
+  async check(): Promise<{ status: string; timestamp: string; services?: Record<string, string> }> {
     const response = await apiClient.get('/health');
     return response.data;
   },

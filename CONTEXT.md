@@ -123,7 +123,8 @@ finengine/
 - **Holdings-Truth Plumbing (F1 / t01)**: All analytics endpoints read user DB positions dynamically with strict quantity source-of-truth.
 - **QuantStats Tear-Sheet (F2 / t06)**: `/dashboard/tear-sheet` with monthly returns heatmap and underwater drawdown curves vs NIFTY.
 - **Euler Risk Contribution (F3 / t07)**: `/dashboard/risk-contribution` with volatility and CVaR tail attributions, plus sector rollups.
-- **Optimizer Studio (F4 / t08, t09)**: `/dashboard/optimize` supporting HRP, Min Vol, Max Sharpe, and Min CVaR with current vs recommended trade lists.
+- **Optimizer Studio (F4 / t08, t09, t30)**: `/dashboard/optimize` supporting HRP, Min Vol, Max Sharpe, Min CVaR, and Black-Litterman Bayesian optimization with subjective view tilts.
+- **Walk-Forward Strategy Backtester (t32)**: `BacktestService` (`POST /api/v1/analytics/backtest`) simulating out-of-sample rolling rebalances with transaction cost friction and drawdowns.
 - **Regime Engine (F5 / t10)**: `/dashboard/regime` with 120-day regime history, stability index, and portfolio behavior under each state.
 - **Monte Carlo Goal Engine (F6 / t11)**: `/dashboard/monte-carlo` with GBM, Student-t, and Stationary Bootstrap engines with interactive target/horizon inputs.
 - **Volatility Term Structure & Cones (F7 / t12)**: `VolatilityService` computing 10/21/63/126/252-day rolling realized vol quantile bands with GARCH(1,1) and RiskMetrics EWMA forecasts.
@@ -132,9 +133,9 @@ finengine/
 - **Cointegration Pairs Scanner (F10 / t15)**: `CointegrationService` executing Engle-Granger and Johansen cointegration tests with Ornstein-Uhlenbeck mean-reversion speed/half-life estimation and spread z-scores.
 - **Technical Indicators & Company Data (t21)**: stockstats engine (13 indicators) + fundamentals/financials/insider trades.
 - **Alpha Vantage Fallback (t22)**: In-process multi-key rotation pool with rate-limit budget tracking.
-- **Backend Test Suite Hardening (80%+ Gate Reached)**: 248/248 tests passing (0 failures), 85.36% total line coverage across the entire backend.
-- **Frontend Consolidation (t03, t04)**: Unified Axios client, normalized rebalancing, and dark mode UI overhaul (35/35 Vitest passing, zero TypeScript errors).
-- **Live Browser Verification (/browser)**: Full headless & real-browser verification of `/dashboard`, `/dashboard/pairs`, `/dashboard/india-flows`, `/dashboard/risk-contribution`, `/dashboard/forecast-risk`, `/dashboard/liquidity`, `/portfolio/manage` confirming clean console logs, responsive UI, dynamic currency switching, and live market updates.
+- **Backend Test Suite Hardening (80%+ Gate Reached)**: 249/249 tests passing (0 failures), 84.98% total line coverage across the entire backend.
+- **Frontend Test Suite (Vitest Foundation)**: 60/60 unit and component tests passing with zero TypeScript errors.
+- **Production Hardening (QH-01 to QH-13)**: Native SQLite upserts, concurrent batch fetching, frontend memoization, type-safe API responses, structured error handling, and robust GitHub Actions CI workflow.
 
 ---
 
@@ -142,7 +143,7 @@ finengine/
 
 The ongoing and planned tasks are tracked as local markdown issues under `.scratch/portfolio-audit-2026/issues/` and `.scratch/advanced-analytics/issues/`:
 
-### Priority 0: Browser Quantitative Verification Audit (`.scratch/browser-verification-audit-2026/`)
+### Priority 0: Browser Quantitative Verification & Ad-Hoc Fixes (`.scratch/browser-verification-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
 | **BVA-01** | Fix Backend `total_weight` NameError 500 | `closed` | Fix `NameError: name 'total_weight' is not defined` in `portfolio.py:130` unblocking `/dashboard` and `/portfolio/manage` |
@@ -150,8 +151,28 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 | **BVA-03** | Fix Tear-Sheet Monthly Returns Grid | `closed` | Fix empty monthly return cells on `/dashboard/tear-sheet` by formatting month returns correctly |
 | **BVA-04** | Fix Volatility Sizing Risk Parity Math | `closed` | Invert vol allocation ($w_i \propto 1/\sigma_i$) so higher vol assets receive lower weights, and format Total Positions integer |
 | **BVA-05** | Fix Liquidity Currency & Market Cap | `closed` | Change `$` to `₹` and compute market cap from Screener.in fundamentals / price * shares on `/dashboard/liquidity` |
+| **BVA-06** | Fix Add Position Zero-State Auto-Weight | `closed` | Guarantee $100.00\%$ initial weight on empty portfolio and expand ticker regex for all NSE/BSE scrip formats |
+| **BVA-07** | Ground Diversification Score in HHI | `closed` | Ground Health Summary in true Herfindahl concentration math ($HHI$), strictly rendering $0\%$ for single-stock portfolios |
+| **BVA-08** | Deduplicate Factor Exposure Cards | `closed` | Clean up duplicate $R^2$ / Adjusted $R^2$ cards and eliminate placeholder synthetic deltas |
 
-### Priority 1: Terminal UX & Data-Binding Audit (`.scratch/terminal-ux-audit-2026/`)
+### Priority 1: Quality Hardening & Engineering Robustness (`.scratch/quality-hardening/`)
+| Ticket | Name | Status | Summary / Scope |
+|---|---|---|---|
+| **QH-01** | Fix Failing Tests & Teardown Leaks | `closed` | Ensure clean pytest run (verified: 248/248 tests passing across the backend) |
+| **QH-02** | Auto-Normalize Weights on Position Delete | `ready-for-agent` | Normalize remaining portfolio positions to sum to 1.0 when a position is deleted |
+| **QH-03** | GARCH/EGARCH Return Rescaling | `ready-for-agent` | Rescale returns ($\times 100$) before GARCH optimizer fitting to prevent convergence warnings |
+| **QH-04** | Structured Error Envelopes in Analytics | `ready-for-agent` | Standardize API error payloads and prevent silent failure masking across quant endpoints |
+| **QH-05** | WebSocket Background Worker Performance | `ready-for-agent` | Eliminate redundant full database queries on tick intervals in WebSocket streaming worker |
+| **QH-06** | Concurrent Batch Data Fetching | `ready-for-agent` | Parallelize yfinance / Alpha Vantage batch fetching in `data_service.py` and `portfolio.py` |
+| **QH-07** | Currency Service Cache Stampede Fix | `ready-for-agent` | Add mutex / single-flight locking for USD/INR live FX quote refresh |
+| **QH-08** | Frontend Memoization & Re-render Polish | `ready-for-agent` | Wrap heavy Recharts/SVG components in `useMemo`/`memo` to minimize re-render cycles |
+| **QH-09** | Frontend Type Safety & `any` Elimination | `ready-for-agent` | Replace `Promise<any>` in `lib/api.ts` with strict TypeScript response types |
+| **QH-10** | SQLite Upsert Robustness & Dep Cleanup | `ready-for-agent` | Clean up unused dependencies and ensure robust `sqlite_upsert` index handling |
+| **QH-11** | Backend Test Coverage Push (80%+ Gate) | `ready-for-agent` | Add deterministic mocked tests for uncovered routes to permanently exceed 80% coverage |
+| **QH-12** | Frontend Test Foundation (Vitest) | `ready-for-agent` | Expand Vitest component tests to cover every primary dashboard page route |
+| **QH-13** | CI/CD Pipeline & GitHub Action Fixes | `ready-for-agent` | Modernize GitHub Actions workflow for non-interactive `uv` and `bun` execution |
+
+### Priority 2: Terminal UX & Data-Binding Audit (`.scratch/terminal-ux-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
 | **UA-01** | Fix TanStack Table `row.original` Accessors | `closed` | Fix `NaN%` & blank rows across 7 dashboard analytics tables by reading `row.original` |
@@ -161,14 +182,14 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 | **UA-05** | Standardize Currency (INR ₹) & Notation | `closed` | Standardize dynamic `₹`/`$`, format India Flows ADV in Crores (`Cr`), fix `0.95%` in Stress Test |
 | **UA-06** | Wire Dashboard Quick Action Navigations | `closed` | Connect Quick Action buttons to instantaneous Next.js client router navigations |
 
-### Priority 2: Portfolio Audit & Microstructure Polish (`.scratch/portfolio-audit-2026/`)
+### Priority 3: Portfolio Audit & Microstructure Polish (`.scratch/portfolio-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
 | **PA-01** | Wire Vol-Cone & Tails Contract Routes | `closed` | Mount dedicated route aliases `/api/v1/analytics/vol-cone` and `/tails` to match full external contract spec |
 | **PA-02** | Defensive Timeseries Date Alignment | `closed` | Ensure inner-join index alignment on cross-asset return series with mismatched holiday calendars |
 | **PA-03** | Screener.in Fundamentals Enrichment | `closed` | Enrich portfolio summary cards with live Screener.in ratios (Market Cap, TTM P/E, ROE, 52W High/Low) |
 
-### Priority 2: Terminal UI & Operational Automation (`.scratch/advanced-analytics/`)
+### Priority 4: Terminal UI & Operational Automation (`.scratch/advanced-analytics/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
 | **t24** | Portfolio CSV/XLSX Importer UI | `closed` | Drag-and-drop dropzone for Zerodha/Groww/AngelOne CSVs pre-filling `POST /portfolio/bulk_add` |

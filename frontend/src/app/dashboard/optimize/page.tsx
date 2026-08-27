@@ -71,6 +71,12 @@ const STRATEGIES = [
     short: 'Min CVaR',
     blurb: 'Shrinks the worst-5%-day loss, not just volatility',
   },
+  {
+    id: 'black_litterman',
+    name: 'Black-Litterman Bayesian',
+    short: 'Black-Litterman',
+    blurb: 'Equilibrium prior anchored with subjective investor conviction',
+  },
 ] as const;
 
 export default function OptimizePage() {
@@ -98,11 +104,47 @@ export default function OptimizePage() {
       ? 'N/A'
       : `${(v * 100).toFixed(decimals)}%`;
 
-  const tradeList = result
-    ? Object.entries(result.trades_required).sort(
-        ([, a], [, b]) => Math.abs(b.weight_delta) - Math.abs(a.weight_delta)
-      )
-    : [];
+  const frontierPoints = useMemo(() => {
+    if (!result) return [];
+    return Array.from({ length: 21 }, (_, i) => {
+      const f = i / 20;
+      const v = (result.expected_annual_volatility * 0.82) + (result.expected_annual_volatility * 0.7 * f);
+      const r = (result.expected_annual_return * 0.7) + (result.expected_annual_return * 0.8 * Math.sqrt(f));
+      return {
+        volatility: +(v * 100).toFixed(2),
+        return: +(r * 100).toFixed(2),
+        name: `Frontier Portfolio #${i + 1}`,
+        type: 'frontier'
+      };
+    });
+  }, [result]);
+
+  const optimalPoint = useMemo(() => {
+    if (!result) return [];
+    return [{
+      volatility: +(result.expected_annual_volatility * 100).toFixed(2),
+      return: +(result.expected_annual_return * 100).toFixed(2),
+      name: `Optimal Portfolio (${result.strategy.toUpperCase()})`,
+      sharpe: result.expected_sharpe?.toFixed(2)
+    }];
+  }, [result]);
+
+  const currentPoint = useMemo(() => {
+    if (!result) return [];
+    return [{
+      volatility: +((result.expected_annual_volatility * 1.08) * 100).toFixed(2),
+      return: +((result.expected_annual_return * 0.92) * 100).toFixed(2),
+      name: 'Current Portfolio (Pre-Rebalance)',
+    }];
+  }, [result]);
+
+  const tradeList = useMemo(() => {
+    return result
+      ? Object.entries(result.trades_required).sort(
+          ([, a], [, b]) => Math.abs(b.weight_delta) - Math.abs(a.weight_delta)
+        )
+      : [];
+  }, [result]);
 
   return (
     <div className="space-y-6">
@@ -355,29 +397,14 @@ export default function OptimizePage() {
                   {/* Simulated Frontier Points */}
                   <Scatter
                     name="Efficient Frontier"
-                    data={Array.from({ length: 21 }, (_, i) => {
-                      const f = i / 20;
-                      const v = (result.expected_annual_volatility * 0.82) + (result.expected_annual_volatility * 0.7 * f);
-                      const r = (result.expected_annual_return * 0.7) + (result.expected_annual_return * 0.8 * Math.sqrt(f));
-                      return {
-                        volatility: +(v * 100).toFixed(2),
-                        return: +(r * 100).toFixed(2),
-                        name: `Frontier Portfolio #${i + 1}`,
-                        type: 'frontier'
-                      };
-                    })}
+                    data={frontierPoints}
                     fill="#3b82f6"
                     opacity={0.4}
                   />
                   {/* Recommended Optimal Point */}
                   <Scatter
                     name="Optimal Portfolio"
-                    data={[{
-                      volatility: +(result.expected_annual_volatility * 100).toFixed(2),
-                      return: +(result.expected_annual_return * 100).toFixed(2),
-                      name: `Optimal Portfolio (${result.strategy.toUpperCase()})`,
-                      sharpe: result.expected_sharpe?.toFixed(2)
-                    }]}
+                    data={optimalPoint}
                     fill="#10b981"
                   >
                     <Cell fill="#10b981" stroke="#059669" strokeWidth={2} />
@@ -385,12 +412,7 @@ export default function OptimizePage() {
                   {/* Current Portfolio Point */}
                   <Scatter
                     name="Current Portfolio"
-                    data={[{
-                      volatility: +((result.expected_annual_volatility * 1.08) * 100).toFixed(2),
-                      return: +((result.expected_annual_return * 0.92) * 100).toFixed(2),
-                      name: 'Current Portfolio Allocation',
-                      sharpe: (result.expected_sharpe ? (result.expected_sharpe * 0.85).toFixed(2) : undefined)
-                    }]}
+                    data={currentPoint}
                     fill="#f59e0b"
                   >
                     <Cell fill="#f59e0b" stroke="#d97706" strokeWidth={2} />

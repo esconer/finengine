@@ -1,6 +1,6 @@
 # 32 — Walk-Forward Strategy Backtester
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: 08
 

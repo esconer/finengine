@@ -2,6 +2,7 @@
 Portfolio API endpoints for portfolio management operations
 """
 
+import asyncio
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -335,19 +336,30 @@ async def bulk_add_positions(
             validated_positions = [pos for pos in validated_positions
                                  if pos.ticker.upper() not in duplicate_tickers]
         
-        # STEP 4: Create position objects and fetch quotes (IN MEMORY ONLY)
-        for pos_data in validated_positions:
-            try:
+        # STEP 4: Create position objects and fetch quotes concurrently (IN MEMORY ONLY)
+        sem = asyncio.Semaphore(5)
+        
+        async def fetch_pos_quote(pos_data):
+            async with sem:
                 ticker = pos_data.ticker.upper()
-                
-                # Fetch quote data
-                quote_data = await data_service.fetch_quote(ticker)
-                if quote_data is None:
-                    logger.error(f"Failed to fetch quote for {ticker}")
-                    failed_positions.append({"ticker": ticker, "reason": "Quote fetch failed"})
-                    failed_count += 1
-                    continue
-                
+                try:
+                    quote = await data_service.fetch_quote(ticker)
+                    return pos_data, quote, None
+                except Exception as ex:
+                    logger.error(f"Error fetching quote for {ticker}: {ex}")
+                    return pos_data, None, ex
+
+        quote_results = await asyncio.gather(*[fetch_pos_quote(pos) for pos in validated_positions])
+
+        for pos_data, quote_data, error_obj in quote_results:
+            ticker = pos_data.ticker.upper()
+            if error_obj is not None or quote_data is None:
+                logger.error(f"Failed to fetch quote for {ticker}")
+                failed_positions.append({"ticker": ticker, "reason": str(error_obj) if error_obj else "Quote fetch failed"})
+                failed_count += 1
+                continue
+
+            try:
                 # Create position object (but don't add to DB yet)
                 position = PortfolioPosition(
                     ticker=ticker,
@@ -672,7 +684,7 @@ async def delete_portfolio_position(
     db: AsyncSession = Depends(get_db_session)
 ) -> SuccessResponse:
     """
-    Delete a portfolio position
+    Delete a portfolio position and auto-normalize remaining position weights
     """
     try:
         result = await db.execute(
@@ -687,11 +699,27 @@ async def delete_portfolio_position(
             )
         
         await db.delete(position)
+        
+        # Auto-normalize remaining position weights to sum to 1.0
+        remaining_result = await db.execute(select(PortfolioPosition))
+        remaining_positions = remaining_result.scalars().all()
+        
+        if remaining_positions:
+            total_current_weight = sum(p.weight for p in remaining_positions if p.weight and p.weight > 0)
+            if total_current_weight > 0:
+                for p in remaining_positions:
+                    p.weight = round(p.weight / total_current_weight, 6)
+            else:
+                equal_w = round(1.0 / len(remaining_positions), 6)
+                for p in remaining_positions:
+                    p.weight = equal_w
+                    
         await db.commit()
         
         return SuccessResponse(
             success=True,
-            message=f"Position {ticker} deleted successfully"
+            message=f"Position {ticker} deleted successfully and remaining weights normalized",
+            data={"weights_renormalized": bool(remaining_positions)}
         )
         
     except HTTPException:

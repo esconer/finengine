@@ -2,7 +2,7 @@
 SQLAlchemy database models for Daisy Risk Engine
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, JSON, Index, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, JSON, Index, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -58,8 +58,9 @@ class StockTimeseries(Base):
     position_id = Column(Integer, ForeignKey("portfolio_positions.id"), nullable=True)
     position = relationship("PortfolioPosition", back_populates="stock_data")
     
-    # Composite index for performance
+    # Composite index and unique constraint for performance and atomic upserts
     __table_args__ = (
+        UniqueConstraint("ticker", "date", name="uq_stock_timeseries_ticker_date"),
         Index("ix_ticker_date", "ticker", "date"),
     )
     

@@ -4,7 +4,7 @@ WebSocket API for real-time updates
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
@@ -141,9 +141,14 @@ async def send_analytics_update():
             else:
                 weights = {t: 1.0 / len(tickers) for t in tickers}
 
+            # Lookback limited to 1 year (~252 trading days) to prevent unbounded memory growth
+            cutoff_date = datetime.utcnow().date() - timedelta(days=365)
             t_res = await db.execute(
                 select(StockTimeseries)
-                .where(StockTimeseries.ticker.in_(tickers))
+                .where(
+                    StockTimeseries.ticker.in_(tickers),
+                    StockTimeseries.date >= cutoff_date
+                )
                 .order_by(StockTimeseries.date.asc())
             )
             rows = t_res.scalars().all()
@@ -179,7 +184,7 @@ async def send_analytics_update():
         logger.error(f"Error sending analytics update: {e}")
 
 async def send_market_data_update():
-    """Send market data update from database"""
+    """Send market data update from database using a single batched query"""
     try:
         async with SessionLocal() as db:
             result = await db.execute(select(PortfolioPosition))
@@ -187,15 +192,25 @@ async def send_market_data_update():
             if not positions:
                 return
 
+            tickers = [p.ticker for p in positions]
+            # Fetch recent timeseries for all portfolio tickers in a single batched query
+            cutoff_date = datetime.utcnow().date() - timedelta(days=14)
+            t_res = await db.execute(
+                select(StockTimeseries)
+                .where(
+                    StockTimeseries.ticker.in_(tickers),
+                    StockTimeseries.date >= cutoff_date
+                )
+                .order_by(StockTimeseries.ticker, StockTimeseries.date.desc())
+            )
+            all_ts_rows = t_res.scalars().all()
+            ts_by_ticker = {}
+            for r in all_ts_rows:
+                ts_by_ticker.setdefault(r.ticker, []).append(r)
+
             market_dict = {}
             for p in positions:
-                t_res = await db.execute(
-                    select(StockTimeseries)
-                    .where(StockTimeseries.ticker == p.ticker)
-                    .order_by(StockTimeseries.date.desc())
-                    .limit(2)
-                )
-                ts_rows = t_res.scalars().all()
+                ts_rows = ts_by_ticker.get(p.ticker, [])
                 price = p.last_price or 0.0
                 change = 0.0
                 volume = 0

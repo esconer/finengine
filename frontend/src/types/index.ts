@@ -77,11 +77,17 @@ export interface ForecastRiskMetrics {
 }
 
 // Factor Exposure Type
-export interface FactorExposure {
-  alpha: number;
-  market: number;
+export interface FactorExposureResponse {
+  portfolio: Record<string, number>;
+  positions: Record<string, Record<string, number>>;
   r_squared: number;
   adjusted_r_squared: number;
+  data_range?: {
+    start: string;
+    end: string;
+  };
+  lookback_days: number;
+  methodology?: string;
 }
 
 // Concentration Metrics Type
@@ -93,7 +99,9 @@ export interface ConcentrationMetrics {
   herfindahl_index: number;
   effective_positions: number;
   diversification_ratio: number;
+  by_weight: Record<string, number>;
   by_sector: Record<string, number>;
+  methodology?: string;
 }
 
 // Liquidity Metrics Type
@@ -261,11 +269,184 @@ export interface UIStore {
 }
 
 export interface AnalyticsStore {
-  cache: Map<string, any>;
+  cache: Map<string, unknown>;
   isCalculating: boolean;
   
   // Actions
-  setCachedData: (key: string, data: any) => void;
-  getCachedData: (key: string) => any;
+  setCachedData: (key: string, data: unknown) => void;
+  getCachedData: (key: string) => unknown;
   clearCache: () => void;
 }
+
+// Quantitative Analytics Response Types
+export interface ForecastRiskResponse {
+  model: string;
+  horizon: number;
+  portfolio: {
+    volatility_forecast?: number | null;
+    var_forecast?: number | null;
+    cvar_forecast?: number | null;
+    confidence_interval?: [number, number];
+  };
+  positions: Record<string, {
+    volatility_forecast?: number | null;
+    var_forecast?: number | null;
+  }>;
+  model_params?: Record<string, any>;
+}
+
+export interface LiquidityResponse {
+  overall_score: number;
+  liquidation_time_days: string;
+  risk_level: string;
+  by_position: Record<string, {
+    score: number;
+    category: string;
+    liquidation_days: string;
+    spread?: number;
+    avg_volume?: number;
+  }>;
+  volume_stats: {
+    avg_volume: number;
+    total_portfolio_volume: number;
+    high_volume_pct: number;
+    medium_volume_pct: number;
+    low_volume_pct: number;
+  };
+  methodology?: string;
+}
+
+export interface OptimizationResponse {
+  strategy: string;
+  weights: Record<string, number>;
+  expected_annual_return: number;
+  expected_annual_volatility: number;
+  expected_sharpe: number | null;
+  solver: string;
+  universe: string[];
+  current_weights: Record<string, number>;
+  trades_required: Record<
+    string,
+    { current_weight: number; recommended_weight: number; weight_delta: number }
+  >;
+  disclaimer: string;
+}
+
+export interface RegimeResponse {
+  as_of: string;
+  current_regime: string;
+  stability_pct: number;
+  states: {
+    regime: string;
+    ann_ret: number;
+    ann_vol: number;
+    historical_days_pct: number;
+  }[];
+  recent_history: { date: string; regime: string }[];
+  observations: number;
+  portfolio_in_current_regime?: { days: number; ann_ret: number; ann_vol: number };
+}
+
+export interface RiskContributionResponse {
+  window: { start: string; end: string };
+  positions: {
+    volatility: Record<string, number>;
+    cvar_tail: Record<string, number>;
+  };
+  sector_rollup: {
+    volatility: Record<string, number>;
+    cvar: Record<string, number>;
+  };
+  portfolio_volatility_annualized: number;
+  portfolio_var_95_daily: number;
+  portfolio_cvar_95_daily: number | null;
+  methodology: string;
+}
+
+export interface StressTestResponse {
+  scenario: string;
+  max_drawdown: number;
+  portfolio_impact: number;
+  position_impacts: Record<string, number>;
+  recovery_time: number;
+  confidence_level: number;
+  methodology?: string;
+}
+
+export interface VolatilitySizingResponse {
+  current_weights: Record<string, number>;
+  recommended_weights: Record<string, number>;
+  trades: Record<string, {
+    shares_delta: number;
+    amount: number;
+  }>;
+  target_volatility: number;
+  current_volatility?: number;
+  volatilities?: Record<string, number>;
+  model_params?: Record<string, any>;
+  methodology?: string;
+}
+
+export interface TearSheetResponse {
+  window: { start: string; end: string };
+  holdings: Record<string, number>;
+  metrics: Record<string, number | null>;
+  relative_vs_nifty: Record<string, number | null>;
+  monthly_returns: Record<string, Record<string, number>>;
+  underwater: { date: string; drawdown: number }[];
+  methodology: string;
+}
+
+export interface MonteCarloResponse {
+  method: string;
+  initial_value: number;
+  target_value: number;
+  horizon_years: number;
+  num_paths: number;
+  prob_success: number;
+  terminal_percentiles: { p5: number; p25: number; p50: number; p75: number; p95: number };
+  fan: { year: number; p5: number; p25: number; p50: number; p75: number; p95: number }[];
+  expected_shortfall_vs_target: number;
+  historical_mu_annual: number;
+  historical_sigma_annual: number;
+  student_t_df: number | null;
+  disclaimer: string;
+}
+
+export interface VolConeResponse {
+  cones: Record<string, { min: number; p25: number; p50: number; p75: number; max: number; current: number }>;
+  garch_forecast: number;
+  ewma_forecast: number;
+}
+
+export interface TailRiskResponse {
+  evt_pot_var_99: number;
+  evt_pot_es_99: number;
+  student_t_tail_matrix: {
+    tickers: string[];
+    matrix: number[][];
+  };
+}
+
+export interface CorrelationStabilityResponse {
+  rolling_60d_avg_corr: number;
+  p90_historical_corr: number;
+  regime_alert: boolean;
+  history: Array<{ date: string; avg_correlation: number }>;
+}
+
+export interface CointegrationResponse {
+  pairs: Array<{
+    pair: [string, string];
+    p_value: number;
+    half_life_days: number;
+    z_score: number;
+    is_cointegrated: boolean;
+  }>;
+}
+
+export interface IndiaFlowsResponse {
+  delivery_spikes: Array<{ ticker: string; delivery_pct: number; avg_delivery_pct: number; spike: boolean }>;
+  institutional_flows: { fii_net_cr: number; dii_net_cr: number; date: string };
+  adv_liquidity: Record<string, { adv_shares: number; days_to_liquidate_10pct: number; days_to_liquidate_20pct: number }>;
+}

@@ -175,8 +175,10 @@ Institutional-grade quantitative analytics, Indian market microstructure feeds, 
 - **India Flows & Microstructure (`/dashboard/india-flows`)**: Dedicated dashboard displaying delivery accumulation spikes, institutional flow bars, and participation liquidity tiers.
 - **Zero-Mock Purge**: Eliminated all pseudo-random generators (`Math.random`, `hash()`), mock loops, and synthetic jitter from business and render logic.
 
-### 3) Test Suite & Coverage Gate Reached
-- **Backend Test Suite**: **243 / 243 Passed** (0 failures, 100% green).
-- **Backend Line Coverage**: **85.36% Total Line Coverage** (officially surpassing the required 80% gate `pytest --cov=app --cov-fail-under=80`).
-- **Frontend Test Suite**: **35 / 35 Passed** (`bun x vitest run`).
+### 3) Quality Hardening, New Optimization & Backtester (QH-01 to QH-13)
+- **Black-Litterman Bayesian Optimizer (`OptimizationService`)**: Implied equilibrium excess returns derived from prior weights combined with absolute and relative investor views under He-Litterman diagonal uncertainty matrices.
+- **Walk-Forward Strategy Backtester (`BacktestService`)**: Out-of-sample rolling rebalancing engine (`POST /api/v1/analytics/backtest`) computing CAGR, annualized volatility, Sharpe, Calmar, turnover penalties, and cumulative equity vs equal-weight benchmark curves.
+- **Backend Test Suite**: **249 / 249 Passed** (0 failures, 100% green) with **85% total line coverage** (`pytest --cov=app --cov-fail-under=80`).
+- **Frontend Test Suite**: **60 / 60 Passed** (`bun run test:run`) across unit and component test suites (`DataTable`, `Sidebar`, `AddPositionModalSimple`, `MetricCard`, `utils`, `store`).
 - **Frontend TypeScript Check**: **0 Errors** (`bun x tsc --noEmit`).
+- **CI/CD Pipeline**: GitHub Actions workflow modernized with `uv sync --extra dev` and `oven-sh/setup-bun@v2` running automated linting, type-checking, and test gates.

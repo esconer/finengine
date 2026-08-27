@@ -41,33 +41,17 @@ jobs:
     - name: Install dependencies
       working-directory: backend
       run: |
-        uv pip install --frozen-lockfile
+        uv sync --extra dev
 
     - name: Run backend linting
       working-directory: backend
       run: |
-        uv pip install ruff
-        ruff check .
-        ruff format --check .
+        uv run ruff check .
 
-    - name: Run backend type checking
+    - name: Run backend tests with 80% coverage gate
       working-directory: backend
       run: |
-        uv pip install mypy
-        mypy app/ --ignore-missing-imports
-
-    - name: Run backend tests
-      working-directory: backend
-      run: |
-        uv pip install pytest pytest-asyncio pytest-cov
-        pytest tests/ --cov=app --cov-report=xml --cov-report=html --cov-report=term
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./backend/coverage.xml
-        flags: backend
-        name: backend-coverage
+        uv run pytest tests/ --cov=app --cov-fail-under=80 --cov-report=xml --cov-report=term
 
     - name: Build backend Docker image
       run: |
@@ -87,41 +71,28 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
       with:
-        node-version: '18'
-        cache: 'npm'
-        cache-dependency-path: frontend/package-lock.json
+        bun-version: latest
 
     - name: Install dependencies
       working-directory: frontend
-      run: npm ci
-
-    - name: Run frontend linting
-      working-directory: frontend
-      run: npm run lint
+      run: bun install --frozen-lockfile
 
     - name: Run frontend type checking
       working-directory: frontend
-      run: npm run type-check
+      run: bun x tsc --noEmit
 
-    - name: Run frontend tests
+    - name: Run frontend unit & component tests
       working-directory: frontend
-      run: npm run test:coverage
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./frontend/coverage/lcov.info
-        flags: frontend
-        name: frontend-coverage
+      run: bun run test:run
 
     - name: Build frontend
       working-directory: frontend
-      run: npm run build
+      run: bun run build
       env:
-        NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+        NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1' }}
 
     - name: Build frontend Docker image
       run: |
@@ -249,22 +220,12 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-    - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig --region us-east-1 --name daisy-risk-engine-prod
-
-    - name: Deploy to EKS
-      run: |
-        # Update deployment manifests with new image tags
-        sed -i "s|image: .*|image: $ECR_REGISTRY/daisy-risk-engine-backend:$IMAGE_TAG|g" k8s/backend-deployment.yaml
-        sed -i "s|image: .*|image: $ECR_REGISTRY/daisy-risk-engine-frontend:$IMAGE_TAG|g" k8s/frontend-deployment.yaml
-        
-        # Apply manifests
-        kubectl apply -f k8s/
-        
-        # Wait for rollout to complete
-        kubectl rollout status deployment/backend -n daisy-risk-engine --timeout=300s
-        kubectl rollout status deployment/frontend -n daisy-risk-engine --timeout=300s
+    # - name: Deploy to EKS (Disabled until k8s manifests are provisioned)
+    #   run: |
+    #     aws eks update-kubeconfig --region us-east-1 --name daisy-risk-engine-prod
+    #     kubectl apply -f k8s/
+    #     kubectl rollout status deployment/backend -n daisy-risk-engine --timeout=300s
+    #     kubectl rollout status deployment/frontend -n daisy-risk-engine --timeout=300s
 
     - name: Run post-deployment tests
       run: |

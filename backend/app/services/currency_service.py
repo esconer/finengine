@@ -24,6 +24,7 @@ class CurrencyConversionService:
         self._exchange_rates: Dict[str, float] = {}
         self._last_updated: Optional[datetime] = None
         self._cache_duration = timedelta(minutes=30)  # Cache for 30 minutes
+        self._refresh_lock = asyncio.Lock()
         
     async def get_exchange_rate(self, from_currency: str, to_currency: str) -> float:
         """
@@ -39,19 +40,27 @@ class CurrencyConversionService:
         if from_currency == to_currency:
             return 1.0
             
-        # Check cache first
-        if self._is_cache_valid() and f"{from_currency}_{to_currency}" in self._exchange_rates:
-            return self._exchange_rates[f"{from_currency}_{to_currency}"]
+        cache_key = f"{from_currency}_{to_currency}"
         
-        # Fetch fresh exchange rate
-        rate = await self._fetch_exchange_rate(from_currency, to_currency)
+        # Check cache first (fast path)
+        if self._is_cache_valid() and cache_key in self._exchange_rates:
+            return self._exchange_rates[cache_key]
         
-        # Update cache
-        self._exchange_rates[f"{from_currency}_{to_currency}"] = rate
-        self._exchange_rates[f"{to_currency}_{from_currency}"] = 1.0 / rate
-        self._last_updated = datetime.utcnow()
-        
-        return rate
+        # Lock to prevent cache stampede under concurrent requests
+        async with self._refresh_lock:
+            # Double check after acquiring lock
+            if self._is_cache_valid() and cache_key in self._exchange_rates:
+                return self._exchange_rates[cache_key]
+                
+            # Fetch fresh exchange rate
+            rate = await self._fetch_exchange_rate(from_currency, to_currency)
+            
+            # Update cache
+            self._exchange_rates[cache_key] = rate
+            self._exchange_rates[f"{to_currency}_{from_currency}"] = 1.0 / rate if rate > 0 else 1.0
+            self._last_updated = datetime.utcnow()
+            
+            return rate
     
     async def convert_amount(self, amount: float, from_currency: str, to_currency: str) -> float:
         """

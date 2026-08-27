@@ -32,7 +32,7 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-STRATEGIES = ("hrp", "min_vol", "max_sharpe", "min_cvar")
+STRATEGIES = ("hrp", "min_vol", "max_sharpe", "min_cvar", "black_litterman")
 TRADING_DAYS = 252
 
 
@@ -149,10 +149,97 @@ def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
     return np.asarray(w.value).flatten()
 
 
+def _black_litterman(
+    returns: pd.DataFrame,
+    views: Optional[Dict[str, float]] = None,
+    relative_views: Optional[list[dict[str, Any]]] = None,
+    risk_free_rate: float = 0.02,
+    tau: float = 0.05,
+    delta: float = 2.5,
+) -> np.ndarray:
+    """Black-Litterman Bayesian Portfolio Optimization.
+
+    - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt
+    - Incorporates absolute views (e.g. {'INFY.NS': 0.15}) and relative views
+    - View uncertainty Omega = diag(P * (tau * Sigma) * P^T) (He-Litterman method)
+    - Blended posterior parameters mu_bl and cov_bl
+    - Long-only tangency solution
+    """
+    mu_ann, cov_ann, assets = _as_matrices(returns)
+    n = len(assets)
+    asset_to_idx = {a: i for i, a in enumerate(assets)}
+
+    # Prior market portfolio (equal weight if market caps not specified)
+    w_mkt = np.ones(n) / n
+    # Implied equilibrium excess returns
+    pi = delta * (cov_ann @ w_mkt)
+
+    p_rows = []
+    q_vals = []
+
+    if views:
+        for ticker, ret in views.items():
+            if ticker in asset_to_idx:
+                row = np.zeros(n)
+                row[asset_to_idx[ticker]] = 1.0
+                p_rows.append(row)
+                q_vals.append(float(ret))
+
+    if relative_views:
+        for rview in relative_views:
+            long_t = rview.get("long")
+            short_t = rview.get("short")
+            diff = float(rview.get("diff", 0.0))
+            if long_t in asset_to_idx and short_t in asset_to_idx:
+                row = np.zeros(n)
+                row[asset_to_idx[long_t]] = 1.0
+                row[asset_to_idx[short_t]] = -1.0
+                p_rows.append(row)
+                q_vals.append(diff)
+
+    if p_rows:
+        P = np.array(p_rows)
+        Q = np.array(q_vals)
+        tau_sigma = tau * cov_ann
+        omega_diag = np.diag(P @ tau_sigma @ P.T)
+        omega_diag = np.clip(omega_diag, 1e-6, None)
+        Omega = np.diag(omega_diag)
+
+        inner = P @ tau_sigma @ P.T + Omega
+        inv_inner = np.linalg.pinv(inner)
+        mu_bl = pi + (tau_sigma @ P.T @ inv_inner @ (Q - P @ pi))
+        cov_bl = (1.0 + tau) * cov_ann - (tau * tau) * (cov_ann @ P.T @ inv_inner @ P @ cov_ann)
+    else:
+        mu_bl = pi
+        cov_bl = cov_ann
+
+    excess = mu_bl - risk_free_rate
+    if (excess <= 0).all():
+        return _min_vol(cov_bl)
+
+    y = cp.Variable(n)
+    prob = cp.Problem(
+        cp.Minimize(cp.quad_form(y, cp.psd_wrap(cov_bl))),
+        [excess @ y == 1, y >= 0],
+    )
+    prob.solve(solver=cp.CLARABEL)
+    if y.value is None or np.isnan(y.value).any():
+        return _min_vol(cov_bl)
+
+    raw = np.asarray(y.value).flatten()
+    raw = np.clip(raw, 0.0, None)
+    total_raw = raw.sum()
+    if total_raw <= 0:
+        return _min_vol(cov_bl)
+    return raw / total_raw
+
+
 def optimize(
     returns: pd.DataFrame,
     strategy: str,
     risk_free_rate: float = 0.02,
+    views: Optional[Dict[str, float]] = None,
+    relative_views: Optional[list[dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run one strategy over a wide returns frame.
 
@@ -172,6 +259,8 @@ def optimize(
             w_vec = _min_vol(cov)
         elif strategy == "max_sharpe":
             w_vec = _max_sharpe(mu, cov, risk_free_rate)
+        elif strategy == "black_litterman":
+            w_vec = _black_litterman(returns, views=views, relative_views=relative_views, risk_free_rate=risk_free_rate)
         else:
             w_vec = _min_cvar(returns)
 

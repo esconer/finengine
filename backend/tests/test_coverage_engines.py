@@ -74,12 +74,25 @@ def test_optimization_service_all_strategies():
     df = _synth_df(252, 3)
     returns = df.pct_change().dropna()
 
-    for strat in ["hrp", "min_vol", "max_sharpe", "min_cvar"]:
+    for strat in ["hrp", "min_vol", "max_sharpe", "min_cvar", "black_litterman"]:
         res = optimize(returns, strat)
         assert "weights" in res
         assert "expected_annual_return" in res
         assert "expected_annual_volatility" in res
         assert abs(sum(res["weights"].values()) - 1.0) < 1e-4
+
+    # Test Black-Litterman with explicit views
+    first_ticker = list(returns.columns)[0]
+    second_ticker = list(returns.columns)[1]
+    res_bl = optimize(
+        returns,
+        "black_litterman",
+        views={first_ticker: 0.25},
+        relative_views=[{"long": first_ticker, "short": second_ticker, "diff": 0.05}],
+    )
+    assert "weights" in res_bl
+    assert abs(sum(res_bl["weights"].values()) - 1.0) < 1e-4
+    assert res_bl["weights"][first_ticker] > 0
 
 
 def test_regime_classification():
@@ -90,3 +103,24 @@ def test_regime_classification():
     assert "current_regime" in res
     assert "stability_pct" in res
     assert len(res["states"]) == 3
+
+
+def test_walk_forward_backtest():
+    from app.services.backtest_service import run_walk_forward_backtest
+    df = _synth_df(400, 3)
+    returns = df.pct_change().dropna()
+    res = run_walk_forward_backtest(
+        returns=returns,
+        strategy="hrp",
+        rebalance_freq_days=21,
+        lookback_days=100,
+        transaction_cost_bps=10.0,
+    )
+    assert "cagr" in res
+    assert "annualized_volatility" in res
+    assert "equity_curve" in res
+    assert len(res["equity_curve"]) > 0
+    assert "rebalance_events" in res
+    assert len(res["rebalance_events"]) > 0
+    assert "drawdowns" in res
+

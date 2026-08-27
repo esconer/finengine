@@ -388,9 +388,22 @@ class TestDataServiceNormalizationAndStorage:
         rows = res.scalars().all()
         assert len(rows) == 3
         
-        # Test unique constraint failure path simulation
-        with patch.object(test_db, "execute", side_effect=[Exception("UNIQUE constraint failed: ..."), None, Exception("UNIQUE constraint failed: ..."), None, Exception("UNIQUE constraint failed: ..."), None]):
-            await service._store_timeseries_data("WIPRO.NS", df)
+        # Test upsert with updated prices
+        df_updated = _sample_df("WIPRO.NS", 3)
+        df_updated["close"] = [500.0, 505.0, 510.0]
+        df_updated["open"] = [498.0, 503.0, 508.0]
+        df_updated["high"] = [510.0, 515.0, 520.0]
+        df_updated["low"] = [490.0, 495.0, 500.0]
+        df_updated["adj_close"] = [500.0, 505.0, 510.0]
+        await service._store_timeseries_data("WIPRO.NS", df_updated)
+        test_db.expire_all()
+
+        res_updated = await test_db.execute(
+            select(StockTimeseries).where(StockTimeseries.ticker == "WIPRO.NS").order_by(StockTimeseries.date)
+        )
+        rows_updated = res_updated.scalars().all()
+        assert len(rows_updated) == 3
+        assert rows_updated[0].close == 500.0
 
         # Clean up
         await test_db.execute(delete(StockTimeseries).where(StockTimeseries.ticker == "WIPRO.NS"))

@@ -57,6 +57,15 @@ export const usePortfolioAnalytics = () => {
         analyticsApi.getRiskScore(),
       ]);
 
+      const results = [summary, realizedRisk, forecastRisk, factorExposure, concentration, liquidity, riskScore];
+      const rejectedCount = results.filter(r => r.status === 'rejected').length;
+
+      if (rejectedCount === results.length) {
+        setError('Failed to fetch analytics data');
+      } else if (rejectedCount > 0) {
+        console.warn(`Partial analytics failure: ${rejectedCount} metrics endpoints were unreachable.`);
+      }
+
       setData({
         summary: summary.status === 'fulfilled' ? summary.value : null,
         realizedRisk: realizedRisk.status === 'fulfilled' ? realizedRisk.value : null,

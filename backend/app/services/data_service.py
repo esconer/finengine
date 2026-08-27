@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import yfinance as yf
 from zoneinfo import ZoneInfo
 
@@ -245,22 +246,24 @@ class DataService:
         results = {}
         failed_tickers = []
         
-        # Process tickers with rate limiting
-        for i, ticker in enumerate(tickers):
-            try:
-                # Add delay to respect rate limits
-                if i > 0:
-                    await asyncio.sleep(0.5)  # 500ms delay between requests
-                
-                df = await self.fetch_historical_data(ticker, resolved_start, resolved_end, force_refresh=force_refresh)
-                
-                if df is not None and not df.empty:
-                    results[ticker] = df
-                else:
-                    failed_tickers.append(ticker)
-                    
-            except Exception as e:
-                logger.error(f"Error in batch fetch for {ticker}: {e}")
+        # Process tickers with controlled concurrency (max 5 simultaneous requests)
+        sem = asyncio.Semaphore(5)
+        
+        async def fetch_one(ticker: str):
+            async with sem:
+                try:
+                    df = await self.fetch_historical_data(ticker, resolved_start, resolved_end, force_refresh=force_refresh)
+                    return ticker, df
+                except Exception as e:
+                    logger.error(f"Error in batch fetch for {ticker}: {e}")
+                    return ticker, None
+        
+        fetch_results = await asyncio.gather(*[fetch_one(t) for t in tickers])
+        
+        for ticker, df in fetch_results:
+            if df is not None and not df.empty:
+                results[ticker] = df
+            else:
                 failed_tickers.append(ticker)
         
         logger.info(f"Batch fetch completed: {len(results)} successful, {len(failed_tickers)} failed")
@@ -572,49 +575,32 @@ class DataService:
                 }
                 records.append(record_data)
             
-            # Use SQLite INSERT OR REPLACE for atomic upsert
-            stored_count = 0
-            replaced_count = 0
-            
-            for record_data in records:
-                try:
-                    # First try to insert - if duplicate exists, it will be replaced
-                    result = await self.db.execute(
-                        insert(StockTimeseries.__table__).values(**record_data)
-                    )
-                    stored_count += 1
-                except Exception as insert_error:
-                    # If insert fails due to unique constraint, replace the existing record
-                    if "UNIQUE constraint failed" in str(insert_error):
-                        # Update existing record
-                        await self.db.execute(
-                            update(StockTimeseries.__table__)
-                            .where(
-                                StockTimeseries.ticker == record_data['ticker'],
-                                StockTimeseries.date == record_data['date']
-                            )
-                            .values(
-                                open=record_data['open'],
-                                high=record_data['high'],
-                                low=record_data['low'],
-                                close=record_data['close'],
-                                adj_close=record_data['adj_close'],
-                                volume=record_data['volume'],
-                                source_used=record_data['source_used'],
-                                fetch_status=record_data['fetch_status'],
-                                fetched_on=record_data['fetched_on']
-                            )
-                        )
-                        replaced_count += 1
-                    else:
-                        logger.error(f"Unexpected error storing record for {ticker} on {record_data['date']}: {insert_error}")
-            
+            if not records:
+                return
+
+            # Use native SQLite ON CONFLICT DO UPDATE for robust atomic batch upsert
+            stmt = sqlite_insert(StockTimeseries.__table__).values(records)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['ticker', 'date'],
+                set_={
+                    'open': stmt.excluded.open,
+                    'high': stmt.excluded.high,
+                    'low': stmt.excluded.low,
+                    'close': stmt.excluded.close,
+                    'adj_close': stmt.excluded.adj_close,
+                    'volume': stmt.excluded.volume,
+                    'source_used': stmt.excluded.source_used,
+                    'fetch_status': stmt.excluded.fetch_status,
+                    'fetched_on': stmt.excluded.fetched_on,
+                }
+            )
+            await self.db.execute(stmt)
             await self.db.commit()
             
-            logger.info(f"Successfully stored {stored_count} new records and replaced {replaced_count} existing records for {ticker}")
+            logger.info(f"Successfully atomic upserted {len(records)} records for {ticker}")
             
             # Log data integrity metrics
-            await self._log_storage_metrics(ticker, stored_count, replaced_count)
+            await self._log_storage_metrics(ticker, len(records), 0)
             
         except Exception as e:
             logger.error(f"Error storing timeseries data for {ticker}: {e}")

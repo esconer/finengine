@@ -82,7 +82,7 @@ if os.getenv("ENVIRONMENT", "development") == "production":
     app.add_middleware(HTTPSRedirectMiddleware)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["daisy-risk-engine.com", "*.daisy-risk-engine.com", "localhost"]
+        allowed_hosts=["daisy-risk-engine.com", "*.daisy-risk-engine.com", "localhost", "127.0.0.1"]
     )
 
 # CORS middleware
