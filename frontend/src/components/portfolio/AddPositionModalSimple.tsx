@@ -88,7 +88,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
     if (!formData.ticker.trim()) {
       newErrors.ticker = 'Ticker symbol is required';
-    } else if (!/^[A-Za-z]{1,10}(\.[A-Za-z]{1,5})?$/.test(formData.ticker.trim())) {
+    } else if (!/^[A-Za-z0-9\-\&\.]{1,20}$/.test(formData.ticker.trim())) {
       newErrors.ticker = 'Invalid ticker symbol format';
     }
 
