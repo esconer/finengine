@@ -406,12 +406,21 @@ class AnalyticsEngine:
             weighted_impact = 0.0
 
             for ticker, weight in weights.items():
-                if ticker in returns.columns and len(returns[ticker].dropna()) > 20:
-                    ticker_ret = returns[ticker].dropna()
-                    # Relative volatility vs market proxy
-                    ticker_vol = float(ticker_ret.std() * np.sqrt(252))
-                    vol_factor = max(0.6, min(2.5, ticker_vol / 0.16)) if ticker_vol > 0 else 1.0
-                    ticker_impact = float(market_shock * vol_factor)
+                if ticker in returns.columns:
+                    s = returns[ticker]
+                    # Filter active non-zero returns to prevent zero-padding volatility deflation
+                    non_zero = s[s != 0.0]
+                    if len(non_zero) >= 20:
+                        ticker_vol = float(non_zero.std() * np.sqrt(252))
+                        # Benchmark base volatility standard = 16% (NIFTY historical volatility)
+                        vol_factor = max(0.5, min(2.8, ticker_vol / 0.16)) if ticker_vol > 0 else 1.0
+                        ticker_impact = float(market_shock * vol_factor)
+                    elif len(non_zero) > 0:
+                        ticker_vol = float(non_zero.std() * np.sqrt(252)) if len(non_zero) > 1 else 0.16
+                        vol_factor = max(0.6, min(2.0, ticker_vol / 0.16)) if ticker_vol > 0 else 1.0
+                        ticker_impact = float(market_shock * vol_factor)
+                    else:
+                        ticker_impact = float(market_shock)
                 else:
                     ticker_impact = float(market_shock)
                 
