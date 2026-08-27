@@ -143,14 +143,15 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
-| **t16** | NSE Data Ingestion Pipeline | `ready-for-agent` | Bhavcopy archives, delivery %, FII/DII net flows, bulk/block deals |
-| **t17** | India Flows Dashboard | `ready-for-agent` | Frontend UI visualizing FII/DII flows and delivery % spikes |
-| **t18** | Liquidity Limits & Days-to-Liquidate | `ready-for-agent` | Amihud illiquidity scores and position liquidation horizon at 10-20% ADV |
-| **t19** | One-Click PDF Portfolio Review | `ready-for-agent` | Complete portfolio health summary PDF generation via jsPDF |
-| **t20** | Mock Purge & Realtime WebSocket Overhaul | `ready-for-agent` | Replace fake jittered broadcasts with true database-driven updates or clean polling |
-| **t23** | Portfolio Importer (CSV / XLSX) | `ready-for-agent` | File upload UI on manage page mapping columns directly to `POST /portfolio/bulk_add` |
-| **Opt-Ext**| Optimizer Constraints & Frontier Line | Deferred | Extended cvxpy constraint forms (min/max weights, sector caps) and interactive frontier line |
-| **Cov-80** | Test Coverage Hardening | Open | Raise backend test coverage to meet the 80% CI gate |
+| **t24** | Portfolio CSV/XLSX Importer UI | `ready-for-agent` | Drag-and-drop dropzone for Zerodha/Groww/AngelOne CSVs pre-filling `POST /portfolio/bulk_add` |
+| **t25** | Interactive Efficient Frontier Curve | `ready-for-agent` | Recharts/SVG Markowitz frontier scatter curve with current vs optimal asset overlays |
+| **t26** | Consolidated Risk Studio Canvas | `ready-for-agent` | `/dashboard/risk-studio` linking Euler risk, copula heatmap, and vol cones side-by-side |
+| **t27** | One-Click PDF Report Header Trigger | `ready-for-agent` | Global header trigger downloading multi-page branded PDF tear-sheet via jsPDF |
+| **t28** | Scheduled Post-Market NSE Ingestion Cron | `ready-for-agent` | Background scheduler (18:30 IST) pulling daily bhavcopy, delivery %, and FII/DII net flows |
+| **t29** | Promoter Pledge & Bulk Deal Scraper | `needs-info` | Ingest quarterly shareholding pattern XMLs & track promoter pledge delta alerts |
+| **t30** | Black-Litterman Bayesian Optimizer | `ready-for-agent` | Blending market equilibrium priors with subjective investor return views |
+| **t31** | Options Greeks & IV Surface Tracking | `needs-info` | Net portfolio delta/gamma/vega exposures and implied volatility smile surface |
+| **t32** | Walk-Forward Strategy Backtester | `ready-for-agent` | Rolling historical simulation of rebalancing strategies vs buy-and-hold |
 
 ---
 
