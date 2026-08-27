@@ -226,22 +226,30 @@ class AnalyticsEngine:
             top_10 = np.sum(np.sort(weights_array)[-10:]) if len(weights_array) >= 10 else 1.0
             
             # Herfindahl Index
-            herfindahl = np.sum(weights_array ** 2)
+            herfindahl = float(np.sum(weights_array ** 2))
             
             # Effective number of positions
-            effective_positions = 1 / herfindahl if herfindahl > 0 else len(weights)
+            effective_positions = float(1 / herfindahl if herfindahl > 0 else len(weights))
             
-            # Diversification ratio (simplified)
-            diversification_ratio = len(weights) / effective_positions
+            # Diversification score (normalized against theoretical maximum 1 - 1/N)
+            n_assets = len(weights)
+            diversification_score = float(((1 - herfindahl) / (1 - 1/n_assets)) * 100) if n_assets > 1 else 0.0
+            diversification_ratio = float(effective_positions / n_assets) if n_assets > 0 else 1.0
             
+            # Gini Inequality Coefficient
+            sorted_w = np.sort(weights_array)
+            gini = float((2 * np.sum((np.arange(1, n_assets + 1) * sorted_w)) - (n_assets + 1)) / n_assets) if n_assets > 1 else 0.0
+
             return {
-                "largest_position": largest_position,
-                "top_3": top_3,
-                "top_5": top_5,
-                "top_10": top_10,
-                "herfindahl_index": herfindahl,
-                "effective_positions": effective_positions,
-                "diversification_ratio": diversification_ratio,
+                "largest_position": float(largest_position),
+                "top_3": float(top_3),
+                "top_5": float(top_5),
+                "top_10": float(top_10),
+                "herfindahl_index": round(herfindahl, 4),
+                "effective_positions": round(effective_positions, 2),
+                "diversification_score": round(diversification_score, 1),
+                "diversification_ratio": round(diversification_ratio, 2),
+                "gini_coefficient": round(gini, 3),
                 "by_weight": dict(sorted(weights.items(), key=lambda x: x[1], reverse=True))
             }
             

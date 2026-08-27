@@ -583,16 +583,18 @@ async def get_concentration_metrics(
             )
         
         return {
-            "largest_position": concentration_result.get("largest_position", 0.25),
-            "top_3": concentration_result.get("top_3", 0.75),
-            "top_5": concentration_result.get("top_5", 1.0),
-            "top_10": concentration_result.get("top_10", 1.0),
-            "herfindahl_index": concentration_result.get("herfindahl_index", 0.25),
-            "effective_positions": concentration_result.get("effective_positions", 4.0),
+            "largest_position": concentration_result.get("largest_position", 0.0),
+            "top_3": concentration_result.get("top_3", 0.0),
+            "top_5": concentration_result.get("top_5", 0.0),
+            "top_10": concentration_result.get("top_10", 0.0),
+            "herfindahl_index": concentration_result.get("herfindahl_index", 0.0),
+            "effective_positions": concentration_result.get("effective_positions", 0.0),
+            "diversification_score": concentration_result.get("diversification_score", 0.0),
             "diversification_ratio": concentration_result.get("diversification_ratio", 1.0),
+            "gini_coefficient": concentration_result.get("gini_coefficient", 0.0),
             "by_weight": concentration_result.get("by_weight", {}),
             "by_sector": by_sector,
-            "methodology": "Concentration analysis using Herfindahl-Hirschman Index and effective number of positions"
+            "methodology": "Concentration analysis using Herfindahl-Hirschman Index (HHI), Effective Positions (N_eff), and Lorenz Gini Coefficient"
         }
         
     except Exception as e:
