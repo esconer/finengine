@@ -166,31 +166,38 @@ export default function LiquidityPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Liquidity Score',
       accessorKey: 'score',
-      cell: ({ row }: any) => (
-        <div className={`font-medium ${getScoreColor(row.score)}`}>
-          {formatScore(row.score)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={`font-medium ${getScoreColor(data.score)}`}>
+            {formatScore(data.score)}
+          </div>
+        );
+      },
     },
     {
       header: 'Category',
       accessorKey: 'category',
       cell: ({ row }: any) => {
-        const colorClass = row.category === 'High' ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300' :
-          row.category === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300' :
+        const data = row.original || row;
+        const colorClass = data.category === 'High' ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300' :
+          data.category === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300' :
             'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300';
         return (
           <span className={`px-2 py-1 text-xs rounded-full font-medium ${colorClass}`}>
-            {row.category}
+            {data.category}
           </span>
         );
       },
@@ -198,38 +205,50 @@ export default function LiquidityPage() {
     {
       header: 'Avg Volume (30d)',
       accessorKey: 'volume_30d',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatCurrency(row.volume_30d)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatCurrency(data.volume_30d)}
+          </div>
+        );
+      },
     },
     {
       header: 'Market Cap',
       accessorKey: 'market_cap',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatCurrency(row.market_cap)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatCurrency(data.market_cap)}
+          </div>
+        );
+      },
     },
     {
       header: 'Bid-Ask Spread',
       accessorKey: 'bid_ask_spread',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.bid_ask_spread)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.bid_ask_spread)}
+          </div>
+        );
+      },
     },
     {
       header: 'Liquidation Time',
       accessorKey: 'liquidation_days',
-      cell: ({ row }: any) => (
-        <div className="text-gray-600 dark:text-gray-400">
-          {row.liquidation_days} days
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-600 dark:text-gray-400">
+            {data.liquidation_days || 1} days
+          </div>
+        );
+      },
     },
   ];
 

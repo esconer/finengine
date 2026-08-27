@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { DashboardLayout } from '@/components/layout/DashboardLayout';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { MetricCard } from '@/components/ui/MetricCard';
 import apiClient from '@/lib/api';
@@ -16,6 +15,8 @@ import {
     Info,
     CheckCircle2
 } from 'lucide-react';
+
+// Rest of imports
 import {
     ResponsiveContainer,
     BarChart,
@@ -72,9 +73,7 @@ export default function RiskStudioPage() {
 
     if (loading) {
         return (
-            <DashboardLayout title="Risk Studio">
-                <LoadingState message="Compiling institutional risk canvas (Euler, EVT, Copula, Vol Cones)..." />
-            </DashboardLayout>
+            <LoadingState message="Compiling institutional risk canvas (Euler, EVT, Copula, Vol Cones)..." />
         );
     }
 
@@ -107,8 +106,7 @@ export default function RiskStudioPage() {
     });
 
     return (
-        <DashboardLayout title="Risk Studio">
-            <div className="space-y-6 pb-12">
+        <div className="space-y-6 pb-12">
                 {/* Header */}
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                     <div>
@@ -374,6 +372,5 @@ export default function RiskStudioPage() {
                     </div>
                 </div>
             </div>
-        </DashboardLayout>
     );
 }

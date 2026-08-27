@@ -145,12 +145,12 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 ### Priority 1: Terminal UX & Data-Binding Audit (`.scratch/terminal-ux-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
-| **UA-01** | Fix TanStack Table `row.original` Accessors | `ready-for-agent` | Fix `NaN%` & blank rows across 7 dashboard analytics tables by reading `row.original` |
-| **UA-02** | Create `/dashboard/settings` Page | `ready-for-agent` | Build dedicated Settings page resolving HTTP 404 with currency, lookback, and cache controls |
-| **UA-03** | Fix Risk Studio Double Layout | `ready-for-agent` | Remove inner `<DashboardLayout>` in `risk-studio/page.tsx` eliminating duplicate sidebars |
-| **UA-04** | Fix Forecast Unwrap & Negative P&L Signs | `ready-for-agent` | Handle unnested API payload on `/portfolio/manage` and retain algebraic `-` on losses |
-| **UA-05** | Standardize Currency (INR ₹) & Notation | `ready-for-agent` | Standardize dynamic `₹`/`$`, format India Flows ADV in Crores (`Cr`), fix `0.95%` in Stress Test |
-| **UA-06** | Wire Dashboard Quick Action Navigations | `ready-for-agent` | Connect Quick Action buttons to instantaneous Next.js client router navigations |
+| **UA-01** | Fix TanStack Table `row.original` Accessors | `closed` | Fix `NaN%` & blank rows across 7 dashboard analytics tables by reading `row.original` |
+| **UA-02** | Create `/dashboard/settings` Page | `closed` | Build dedicated Settings page resolving HTTP 404 with currency, lookback, and cache controls |
+| **UA-03** | Fix Risk Studio Double Layout | `closed` | Remove inner `<DashboardLayout>` in `risk-studio/page.tsx` eliminating duplicate sidebars |
+| **UA-04** | Fix Forecast Unwrap & Negative P&L Signs | `closed` | Handle unnested API payload on `/portfolio/manage` and retain algebraic `-` on losses |
+| **UA-05** | Standardize Currency (INR ₹) & Notation | `closed` | Standardize dynamic `₹`/`$`, format India Flows ADV in Crores (`Cr`), fix `0.95%` in Stress Test |
+| **UA-06** | Wire Dashboard Quick Action Navigations | `closed` | Connect Quick Action buttons to instantaneous Next.js client router navigations |
 
 ### Priority 2: Portfolio Audit & Microstructure Polish (`.scratch/portfolio-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |

@@ -196,26 +196,34 @@ export default function StressTestingPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Impact',
       accessorKey: 'impact',
-      cell: ({ row }: any) => (
-        <div className={`font-medium ${getImpactColor(row.impact)}`}>
-          {formatPercentage(row.impact)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={`font-medium ${getImpactColor(data.impact)}`}>
+            {formatPercentage(data.impact)}
+          </div>
+        );
+      },
     },
     {
       header: 'Severity',
       accessorKey: 'severity_level',
       cell: ({ row }: any) => {
-        const severity = row.impact < -15 ? 'Critical' : row.impact < -10 ? 'High' : row.impact < -5 ? 'Medium' : 'Low';
+        const data = row.original || row;
+        const impactVal = data.impact ?? 0;
+        const severity = impactVal < -15 ? 'Critical' : impactVal < -10 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
         const colorClass = severity === 'Critical' ? 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300' :
                           severity === 'High' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-300' :
                           severity === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300' :
@@ -426,7 +434,7 @@ export default function StressTestingPage() {
                     <div className="flex justify-between">
                       <span className="text-sm text-gray-600 dark:text-gray-400">Confidence Level</span>
                       <span className="text-sm font-medium text-gray-900 dark:text-white">
-                        {result.confidence_level || 95}%
+                        {result.confidence_level ? (result.confidence_level < 1 ? (result.confidence_level * 100).toFixed(0) : result.confidence_level) : 95}%
                       </span>
                     </div>
                   </>

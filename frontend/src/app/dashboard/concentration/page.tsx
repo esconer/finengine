@@ -56,12 +56,19 @@ export default function ConcentrationPage() {
       const data = await analyticsApi.getConcentrationMetrics();
       setConcentrationData(data);
 
-      // Convert by_weight data for table
-      const positionsList = Object.entries(data.by_weight || {}).map(([ticker, weight]) => ({
-        ticker,
-        weight: weight as number,
-        sector: 'Technology' // Simplified for demo
-      })).sort((a, b) => b.weight - a.weight);
+      // Convert by_weight data for table with real sector and pre-calculated cumulative weights
+      let cumWeight = 0;
+      const sortedEntries = Object.entries(data.by_weight || {}).sort(([, a], [, b]) => (b as number) - (a as number));
+      const positionsList = sortedEntries.map(([ticker, weight]) => {
+        cumWeight += (weight as number);
+        const pos = positions.find(p => p.ticker === ticker);
+        return {
+          ticker,
+          weight: weight as number,
+          cumulative_weight: cumWeight,
+          sector: pos?.sector || 'General'
+        };
+      });
       setPositionData(positionsList);
     } catch (error) {
       console.error('Failed to fetch concentration data:', error);
@@ -81,7 +88,10 @@ export default function ConcentrationPage() {
   };
 
   // Format metrics for display
-  const formatPercentage = (value: number, decimals = 1) => {
+  const formatPercentage = (value: number | undefined | null, decimals = 1) => {
+    if (value === undefined || value === null || isNaN(value)) {
+      return 'N/A';
+    }
     return `${(value * 100).toFixed(decimals)}%`;
   };
 
@@ -163,31 +173,35 @@ export default function ConcentrationPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Weight',
       accessorKey: 'weight',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.weight)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.weight)}
+          </div>
+        );
+      },
     },
     {
       header: 'Cumulative %',
       accessorKey: 'cumulative_weight',
       cell: ({ row }: any) => {
-        const cumulativeWeight = positionData
-          .filter(p => positionData.indexOf(p) <= positionData.indexOf(row))
-          .reduce((sum, p) => sum + p.weight, 0);
+        const data = row.original || row;
         return (
           <div className="text-gray-900 dark:text-white">
-            {formatPercentage(cumulativeWeight)}
+            {formatPercentage(data.cumulative_weight)}
           </div>
         );
       },
@@ -195,17 +209,22 @@ export default function ConcentrationPage() {
     {
       header: 'Sector',
       accessorKey: 'sector',
-      cell: ({ row }: any) => (
-        <div className="text-gray-600 dark:text-gray-400">
-          {row.sector}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-600 dark:text-gray-400">
+            {data.sector}
+          </div>
+        );
+      },
     },
     {
       header: 'Concentration Risk',
       accessorKey: 'concentration_risk',
       cell: ({ row }: any) => {
-        const riskLevel = row.weight > 0.15 ? 'High' : row.weight > 0.10 ? 'Medium' : 'Low';
+        const data = row.original || row;
+        const weightVal = data.weight ?? 0;
+        const riskLevel = weightVal > 0.15 ? 'High' : weightVal > 0.10 ? 'Medium' : 'Low';
         const colorClass = riskLevel === 'High' ? 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300' :
           riskLevel === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300' :
             'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300';

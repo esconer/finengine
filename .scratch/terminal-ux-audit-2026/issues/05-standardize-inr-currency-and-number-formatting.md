@@ -1,6 +1,6 @@
 # Issue 05: Standardize INR Currency & Indian Microstructure Number Formatting
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P2
 Blocked by: —

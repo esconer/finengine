@@ -1,6 +1,6 @@
 # Issue 04: Fix API Response Unwrapping & Negative Sign in Portfolio Management
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P1
 Blocked by: —

@@ -1,6 +1,6 @@
 # Issue 02: Create Dedicated /dashboard/settings Page Component
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P1
 Blocked by: —

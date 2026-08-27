@@ -1,6 +1,6 @@
 # Issue 01: Fix TanStack Table row.original Accessor Bug Across 7 Dashboard Pages
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P1
 Blocked by: —

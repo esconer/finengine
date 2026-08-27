@@ -1,6 +1,6 @@
 # Issue 03: Eliminate Nested Double DashboardLayout on /dashboard/risk-studio
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P1
 Blocked by: —

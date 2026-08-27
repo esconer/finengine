@@ -151,62 +151,83 @@ export default function VolatilitySizingPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Current Weight',
       accessorKey: 'current_weight',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.current_weight)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.current_weight)}
+          </div>
+        );
+      },
     },
     {
       header: 'Target Weight',
       accessorKey: 'target_weight',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.target_weight)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.target_weight)}
+          </div>
+        );
+      },
     },
     {
       header: 'Recommended Weight',
       accessorKey: 'recommended_weight',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.recommended_weight)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.recommended_weight)}
+          </div>
+        );
+      },
     },
     {
       header: 'Volatility',
       accessorKey: 'volatility',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.volatility)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.volatility)}
+          </div>
+        );
+      },
     },
     {
       header: 'Weight Change',
       accessorKey: 'weight_change',
-      cell: ({ row }: any) => (
-        <div className={`font-medium ${getChangeColor(row.weight_change)}`}>
-          {row.weight_change > 0 ? '+' : ''}{formatPercentage(row.weight_change)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        const change = data.weight_change ?? 0;
+        return (
+          <div className={`font-medium ${getChangeColor(change)}`}>
+            {change > 0 ? '+' : ''}{formatPercentage(change)}
+          </div>
+        );
+      },
     },
     {
       header: 'Action',
       accessorKey: 'recommended_action',
       cell: ({ row }: any) => {
-        const action = Math.abs(row.weight_change) < 0.005 ? 'Hold' : row.weight_change > 0 ? 'Buy' : 'Sell';
+        const data = row.original || row;
+        const change = data.weight_change ?? 0;
+        const action = Math.abs(change) < 0.005 ? 'Hold' : change > 0 ? 'Buy' : 'Sell';
         const colorClass = action === 'Buy' ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300' :
                           action === 'Sell' ? 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300' :
                           'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300';

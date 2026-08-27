@@ -137,17 +137,21 @@ export default function ForecastRiskPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Volatility Forecast',
       accessorKey: 'volatility_forecast',
       cell: ({ row }: any) => {
-        const volatility = row.volatility_forecast;
+        const data = row.original || row;
+        const volatility = data.volatility_forecast;
         const displayValue = formatPercentage(volatility);
         
         return (
@@ -161,7 +165,8 @@ export default function ForecastRiskPage() {
       header: 'VaR Forecast',
       accessorKey: 'var_forecast',
       cell: ({ row }: any) => {
-        const varValue = row.var_forecast;
+        const data = row.original || row;
+        const varValue = data.var_forecast;
         const displayValue = formatPercentage(varValue);
         
         return (
@@ -175,8 +180,8 @@ export default function ForecastRiskPage() {
       header: 'Risk Level',
       accessorKey: 'risk_level',
       cell: ({ row }: any) => {
-        // Calculate risk level based on VaR if available
-        const varValue = Math.abs(row.var_forecast || 0.02); // Default 2% if not available
+        const data = row.original || row;
+        const varValue = Math.abs(data.var_forecast || 0.02);
         const riskLevel = varValue > 0.05 ? 'High' :
           varValue > 0.03 ? 'Medium' : 'Low';
         const colorClass = riskLevel === 'High' ? 'text-red-600 bg-red-100 dark:bg-red-900/20' :

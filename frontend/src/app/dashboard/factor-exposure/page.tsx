@@ -155,29 +155,38 @@ export default function FactorExposurePage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Market Beta (β)',
       accessorKey: 'market',
-      cell: ({ row }: any) => (
-        <div className={getRiskColor(row.market)}>
-          {formatFactor(row.market ?? 1.0)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={getRiskColor(data.market)}>
+            {formatFactor(data.market ?? 1.0)}
+          </div>
+        );
+      },
     },
     {
       header: "Jensen's Alpha (α)",
       accessorKey: 'alpha',
-      cell: ({ row }: any) => (
-        <div className={row.alpha >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
-          {formatFactor(row.alpha ?? 0.0, 4)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={(data.alpha ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
+            {formatFactor(data.alpha ?? 0.0, 4)}
+          </div>
+        );
+      },
     },
   ];
 

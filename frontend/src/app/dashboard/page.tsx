@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
@@ -49,6 +50,7 @@ interface PortfolioPosition {
 }
 
 export default function DashboardSummary() {
+  const router = useRouter();
   const { positions, fetchPortfolio, isLoading, error, totalValue } = usePortfolioStore();
   const { updateLastUpdated } = useUIStore();
   const [showAddModal, setShowAddModal] = useState(false);
@@ -133,7 +135,7 @@ export default function DashboardSummary() {
         const data = row.original || row;
         return (
           <div className="text-gray-900 dark:text-white">
-            {data.market_value ? `$${data.market_value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '$0.00'}
+            {data.market_value ? `₹${data.market_value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '₹0.00'}
           </div>
         );
       },
@@ -145,7 +147,7 @@ export default function DashboardSummary() {
         const data = row.original || row;
         return (
           <div className="text-gray-900 dark:text-white">
-            {data.last_price ? `$${data.last_price.toFixed(2)}` : '$0.00'}
+            {data.last_price ? `₹${data.last_price.toFixed(2)}` : '₹0.00'}
           </div>
         );
       },
@@ -442,7 +444,7 @@ export default function DashboardSummary() {
           isOpen={showAddModal}
           onClose={() => setShowAddModal(false)}
           onAdd={handleAddPosition}
-          currency="USD"
+          currency="INR"
         />
       </div>
 
@@ -463,27 +465,17 @@ export default function DashboardSummary() {
           </button>
 
           <button
-            onClick={handleRefreshData}
-            disabled={isOverallLoading}
-            className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-50"
+            onClick={() => router.push('/dashboard/realized-risk')}
+            className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
           >
-            <RefreshCw className={`w-6 h-6 text-blue-600 mb-2 ${isOverallLoading ? 'animate-spin' : ''}`} />
+            <RefreshCw className="w-6 h-6 text-blue-600 mb-2" />
             <div className="text-sm font-medium text-gray-900 dark:text-white">
-              Run Analysis
+              Risk Analytics
             </div>
           </button>
 
           <button
-            onClick={async () => {
-              try {
-                await portfolioApi.normalizeWeights();
-                await fetchPortfolio();
-                alert('Portfolio rebalanced successfully');
-              } catch (error) {
-                console.error('Failed to rebalance portfolio:', error);
-                alert('Failed to rebalance portfolio');
-              }
-            }}
+            onClick={() => router.push('/dashboard/optimize')}
             className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
           >
             <Target className="w-6 h-6 text-purple-600 mb-2" />
@@ -493,7 +485,7 @@ export default function DashboardSummary() {
           </button>
 
           <button
-            onClick={() => window.location.href = '/dashboard/stress-testing'}
+            onClick={() => router.push('/dashboard/stress-testing')}
             className="p-4 text-left rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
           >
             <Shield className="w-6 h-6 text-orange-600 mb-2" />

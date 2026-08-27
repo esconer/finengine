@@ -1,6 +1,6 @@
 # Issue 06: Wire Dashboard Quick Action Navigation Buttons
 
-Status: ready-for-agent
+Status: closed
 Type: bug
 Priority: P2
 Blocked by: —

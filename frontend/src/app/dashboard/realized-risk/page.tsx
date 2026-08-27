@@ -107,68 +107,88 @@ export default function RealizedRiskPage() {
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => (
-        <div className="font-medium text-gray-900 dark:text-white">
-          {row.ticker}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="font-medium text-gray-900 dark:text-white">
+            {data.ticker}
+          </div>
+        );
+      },
     },
     {
       header: 'Weight',
       accessorKey: 'weight',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.weight)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.weight)}
+          </div>
+        );
+      },
     },
     {
       header: 'Annual Return',
       accessorKey: 'annual_return',
-      cell: ({ row }: any) => (
-        <div className={`${row.annual_return >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
-          }`}>
-          {formatPercentage(row.annual_return)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={`${data.annual_return >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+            {formatPercentage(data.annual_return)}
+          </div>
+        );
+      },
     },
     {
       header: 'Volatility',
       accessorKey: 'annual_volatility',
-      cell: ({ row }: any) => (
-        <div className="text-gray-900 dark:text-white">
-          {formatPercentage(row.annual_volatility)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-gray-900 dark:text-white">
+            {formatPercentage(data.annual_volatility)}
+          </div>
+        );
+      },
     },
     {
       header: 'Sharpe Ratio',
       accessorKey: 'sharpe_ratio',
-      cell: ({ row }: any) => (
-        <div className={`${row.sharpe_ratio >= 1 ? 'text-green-600 dark:text-green-400' :
-            row.sharpe_ratio >= 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400'
-          }`}>
-          {formatRatio(row.sharpe_ratio)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className={`${data.sharpe_ratio >= 1 ? 'text-green-600 dark:text-green-400' :
+              data.sharpe_ratio >= 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400'
+            }`}>
+            {formatRatio(data.sharpe_ratio)}
+          </div>
+        );
+      },
     },
     {
       header: 'Max Drawdown',
       accessorKey: 'max_drawdown',
-      cell: ({ row }: any) => (
-        <div className="text-red-600 dark:text-red-400">
-          {formatPercentage(row.max_drawdown)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-red-600 dark:text-red-400">
+            {formatPercentage(data.max_drawdown)}
+          </div>
+        );
+      },
     },
     {
       header: 'VaR (95%)',
       accessorKey: 'var_95',
-      cell: ({ row }: any) => (
-        <div className="text-red-600 dark:text-red-400">
-          {formatPercentage(row.var_95)}
-        </div>
-      ),
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-red-600 dark:text-red-400">
+            {formatPercentage(data.var_95)}
+          </div>
+        );
+      },
     },
   ];
 

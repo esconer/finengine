@@ -97,10 +97,11 @@ export default function PortfolioManagePage() {
                 tickers
             });
 
-            if (response && response.data) {
+            const data = (response as any)?.data || response;
+            if (data && data.positions) {
                 // Update positions with forecast risk data
                 const updatedPositions = positions.map(position => {
-                    const tickerData = response.data.positions?.[position.ticker];
+                    const tickerData = data.positions?.[position.ticker];
                     if (tickerData) {
                         return {
                             ...position,
@@ -318,7 +319,8 @@ export default function PortfolioManagePage() {
 
     const formatCurrency = (amount: number) => {
         const symbol = currency === 'INR' ? '₹' : '$';
-        return `${symbol}${Math.abs(amount).toLocaleString('en-US', {
+        const sign = amount < 0 ? '-' : '';
+        return `${sign}${symbol}${Math.abs(amount).toLocaleString('en-US', {
             minimumFractionDigits: 0,
             maximumFractionDigits: 0
         })}`;
