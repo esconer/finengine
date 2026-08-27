@@ -917,7 +917,7 @@ class AnalyticsEngine:
         """Calculate factor exposures using OLS regression against market benchmark"""
         try:
             if returns.empty:
-                return {'portfolio': {'alpha': 0.0, 'market': 1.0}, 'positions': {}}
+                return {'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0}, 'positions': {}}
 
             positions_exp = {}
             if not benchmark_returns.empty and len(benchmark_returns) > 10:
@@ -928,17 +928,39 @@ class AnalyticsEngine:
 
                     for ticker in aligned_returns.columns:
                         try:
-                            X = sm.add_constant(aligned_benchmark)
-                            y = aligned_returns[ticker]
-                            model = sm.OLS(y, X).fit()
-                            alpha = float(model.params.iloc[0]) if len(model.params) > 0 else 0.0
-                            beta = float(model.params.iloc[1]) if len(model.params) > 1 else 1.0
+                            s = aligned_returns[ticker]
+                            non_zero = s[s != 0.0]
+                            data_pts = len(non_zero)
+                            is_limited = data_pts < 30
+
+                            if data_pts >= 10:
+                                valid_idx = s.index
+                                X = sm.add_constant(aligned_benchmark.loc[valid_idx])
+                                y = s.loc[valid_idx]
+                                model = sm.OLS(y, X).fit()
+                                alpha = float(model.params.iloc[0]) if len(model.params) > 0 else 0.0
+                                beta = float(model.params.iloc[1]) if len(model.params) > 1 else 1.0
+                            else:
+                                alpha = 0.0
+                                beta = 1.0
+
                             positions_exp[ticker] = {
                                 'alpha': round(alpha, 6),
-                                'market': round(beta, 4)
+                                'annualized_alpha': round(alpha * 252.0, 4),
+                                'market': round(beta, 4),
+                                'is_limited_history': is_limited,
+                                'history_warning': f"Only {data_pts} active trading days on exchange feed" if is_limited else None,
+                                'data_points': data_pts
                             }
                         except Exception:
-                            positions_exp[ticker] = {'alpha': 0.0, 'market': 1.0}
+                            positions_exp[ticker] = {
+                                'alpha': 0.0,
+                                'annualized_alpha': 0.0,
+                                'market': 1.0,
+                                'is_limited_history': False,
+                                'history_warning': None,
+                                'data_points': 0
+                            }
 
                     port_returns = self._calculate_portfolio_returns(aligned_returns, weights)
                     if not port_returns.empty:
@@ -950,6 +972,7 @@ class AnalyticsEngine:
                             return {
                                 'portfolio': {
                                     'alpha': round(port_alpha, 6),
+                                    'annualized_alpha': round(port_alpha * 252.0, 4),
                                     'market': round(port_beta, 4)
                                 },
                                 'positions': positions_exp
@@ -958,14 +981,21 @@ class AnalyticsEngine:
                             pass
 
             for ticker in returns.columns:
-                positions_exp[ticker] = {'alpha': 0.0, 'market': 1.0}
+                positions_exp[ticker] = {
+                    'alpha': 0.0,
+                    'annualized_alpha': 0.0,
+                    'market': 1.0,
+                    'is_limited_history': False,
+                    'history_warning': None,
+                    'data_points': 0
+                }
             return {
-                'portfolio': {'alpha': 0.0, 'market': 1.0},
+                'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0},
                 'positions': positions_exp
             }
         except Exception as e:
             logger.error(f"Factor exposure calculation error: {e}")
-            return {'portfolio': {'alpha': 0.0, 'market': 1.0}, 'positions': {}}
+            return {'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0}, 'positions': {}}
 
     def _calculate_r_squared(
         self, 

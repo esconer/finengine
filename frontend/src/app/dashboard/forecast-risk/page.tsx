@@ -407,12 +407,16 @@ export default function ForecastRiskPage() {
 
       setForecastData(data);
 
-      // Convert positions data for table with validation
+      // Convert positions data for table with calibrated risk level
       const positionsList = Object.entries(data.positions || {}).map(
         ([ticker, posData]: [string, any]) => {
-          const varValue = Math.abs(posData?.var_forecast || 0.02);
+          const volValue = posData?.volatility_forecast ?? 0.20;
+          // Calibrate risk level by annualized forward volatility:
+          // > 35% = High (Smallcap / High Beta)
+          // 20% - 35% = Medium (Midcap / Typical Equity)
+          // < 20% = Low (Large-cap / Utility / Index ETF)
           const riskLevel =
-            varValue > 0.05 ? 'High' : varValue > 0.03 ? 'Medium' : 'Low';
+            volValue > 0.35 ? 'High' : volValue > 0.20 ? 'Medium' : 'Low';
 
           return {
             ticker,
@@ -466,7 +470,7 @@ export default function ForecastRiskPage() {
   };
 
   // Position forecast table columns
-  const positionColumns: ColumnDef<any>[] = [
+  const positionColumns: ColumnDef<any>[] = useMemo(() => [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
@@ -509,7 +513,7 @@ export default function ForecastRiskPage() {
       },
     },
     {
-      header: 'VaR Forecast',
+      header: `${forecastHorizon}-Day VaR (95% Downside)`,
       accessorKey: 'var_forecast',
       cell: ({ row }: any) => {
         const data = row.original || row;
@@ -551,7 +555,7 @@ export default function ForecastRiskPage() {
         );
       },
     },
-  ];
+  ], [forecastHorizon, loading]);
 
   const models = [
     {

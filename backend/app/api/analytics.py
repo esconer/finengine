@@ -514,10 +514,22 @@ async def get_factor_exposure(
             benchmark_data=benchmark_returns,
             weights=allocation
         )
+
+        # Collect warnings for assets with limited history
+        warnings_list = [
+            {
+                "ticker": t,
+                "data_points": p.get("data_points", 0),
+                "message": f"{t} has only {p.get('data_points', 0)} trading days. Factor regression beta and alpha may be constrained."
+            }
+            for t, p in factor_result.get("positions", {}).items()
+            if p.get("is_limited_history")
+        ]
         
         return {
             "portfolio": factor_result.get("portfolio", {}),
             "positions": factor_result.get("positions", {}),
+            "warnings": warnings_list,
             "r_squared": factor_result.get("r_squared", 0.0),
             "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
             "data_range": {"start": start, "end": end},
