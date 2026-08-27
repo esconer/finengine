@@ -29,7 +29,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [totalPortfolioValue, setTotalPortfolioValue] = useState(100000);
+  const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
+  const [existingCount, setExistingCount] = useState(0);
 
   // Fetch total portfolio value
   useEffect(() => {
@@ -41,10 +42,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   const fetchTotalPortfolioValue = async () => {
     try {
       const data = await portfolioApi.getPortfolio({ currency });
-      setTotalPortfolioValue(data.total_value || 100000);
+      const posList = data.positions || [];
+      setExistingCount(posList.length);
+      setTotalPortfolioValue(data.total_value || 0);
     } catch (error) {
       console.error('Failed to fetch portfolio total:', error);
-      setTotalPortfolioValue(100000);
+      setTotalPortfolioValue(0);
+      setExistingCount(0);
     }
   };
 
@@ -56,22 +60,27 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         weight: 0,
         quantity: 0,
         buy_price: 0,
-        region: 'US',
+        region: currency === 'INR' ? 'IN' : 'US',
         custom_name: ''
       });
       setErrors({});
     }
-  }, [isOpen]);
+  }, [isOpen, currency]);
 
   // Auto-calculate weight when quantity or buy price changes
   useEffect(() => {
     if (formData.quantity > 0 && formData.buy_price > 0) {
       const positionValue = formData.quantity * formData.buy_price;
-      const newTotalValue = totalPortfolioValue + positionValue;
-      const estimatedWeight = positionValue / newTotalValue;
-      setFormData(prev => ({ ...prev, weight: estimatedWeight }));
+      if (existingCount === 0 || totalPortfolioValue <= 0) {
+        // First position in an empty portfolio is always 100% (1.0)
+        setFormData(prev => ({ ...prev, weight: 1.0 }));
+      } else {
+        const newTotalValue = totalPortfolioValue + positionValue;
+        const estimatedWeight = positionValue / newTotalValue;
+        setFormData(prev => ({ ...prev, weight: estimatedWeight }));
+      }
     }
-  }, [formData.quantity, formData.buy_price, totalPortfolioValue]);
+  }, [formData.quantity, formData.buy_price, totalPortfolioValue, existingCount]);
 
   // Validate form
   const validateForm = (): boolean => {
@@ -122,11 +131,23 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
   // Handle input change
   const handleInputChange = (field: keyof PortfolioCreateRequest, value: string | number) => {
-    setFormData(prev => ({ ...prev, [field]: value }));
+    let updatedFormData = { ...formData, [field]: value };
+    if (field === 'ticker' && typeof value === 'string') {
+      const trimmed = value.trim().toUpperCase();
+      if (trimmed.endsWith('.NS') || trimmed.endsWith('.BO')) {
+        updatedFormData.region = 'IN';
+      } else if (trimmed) {
+        updatedFormData.region = currency === 'INR' ? 'IN' : 'US';
+      }
+    }
+    setFormData(updatedFormData);
     if (errors[field]) {
       setErrors(prev => ({ ...prev, [field]: '' }));
     }
   };
+
+  const isIndianTicker = formData.ticker.endsWith('.NS') || formData.ticker.endsWith('.BO') || formData.region === 'IN' || currency === 'INR';
+  const effectiveCurrency = isIndianTicker ? 'INR' : currency;
 
   if (!isOpen) {
     return null;
@@ -167,7 +188,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
               type="text"
               value={formData.ticker}
               onChange={(e) => handleInputChange('ticker', e.target.value.toUpperCase())}
-              placeholder="AAPL or AAPL.NS"
+              placeholder="e.g. MOTHERSON.NS, INFY.NS, AAPL"
               className={cn(
                 "w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors text-gray-900 dark:text-white bg-white dark:bg-gray-800",
                 errors.ticker ? "border-red-300 dark:border-red-600" : "border-gray-300 dark:border-gray-600"
@@ -205,13 +226,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             {/* Buy Price */}
             <div>
               <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
-                Buy Price ({currency}) *
+                Buy Price ({effectiveCurrency}) *
               </label>
               <input
                 type="number"
                 value={formData.buy_price || ''}
                 onChange={(e) => handleInputChange('buy_price', parseFloat(e.target.value) || 0)}
-                placeholder="150.00"
+                placeholder={effectiveCurrency === 'INR' ? "100.00" : "150.00"}
                 min="0"
                 step="0.01"
                 className={cn(

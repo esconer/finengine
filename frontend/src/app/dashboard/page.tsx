@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { ColumnDef } from '@tanstack/react-table';
@@ -86,6 +86,23 @@ export default function DashboardSummary() {
     }
   }, [isLoading, error, positions.length, updateLastUpdated]);
 
+  // Quantitative Diversification Score based on Herfindahl Concentration & Sector Breadth
+  const diversificationScore = useMemo(() => {
+    if (positions.length <= 1) return 0;
+    const weights = positions.map(p => {
+      const mv = p.market_value || ((p as any).quantity ? (p as any).quantity * (p.last_price || 0) : 0);
+      return (totalValue && totalValue > 0) ? (mv / totalValue) : p.weight;
+    });
+    const totalW = weights.reduce((a, b) => a + b, 0) || 1;
+    const normW = weights.map(w => w / totalW);
+    const hhi = normW.reduce((sum, w) => sum + w * w, 0); // 1.0 for 1 stock, 0.5 for 2 equal stocks, 0.1 for 10 stocks
+    const effectiveN = 1 / Math.max(hhi, 0.01);
+    // Score scaled from 0% (1 stock) to 100% (10+ effective stocks across 4+ sectors)
+    const positionScore = Math.min(100, Math.max(0, ((effectiveN - 1) / 9) * 100));
+    const sectorMultiplier = Math.min(1, Math.max(0.25, (sectorData.length / 4)));
+    return Math.round(positionScore * sectorMultiplier);
+  }, [positions, totalValue, sectorData]);
+
   // Calculate enhanced portfolio metrics
   const portfolioMetrics = {
     totalValue: totalValue || 0,
@@ -97,6 +114,7 @@ export default function DashboardSummary() {
     volatility: analyticsData.summary?.realized_volatility || 0,
     sharpeRatio: analyticsData.summary?.sharpe_ratio || 0,
     maxDrawdown: analyticsData.summary?.max_drawdown || 0,
+    diversificationScore,
   };
 
   // DataTable columns with enhanced functionality
@@ -504,8 +522,14 @@ export default function DashboardSummary() {
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="text-center">
-              <div className="text-2xl font-bold text-green-600 dark:text-green-400">
-                {((1 - portfolioMetrics.riskScore / 100) * 100).toFixed(0)}%
+              <div className={`text-2xl font-bold ${
+                diversificationScore <= 20
+                  ? 'text-red-500 dark:text-red-400'
+                  : diversificationScore <= 60
+                  ? 'text-amber-500 dark:text-amber-400'
+                  : 'text-green-600 dark:text-green-400'
+              }`}>
+                {diversificationScore}%
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 Diversification Score

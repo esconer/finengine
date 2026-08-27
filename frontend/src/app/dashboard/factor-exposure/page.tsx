@@ -256,34 +256,6 @@ export default function FactorExposurePage() {
           loading={loading}
         />
         <MetricCard
-          title="Adjusted R²"
-          value={factorData?.adjusted_r_squared !== undefined ? factorData.adjusted_r_squared.toFixed(3) : 'N/A'}
-          change={0}
-          changeType="neutral"
-          icon={Activity}
-          loading={loading}
-        />
-      </div>
-
-      {/* Extended Factor Metrics */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        <MetricCard
-          title="R-squared"
-          value={factorData?.r_squared ? factorData.r_squared.toFixed(3) : 'N/A'}
-          change={0.02}
-          changeType="positive"
-          icon={BarChart3}
-          loading={loading}
-        />
-        <MetricCard
-          title="Adjusted R²"
-          value={factorData?.adjusted_r_squared ? factorData.adjusted_r_squared.toFixed(3) : 'N/A'}
-          change={0.01}
-          changeType="positive"
-          icon={Target}
-          loading={loading}
-        />
-        <MetricCard
           title="Model Fit Quality"
           value={factorData?.r_squared && factorData.r_squared > 0.7 ? 'Strong' : factorData?.r_squared && factorData.r_squared > 0.4 ? 'Moderate' : 'Weak'}
           change={0}
