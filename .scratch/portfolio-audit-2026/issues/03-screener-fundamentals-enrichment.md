@@ -1,6 +1,6 @@
-﻿# Issue 03: Live Screener.in Fundamentals & Ratio Enrichment
+# Issue 03: Live Screener.in Fundamentals & Ratio Enrichment
 
-Status: ready-for-agent
+Status: closed
 
 ## Description
 Screener.in provides valuable fundamental ratios for Indian equities (P/E, ROCE, ROE, Book Value, 52-week High/Low, Promoter Holding). FinEngine's portfolio overview currently displays primary data from Yahoo Finance.

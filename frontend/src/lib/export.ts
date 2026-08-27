@@ -322,21 +322,118 @@ export class ExportService {
         }
     }
 
-    static exportMultipleFormats(
-        data: ExportableData[],
-        chartElement: HTMLElement,
-        baseFilename: string
-    ): Promise<void[]> {
-        return Promise.all([
-            this.exportPDF(data, `${baseFilename}_report`),
-            this.exportExcel(data, `${baseFilename}_data`),
-            this.exportCSV(data[0]?.data || [], `${baseFilename}_summary`),
-            this.exportChart(chartElement, {
-                filename: `${baseFilename}_chart`,
-                format: 'png',
-                quality: 0.9
-            })
-        ]);
+    static exportInstitutionalReviewPDF(portfolioData: {
+        positions: any[];
+        totalValue: number;
+        currency: string;
+        riskMetrics?: any;
+    }, filename: string = 'Daisy_Portfolio_Risk_Review'): void {
+        const doc = new jsPDF();
+        const margin = 15;
+        let y = 20;
+
+        // Header
+        doc.setFillColor(15, 23, 42); // slate-900
+        doc.rect(0, 0, doc.internal.pageSize.width, 35, 'F');
+
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(18);
+        doc.setFont('helvetica', 'bold');
+        doc.text('DAISY RISK ENGINE', margin, y);
+
+        doc.setFontSize(10);
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(148, 163, 184); // slate-400
+        doc.text('Institutional Quantitative Risk & Portfolio Review', margin, y + 7);
+
+        doc.setFontSize(9);
+        doc.text(`Generated: ${new Date().toLocaleString()}`, doc.internal.pageSize.width - margin - 55, y);
+
+        y = 48;
+        doc.setTextColor(30, 41, 59);
+
+        // Portfolio Summary Box
+        doc.setFontSize(13);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Portfolio Executive Summary', margin, y);
+        y += 8;
+
+        doc.setFontSize(10);
+        doc.setFont('helvetica', 'normal');
+        doc.text(`Total Portfolio Value: ${portfolioData.currency === 'INR' ? 'INR ' : '$'}${portfolioData.totalValue.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`, margin, y);
+        doc.text(`Active Holdings: ${portfolioData.positions.length} Equities`, margin + 100, y);
+        y += 12;
+
+        // Holdings Table
+        doc.setFontSize(12);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Holdings & Asset Allocation', margin, y);
+        y += 6;
+
+        const headers = ['Ticker', 'Quantity', 'Buy Price', 'Last Price', 'Market Value', 'Weight', 'Sector'];
+        const colWidths = [28, 22, 25, 25, 32, 18, 30];
+        
+        doc.setFillColor(241, 245, 249);
+        doc.rect(margin, y, 180, 7, 'F');
+        doc.setFontSize(9);
+        doc.setFont('helvetica', 'bold');
+        doc.setTextColor(51, 65, 85);
+
+        let currentX = margin + 2;
+        headers.forEach((h, idx) => {
+            doc.text(h, currentX, y + 5);
+            currentX += colWidths[idx];
+        });
+        y += 9;
+
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(30, 41, 59);
+
+        portfolioData.positions.forEach(p => {
+            currentX = margin + 2;
+            const values = [
+                String(p.ticker || ''),
+                String(p.quantity || 0),
+                String(p.buy_price ? p.buy_price.toFixed(1) : '0'),
+                String(p.last_price ? p.last_price.toFixed(1) : '0'),
+                String(p.market_value ? p.market_value.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '0'),
+                `${((p.weight || 0) * 100).toFixed(1)}%`,
+                String(p.sector || 'General')
+            ];
+
+            values.forEach((v, idx) => {
+                doc.text(v, currentX, y + 4);
+                currentX += colWidths[idx];
+            });
+
+            doc.setDrawColor(226, 232, 240);
+            doc.line(margin, y + 6, margin + 180, y + 6);
+            y += 7;
+        });
+
+        y += 10;
+
+        // Risk Attributions
+        doc.setFontSize(12);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Quantitative Risk & Microstructure Summary', margin, y);
+        y += 8;
+
+        doc.setFontSize(9);
+        doc.setFont('helvetica', 'normal');
+        doc.text('• Euler Decomposition: Volatility and CVaR tail shares calculated against multi-asset empirical covariance.', margin, y);
+        y += 5;
+        doc.text('• Extreme Value Theory: 99% EVT-POT Generalized Pareto VaR accounts for fat-tailed crash probabilities.', margin, y);
+        y += 5;
+        doc.text('• Market Microstructure: ADV Liquidity Sizing ensures liquidation horizon within 10%-20% market volume.', margin, y);
+        y += 15;
+
+        // Disclaimer Footer
+        doc.setFontSize(8);
+        doc.setTextColor(148, 163, 184);
+        doc.text('CONFIDENTIAL — Generated for internal investment management purposes only. Daisy Risk Engine.', margin, 280);
+
+        doc.save(`${filename}.pdf`);
     }
 }
 

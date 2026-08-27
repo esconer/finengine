@@ -145,17 +145,17 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 ### Priority 1: Portfolio Audit & Microstructure Polish (`.scratch/portfolio-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
-| **PA-01** | Wire Vol-Cone & Tails Contract Routes | `ready-for-agent` | Mount dedicated route aliases `/api/v1/analytics/vol-cone` and `/tails` to match full external contract spec |
-| **PA-02** | Defensive Timeseries Date Alignment | `ready-for-agent` | Ensure inner-join index alignment on cross-asset return series with mismatched holiday calendars |
-| **PA-03** | Screener.in Fundamentals Enrichment | `ready-for-agent` | Enrich portfolio summary cards with live Screener.in ratios (Market Cap, TTM P/E, ROE, 52W High/Low) |
+| **PA-01** | Wire Vol-Cone & Tails Contract Routes | `closed` | Mount dedicated route aliases `/api/v1/analytics/vol-cone` and `/tails` to match full external contract spec |
+| **PA-02** | Defensive Timeseries Date Alignment | `closed` | Ensure inner-join index alignment on cross-asset return series with mismatched holiday calendars |
+| **PA-03** | Screener.in Fundamentals Enrichment | `closed` | Enrich portfolio summary cards with live Screener.in ratios (Market Cap, TTM P/E, ROE, 52W High/Low) |
 
 ### Priority 2: Terminal UI & Operational Automation (`.scratch/advanced-analytics/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
-| **t24** | Portfolio CSV/XLSX Importer UI | `ready-for-agent` | Drag-and-drop dropzone for Zerodha/Groww/AngelOne CSVs pre-filling `POST /portfolio/bulk_add` |
-| **t25** | Interactive Efficient Frontier Curve | `ready-for-agent` | Recharts/SVG Markowitz frontier scatter curve with current vs optimal asset overlays |
-| **t26** | Consolidated Risk Studio Canvas | `ready-for-agent` | `/dashboard/risk-studio` linking Euler risk, copula heatmap, and vol cones side-by-side |
-| **t27** | One-Click PDF Report Header Trigger | `ready-for-agent` | Global header trigger downloading multi-page branded PDF tear-sheet via jsPDF |
+| **t24** | Portfolio CSV/XLSX Importer UI | `closed` | Drag-and-drop dropzone for Zerodha/Groww/AngelOne CSVs pre-filling `POST /portfolio/bulk_add` |
+| **t25** | Interactive Efficient Frontier Curve | `closed` | Recharts/SVG Markowitz frontier scatter curve with current vs optimal asset overlays |
+| **t26** | Consolidated Risk Studio Canvas | `closed` | `/dashboard/risk-studio` linking Euler risk, copula heatmap, and vol cones side-by-side |
+| **t27** | One-Click PDF Report Header Trigger | `closed` | Global header trigger downloading multi-page branded PDF tear-sheet via jsPDF |
 | **t28** | Scheduled Post-Market NSE Ingestion Cron | `deferred` | Background scheduler (18:30 IST) pulling daily bhavcopy, delivery %, and FII/DII net flows |
 | **t29** | Promoter Pledge & Bulk Deal Scraper | `needs-info` | Ingest quarterly shareholding pattern XMLs & track promoter pledge delta alerts |
 | **t30** | Black-Litterman Bayesian Optimizer | `ready-for-agent` | Blending market equilibrium priors with subjective investor return views |

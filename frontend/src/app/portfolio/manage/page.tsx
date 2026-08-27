@@ -19,7 +19,8 @@ import {
     X,
     AlertTriangle,
     Shield,
-    Activity
+    Activity,
+    UploadCloud
 } from 'lucide-react';
 import {
     PortfolioPosition,
@@ -33,6 +34,7 @@ import { LoadingState } from '@/components/ui/LoadingState';
 import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { EditPositionModal } from '@/components/portfolio/EditPositionModal';
+import { PortfolioDropzone } from '@/components/portfolio/PortfolioDropzone';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -55,6 +57,7 @@ export default function PortfolioManagePage() {
 
     // Modal states
     const [showAddModal, setShowAddModal] = useState(false);
+    const [showImportModal, setShowImportModal] = useState(false);
     const [showEditModal, setShowEditModal] = useState(false);
     const [selectedPosition, setSelectedPosition] = useState<SimplePortfolioPosition | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -381,6 +384,14 @@ export default function PortfolioManagePage() {
                         >
                             <RefreshCw className="w-4 h-4" />
                             <span>Refresh</span>
+                        </button>
+
+                        <button
+                            onClick={() => setShowImportModal(true)}
+                            className="flex items-center space-x-2 px-4 py-2 text-sm font-medium text-slate-200 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 focus:outline-none transition-colors"
+                        >
+                            <UploadCloud className="w-4 h-4 text-blue-400" />
+                            <span>Import CSV</span>
                         </button>
 
                         <button
@@ -749,6 +760,13 @@ export default function PortfolioManagePage() {
                     onClose={() => setShowAddModal(false)}
                     onAdd={handleAddPosition}
                     currency={currency}
+                />
+
+                {/* Import Portfolio CSV Dropzone Modal */}
+                <PortfolioDropzone
+                    isOpen={showImportModal}
+                    onClose={() => setShowImportModal(false)}
+                    onSuccess={fetchPortfolio}
                 />
 
                 {/* Edit Position Modal */}

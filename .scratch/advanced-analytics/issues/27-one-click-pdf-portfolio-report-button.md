@@ -1,6 +1,6 @@
 # 27 — One-Click PDF Portfolio Report Header Trigger
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: 19
 

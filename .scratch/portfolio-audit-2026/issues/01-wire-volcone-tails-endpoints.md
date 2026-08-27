@@ -1,6 +1,6 @@
-﻿# Issue 01: Wire Explicit /vol-cone and /tails API Endpoints
+# Issue 01: Wire Explicit /vol-cone and /tails API Endpoints
 
-Status: ready-for-agent
+Status: closed
 
 ## Description
 `PROJECT.md` (Milestone 1 contract) defines:

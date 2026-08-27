@@ -1,6 +1,6 @@
 # 24 — Portfolio CSV/XLSX Drag-and-Drop Importer UI
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: —
 

@@ -97,6 +97,12 @@ const navigation: NavigationItem[] = [
         description: 'Which positions drive your risk'
     },
     {
+        name: 'Risk Studio',
+        href: '/dashboard/risk-studio',
+        icon: Zap,
+        description: 'Consolidated multi-model risk canvas'
+    },
+    {
         name: 'Optimizer',
         href: '/dashboard/optimize',
         icon: SlidersHorizontal,

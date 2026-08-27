@@ -15,9 +15,11 @@ import {
   Settings,
   LogOut,
   RefreshCw,
-  Activity
+  Activity,
+  FileDown
 } from 'lucide-react';
 import { useUIStore, usePortfolioStore } from '@/lib/store';
+import { ExportService } from '@/lib/export';
 import { cn } from '@/lib/utils';
 
 interface HeaderProps {
@@ -116,6 +118,24 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
               liveDataMode && 'animate-spin'
             )} />
             <span className="hidden sm:inline">Live</span>
+          </button>
+
+          {/* Export PDF Tear-Sheet */}
+          <button
+            onClick={() => {
+              const totalVal = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+              ExportService.exportInstitutionalReviewPDF({
+                positions,
+                totalValue: totalVal,
+                currency: 'INR'
+              });
+            }}
+            disabled={positions.length === 0}
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 transition disabled:opacity-50"
+            title="Download Institutional PDF Review"
+          >
+            <FileDown className="w-3.5 h-3.5 text-indigo-500" />
+            <span className="hidden md:inline">Export PDF</span>
           </button>
 
           {/* Refresh button */}

@@ -60,6 +60,10 @@ const routeTitles: Record<string, { title: string; subtitle?: string }> = {
     title: 'Risk Contribution',
     subtitle: 'Euler decomposition of risk per position and tail attribution'
   },
+  '/dashboard/risk-studio': {
+    title: 'Risk Studio',
+    subtitle: 'Consolidated Euler attribution, EVT tail risk, Copula matrix & Vol Cones'
+  },
   '/dashboard/optimize': {
     title: 'Portfolio Optimizer',
     subtitle: 'Rebalance within your holdings across four strategies'

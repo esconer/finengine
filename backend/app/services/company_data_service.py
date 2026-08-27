@@ -116,8 +116,21 @@ class CompanyDataService:
             raise ValueError(f"No fundamentals returned for {ticker}")
 
         out: Dict[str, Any] = {"ticker": _normalize(ticker).upper()}
+        fallback_map = {
+            "longName": ["shortName", "companyName"],
+            "fiftyTwoWeekHigh": ["52WeekHigh", "fifty_two_week_high", "yearHigh"],
+            "fiftyTwoWeekLow": ["52WeekLow", "fifty_two_week_low", "yearLow"],
+            "trailingPE": ["pe_ratio", "trailing_pe", "trailingPe"],
+            "marketCap": ["market_cap", "totalMarketCap"],
+            "returnOnEquity": ["roe", "return_on_equity"],
+        }
         for our_key, yf_key in self.FUNDAMENTAL_FIELDS:
             val = info.get(yf_key)
+            if val is None and yf_key in fallback_map:
+                for alt_key in fallback_map[yf_key]:
+                    val = info.get(alt_key)
+                    if val is not None:
+                        break
             if val is not None:
                 out[our_key] = val
 

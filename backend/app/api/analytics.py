@@ -975,9 +975,9 @@ async def _build_wide_returns(
             _assign_price(price_data_dict, ticker, df)
     if not price_data_dict:
         raise ValueError("No price data available for the requested window")
-    prices = pd.DataFrame(price_data_dict).dropna(how="all")
-    returns_df = prices.pct_change().dropna(how="all")
-    portfolio_returns = (returns_df.fillna(0.0) * pd.Series(weights)).sum(axis=1)
+    prices = pd.DataFrame(price_data_dict).sort_index().ffill().dropna()
+    returns_df = prices.pct_change().dropna()
+    portfolio_returns = (returns_df * pd.Series(weights)).sum(axis=1)
     return returns_df, portfolio_returns
 
 
@@ -1537,3 +1537,88 @@ async def get_liquidity_limits(
     except Exception as e:
         logger.error(f"Error getting liquidity limits: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/vol-cone")
+async def get_volatility_cone(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    lookback_days: int = Query(default=756, ge=60, le=2520, description="Lookback window in days"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> Dict[str, Any]:
+    """
+    Realized volatility term structure cone (10, 21, 63, 126, 252d quantile bands)
+    and current GARCH(1,1) forward volatility forecast.
+    """
+    try:
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        _, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+
+        if len(port_ret) < 30:
+            raise HTTPException(status_code=400, detail="Insufficient return history for volatility cone")
+
+        from app.services.volatility_service import VolatilityService
+        cone_data = VolatilityService.calculate_volatility_cone(port_ret)
+        return cone_data
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in vol-cone: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/tail-dependence")
+@router.get("/tails")
+async def get_tail_risk_and_copula(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    lookback_days: int = Query(default=756, ge=60, le=2520, description="Lookback window in days"),
+    confidence_level: float = Query(default=0.99, ge=0.90, le=0.999, description="Confidence level for EVT VaR"),
+    threshold_quantile: float = Query(default=0.95, ge=0.80, le=0.98, description="POT threshold quantile"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> Dict[str, Any]:
+    """
+    Extreme Value Theory (EVT) Peaks-Over-Threshold 99% VaR/Expected Shortfall
+    and pairwise Student-t Copula lower-tail dependence crash comovement matrix.
+    """
+    try:
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        wide_ret, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+
+        if len(port_ret) < 30:
+            raise HTTPException(status_code=400, detail="Insufficient return history for tail risk modeling")
+
+        from app.services.tail_risk_service import TailRiskService
+        evt_stats = TailRiskService.calculate_evt_pot_var_es(
+            port_ret, confidence_level=confidence_level, threshold_quantile=threshold_quantile
+        )
+        tail_copula_matrix = TailRiskService.calculate_tail_dependence_matrix(wide_ret)
+
+        return {
+            **evt_stats,
+            "tail_dependence_matrix": tail_copula_matrix,
+            "tickers": ticker_list,
+            "observations": len(port_ret),
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in tail-dependence: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+

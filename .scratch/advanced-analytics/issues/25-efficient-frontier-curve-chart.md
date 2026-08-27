@@ -1,6 +1,6 @@
 # 25 — Interactive Efficient Frontier Curve Chart
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: 08
 

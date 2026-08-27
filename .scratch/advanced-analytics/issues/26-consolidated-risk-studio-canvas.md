@@ -1,6 +1,6 @@
 # 26 — Consolidated Risk Studio Command Center View
 
-Status: ready-for-agent
+Status: closed
 Type: feature
 Blocked by: 07, 12, 13, 14
 
