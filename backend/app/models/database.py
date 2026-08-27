@@ -110,3 +110,94 @@ class FetchLog(Base):
     
     def __repr__(self):
         return f"<FetchLog(ticker='{self.ticker}', status='{self.status}', timestamp='{self.timestamp}')>"
+
+
+class NSEBhavcopy(Base):
+    """Daily NSE equity bhavcopy with delivery metrics"""
+    __tablename__ = "nse_bhavcopy"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    date = Column(DateTime, nullable=False, index=True)
+    series = Column(String(10), default="EQ")
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    prev_close = Column(Float, nullable=False)
+    avg_price = Column(Float, nullable=False)
+    ttl_trd_qnty = Column(Integer, nullable=False)
+    turnover_lacs = Column(Float, nullable=False)
+    no_of_trades = Column(Integer, nullable=False, default=0)
+    deliv_qty = Column(Integer, nullable=True)
+    deliv_per = Column(Float, nullable=True)
+    
+    __table_args__ = (
+        Index("ix_bhav_symbol_date", "symbol", "date"),
+    )
+    
+    def __repr__(self):
+        return f"<NSEBhavcopy(symbol='{self.symbol}', date='{self.date}', close={self.close}, deliv_per={self.deliv_per})>"
+
+
+class NSEInstitutionalFlow(Base):
+    """Daily FII / DII equity cash market flows"""
+    __tablename__ = "nse_institutional_flows"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(DateTime, nullable=False, index=True)
+    category = Column(String(20), nullable=False)  # "FII", "DII", etc.
+    buy_value_crores = Column(Float, nullable=False)
+    sell_value_crores = Column(Float, nullable=False)
+    net_value_crores = Column(Float, nullable=False)
+    
+    __table_args__ = (
+        Index("ix_flow_date_cat", "date", "category"),
+    )
+    
+    def __repr__(self):
+        return f"<NSEInstitutionalFlow(date='{self.date}', category='{self.category}', net={self.net_value_crores})>"
+
+
+class NSEBulkBlockDeal(Base):
+    """NSE bulk and block deal transactions"""
+    __tablename__ = "nse_bulk_block_deals"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    deal_type = Column(String(10), nullable=False)  # "BULK" or "BLOCK"
+    date = Column(DateTime, nullable=False, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    client_name = Column(String(200), nullable=False)
+    buy_sell = Column(String(10), nullable=False)  # "BUY" or "SELL"
+    quantity = Column(Integer, nullable=False)
+    trade_price = Column(Float, nullable=False)
+    remarks = Column(String(200), nullable=True)
+    
+    __table_args__ = (
+        Index("ix_deal_symbol_date", "symbol", "date"),
+    )
+    
+    def __repr__(self):
+        return f"<NSEBulkBlockDeal(deal_type='{self.deal_type}', symbol='{self.symbol}', client='{self.client_name}', buy_sell='{self.buy_sell}')>"
+
+
+class NSEShareholdingPattern(Base):
+    """Quarterly shareholding patterns and promoter pledge deltas"""
+    __tablename__ = "nse_shareholding_patterns"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    period_ended = Column(String(20), nullable=False)  # e.g., "2024-12-31"
+    promoter_pct = Column(Float, nullable=False)
+    promoter_pledged_pct = Column(Float, default=0.0)
+    fii_pct = Column(Float, default=0.0)
+    dii_pct = Column(Float, default=0.0)
+    public_pct = Column(Float, default=0.0)
+    updated_on = Column(DateTime(timezone=True), server_default=func.now())
+    
+    __table_args__ = (
+        Index("ix_shp_symbol_period", "symbol", "period_ended"),
+    )
+    
+    def __repr__(self):
+        return f"<NSEShareholdingPattern(symbol='{self.symbol}', period='{self.period_ended}', promoter={self.promoter_pct}%, pledged={self.promoter_pledged_pct}%)>"

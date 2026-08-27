@@ -17,21 +17,13 @@ const apiClient: AxiosInstance = axios.create({
 
 // Request interceptor
 apiClient.interceptors.request.use(
-  (config) => {
-    console.log(`API Request: ${config.method?.toUpperCase()} ${config.url}`);
-    return config;
-  },
-  (error) => {
-    return Promise.reject(error);
-  }
+  (config) => config,
+  (error) => Promise.reject(error)
 );
 
 // Response interceptor
 apiClient.interceptors.response.use(
-  (response) => {
-    console.log(`API Response: ${response.status} ${response.config.url}`);
-    return response;
-  },
+  (response) => response,
   (error) => {
     let errorMessage = 'Unknown API error';
 
@@ -119,17 +111,13 @@ export const portfolioApi = {
 
   // Add position
   async addPosition(data: PortfolioCreateRequest): Promise<any> {
-    console.log('📤 API: Adding position with data:', data);
     const response = await apiClient.post('/portfolio/add', data);
-    console.log('📥 API: Position added successfully:', response.data);
     return response.data;
   },
 
   // Bulk add positions
   async bulkAddPositions(data: PortfolioBulkAddRequest): Promise<any> {
-    console.log('📤 API: Bulk adding positions with data:', data);
     const response = await apiClient.post('/portfolio/bulk_add', data);
-    console.log('📥 API: Bulk positions added successfully:', response.data);
     return response.data;
   },
 
@@ -290,6 +278,7 @@ export const analyticsApi = {
   async getVolatilitySizing(params?: {
     model?: string;
     target_volatility?: number;
+    portfolio_value?: number;
   }): Promise<any> {
     const response = await apiClient.get('/analytics/volatility-sizing', { params });
     return response.data;

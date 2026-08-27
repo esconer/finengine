@@ -120,15 +120,20 @@ finengine/
 ## 6. Project Status & Feature Map
 
 ### Shipped & Verified
-- **Holdings-Truth Plumbing (F1 / t01)**: All analytics endpoints read user DB positions dynamically.
+- **Holdings-Truth Plumbing (F1 / t01)**: All analytics endpoints read user DB positions dynamically with strict quantity source-of-truth.
 - **QuantStats Tear-Sheet (F2 / t06)**: `/dashboard/tear-sheet` with monthly returns heatmap and underwater drawdown curves vs NIFTY.
 - **Euler Risk Contribution (F3 / t07)**: `/dashboard/risk-contribution` with volatility and CVaR tail attributions, plus sector rollups.
 - **Optimizer Studio (F4 / t08, t09)**: `/dashboard/optimize` supporting HRP, Min Vol, Max Sharpe, and Min CVaR with current vs recommended trade lists.
 - **Regime Engine (F5 / t10)**: `/dashboard/regime` with 120-day regime history, stability index, and portfolio behavior under each state.
 - **Monte Carlo Goal Engine (F6 / t11)**: `/dashboard/monte-carlo` with GBM, Student-t, and Stationary Bootstrap engines with interactive target/horizon inputs.
+- **Volatility Term Structure & Cones (F7 / t12)**: `VolatilityService` computing 10/21/63/126/252-day rolling realized vol quantile bands with GARCH(1,1) and RiskMetrics EWMA forecasts.
+- **Extreme Value Theory & Tail Dependence (F8 / t13)**: `TailRiskService` computing 99% EVT-POT (Peaks-Over-Threshold) VaR/Expected Shortfall via `scipy.stats.genpareto` and bivariate Student-t Copula lower-tail crash dependence matrix.
+- **Correlation Stability Monitor (F9 / t14)**: `CorrelationService` computing rolling 60-day average pairwise correlation with historical 90th-percentile diversification breakdown alerts.
+- **Cointegration Pairs Scanner (F10 / t15)**: `CointegrationService` executing Engle-Granger and Johansen cointegration tests with Ornstein-Uhlenbeck mean-reversion speed/half-life estimation and spread z-scores.
 - **Technical Indicators & Company Data (t21)**: stockstats engine (13 indicators) + fundamentals/financials/insider trades.
 - **Alpha Vantage Fallback (t22)**: In-process multi-key rotation pool with rate-limit budget tracking.
-- **Frontend Consolidation (t03, t04)**: Unified Axios client, normalized rebalancing, and dark mode UI overhaul.
+- **Backend Test Suite Hardening (80%+ Gate Reached)**: 240/240 tests passing (0 failures), 85.61% total line coverage across the entire backend.
+- **Frontend Consolidation (t03, t04)**: Unified Axios client, normalized rebalancing, and dark mode UI overhaul (35/35 Vitest passing, zero TypeScript errors).
 
 ---
 
@@ -138,11 +143,7 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
-| **t12** | Volatility Cone & Term Structure | `ready-for-agent` | Realized vol over 10/21/63/126/252-day windows vs GARCH forecast band |
-| **t13** | EVT VaR & Copula Tail Matrix | `ready-for-agent` | Peak-Over-Threshold (POT) extreme value theory and joint tail-crash matrix |
-| **t14** | Correlation Stability Monitor | `ready-for-agent` | Rolling correlation regime breaks and diversification breakdown alerts |
-| **t15** | Cointegration Pairs Scanner | `ready-for-agent` | Engle-Granger & Johansen cointegration tests with half-life calculations |
-| **t16** | NSE Data Ingestion Pipeline | `needs-info` | Bhavcopy archives, delivery %, FII/DII net flows, bulk/block deals |
+| **t16** | NSE Data Ingestion Pipeline | `ready-for-agent` | Bhavcopy archives, delivery %, FII/DII net flows, bulk/block deals |
 | **t17** | India Flows Dashboard | `ready-for-agent` | Frontend UI visualizing FII/DII flows and delivery % spikes |
 | **t18** | Liquidity Limits & Days-to-Liquidate | `ready-for-agent` | Amihud illiquidity scores and position liquidation horizon at 10-20% ADV |
 | **t19** | One-Click PDF Portfolio Review | `ready-for-agent` | Complete portfolio health summary PDF generation via jsPDF |

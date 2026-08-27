@@ -218,23 +218,29 @@ class DataService:
     async def fetch_ohlcv_batch(
         self, 
         tickers: List[str], 
-        days: int = 252
-    ) -> Dict[str, pd.DataFrame]:
+        days: int = 252,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        force_refresh: bool = False
+    ) -> Dict[str, Any]:
         """
         Fetch OHLCV data for multiple tickers efficiently
         
         Args:
             tickers: List of ticker symbols
-            days: Number of days to fetch
+            days: Number of days to fetch (if start_date not provided)
+            start_date: Optional start date string (YYYY-MM-DD)
+            end_date: Optional end date string (YYYY-MM-DD)
+            force_refresh: Whether to bypass cache
             
         Returns:
-            Dictionary mapping ticker to DataFrame
+            Dictionary mapping ticker to DataFrame and list of failed tickers
         """
         logger.info(f"Fetching batch data for {len(tickers)} tickers")
         
-        # Calculate date range
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        # Calculate date range if not provided
+        resolved_end = end_date or datetime.now().strftime('%Y-%m-%d')
+        resolved_start = start_date or (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         
         results = {}
         failed_tickers = []
@@ -246,9 +252,9 @@ class DataService:
                 if i > 0:
                     await asyncio.sleep(0.5)  # 500ms delay between requests
                 
-                df = await self.fetch_historical_data(ticker, start_date, end_date)
+                df = await self.fetch_historical_data(ticker, resolved_start, resolved_end, force_refresh=force_refresh)
                 
-                if df is not None:
+                if df is not None and not df.empty:
                     results[ticker] = df
                 else:
                     failed_tickers.append(ticker)

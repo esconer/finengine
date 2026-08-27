@@ -362,27 +362,6 @@ export const useAnalyticsStore = create<AnalyticsStore>((set, get) => ({
     },
 }));
 
-// Hook for auto-refresh functionality
-export const useAutoRefresh = (enabled: boolean = true, interval: number = 300000) => {
-    const { liveDataMode } = useUIStore();
-    const { fetchPortfolio } = usePortfolioStore();
-    const { updateRealTimeData } = useAnalyticsStore();
-
-    // This would be implemented with useEffect in a React component
-    // For now, this is a placeholder for the hook structure
-    return {
-        start: () => console.log('Auto-refresh started'),
-        stop: () => console.log('Auto-refresh stopped'),
-        refreshAnalytics: () => {
-            // Trigger analytics refresh
-            updateRealTimeData('analytics', { refreshing: true });
-            setTimeout(() => {
-                updateRealTimeData('analytics', { refreshing: false });
-            }, 1000);
-        },
-    };
-};
-
 // Hook for CSV export functionality
 export const useCSVExport = <T>(data: T[], filename: string) => {
     const exportData = () => {

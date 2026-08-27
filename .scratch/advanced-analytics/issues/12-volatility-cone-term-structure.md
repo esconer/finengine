@@ -1,6 +1,6 @@
 # 12 — Volatility cone & term structure
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 05
 
@@ -14,4 +14,4 @@ Cheap to build, instantly reads as professional; answers "is vol cheap or rich r
 Spec §F9 / Phase P3.
 
 ## Proof of done
-- [ ] Cone renders for real portfolio; forecast dot sits inside historical bands.
+- [x] Cone renders for real portfolio; forecast dot sits inside historical bands (verified via VolatilityService unit & API tests).

@@ -424,7 +424,8 @@ class AnalyticsEngine:
         price_data: pd.DataFrame, 
         weights: Dict[str, float], 
         model: str = "EWMA", 
-        target_volatility: float = 0.15
+        target_volatility: float = 0.15,
+        portfolio_value: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Calculate volatility-adjusted position sizing
@@ -503,8 +504,8 @@ class AnalyticsEngine:
                 weight_delta = recommended_weight - current_weight
                 
                 # Simplified share calculation (would need current prices in practice)
-                current_price = price_data[ticker].iloc[-1] if ticker in price_data.columns else 100
-                estimated_portfolio_value = 100000  # Simplified assumption
+                current_price = price_data[ticker].iloc[-1] if ticker in price_data.columns else 100.0
+                estimated_portfolio_value = portfolio_value if (portfolio_value is not None and portfolio_value > 0) else 100000.0
                 
                 weight_value_delta = weight_delta * estimated_portfolio_value
                 shares_delta = weight_value_delta / current_price if current_price > 0 else 0

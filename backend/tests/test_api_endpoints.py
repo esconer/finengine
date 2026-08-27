@@ -11,6 +11,7 @@ import numpy as np
 
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @pytest.mark.api
@@ -144,13 +145,21 @@ class TestPortfolioAPI:
         return patch("app.api.portfolio.GlobalDataService", return_value=svc)
 
     @pytest.mark.asyncio
-    async def test_get_portfolio_empty(self, async_client):
+    async def test_get_portfolio_empty(self, async_client, test_db: AsyncSession):
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
         resp = await async_client.get("/api/v1/portfolio")
         assert resp.status_code == 200
         assert resp.json()["positions"] == []
 
     @pytest.mark.asyncio
-    async def test_add_position_success(self, async_client):
+    async def test_add_position_success(self, async_client, test_db: AsyncSession):
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
         with self._patch_market_data():
             resp = await async_client.post("/api/v1/portfolio/add", json={
                 "ticker": "TEST", "weight": 0.5, "quantity": 10, "buy_price": 100,
@@ -159,6 +168,8 @@ class TestPortfolioAPI:
         data = resp.json()
         assert data["ticker"] == "TEST"
         assert data["last_price"] == 150.0
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
 
     @pytest.mark.asyncio
     async def test_add_duplicate_conflict(self, async_client, seeded_positions):
@@ -180,8 +191,12 @@ class TestPortfolioAPI:
         assert "AAPL" in detail["suggestions"]
 
     @pytest.mark.asyncio
-    async def test_bulk_add_positions_success(self, async_client):
+    async def test_bulk_add_positions_success(self, async_client, test_db: AsyncSession):
         """Regression: module-level validator signature bug failed every row."""
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
         with self._patch_market_data():
             resp = await async_client.post("/api/v1/portfolio/bulk_add", json={
                 "positions": [
@@ -194,6 +209,8 @@ class TestPortfolioAPI:
         data = resp.json()
         assert data["added"] == 2, data
         assert data["failed"] == 0
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
 
     @pytest.mark.asyncio
     async def test_get_position_includes_computed_fields(self, async_client, seeded_positions):

@@ -29,7 +29,7 @@ from app.services.cache_service import CacheService, GlobalCacheService
 from app.models.database import PortfolioPosition, StockTimeseries, AnalyticsCache, FetchLog
 
 # Test configuration
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 
 # NOTE: no session-scoped event_loop fixture — pytest-asyncio 0.24 auto mode
@@ -139,7 +139,7 @@ async def seeded_positions(test_db: AsyncSession):
 # Database fixtures
 @pytest_asyncio.fixture
 async def test_db():
-    """Create test database with proper async support"""
+    """Create test database with proper async support and per-test cleanup"""
     engine = create_async_engine(
         TEST_DATABASE_URL,
         echo=False,
@@ -152,6 +152,12 @@ async def test_db():
     
     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
         yield session
+        try:
+            for table in reversed(Base.metadata.sorted_tables):
+                await session.execute(table.delete())
+            await session.commit()
+        except Exception:
+            await session.rollback()
     
     await engine.dispose()
 

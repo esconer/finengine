@@ -292,3 +292,124 @@ class APIConfigResponse(BaseModel):
     primary_source: str
     cache_ttl_minutes: int
     enable_cache: bool
+
+
+# Correlation Stability Schemas
+class CorrelationDataPoint(BaseModel):
+    """Single date point for rolling correlation history"""
+    date: str
+    avg_correlation: float
+    threshold_90th: Optional[float] = None
+    threshold_75th: Optional[float] = None
+
+
+class CorrelationStabilityResponse(BaseModel):
+    """Schema for rolling 60-day correlation stability and regime break response"""
+    as_of: str
+    current_avg_correlation: float
+    historical_threshold_90th: float
+    historical_threshold_75th: float
+    historical_median: float
+    is_regime_break: bool
+    alert_level: str  # "CRITICAL", "ELEVATED", "NORMAL"
+    message: str
+    series: List[CorrelationDataPoint]
+
+
+# Cointegration Scanner Schemas
+class CointPairResult(BaseModel):
+    """Schema for a single cointegrated pair analysis result"""
+    ticker_a: str
+    ticker_b: str
+    engle_granger_pvalue: float
+    engle_granger_tstat: float
+    is_cointegrated: bool
+    hedge_ratio_beta: float
+    intercept_alpha: float
+    ou_half_life_days: Optional[float] = None
+    ou_reversion_speed_theta: Optional[float] = None
+    current_spread_zscore: Optional[float] = None
+    johansen_cointegrated: bool
+    last_price_a: float
+    last_price_b: float
+    signal: str
+    spread_series: Optional[List[Dict[str, Any]]] = None
+
+
+class CointScannerResponse(BaseModel):
+    """Schema for cointegration scanner response"""
+    as_of: str
+    universe_size: int
+    scanned_pairs_count: int
+    cointegrated_pairs_count: int
+    pairs: List[CointPairResult]
+
+
+# Volatility Term Structure & Cone Schemas
+class VolConeWindow(BaseModel):
+    """Realized volatility quantiles for a single rolling window"""
+    window_days: int
+    min: float
+    p25: float
+    median: float
+    p75: float
+    max: float
+    current_realized: float
+    percentile_rank: Optional[float] = None
+
+
+class VolForecastOverlay(BaseModel):
+    """Volatility forecast overlay with valuation positioning"""
+    model: str
+    annualized_vol: float
+    horizon_days: int
+    percentile_rank: float
+    valuation: str  # "cheap" | "normal" | "rich"
+
+
+class VolConeResponse(BaseModel):
+    """Schema for volatility cone analytics response"""
+    symbol: str
+    as_of: str
+    windows: List[VolConeWindow]
+    current_forecast: VolForecastOverlay
+
+
+# Tail Risk & EVT / Copula Schemas
+class EVTPOTVarMetrics(BaseModel):
+    """EVT Peaks-Over-Threshold 99% VaR and Expected Shortfall metrics"""
+    confidence_level: float = 0.99
+    evt_pot_var_99: float
+    evt_pot_es_99: float
+    historical_var_99: float
+    historical_es_99: float
+    threshold_u: float
+    gpd_shape_xi: float
+    gpd_scale_beta: float
+    exceedances_count: int
+    total_observations: int
+    is_fat_tailed: bool
+
+
+class HighTailRiskPair(BaseModel):
+    """Pairwise lower-tail dependence risk detail"""
+    pair: List[str]
+    lower_tail_lambda: float
+    linear_correlation: float
+    degrees_of_freedom: float
+    risk_category: str  # "VERY_HIGH" | "HIGH" | "MODERATE" | "LOW"
+
+
+class TailDependenceMatrix(BaseModel):
+    """Pairwise Student-t copula lower-tail dependence matrix"""
+    tickers: List[str]
+    matrix: List[List[float]]
+    high_tail_risk_pairs: List[HighTailRiskPair]
+
+
+class TailRiskResponse(BaseModel):
+    """Schema for EVT tail risk and copula lower-tail dependence response"""
+    as_of: str
+    evt_var: EVTPOTVarMetrics
+    tail_dependence_matrix: TailDependenceMatrix
+

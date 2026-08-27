@@ -1,6 +1,6 @@
 # 13 — EVT VaR + copula tail-dependence matrix
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 11
 
@@ -16,5 +16,5 @@ Correlation understates crash co-movement; λ answers "which pairs die together"
 Spec §F7 / Phase P4.
 
 ## Proof of done
-- [ ] 99% EVT VaR more conservative than historical VaR for equity portfolio (sanity).
-- [ ] Heatmap highlights ≥1 known high-λ pair (e.g. two IT names).
+- [x] 99% EVT VaR more conservative than historical VaR for equity portfolio (sanity).
+- [x] Heatmap highlights ≥1 known high-λ pair (e.g. two IT names) (verified via TailRiskService unit & API tests).

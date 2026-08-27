@@ -22,8 +22,11 @@ from app.services.analytics_engine import GlobalAnalyticsEngine, AnalyticsEngine
 from app.models.schemas import (
     RealizedRiskMetrics, ForecastRiskMetrics, FactorExposure, ConcentrationMetrics,
     LiquidityMetrics, RiskScore, StressTestRequest, StressTestResponse,
-    VolatilitySizingRequest, VolatilitySizingResponse
+    VolatilitySizingRequest, VolatilitySizingResponse,
+    CorrelationStabilityResponse, CointScannerResponse
 )
+from app.services.correlation_service import analyze_correlation_stability
+from app.services.cointegration_service import CointegrationService
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -648,6 +651,7 @@ async def run_stress_test(
 async def get_volatility_sizing(
     model: str = Query(default="EWMA", description="Volatility model"),
     target_volatility: float = Query(default=0.15, gt=0, lt=1, description="Target volatility"),
+    portfolio_value: Optional[float] = Query(default=None, gt=0, description="Explicit portfolio value for sizing calculation"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
@@ -666,6 +670,18 @@ async def get_volatility_sizing(
                 "target_volatility": target_volatility,
                 "error": "No portfolio positions found for volatility sizing"
             }
+        
+        # Calculate actual portfolio value from DB if not explicitly passed
+        resolved_pv = portfolio_value
+        if resolved_pv is None:
+            pos_result = await db.execute(select(PortfolioPosition))
+            positions_list = pos_result.scalars().all()
+            resolved_pv = sum(
+                (p.market_value if (p.market_value and p.market_value > 0) else (p.quantity or 0.0) * (p.last_price or 0.0))
+                for p in positions_list
+            )
+            if resolved_pv <= 0:
+                resolved_pv = 100000.0
         
         # Fetch price data for volatility sizing
         end = datetime.now().strftime('%Y-%m-%d')
@@ -690,7 +706,13 @@ async def get_volatility_sizing(
         price_data = pd.DataFrame(price_data_dict)
         
         # Calculate volatility sizing using analytics engine
-        sizing_result = await analytics_engine.volatility_sizing(price_data, weights, model, target_volatility)
+        sizing_result = await analytics_engine.volatility_sizing(
+            price_data, 
+            weights, 
+            model, 
+            target_volatility, 
+            portfolio_value=resolved_pv
+        )
         
         return sizing_result
         
@@ -1291,3 +1313,119 @@ async def run_monte_carlo(
     except Exception as e:
         logger.error(f"Error in monte-carlo: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/correlation-stability", response_model=CorrelationStabilityResponse)
+async def get_correlation_stability(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    lookback_days: int = Query(default=756, ge=60, le=2520, description="Historical lookback window in days"),
+    window_days: int = Query(default=60, ge=10, le=252, description="Rolling pairwise correlation window size"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+) -> CorrelationStabilityResponse:
+    """
+    Rolling 60-day average pairwise correlation monitor with 2-year 90th-percentile
+    regime break alerts and diversification breakdown detection.
+    """
+    try:
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        if len(ticker_list) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="At least 2 distinct tickers are required for pairwise correlation analysis",
+            )
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        try:
+            returns_df, _ = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        if len(returns_df.columns) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="At least 2 assets with valid price history are required",
+            )
+
+        result = analyze_correlation_stability(
+            returns_df=returns_df,
+            window_days=window_days,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in correlation-stability: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/coint", response_model=CointScannerResponse)
+async def get_cointegration_pairs(
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
+    lookback_days: int = Query(default=756, ge=60, le=2520, description="Historical price lookback"),
+    p_value_threshold: float = Query(default=0.05, gt=0, le=1.0, description="Cointegration p-value threshold"),
+    max_half_life: Optional[int] = Query(default=60, ge=1, le=1000, description="Max OU half-life filter"),
+    include_spread_series: bool = Query(default=False, description="Include historical spread series"),
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+    cache_service: CacheService = Depends(get_cache_service),
+) -> CointScannerResponse:
+    """
+    Pairs cointegration scanner across holdings/watchlists implementing Engle-Granger,
+    Johansen rank tests, OLS hedge ratios, Ornstein-Uhlenbeck mean-reversion half-life,
+    and spread z-scores.
+    """
+    try:
+        if tickers:
+            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        else:
+            try:
+                ticker_list, _ = await resolve_allocation(None, db)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+
+        if len(ticker_list) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="At least 2 tickers are required for cointegration scanning",
+            )
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        price_data_dict: Dict[str, pd.Series] = {}
+        for ticker in ticker_list:
+            df = await data_service.fetch_historical_data(ticker, start, end)
+            if df is not None and not df.empty:
+                _assign_price(price_data_dict, ticker, df)
+
+        if len(price_data_dict) < 2:
+            raise HTTPException(
+                status_code=404,
+                detail="Insufficient price data available for at least 2 tickers",
+            )
+
+        coint_service = CointegrationService(db_session=db, cache_service=cache_service)
+        result = await coint_service.scan_pairs(
+            price_data=price_data_dict,
+            p_value_threshold=p_value_threshold,
+            max_half_life=max_half_life,
+            include_spread_series=include_spread_series,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in coint scanner: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+

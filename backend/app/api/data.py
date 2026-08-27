@@ -325,7 +325,12 @@ async def get_batch_stock_data(
         tickers = [ticker.upper() for ticker in request.tickers]
         
         # Fetch batch data
-        results = await data_service.fetch_ohlcv_batch(tickers, days=252)
+        results = await data_service.fetch_ohlcv_batch(
+            tickers,
+            start_date=start,
+            end_date=end,
+            force_refresh=request.force_refresh
+        )
         
         # Convert DataFrames to response format
         data_dict = {}

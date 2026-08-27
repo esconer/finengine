@@ -1,6 +1,6 @@
 # 15 — Cointegration / pairs scanner
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 05
 
@@ -15,5 +15,5 @@ Relative-value candidates inside your own universe — nothing free does this fo
 Spec §F10 / Phase P4.
 
 ## Proof of done
-- [ ] Scanner on 10 tickers completes <30s (cache pairwise results).
-- [ ] A known cointegrated pair (e.g. two PSU banks) scores plausible p-value.
+- [x] Scanner on 10 tickers completes <30s (cache pairwise results).
+- [x] A known cointegrated pair (e.g. two PSU banks) scores plausible p-value (verified via CointegrationService unit & API tests).

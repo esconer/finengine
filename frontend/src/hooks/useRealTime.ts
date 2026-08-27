@@ -82,6 +82,7 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
 // Enhanced real-time analytics hook with automatic updates
 export function useEnhancedRealTimeAnalytics() {
     const { realTimeData } = useAnalyticsStore();
+    const { fetchPortfolio } = usePortfolioStore();
     const { portfolioData, analyticsData, marketData, lastUpdate, isConnected, subscribe, unsubscribe } = useRealTimeAnalytics();
     const { liveDataMode } = useUIStore();
     const [dataFreshness, setDataFreshness] = useState<'fresh' | 'stale' | 'outdated'>('fresh');
@@ -162,9 +163,8 @@ export function useEnhancedRealTimeAnalytics() {
 
         // Actions
         refreshData: useCallback(() => {
-            // Trigger manual refresh
-            console.log('Manual data refresh triggered');
-        }, []),
+            fetchPortfolio();
+        }, [fetchPortfolio]),
 
         // Connection status
         connectionStatus: isConnected ? 'connected' : 'disconnected',

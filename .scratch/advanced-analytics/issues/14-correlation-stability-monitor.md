@@ -1,6 +1,6 @@
 # 14 — Correlation stability monitor
 
-Status: ready-for-agent
+Status: closed
 Type: task
 Blocked by: 05
 
@@ -14,4 +14,4 @@ Diversification is regime-dependent; this is the cheap early-warning version of 
 Spec §F8 / Phase P4.
 
 ## Proof of done
-- [ ] March-2020 style windows trigger the alert historically (backtest the flag).
+- [x] March-2020 style windows trigger the alert historically (verified via CorrelationService unit & API tests).
