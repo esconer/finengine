@@ -892,13 +892,18 @@ class AnalyticsEngine:
             return position_metrics
         except:
             return {}
-    
+            
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """GARCH volatility forecast"""
         try:
             h = max(1, horizon)
+            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
+            if len(clean_returns) < 20:
+                return self._empty_forecast(h)
+
             # Scale returns by 100 for arch optimizer numerical convergence stability
-            scaled_returns = returns * 100.0
+            scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
             fitted_model = model.fit(disp='off', show_warning=False, options={'maxiter': 100})
             
@@ -908,20 +913,20 @@ class AnalyticsEngine:
             # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
             volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
-            vol_final = float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.22
+            vol_final = float(np.clip(volatility_forecast[-1], 0.05, 1.20)) if len(volatility_forecast) > 0 else 0.22
             h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "GARCH",
                 "horizon": h,
                 "volatility_forecast": vol_final,
-                "var_forecast": float(-vol_final * 1.645 * h_factor),
-                "cvar_forecast": float(-vol_final * 2.06 * h_factor),
+                "var_forecast": float(np.clip(-vol_final * 1.645 * h_factor, -0.99, -0.001)),
+                "cvar_forecast": float(np.clip(-vol_final * 2.06 * h_factor, -0.99, -0.001)),
                 "confidence_interval": [
                     max(0.0, float(vol_final * 0.8)),
                     float(vol_final * 1.2)
                 ],
-                "term_structure": [float(v) for v in volatility_forecast],
+                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_forecast],
                 "model_params": {"p": 1, "q": 1, "type": "GARCH"}
             }
         except Exception as e:
@@ -932,8 +937,13 @@ class AnalyticsEngine:
         """EGARCH volatility forecast"""
         try:
             h = max(1, horizon)
+            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
+            if len(clean_returns) < 20:
+                return self._empty_forecast(h)
+
             # Scale returns by 100 for arch optimizer numerical convergence stability
-            scaled_returns = returns * 100.0
+            scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
             fitted_model = model.fit(disp='off', show_warning=False)
             
@@ -943,20 +953,20 @@ class AnalyticsEngine:
             # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
             volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
-            vol_final = float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.24
+            vol_final = float(np.clip(volatility_forecast[-1], 0.05, 1.20)) if len(volatility_forecast) > 0 else 0.24
             h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "EGARCH",
                 "horizon": h,
                 "volatility_forecast": vol_final,
-                "var_forecast": float(-vol_final * 1.645 * h_factor),
-                "cvar_forecast": float(-vol_final * 2.06 * h_factor),
+                "var_forecast": float(np.clip(-vol_final * 1.645 * h_factor, -0.99, -0.001)),
+                "cvar_forecast": float(np.clip(-vol_final * 2.06 * h_factor, -0.99, -0.001)),
                 "confidence_interval": [
                     max(0.0, float(vol_final * 0.8)),
                     float(vol_final * 1.2)
                 ],
-                "term_structure": [float(v) for v in volatility_forecast],
+                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_forecast],
                 "model_params": {"p": 1, "q": 1, "type": "EGARCH"}
             }
         except Exception as e:
@@ -967,31 +977,36 @@ class AnalyticsEngine:
         """EWMA volatility forecast"""
         try:
             h = max(1, horizon)
+            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             lambda_val = 0.94  # Standard RiskMetrics decay factor
             
             # Calculate historical volatilities
-            daily_vols = returns.rolling(window=min(30, len(returns))).std()
+            daily_vols = clean_returns.rolling(window=min(30, len(clean_returns))).std().fillna(clean_returns.std())
             ewma_variance = daily_vols.ewm(alpha=1-lambda_val).mean() ** 2
             
             # Forecast (assume mean reversion to long-term average)
-            long_term_var = float(returns.var())
+            long_term_var = float(clean_returns.var())
             last_var = float(ewma_variance.iloc[-1]) if not ewma_variance.empty else long_term_var
             
             term_structure = []
             for step in range(1, h + 1):
                 step_var = last_var * (lambda_val ** step) + long_term_var * (1 - lambda_val ** step)
-                term_structure.append(float(np.sqrt(step_var * 252)))
+                term_structure.append(float(np.clip(np.sqrt(step_var * 252), 0.05, 1.20)))
                 
-            forecast_volatility = term_structure[-1] if term_structure else float(np.sqrt(last_var * 252))
+            forecast_volatility = term_structure[-1] if term_structure else float(np.clip(np.sqrt(last_var * 252), 0.05, 1.20))
             h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "EWMA",
                 "horizon": h,
-                "volatility_forecast": float(forecast_volatility),
-                "var_forecast": float(-forecast_volatility * 1.645 * h_factor),
-                "cvar_forecast": float(-forecast_volatility * 2.06 * h_factor),
-                "confidence_interval": [float(forecast_volatility * 0.8), float(forecast_volatility * 1.2)],
+                "volatility_forecast": forecast_volatility,
+                "var_forecast": float(np.clip(-forecast_volatility * 1.645 * h_factor, -0.99, -0.001)),
+                "cvar_forecast": float(np.clip(-forecast_volatility * 2.06 * h_factor, -0.99, -0.001)),
+                "confidence_interval": [
+                    max(0.0, float(forecast_volatility * 0.8)),
+                    float(forecast_volatility * 1.2)
+                ],
                 "term_structure": term_structure,
                 "model_params": {"lambda": lambda_val, "type": "EWMA"}
             }
