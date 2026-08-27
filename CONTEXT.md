@@ -132,15 +132,24 @@ finengine/
 - **Cointegration Pairs Scanner (F10 / t15)**: `CointegrationService` executing Engle-Granger and Johansen cointegration tests with Ornstein-Uhlenbeck mean-reversion speed/half-life estimation and spread z-scores.
 - **Technical Indicators & Company Data (t21)**: stockstats engine (13 indicators) + fundamentals/financials/insider trades.
 - **Alpha Vantage Fallback (t22)**: In-process multi-key rotation pool with rate-limit budget tracking.
-- **Backend Test Suite Hardening (80%+ Gate Reached)**: 240/240 tests passing (0 failures), 85.61% total line coverage across the entire backend.
+- **Backend Test Suite Hardening (80%+ Gate Reached)**: 248/248 tests passing (0 failures), 85.36% total line coverage across the entire backend.
 - **Frontend Consolidation (t03, t04)**: Unified Axios client, normalized rebalancing, and dark mode UI overhaul (35/35 Vitest passing, zero TypeScript errors).
+- **Live Browser Verification (/browser)**: Full headless & real-browser verification of `/dashboard`, `/dashboard/pairs`, `/dashboard/india-flows`, `/dashboard/risk-contribution`, `/dashboard/forecast-risk`, `/dashboard/liquidity`, `/portfolio/manage` confirming clean console logs, responsive UI, dynamic currency switching, and live market updates.
 
 ---
 
 ## 7. Current Open Tickets & Roadmap (TODOs)
 
-The ongoing and planned tasks are tracked as local markdown issues under `.scratch/advanced-analytics/issues/`:
+The ongoing and planned tasks are tracked as local markdown issues under `.scratch/portfolio-audit-2026/issues/` and `.scratch/advanced-analytics/issues/`:
 
+### Priority 1: Portfolio Audit & Microstructure Polish (`.scratch/portfolio-audit-2026/`)
+| Ticket | Name | Status | Summary / Scope |
+|---|---|---|---|
+| **PA-01** | Wire Vol-Cone & Tails Contract Routes | `ready-for-agent` | Mount dedicated route aliases `/api/v1/analytics/vol-cone` and `/tails` to match full external contract spec |
+| **PA-02** | Defensive Timeseries Date Alignment | `ready-for-agent` | Ensure inner-join index alignment on cross-asset return series with mismatched holiday calendars |
+| **PA-03** | Screener.in Fundamentals Enrichment | `ready-for-agent` | Enrich portfolio summary cards with live Screener.in ratios (Market Cap, TTM P/E, ROE, 52W High/Low) |
+
+### Priority 2: Terminal UI & Operational Automation (`.scratch/advanced-analytics/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|
 | **t24** | Portfolio CSV/XLSX Importer UI | `ready-for-agent` | Drag-and-drop dropzone for Zerodha/Groww/AngelOne CSVs pre-filling `POST /portfolio/bulk_add` |
