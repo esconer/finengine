@@ -84,8 +84,8 @@ class AnalyticsEngine:
             metrics.update(self._calculate_drawdown_metrics(portfolio_returns))
             metrics.update(self._calculate_return_distribution(portfolio_returns))
             
-            # Position-level metrics
-            metrics['positions'] = self._calculate_position_metrics(returns, weights)
+            # Position-level metrics using active price series
+            metrics['positions'] = self._calculate_position_metrics(returns, weights, raw_prices=price_data)
             
             return metrics
             
@@ -679,20 +679,27 @@ class AnalyticsEngine:
             if returns.empty:
                 return {}
             
-            # Annual return and volatility
-            annual_return = returns.mean() * 252
-            annual_volatility = returns.std() * np.sqrt(252)
-            
-            # Sharpe ratio
-            sharpe_ratio = (annual_return - self.risk_free_rate) / annual_volatility if annual_volatility > 0 else 0
-            
-            # Sortino ratio
-            downside_returns = returns[returns < 0]
-            downside_deviation = downside_returns.std() * np.sqrt(252) if not downside_returns.empty else 0
-            sortino_ratio = (annual_return - self.risk_free_rate) / downside_deviation if downside_deviation > 0 else 0
+            if len(returns) < 10:
+                # Insufficient sample size for reliable annualization: return period cumulative return and 0 Sharpe
+                annual_return = float(returns.sum())
+                annual_volatility = float(returns.std() * np.sqrt(252)) if len(returns) > 1 else 0.0
+                sharpe_ratio = 0.0
+                sortino_ratio = 0.0
+            else:
+                # Annual return and volatility
+                annual_return = float(returns.mean() * 252)
+                annual_volatility = float(returns.std() * np.sqrt(252))
+                
+                # Sharpe ratio
+                sharpe_ratio = float((annual_return - self.risk_free_rate) / annual_volatility) if annual_volatility > 0 else 0.0
+                
+                # Sortino ratio
+                downside_returns = returns[returns < 0]
+                downside_deviation = float(downside_returns.std() * np.sqrt(252)) if not downside_returns.empty else 0.0
+                sortino_ratio = float((annual_return - self.risk_free_rate) / downside_deviation) if downside_deviation > 0 else 0.0
             
             # Hit ratio
-            hit_ratio = (returns > 0).mean()
+            hit_ratio = float((returns > 0).mean())
             
             return {
                 "annual_return": annual_return,
@@ -754,22 +761,41 @@ class AnalyticsEngine:
         except:
             return {}
     
-    def _calculate_position_metrics(self, returns: pd.DataFrame, weights: Dict[str, float]) -> Dict[str, Any]:
-        """Calculate metrics for individual positions"""
+    def _calculate_position_metrics(
+        self,
+        returns: pd.DataFrame,
+        weights: Dict[str, float],
+        raw_prices: Optional[pd.DataFrame] = None
+    ) -> Dict[str, Any]:
+        """Calculate metrics for individual positions based on active price history"""
         try:
             if returns.empty:
                 return {}
             
             position_metrics = {}
             for ticker in returns.columns:
-                ticker_returns = returns[ticker].dropna()
+                # Use raw active price series if available to avoid artificial zero-dilution on newly listed assets
+                if raw_prices is not None and ticker in raw_prices.columns:
+                    raw_s = raw_prices[ticker].dropna()
+                    if len(raw_s) >= 2:
+                        ticker_returns = raw_s.pct_change(fill_method=None).dropna()
+                    else:
+                        ticker_returns = returns[ticker].dropna()
+                else:
+                    ticker_returns = returns[ticker].dropna()
+
                 if not ticker_returns.empty:
+                    data_points = len(ticker_returns)
+                    is_limited = data_points < 30
                     metrics = self._calculate_basic_metrics(ticker_returns)
                     metrics.update(self._calculate_risk_metrics(ticker_returns))
                     metrics.update(self._calculate_drawdown_metrics(ticker_returns))
                     position_metrics[ticker] = {
                         **metrics,
-                        "weight": weights.get(ticker, 0)
+                        "weight": weights.get(ticker, 0),
+                        "data_points": data_points,
+                        "is_limited_history": is_limited,
+                        "history_warning": f"Only {data_points} trading days available on exchange feed" if is_limited else None
                     }
             
             return position_metrics

@@ -127,6 +127,7 @@ yfinance (NSE/BSE tickers auto-suffixed .NS/.BO)
 - Resolved dashboard timeout bug by introducing non-blocking quote fetches, staleness checks on `GET /portfolio`, and concurrent multi-ticker batch processing.
 - Resolved memory and CPU spikes (QH-14): analytical GARCH forecasting, idle WebSocket gates, in-memory DataFrame TTL caching, Turbopack package import tree-shaking, and production static build workflow.
 - Resolved dashboard visual & quantitative audit (Audit Issue 09): return alignment for short-history assets (NIFTYIETF.NS), performance history chart holding-quantity scaling, metric card deduplication, and single-header DataTable.
+- Resolved realized risk page audit (Audit Issue 10): allocation resolution preserves DB market-value weights (replacing 7.14% flat weights with real 13.86%, 13.09%, etc.), card deduplication, active-series metrics with sample size guard ($N < 10$), and UI warning banner for limited historical depth instruments (e.g. `NIFTYIETF.NS`).
 
 ---
 

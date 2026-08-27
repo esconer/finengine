@@ -62,15 +62,24 @@ async def resolve_allocation(
     tickers_param: Optional[str],
     db: AsyncSession,
 ) -> tuple[List[str], Dict[str, float]]:
-    """Shared allocation resolution: explicit tickers (equal weight) or DB positions."""
+    """Shared allocation resolution: DB positions with real market-value weights, or custom tickers."""
+    db_weights = await _load_portfolio_allocation(db)
     if tickers_param:
         ticker_list = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
-        eq = 1.0 / len(ticker_list) if ticker_list else 1.0
+        if not ticker_list:
+            raise ValueError("No tickers specified")
+        if db_weights:
+            subset = {t: db_weights.get(t, 0.0) for t in ticker_list if t in db_weights}
+            if subset and sum(subset.values()) > 0:
+                tot = sum(subset.values())
+                return ticker_list, {t: v / tot for t, v in subset.items()}
+        # Fallback for ad-hoc / external tickers not in DB
+        eq = 1.0 / len(ticker_list)
         return ticker_list, {t: eq for t in ticker_list}
-    weights = await _load_portfolio_allocation(db)
-    if not weights:
+
+    if not db_weights:
         raise ValueError("No portfolio positions found")
-    return list(weights.keys()), weights
+    return list(db_weights.keys()), db_weights
 
 
 def _q(metric_fn, *args, **kwargs):
@@ -200,31 +209,26 @@ async def get_realized_risk(
         if not start:
             start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
 
-        # Resolve tickers + weights: explicit param wins, else actual DB positions
-        if tickers:
-            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-            equal_weight = 1.0 / len(ticker_list) if ticker_list else 1.0
-            weights = {ticker: equal_weight for ticker in ticker_list}
-        else:
-            weights = await _load_portfolio_allocation(db)
-            if not weights:
-                return {
-                    "portfolio": {
-                        "annual_return": 0.0,
-                        "annual_volatility": 0.20,
-                        "sharpe_ratio": 0.0,
-                        "sortino_ratio": 0.0,
-                        "skewness": 0.0,
-                        "kurtosis": 3.0,
-                        "max_drawdown": 0.0,
-                        "var_95": -0.032,
-                        "cvar_95": -0.047,
-                        "hit_ratio": 0.5
-                    },
-                    "positions": {},
-                    "error": "No portfolio positions found"
-                }
-            ticker_list = list(weights.keys())
+        # Resolve tickers + weights via resolve_allocation
+        try:
+            ticker_list, weights = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            return {
+                "portfolio": {
+                    "annual_return": 0.0,
+                    "annual_volatility": 0.20,
+                    "sharpe_ratio": 0.0,
+                    "sortino_ratio": 0.0,
+                    "skewness": 0.0,
+                    "kurtosis": 3.0,
+                    "max_drawdown": 0.0,
+                    "var_95": -0.032,
+                    "cvar_95": -0.047,
+                    "hit_ratio": 0.5
+                },
+                "positions": {},
+                "error": str(e)
+            }
 
         # Fetch price data for all tickers concurrently
         price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
@@ -268,21 +272,34 @@ async def get_realized_risk(
             "hit_ratio": metrics.get("hit_ratio", 0.5)
         }
         
-        # Position-level metrics
+        # Position-level metrics & data quality warnings
         positions = {}
+        warnings_list = []
         for ticker, pos_metrics in metrics.get("positions", {}).items():
+            is_limited = pos_metrics.get("is_limited_history", False)
+            data_pts = pos_metrics.get("data_points", 0)
+            if is_limited:
+                warnings_list.append({
+                    "ticker": ticker,
+                    "data_points": data_pts,
+                    "message": f"{ticker} has only {data_pts} trading days of data available on exchange feeds. Historical risk ratios are constrained."
+                })
             positions[ticker] = {
                 "annual_return": pos_metrics.get("annual_return", 0),
                 "annual_volatility": pos_metrics.get("annual_volatility", 0.20),
                 "sharpe_ratio": pos_metrics.get("sharpe_ratio", 0),
                 "max_drawdown": pos_metrics.get("max_drawdown", 0),
                 "var_95": pos_metrics.get("var_95", -0.032),
-                "weight": pos_metrics.get("weight", 0)
+                "weight": pos_metrics.get("weight", 0),
+                "data_points": data_pts,
+                "is_limited_history": is_limited,
+                "history_warning": pos_metrics.get("history_warning")
             }
         
         return {
             "portfolio": portfolio_metrics,
             "positions": positions,
+            "warnings": warnings_list,
             "data_range": {"start": start, "end": end},
             "methodology": "Real-time calculations using quantstats and statistical models"
         }
@@ -306,27 +323,23 @@ async def get_forecast_risk(
     Get forecast risk metrics using specified model
     """
     try:
-        # Resolve tickers: explicit param wins, else actual DB positions
-        if tickers:
-            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-            allocation = {t: 1.0 / len(ticker_list) for t in ticker_list}
-        else:
-            allocation = await _load_portfolio_allocation(db)
-            if not allocation:
-                return {
-                    "model": model,
-                    "horizon": horizon,
-                    "portfolio": {
-                        "volatility_forecast": 0.22,
-                        "var_forecast": -0.028,
-                        "cvar_forecast": -0.041,
-                        "confidence_interval": [0.18, 0.26]
-                    },
-                    "positions": {},
-                    "model_params": {"p": 1, "q": 1, "type": model},
-                    "error": "No portfolio positions found"
-                }
-            ticker_list = list(allocation.keys())
+        # Resolve tickers & allocation via resolve_allocation
+        try:
+            ticker_list, allocation = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            return {
+                "model": model,
+                "horizon": horizon,
+                "portfolio": {
+                    "volatility_forecast": 0.22,
+                    "var_forecast": -0.028,
+                    "cvar_forecast": -0.041,
+                    "confidence_interval": [0.18, 0.26]
+                },
+                "positions": {},
+                "model_params": {"p": 1, "q": 1, "type": model},
+                "error": str(e)
+            }
         
         # Default date range for sufficient historical data
         end = datetime.now().strftime('%Y-%m-%d')
@@ -417,25 +430,20 @@ async def get_factor_exposure(
     Get factor exposure analysis
     """
     try:
-        # Resolve tickers: explicit param wins, else actual DB positions
-        if tickers:
-            ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-            eq = 1.0 / len(ticker_list) if ticker_list else 1.0
-            allocation = {t: eq for t in ticker_list}
-        else:
-            allocation = await _load_portfolio_allocation(db)
-            if not allocation:
-                return {
-                    "portfolio": {
-                        "alpha": 0.0,
-                        "market": 1.0
-                    },
-                    "positions": {},
-                    "r_squared": 0.0,
-                    "adjusted_r_squared": 0.0,
-                    "error": "No portfolio positions found"
-                }
-            ticker_list = list(allocation.keys())
+        # Resolve tickers & allocation via resolve_allocation
+        try:
+            ticker_list, allocation = await resolve_allocation(tickers, db)
+        except ValueError as e:
+            return {
+                "portfolio": {
+                    "alpha": 0.0,
+                    "market": 1.0
+                },
+                "positions": {},
+                "r_squared": 0.0,
+                "adjusted_r_squared": 0.0,
+                "error": str(e)
+            }
         
         # Calculate date range
         end = datetime.now().strftime('%Y-%m-%d')
