@@ -1,6 +1,6 @@
 # 28 — Scheduled Post-Market NSE Bhavcopy & Institutional Ingestion Cron
 
-Status: ready-for-agent
+Status: deferred
 Type: task
 Blocked by: 16
 

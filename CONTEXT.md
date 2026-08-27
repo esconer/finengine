@@ -156,7 +156,7 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 | **t25** | Interactive Efficient Frontier Curve | `ready-for-agent` | Recharts/SVG Markowitz frontier scatter curve with current vs optimal asset overlays |
 | **t26** | Consolidated Risk Studio Canvas | `ready-for-agent` | `/dashboard/risk-studio` linking Euler risk, copula heatmap, and vol cones side-by-side |
 | **t27** | One-Click PDF Report Header Trigger | `ready-for-agent` | Global header trigger downloading multi-page branded PDF tear-sheet via jsPDF |
-| **t28** | Scheduled Post-Market NSE Ingestion Cron | `ready-for-agent` | Background scheduler (18:30 IST) pulling daily bhavcopy, delivery %, and FII/DII net flows |
+| **t28** | Scheduled Post-Market NSE Ingestion Cron | `deferred` | Background scheduler (18:30 IST) pulling daily bhavcopy, delivery %, and FII/DII net flows |
 | **t29** | Promoter Pledge & Bulk Deal Scraper | `needs-info` | Ingest quarterly shareholding pattern XMLs & track promoter pledge delta alerts |
 | **t30** | Black-Litterman Bayesian Optimizer | `ready-for-agent` | Blending market equilibrium priors with subjective investor return views |
 | **t31** | Options Greeks & IV Surface Tracking | `needs-info` | Net portfolio delta/gamma/vega exposures and implied volatility smile surface |
