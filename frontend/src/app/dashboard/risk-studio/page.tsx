@@ -82,13 +82,23 @@ export default function RiskStudioPage() {
         val !== undefined && val !== null ? `${(val * 100).toFixed(2)}%` : '—';
 
     // Prepare Euler Chart Data
-    const eulerPositions = riskContribution?.positions
-        ? Object.entries(riskContribution.positions).map(([ticker, data]: [string, any]) => ({
+    const eulerPositions = riskContribution?.positions?.volatility
+        ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
               ticker,
-              vol_contrib: +(data.vol_contribution_pct || 0).toFixed(1),
-              cvar_contrib: +(data.cvar_contribution_pct || 0).toFixed(1)
+              vol_contrib: +((volShare || 0) * 100).toFixed(1),
+              cvar_contrib: +(((riskContribution.positions.cvar_tail?.[ticker] || 0)) * 100).toFixed(1)
           }))
-        : [];
+        : (riskContribution?.positions
+            ? Object.entries(riskContribution.positions).map(([ticker, data]: [string, any]) => ({
+                  ticker,
+                  vol_contrib: +(data.vol_contribution_pct || data.vol_contrib || 0).toFixed(1),
+                  cvar_contrib: +(data.cvar_contribution_pct || data.cvar_contrib || 0).toFixed(1)
+              }))
+            : []);
+
+    const sectorRollup = riskContribution?.sector_rollup?.volatility || riskContribution?.sector_vol_shares;
+    const copulaTickers: string[] = tailRisk?.tail_dependence_matrix?.tickers || tailRisk?.tickers || [];
+    const copulaMatrix: number[][] = tailRisk?.tail_dependence_matrix?.matrix || tailRisk?.matrix || [];
 
     // Prepare Vol Cone Chart Data
     const coneWindows = [10, 21, 63, 126, 252];
@@ -139,17 +149,17 @@ export default function RiskStudioPage() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <MetricCard
                         title="Portfolio Volatility (ann.)"
-                        value={fmtPct(riskContribution?.portfolio_volatility)}
+                        value={fmtPct(riskContribution?.portfolio_volatility_annualized || riskContribution?.portfolio_volatility)}
                         icon={Activity}
                     />
                     <MetricCard
                         title="99% EVT-POT VaR (1-Day)"
-                        value={fmtPct(tailRisk?.evt_var_99)}
+                        value={fmtPct(tailRisk?.evt_pot_var_99 || tailRisk?.evt_var_99)}
                         icon={Flame}
                     />
                     <MetricCard
                         title="99% Expected Shortfall"
-                        value={fmtPct(tailRisk?.evt_es_99)}
+                        value={fmtPct(tailRisk?.evt_pot_es_99 || tailRisk?.evt_es_99)}
                         icon={ShieldAlert}
                     />
                     <MetricCard
@@ -203,10 +213,10 @@ export default function RiskStudioPage() {
                                 </ResponsiveContainer>
                             </div>
                         </div>
-                        {riskContribution?.sector_vol_shares && (
+                        {sectorRollup && (
                             <div className="mt-4 pt-3 border-t border-slate-800 flex flex-wrap gap-2 text-xs">
                                 <span className="text-slate-400">Sector Rollup:</span>
-                                {Object.entries(riskContribution.sector_vol_shares).map(([sec, share]: [string, any]) => (
+                                {Object.entries(sectorRollup).map(([sec, share]: [string, any]) => (
                                     <span key={sec} className="bg-slate-800 px-2 py-0.5 rounded text-slate-300">
                                         {sec}: <strong className="text-white">{(share * 100).toFixed(1)}%</strong>
                                     </span>
@@ -230,27 +240,27 @@ export default function RiskStudioPage() {
                             <p className="text-xs text-slate-400 mb-4">
                                 Bivariate Student-t Copula tail dependence coefficient measuring simultaneous crash comovement.
                             </p>
-                            {tailRisk?.tail_dependence_matrix ? (
+                            {copulaTickers.length > 0 && copulaMatrix.length > 0 ? (
                                 <div className="overflow-x-auto border border-slate-800 rounded-lg bg-slate-950/60 p-2">
                                     <table className="w-full text-xs text-center">
                                         <thead>
                                             <tr>
                                                 <th className="p-2 text-left text-slate-400">Asset</th>
-                                                {Object.keys(tailRisk.tail_dependence_matrix).map(k => (
-                                                    <th key={k} className="p-2 font-mono text-slate-300">{k}</th>
+                                                {copulaTickers.map(t => (
+                                                    <th key={t} className="p-2 font-mono text-slate-300">{t}</th>
                                                 ))}
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {Object.entries(tailRisk.tail_dependence_matrix).map(([rowK, cols]: [string, any]) => (
-                                                <tr key={rowK} className="border-t border-slate-800/60">
-                                                    <td className="p-2 text-left font-mono font-medium text-slate-300">{rowK}</td>
-                                                    {Object.entries(cols).map(([colK, val]: [string, any]) => {
-                                                        const num = typeof val === 'number' ? val : 0;
-                                                        const isSelf = rowK === colK;
+                                            {copulaTickers.map((rowTicker, rowIdx) => (
+                                                <tr key={rowTicker} className="border-t border-slate-800/60">
+                                                    <td className="p-2 text-left font-mono font-medium text-slate-300">{rowTicker}</td>
+                                                    {copulaTickers.map((colTicker, colIdx) => {
+                                                        const num = copulaMatrix[rowIdx]?.[colIdx] ?? (rowIdx === colIdx ? 1.0 : 0.0);
+                                                        const isSelf = rowIdx === colIdx;
                                                         const intensity = isSelf ? 'bg-slate-800/80 text-slate-400' : num > 0.3 ? 'bg-rose-500/20 text-rose-300 font-semibold' : 'bg-emerald-500/10 text-emerald-300';
                                                         return (
-                                                            <td key={colK} className={`p-2 font-mono ${intensity}`}>
+                                                            <td key={colTicker} className={`p-2 font-mono ${intensity}`}>
                                                                 {num.toFixed(3)}
                                                             </td>
                                                         );
@@ -267,9 +277,9 @@ export default function RiskStudioPage() {
                             )}
                         </div>
                         <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-                            <span>EVT Shape: <strong className="text-white font-mono">{tailRisk?.gpd_parameters?.shape_xi?.toFixed(4) || '—'}</strong></span>
-                            <span>Scale: <strong className="text-white font-mono">{tailRisk?.gpd_parameters?.scale_beta?.toFixed(4) || '—'}</strong></span>
-                            <span>Fat Tailed: <strong className="text-emerald-400">{tailRisk?.gpd_parameters?.is_fat_tailed ? 'Yes' : 'No'}</strong></span>
+                            <span>EVT Shape: <strong className="text-white font-mono">{tailRisk?.gpd_shape_xi !== undefined ? Number(tailRisk.gpd_shape_xi).toFixed(4) : (tailRisk?.gpd_parameters?.shape_xi?.toFixed(4) || '—')}</strong></span>
+                            <span>Scale: <strong className="text-white font-mono">{tailRisk?.gpd_scale_beta !== undefined ? Number(tailRisk.gpd_scale_beta).toFixed(4) : (tailRisk?.gpd_parameters?.scale_beta?.toFixed(4) || '—')}</strong></span>
+                            <span>Fat Tailed: <strong className="text-emerald-400">{(tailRisk?.is_fat_tailed !== undefined ? tailRisk.is_fat_tailed : tailRisk?.gpd_parameters?.is_fat_tailed) ? 'Yes' : 'No'}</strong></span>
                         </div>
                     </div>
 
@@ -336,7 +346,7 @@ export default function RiskStudioPage() {
                                 </span>
                             </div>
                             <p className="text-xs text-slate-400 mb-4">
-                                Rolling pairwise correlation vs 90th percentile threshold ({correlation?.percentile_90_threshold?.toFixed(2) || '0.54'}).
+                                Rolling pairwise correlation vs 90th percentile threshold ({(correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.54).toFixed(2)}).
                             </p>
                             <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-lg space-y-3">
                                 <div className="flex items-center justify-between text-xs">
@@ -348,13 +358,13 @@ export default function RiskStudioPage() {
                                 <div className="flex items-center justify-between text-xs">
                                     <span className="text-slate-400">Historical 90th Percentile:</span>
                                     <span className="font-mono text-xs text-amber-400">
-                                        {(correlation?.percentile_90_threshold || 0).toFixed(3)}
+                                        {(correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.54).toFixed(3)}
                                     </span>
                                 </div>
                                 <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
                                     <div
                                         className={`h-full rounded-full ${
-                                            (correlation?.current_avg_correlation || 0) > (correlation?.percentile_90_threshold || 0.54)
+                                            (correlation?.current_avg_correlation || 0) > (correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.54)
                                                 ? 'bg-rose-500'
                                                 : 'bg-emerald-500'
                                         }`}

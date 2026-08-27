@@ -303,7 +303,7 @@ export default function VolatilitySizingPage() {
         />
         <MetricCard
           title="Total Positions"
-          value={positions.length}
+          value={String(positions.length)}
           icon={Zap}
           loading={loading}
         />

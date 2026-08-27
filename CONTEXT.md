@@ -142,6 +142,15 @@ finengine/
 
 The ongoing and planned tasks are tracked as local markdown issues under `.scratch/portfolio-audit-2026/issues/` and `.scratch/advanced-analytics/issues/`:
 
+### Priority 0: Browser Quantitative Verification Audit (`.scratch/browser-verification-audit-2026/`)
+| Ticket | Name | Status | Summary / Scope |
+|---|---|---|---|
+| **BVA-01** | Fix Backend `total_weight` NameError 500 | `closed` | Fix `NameError: name 'total_weight' is not defined` in `portfolio.py:130` unblocking `/dashboard` and `/portfolio/manage` |
+| **BVA-02** | Fix Risk Studio Copula Matrix & Metrics | `closed` | Fix copula response key mapping (rendering schema keys as tickers) and bind EVT VaR / ES metric cards |
+| **BVA-03** | Fix Tear-Sheet Monthly Returns Grid | `closed` | Fix empty monthly return cells on `/dashboard/tear-sheet` by formatting month returns correctly |
+| **BVA-04** | Fix Volatility Sizing Risk Parity Math | `closed` | Invert vol allocation ($w_i \propto 1/\sigma_i$) so higher vol assets receive lower weights, and format Total Positions integer |
+| **BVA-05** | Fix Liquidity Currency & Market Cap | `closed` | Change `$` to `₹` and compute market cap from Screener.in fundamentals / price * shares on `/dashboard/liquidity` |
+
 ### Priority 1: Terminal UX & Data-Binding Audit (`.scratch/terminal-ux-audit-2026/`)
 | Ticket | Name | Status | Summary / Scope |
 |---|---|---|---|

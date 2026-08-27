@@ -239,7 +239,8 @@ export default function TearSheetPage() {
                         {year}
                       </td>
                       {MONTHS.map((_, mi) => {
-                        const val = data.monthly_returns[year]?.[String(mi + 1)];
+                        const mKey = String(mi + 1);
+                        const val = data.monthly_returns[year]?.[mKey] ?? (data.monthly_returns[year] as any)?.[mi + 1] ?? (data.monthly_returns[year] as any)?.[MONTHS[mi]] ?? (data.monthly_returns[year] as any)?.[MONTHS[mi].toUpperCase()];
                         return (
                           <td key={mi} className="px-1 pb-1">
                             {val === undefined ? (

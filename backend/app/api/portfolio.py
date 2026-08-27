@@ -123,6 +123,8 @@ async def get_portfolio(
         else:
             normalized_sectors = {}
         
+        total_weight = sum(p.weight for p in position_responses) if position_responses else 0.0
+        
         return PortfolioSummaryResponse(
             positions=position_responses,
             total_value=total_value,

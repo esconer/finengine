@@ -223,6 +223,8 @@ class TestPortfolioAPIEndpoints:
             data = resp.json()
             assert "Financials" in data["sectors"]
             assert data["sectors"]["Financials"] == 1.0
+            assert "total_weight" in data
+            assert data["total_weight"] > 0
 
         # Clean up
         await test_db.execute(delete(PortfolioPosition))

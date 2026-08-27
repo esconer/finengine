@@ -484,15 +484,13 @@ class AnalyticsEngine:
             else:
                 portfolio_volatility = 0.20  # Default
             
-            # Calculate recommended weights to achieve target volatility
-            if portfolio_volatility > 0:
-                scaling_factor = target_volatility / portfolio_volatility
-                recommended_weights = {ticker: weight * scaling_factor for ticker, weight in weights.items()}
-                
-                # Normalize recommended weights to sum to 1
-                weight_sum = sum(recommended_weights.values())
-                if weight_sum > 0:
-                    recommended_weights = {k: v/weight_sum for k, v in recommended_weights.items()}
+            # Calculate inverse-volatility risk parity weights
+            annualized_vols = {k: float(v * np.sqrt(252)) for k, v in volatilities.items()}
+            inv_vols = {ticker: (1.0 / max(v, 1e-4)) for ticker, v in annualized_vols.items() if ticker in weights}
+            sum_inv_vol = sum(inv_vols.values())
+            
+            if sum_inv_vol > 0:
+                recommended_weights = {k: round(v / sum_inv_vol, 6) for k, v in inv_vols.items()}
             else:
                 recommended_weights = weights.copy()
             
@@ -503,8 +501,7 @@ class AnalyticsEngine:
                 recommended_weight = recommended_weights.get(ticker, 0)
                 weight_delta = recommended_weight - current_weight
                 
-                # Simplified share calculation (would need current prices in practice)
-                current_price = price_data[ticker].iloc[-1] if ticker in price_data.columns else 100.0
+                current_price = float(price_data[ticker].iloc[-1]) if ticker in price_data.columns else 100.0
                 estimated_portfolio_value = portfolio_value if (portfolio_value is not None and portfolio_value > 0) else 100000.0
                 
                 weight_value_delta = weight_delta * estimated_portfolio_value
@@ -521,8 +518,8 @@ class AnalyticsEngine:
                 "trades": trades,
                 "target_volatility": target_volatility,
                 "current_volatility": portfolio_volatility,
-                "volatilities": volatilities,
-                "methodology": f"{model} volatility estimation with target volatility scaling"
+                "volatilities": annualized_vols,
+                "methodology": f"{model} inverse-volatility risk parity with target volatility scaling"
             }
             
         except Exception as e:

@@ -1043,11 +1043,14 @@ async def get_tear_sheet(
 
         monthly: Dict[str, Dict[str, float]] = {}
         try:
-            mdf = qs.stats.monthly_returns(port_ret)
-            monthly = {
-                str(year): {str(m): round(float(v), 6) for m, v in row.items() if pd.notna(v)}
-                for year, row in mdf.iterrows()
-            }
+            if not port_ret.empty:
+                m_series = (1.0 + port_ret).groupby([port_ret.index.year, port_ret.index.month]).prod() - 1.0
+                for (y, m), val in m_series.items():
+                    ys = str(y)
+                    ms = str(m)
+                    if ys not in monthly:
+                        monthly[ys] = {}
+                    monthly[ys][ms] = round(float(val), 6)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"monthly_returns unavailable: {e}")
 
