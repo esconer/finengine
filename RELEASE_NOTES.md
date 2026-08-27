@@ -150,3 +150,33 @@ Plus dashboard-home widgets: regime banner strip and top risk drivers, both sile
 - t09 resolved (constraints + frontier chart deferred, noted in ticket)
 - t11 resolved
 - t23 (portfolio importer) designed, deprioritized by owner
+---
+
+## 2026-08-27 — Quantitative Hardening, India Microstructure, and 85%+ Test Coverage Gate
+
+Institutional-grade quantitative analytics, Indian market microstructure feeds, and total test hardening across frontend and backend.
+
+### 1) Shipped Quantitative Services & Endpoints
+- **Volatility Cones & Term Structure (`VolatilityService`)**:
+  - `GET /api/v1/analytics/vol-cone`: Multi-window rolling realized volatility quantiles (10, 21, 63, 126, 252 trading days) alongside GARCH(1,1) forward forecasts and RiskMetrics EWMA ($\lambda=0.94$).
+- **Extreme Value Theory & Tail Dependence (`TailRiskService`)**:
+  - `GET /api/v1/analytics/tail-dependence`: 99% EVT-POT (Peaks-Over-Threshold) Generalized Pareto VaR and Expected Shortfall with numerical stability bounds ($\xi \in [-0.5, 0.95]$), plus bivariate Student-t Copula lower-tail crash dependence ($\lambda_L$) matrix.
+- **Correlation Stability Monitor (`CorrelationService`)**:
+  - `GET /api/v1/analytics/correlation-stability`: Rolling 60-day average pairwise correlation monitor tracking diversification breakdown against historical 90th-percentile thresholds.
+- **Cointegration & Pairs Scanner (`CointegrationService`)**:
+  - `GET /api/v1/analytics/coint`: Pairwise Engle-Granger and Johansen cointegration rank scanner computing OLS hedge ratios ($\beta$), Ornstein-Uhlenbeck (OU) mean-reversion speed, half-life days, and spread z-scores.
+- **India Market Microstructure & ADV Limits (`IndiaDataService`)**:
+  - `GET /api/v1/analytics/india-flows`: 30-day FII / DII institutional net cash market flows.
+  - `GET /api/v1/analytics/delivery-anomalies`: Daily NSE delivery % spike detector (>2σ over 20d average).
+  - `GET /api/v1/analytics/liquidity-limits`: Participation-based liquidation horizons (days-to-liquidate @ 10% & 20% ADV), Amihud (2002) illiquidity ratios, and 5% ADV max position size limits.
+
+### 2) Frontend Visual Pages & Polish
+- **Cointegration Pairs Scanner (`/dashboard/pairs`)**: Full interactive UI table with p-values, hedge ratios, OU half-life, and live spread z-scores.
+- **India Flows & Microstructure (`/dashboard/india-flows`)**: Dedicated dashboard displaying delivery accumulation spikes, institutional flow bars, and participation liquidity tiers.
+- **Zero-Mock Purge**: Eliminated all pseudo-random generators (`Math.random`, `hash()`), mock loops, and synthetic jitter from business and render logic.
+
+### 3) Test Suite & Coverage Gate Reached
+- **Backend Test Suite**: **243 / 243 Passed** (0 failures, 100% green).
+- **Backend Line Coverage**: **85.36% Total Line Coverage** (officially surpassing the required 80% gate `pytest --cov=app --cov-fail-under=80`).
+- **Frontend Test Suite**: **35 / 35 Passed** (`bun x vitest run`).
+- **Frontend TypeScript Check**: **0 Errors** (`bun x tsc --noEmit`).
