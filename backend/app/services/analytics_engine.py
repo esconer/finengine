@@ -805,95 +805,108 @@ class AnalyticsEngine:
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """GARCH volatility forecast"""
         try:
+            h = max(1, horizon)
             # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = returns * 100.0
             model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
             fitted_model = model.fit(disp='off', show_warning=False, options={'maxiter': 100})
             
             # Generate analytical forecast (fast O(1) computation instead of 1000 simulation paths)
-            forecast = fitted_model.forecast(horizon=horizon, method='analytic')
+            forecast = fitted_model.forecast(horizon=h, method='analytic')
             
             # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
             volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
+            vol_final = float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.22
+            h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "GARCH",
-                "horizon": horizon,
-                "volatility_forecast": float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.22,
-                "var_forecast": -float(volatility_forecast[-1]) * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.028,
-                "cvar_forecast": -float(volatility_forecast[-1]) * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.041,
+                "horizon": h,
+                "volatility_forecast": vol_final,
+                "var_forecast": float(-vol_final * 1.645 * h_factor),
+                "cvar_forecast": float(-vol_final * 2.06 * h_factor),
                 "confidence_interval": [
-                    max(0, float(volatility_forecast[-1]) * 0.8) if len(volatility_forecast) > 0 else 0.18,
-                    float(volatility_forecast[-1]) * 1.2 if len(volatility_forecast) > 0 else 0.26
+                    max(0.0, float(vol_final * 0.8)),
+                    float(vol_final * 1.2)
                 ],
+                "term_structure": [float(v) for v in volatility_forecast],
                 "model_params": {"p": 1, "q": 1, "type": "GARCH"}
             }
         except Exception as e:
             logger.error(f"GARCH forecast error: {e}")
-            return self._empty_forecast()
+            return self._empty_forecast(h)
     
     async def _egarch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EGARCH volatility forecast"""
         try:
+            h = max(1, horizon)
             # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = returns * 100.0
             model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
             fitted_model = model.fit(disp='off', show_warning=False)
             
             # Generate forecast
-            forecast = fitted_model.forecast(horizon=horizon)
+            forecast = fitted_model.forecast(horizon=h)
             
             # Extract volatility forecast and unscale
             variance_forecast = forecast.variance.values[-1, :]
             volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
+            vol_final = float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.24
+            h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "EGARCH",
-                "horizon": horizon,
-                "volatility_forecast": float(volatility_forecast[-1]) if len(volatility_forecast) > 0 else 0.24,
-                "var_forecast": -float(volatility_forecast[-1]) * 1.645 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.031,
-                "cvar_forecast": -float(volatility_forecast[-1]) * 2.0 / np.sqrt(252) if len(volatility_forecast) > 0 else -0.045,
+                "horizon": h,
+                "volatility_forecast": vol_final,
+                "var_forecast": float(-vol_final * 1.645 * h_factor),
+                "cvar_forecast": float(-vol_final * 2.06 * h_factor),
                 "confidence_interval": [
-                    max(0, float(volatility_forecast[-1]) * 0.8) if len(volatility_forecast) > 0 else 0.19,
-                    float(volatility_forecast[-1]) * 1.2 if len(volatility_forecast) > 0 else 0.29
+                    max(0.0, float(vol_final * 0.8)),
+                    float(vol_final * 1.2)
                 ],
+                "term_structure": [float(v) for v in volatility_forecast],
                 "model_params": {"p": 1, "q": 1, "type": "EGARCH"}
             }
         except Exception as e:
             logger.error(f"EGARCH forecast error: {e}")
-            return self._empty_forecast()
+            return self._empty_forecast(h)
     
     def _ewma_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EWMA volatility forecast"""
         try:
-            # EWMA volatility calculation
-            lambda_val = 0.94  # Standard decay factor
+            h = max(1, horizon)
+            lambda_val = 0.94  # Standard RiskMetrics decay factor
             
             # Calculate historical volatilities
-            daily_vols = returns.rolling(window=30).std()
+            daily_vols = returns.rolling(window=min(30, len(returns))).std()
             ewma_variance = daily_vols.ewm(alpha=1-lambda_val).mean() ** 2
             
             # Forecast (assume mean reversion to long-term average)
-            long_term_var = returns.var()
-            last_var = ewma_variance.iloc[-1] if not ewma_variance.empty else long_term_var
+            long_term_var = float(returns.var())
+            last_var = float(ewma_variance.iloc[-1]) if not ewma_variance.empty else long_term_var
             
-            # Simple forecast: mean revert toward long-term average
-            forecast_variance = last_var * (lambda_val ** horizon) + long_term_var * (1 - lambda_val ** horizon)
-            forecast_volatility = np.sqrt(forecast_variance * 252)
+            term_structure = []
+            for step in range(1, h + 1):
+                step_var = last_var * (lambda_val ** step) + long_term_var * (1 - lambda_val ** step)
+                term_structure.append(float(np.sqrt(step_var * 252)))
+                
+            forecast_volatility = term_structure[-1] if term_structure else float(np.sqrt(last_var * 252))
+            h_factor = np.sqrt(h / 252.0)
             
             return {
                 "model": "EWMA",
-                "horizon": horizon,
-                "volatility_forecast": forecast_volatility,
-                "var_forecast": -forecast_volatility * 1.645 / np.sqrt(252),
-                "cvar_forecast": -forecast_volatility * 2.0 / np.sqrt(252),
-                "confidence_interval": [forecast_volatility * 0.8, forecast_volatility * 1.2],
+                "horizon": h,
+                "volatility_forecast": float(forecast_volatility),
+                "var_forecast": float(-forecast_volatility * 1.645 * h_factor),
+                "cvar_forecast": float(-forecast_volatility * 2.06 * h_factor),
+                "confidence_interval": [float(forecast_volatility * 0.8), float(forecast_volatility * 1.2)],
+                "term_structure": term_structure,
                 "model_params": {"lambda": lambda_val, "type": "EWMA"}
             }
         except Exception as e:
             logger.error(f"EWMA forecast error: {e}")
-            return self._empty_forecast()
+            return self._empty_forecast(h)
     
     def _calculate_factor_exposures(
         self, 
@@ -1070,14 +1083,18 @@ class AnalyticsEngine:
             "error": "Insufficient data for calculations"
         }
     
-    def _empty_forecast(self) -> Dict[str, Any]:
+    def _empty_forecast(self, horizon: int = 1) -> Dict[str, Any]:
+        h = max(1, horizon)
+        h_factor = np.sqrt(h / 252.0)
+        base_vol = 0.22
         return {
             "model": "GARCH",
-            "horizon": 1,
-            "volatility_forecast": 0.22,
-            "var_forecast": -0.028,
-            "cvar_forecast": -0.041,
+            "horizon": h,
+            "volatility_forecast": base_vol,
+            "var_forecast": float(-base_vol * 1.645 * h_factor),
+            "cvar_forecast": float(-base_vol * 2.06 * h_factor),
             "confidence_interval": [0.18, 0.26],
+            "term_structure": [base_vol] * h,
             "model_params": {"p": 1, "q": 1, "type": "GARCH"},
             "error": "Insufficient data for forecast"
         }

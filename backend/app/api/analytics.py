@@ -366,35 +366,67 @@ async def get_forecast_risk(
         # Combine price data
         price_data = pd.DataFrame(price_data_dict)
 
-        # Calculate portfolio returns
-        returns = price_data.pct_change().dropna()
+        # Defensively forward/backfill price series to support assets with mixed inception dates
+        cleaned_prices = price_data.sort_index().ffill().bfill()
+        returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0).iloc[1:]
 
-        # Weight asset returns by the DB allocation when positions were resolved;
-        # explicit-ticker requests have no weights and stay equal-weighted.
-        portfolio_returns = returns.mean(axis=1)
-        if not tickers:
-            matched = {t: w for t, w in (allocation or {}).items() if t in returns.columns}
-            total_w = sum(matched.values())
-            if matched and total_w > 0:
-                norm = pd.Series({t: w / total_w for t, w in matched.items()})
-                portfolio_returns = returns[norm.index].mul(norm, axis=1).sum(axis=1)
+        # Weight asset returns by allocation
+        if allocation:
+            weight_series = pd.Series({t: allocation.get(t, 0.0) for t in returns.columns})
+            weight_sum = weight_series.sum()
+            if weight_sum > 0:
+                weight_series = weight_series / weight_sum
+            else:
+                weight_series = pd.Series(1.0 / len(returns.columns), index=returns.columns)
+            portfolio_returns = (returns * weight_series).sum(axis=1)
+        else:
+            portfolio_returns = returns.mean(axis=1)
 
         # Calculate portfolio volatility forecast using analytics engine
         forecast_result = await analytics_engine.forecast_volatility(portfolio_returns, model, horizon)
         
-        # Position-level forecasts
+        # Position-level forecasts using active price history
         positions = {}
-        for ticker in returns.columns:
+        warnings_list = []
+        for ticker in price_data.columns:
             try:
-                ticker_forecast = await analytics_engine.forecast_volatility(returns[ticker], model, horizon)
+                raw_s = price_data[ticker].dropna()
+                data_pts = len(raw_s)
+                if data_pts >= 30:
+                    ticker_rets = raw_s.pct_change(fill_method=None).dropna()
+                    ticker_forecast = await analytics_engine.forecast_volatility(ticker_rets, model, horizon)
+                    vol_fc = ticker_forecast.get("volatility_forecast")
+                    var_fc = ticker_forecast.get("var_forecast")
+                    is_limited = False
+                    warning = None
+                else:
+                    ticker_rets = raw_s.pct_change(fill_method=None).dropna()
+                    h_factor = np.sqrt(max(1, horizon) / 252.0)
+                    vol_fc = float(ticker_rets.std() * np.sqrt(252)) if len(ticker_rets) > 1 else None
+                    var_fc = float(-vol_fc * 1.645 * h_factor) if vol_fc is not None else None
+                    is_limited = True
+                    warning = f"Only {data_pts} trading days available on exchange feed"
+                    warnings_list.append({
+                        "ticker": ticker,
+                        "data_points": data_pts,
+                        "message": f"{ticker} has only {data_pts} trading days available. Forecast volatility uses sample volatility."
+                    })
+                
                 positions[ticker] = {
-                    "volatility_forecast": ticker_forecast.get("volatility_forecast", 0.25),
-                    "var_forecast": ticker_forecast.get("var_forecast", -0.032)
+                    "volatility_forecast": vol_fc,
+                    "var_forecast": var_fc,
+                    "is_limited_history": is_limited,
+                    "history_warning": warning,
+                    "data_points": data_pts
                 }
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error forecasting {ticker}: {e}")
                 positions[ticker] = {
                     "volatility_forecast": 0.25,
-                    "var_forecast": -0.032
+                    "var_forecast": -0.032,
+                    "is_limited_history": False,
+                    "history_warning": None,
+                    "data_points": 0
                 }
         
         return {
@@ -404,9 +436,11 @@ async def get_forecast_risk(
                 "volatility_forecast": forecast_result.get("volatility_forecast", 0.22),
                 "var_forecast": forecast_result.get("var_forecast", -0.028),
                 "cvar_forecast": forecast_result.get("cvar_forecast", -0.041),
-                "confidence_interval": forecast_result.get("confidence_interval", [0.18, 0.26])
+                "confidence_interval": forecast_result.get("confidence_interval", [0.18, 0.26]),
+                "term_structure": forecast_result.get("term_structure", [])
             },
             "positions": positions,
+            "warnings": warnings_list,
             "model_params": forecast_result.get("model_params", {"p": 1, "q": 1, "type": model}),
             "data_range": {"start": start, "end": end},
             "methodology": f"Volatility forecasting using {model} model with {horizon}-day horizon"
