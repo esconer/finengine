@@ -271,6 +271,9 @@ class TestAnalyticsAPI:
         service.get_service.return_value.fetch_historical_data = AsyncMock(
             return_value=frame
         )
+        service.get_service.return_value.fetch_quote = AsyncMock(
+            return_value={"market_cap": 100000000000.0}
+        )
         return patch("app.api.analytics.GlobalDataService", return_value=service)
 
     @pytest.mark.asyncio

@@ -280,12 +280,18 @@ class AnalyticsEngine:
             volume_stats = {'volumes': [], 'total_volume': 0}
             
             for ticker, df in price_data.items():
-                if df.empty or 'Volume' not in df.columns:
+                if df is None or df.empty:
+                    continue
+                
+                vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
+                close_col = 'Close' if 'Close' in df.columns else ('close' if 'close' in df.columns else None)
+                
+                if not vol_col:
                     continue
                 
                 # Calculate liquidity score based on volume, price, and daily turnover
-                volume = float(df['Volume'].mean())
-                price = float(df['Close'].iloc[-1]) if not df.empty else 0.0
+                volume = float(df[vol_col].mean())
+                price = float(df[close_col].iloc[-1]) if close_col and not df.empty else 0.0
                 daily_turnover = volume * price
                 
                 # Market cap / AUM dynamic resolution

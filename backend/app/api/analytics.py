@@ -634,12 +634,23 @@ async def get_liquidity_metrics(
             async with sem:
                 try:
                     res = data_service.fetch_historical_data(ticker, start, end)
-                    if asyncio.iscoroutine(res):
+                    if asyncio.iscoroutine(res) or inspect.isawaitable(res):
                         df = await res
                     else:
                         df = res
-                    quote = await data_service.fetch_quote(ticker)
-                    mc = quote.get('market_cap') if quote else None
+                    
+                    mc = None
+                    if hasattr(data_service, 'fetch_quote'):
+                        q_res = data_service.fetch_quote(ticker)
+                        if asyncio.iscoroutine(q_res) or inspect.isawaitable(q_res):
+                            quote = await q_res
+                        elif isinstance(q_res, dict):
+                            quote = q_res
+                        else:
+                            quote = None
+                        if quote and isinstance(quote, dict):
+                            mc = quote.get('market_cap')
+                    
                     return ticker, df, mc
                 except Exception as e:
                     logger.error(f"Error in liquidity fetch for {ticker}: {e}")
