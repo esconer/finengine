@@ -24,6 +24,12 @@ import {
   OptimizationResponse,
   RegimeResponse,
   MonteCarloResponse,
+  EquityResearchProfile,
+  ShareholdingDataResponse,
+  ConcallItem,
+  CustomRatiosDataResponse,
+  ScreenerStrategyResponse,
+  ScreenerStrategyMeta,
 } from '@/types';
 
 // Create axios instance
@@ -402,6 +408,82 @@ export const analyticsApi = {
     seed?: number;
   }): Promise<MonteCarloResponse> {
     const response = await apiClient.post('/analytics/monte-carlo', data);
+    return response.data;
+  },
+};
+
+// Equity Research API (bfinance integration)
+export const equityResearchApi = {
+  async getFullProfile(ticker: string): Promise<EquityResearchProfile> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/full-profile`);
+    return response.data;
+  },
+
+  async getShareholding(ticker: string): Promise<ShareholdingDataResponse> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/shareholding`);
+    return response.data;
+  },
+
+  async getConcalls(ticker: string): Promise<{ ticker: string; count: number; concalls: ConcallItem[] }> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/concalls`);
+    return response.data;
+  },
+
+  async getCustomRatios(ticker: string): Promise<CustomRatiosDataResponse> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/custom-ratios`);
+    return response.data;
+  },
+
+  async getAiMemoPrompt(ticker: string, customInstructions?: string): Promise<{ ticker: string; prompt: string }> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/ai-memo-prompt`, {
+      params: customInstructions ? { custom_instructions: customInstructions } : undefined,
+    });
+    return response.data;
+  },
+
+  async getAiForensicPrompt(ticker: string): Promise<{ ticker: string; prompt: string }> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/ai-forensic-prompt`);
+    return response.data;
+  },
+
+  async getAiDossier(ticker: string, format: string = 'markdown'): Promise<{ ticker: string; format: string; content?: string; data?: any }> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/ai-dossier`, {
+      params: { format },
+    });
+    return response.data;
+  },
+
+  async downloadExcelModel(ticker: string): Promise<Blob> {
+    const response = await apiClient.get(`/company/${encodeURIComponent(ticker)}/export-excel`, {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+};
+
+// Screener API
+export const screenerApi = {
+  async getStrategies(): Promise<ScreenerStrategyMeta[]> {
+    const response = await apiClient.get('/screens');
+    return response.data;
+  },
+
+  async runScreen(strategy: string, maxStocks: number = 50): Promise<ScreenerStrategyResponse> {
+    const response = await apiClient.get(`/screens/${encodeURIComponent(strategy)}`, {
+      params: { max_stocks: maxStocks },
+    });
+    return response.data;
+  },
+
+  async runCustomScreen(criteria: {
+    min_roce?: number;
+    min_roe?: number;
+    max_pe?: number;
+    min_mcap_cr?: number;
+    min_div_yield?: number;
+    max_stocks?: number;
+  }): Promise<ScreenerStrategyResponse> {
+    const response = await apiClient.post('/screens/custom', criteria);
     return response.data;
   },
 };

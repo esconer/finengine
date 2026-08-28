@@ -11,6 +11,8 @@ describe('Sidebar Component', () => {
   it('renders navigation links', () => {
     render(<Sidebar />);
     expect(screen.getByText('Summary')).toBeDefined();
+    expect(screen.getByText('Equity Research')).toBeDefined();
+    expect(screen.getByText('Screener Studio')).toBeDefined();
     expect(screen.getByText('Realized Risk')).toBeDefined();
     expect(screen.getByText('Forecast Risk')).toBeDefined();
   });

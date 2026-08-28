@@ -23,7 +23,9 @@ import {
     Newspaper,
     PieChart,
     SlidersHorizontal,
-    Radar
+    Radar,
+    BookOpen,
+    Filter,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -41,6 +43,18 @@ const navigation: NavigationItem[] = [
         href: '/dashboard',
         icon: LayoutDashboard,
         description: 'Portfolio overview and key metrics'
+    },
+    {
+        name: 'Equity Research',
+        href: '/dashboard/equity-research',
+        icon: BookOpen,
+        description: 'Bloomberg-grade equity terminal, concall audio & financial models'
+    },
+    {
+        name: 'Screener Studio',
+        href: '/dashboard/screener-studio',
+        icon: Filter,
+        description: 'Coffee Can, Magic Formula & compounder screens'
     },
     {
         name: 'Realized Risk',

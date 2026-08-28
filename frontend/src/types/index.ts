@@ -449,4 +449,134 @@ export interface IndiaFlowsResponse {
   delivery_spikes: Array<{ ticker: string; delivery_pct: number; avg_delivery_pct: number; spike: boolean }>;
   institutional_flows: { fii_net_cr: number; dii_net_cr: number; date: string };
   adv_liquidity: Record<string, { adv_shares: number; days_to_liquidate_10pct: number; days_to_liquidate_20pct: number }>;
-}
+}
+
+// Equity Research Types
+export interface EquityResearchProfile {
+  symbol: string;
+  ticker: string;
+  name: string;
+  about?: string;
+  website?: string;
+  bse_code?: string;
+  nse_symbol?: string;
+  sector?: string;
+  industry_group?: string;
+  industry?: string;
+  sub_industry?: string;
+  indices: string[];
+  current_price: number;
+  market_cap_cr?: number;
+  high_52w?: number;
+  low_52w?: number;
+  stock_pe?: number;
+  book_value?: number;
+  dividend_yield?: number;
+  roce?: number;
+  roe?: number;
+  face_value?: number;
+  debt_to_equity?: number;
+  peg_ratio?: number;
+  eps_ttm?: number;
+  promoter_holding?: number;
+  promoter_pledged?: number;
+  custom_ratios: {
+    piotroski_score: number;
+    graham_number?: number;
+    graham_upside_pct?: number;
+    enterprise_value_cr?: number;
+    ev_to_ebitda?: number;
+    interest_coverage?: number;
+    cfo_to_pat_ratio?: number;
+  };
+  cagrs: Record<string, Record<string, string>>;
+  pros: string[];
+  cons: string[];
+  peers: Array<{
+    rank?: number;
+    name: string;
+    symbol?: string;
+    cmp?: number;
+    pe?: number;
+    market_cap_cr?: number;
+    dividend_yield?: number;
+    roce?: number;
+  }>;
+  concall_count: number;
+  annual_reports: Array<{ year: string; url: string }>;
+  credit_ratings: Array<{ agency: string; rating: string }>;
+}
+
+export interface ShareholdingBlock {
+  periods: string[];
+  rows: Record<string, number[]>;
+  chart_series: Array<{
+    period: string;
+    promoters?: number;
+    fiis?: number;
+    diis?: number;
+    government?: number;
+    public?: number;
+    others?: number;
+    [key: string]: any;
+  }>;
+}
+
+export interface ShareholdingDataResponse {
+  ticker: string;
+  quarterly: ShareholdingBlock;
+  yearly: ShareholdingBlock;
+}
+
+export interface ConcallItem {
+  date: string;
+  quarter?: string;
+  title: string;
+  transcript_url?: string;
+  audio_url?: string;
+  presentation_url?: string;
+}
+
+export interface CustomRatiosDataResponse {
+  ticker: string;
+  piotroski_score: number;
+  graham_number?: number;
+  graham_upside_pct?: number;
+  enterprise_value_cr: number;
+  ev_to_ebitda?: number;
+  interest_coverage?: number;
+  cfo_to_pat_ratio?: number;
+  current_price: number;
+  ratios_history: {
+    periods: string[];
+    rows: Record<string, number[]>;
+  };
+}
+
+export interface ScreenerStock {
+  symbol: string;
+  ticker: string;
+  name: string;
+  price: number;
+  market_cap_cr: number;
+  pe_ratio?: number;
+  roce_pct?: number;
+  roe_pct?: number;
+  dividend_yield_pct?: number;
+  book_value?: number;
+}
+
+export interface ScreenerStrategyResponse {
+  strategy: string;
+  name: string;
+  description: string;
+  count: number;
+  stocks: ScreenerStock[];
+}
+
+export interface ScreenerStrategyMeta {
+  key: string;
+  name: string;
+  description: string;
+}
+

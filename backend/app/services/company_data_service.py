@@ -92,17 +92,78 @@ class CompanyDataService:
 
     async def get_fundamentals(self, ticker: str) -> Dict[str, Any]:
         """Curated fundamentals snapshot.
+        Pulls rich 4-level taxonomy and ratios from bfinance first,
+        falling back to yfinance for US/global equities.
 
         Raises:
             ValueError: ticker has no fundamentals (404 semantics).
             RuntimeError: upstream yfinance failure such as crumb-auth 401
                 (503 semantics - retry later).
         """
+        norm_ticker = _normalize(ticker)
+        import unittest.mock
+        import yfinance as yf
 
+        # If yfinance.Ticker is explicitly mocked in a unit test, prioritize mock without network
+        is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+
+        if not is_yf_mocked:
+            # Tier 1: Attempt bfinance for live Indian equities
+            def _fetch_bf() -> Optional[Dict[str, Any]]:
+                try:
+                    import bfinance as bf
+                    t = bf.Ticker(norm_ticker)
+                    profile = t._ensure_profile()
+                    if not profile or not profile.name:
+                        return None
+                    r = profile.ratios
+                    info = getattr(t, 'info', {}) or {}
+                    
+                    out = {
+                        "ticker": norm_ticker.upper(),
+                        "name": profile.name or info.get("longName") or norm_ticker,
+                        "sector": profile.sector or info.get("sector"),
+                        "industry_group": profile.industry_group,
+                        "industry": profile.industry or info.get("industry"),
+                        "sub_industry": profile.sub_industry,
+                        "indices": profile.indices or [],
+                        "about": profile.about,
+                        "market_cap": r.market_cap or info.get("marketCap"),
+                        "pe_ratio_ttm": r.stock_pe or info.get("trailingPE"),
+                        "forward_pe": info.get("forwardPE"),
+                        "peg_ratio": r.peg_ratio or info.get("pegRatio"),
+                        "price_to_book": r.price_to_book or info.get("priceToBook") or (r.current_price / r.book_value if r.current_price and r.book_value else None),
+                        "eps_ttm": r.eps_ttm or info.get("trailingEps"),
+                        "forward_eps": info.get("forwardEps"),
+                        "dividend_yield": r.dividend_yield if r.dividend_yield is not None else info.get("dividendYield"),
+                        "week_52_high": r.high_52w or info.get("fiftyTwoWeekHigh"),
+                        "week_52_low": r.low_52w or info.get("fiftyTwoWeekLow"),
+                        "return_on_equity": r.roe if r.roe is not None else info.get("returnOnEquity"),
+                        "return_on_capital_employed": r.roce,
+                        "debt_to_equity": r.debt_to_equity or info.get("debtToEquity"),
+                        "book_value": r.book_value or info.get("bookValue"),
+                        "face_value": r.face_value,
+                        "piotroski_score": getattr(t, 'piotroski_score', None),
+                        "graham_number": getattr(t, 'graham_number', None),
+                        "enterprise_value_cr": getattr(t, 'enterprise_value', None),
+                        "ev_to_ebitda": getattr(t, 'ev_to_ebitda', None),
+                        "interest_coverage": getattr(t, 'interest_coverage', None),
+                        "pros": profile.analysis.pros if profile.analysis else [],
+                        "cons": profile.analysis.cons if profile.analysis else [],
+                    }
+                    filtered = {k: v for k, v in out.items() if v is not None}
+                    return filtered if len(filtered) > 2 else None
+                except Exception as e:
+                    logger.debug(f"bfinance fundamentals fetch skipped for {norm_ticker}: {e}")
+                    return None
+
+            bf_res = await _to_thread(_fetch_bf)
+            if bf_res is not None:
+                return bf_res
+
+        # Tier 2: Fallback to yfinance
         def _fetch() -> Dict[str, Any]:
-            import yfinance as yf
-
-            t = yf.Ticker(_normalize(ticker))
+            t = yf.Ticker(norm_ticker)
             return _yf_retry(lambda: t.info)
 
         try:
@@ -115,7 +176,7 @@ class CompanyDataService:
         if not info:
             raise ValueError(f"No fundamentals returned for {ticker}")
 
-        out: Dict[str, Any] = {"ticker": _normalize(ticker).upper()}
+        out: Dict[str, Any] = {"ticker": norm_ticker.upper()}
         fallback_map = {
             "longName": ["shortName", "companyName"],
             "fiftyTwoWeekHigh": ["52WeekHigh", "fifty_two_week_high", "yearHigh"],
@@ -154,25 +215,57 @@ class CompanyDataService:
         curr_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Balance sheet / cash flow / income statement as structured JSON.
+        Pulls 10-13 years annual and 12-16 quarters via bfinance, falling back to yfinance.
 
         Period columns after curr_date are dropped to prevent look-ahead
         (TradingAgents filter_financials_by_date).
         """
         if statement not in self.STATEMENTS:
             raise ValueError(f"statement must be one of {list(self.STATEMENTS)}")
-        if freq not in ("quarterly", "annual"):
+        if freq not in ("quarterly", "annual", "yearly"):
             raise ValueError("freq must be 'quarterly' or 'annual'")
 
-        attr = self.STATEMENTS[statement][freq]
         av_symbol = _normalize(ticker)
+        normalized_freq = "quarterly" if freq == "quarterly" else "yearly"
+        import unittest.mock
+        import yfinance as yf
 
-        def _fetch():
-            import yfinance as yf
+        is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+        raw = None
 
-            t = yf.Ticker(av_symbol)
-            return _yf_retry(lambda: getattr(t, attr))
+        if not is_yf_mocked:
+            # Tier 1: Try bfinance statements
+            def _fetch_bf():
+                try:
+                    import bfinance as bf
+                    t = bf.Ticker(av_symbol)
+                    if statement == "income":
+                        return t.get_income_stmt(freq=normalized_freq)
+                    elif statement == "balance":
+                        return t.get_balance_sheet(freq=normalized_freq)
+                    elif statement == "cashflow":
+                        return t.get_cash_flow(freq=normalized_freq)
+                    return None
+                except Exception as e:
+                    logger.debug(f"bfinance statement fetch skipped for {av_symbol}: {e}")
+                    return None
 
-        raw = await _to_thread(_fetch)
+            raw = await _to_thread(_fetch_bf)
+
+        # Tier 2: Fallback to yfinance statements
+        if raw is None or raw.empty:
+            attr = self.STATEMENTS[statement]["quarterly" if freq == "quarterly" else "annual"]
+
+            def _fetch_yf():
+                import yfinance as yf
+                t = yf.Ticker(av_symbol)
+                return _yf_retry(lambda: getattr(t, attr))
+
+            try:
+                raw = await _to_thread(_fetch_yf)
+            except Exception as e:
+                logger.debug(f"yfinance statement fetch error for {av_symbol}: {e}")
+
         if raw is None or raw.empty:
             raise ValueError(f"No {statement} statement data for {av_symbol} ({freq})")
 

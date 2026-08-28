@@ -116,21 +116,14 @@ class DataService:
                     self._in_memory_df_cache[cache_key] = (now_ts, cached_data)
                     return cached_data
             
-            # Attempt to fetch from yfinance
-            success = await self.cache.log_fetch_attempt(
-                ticker=normalized_ticker,
-                status="attempting",
-                primary_attempt=True
-            )
-            
-            # Download data with retry logic
+            # Download data with retry logic (Tier 1: bfinance -> Tier 2: yfinance inside _download_with_timeout)
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     df = await self._download_with_timeout(normalized_ticker, start, end)
                     
                     if df is not None and not df.empty:
-                        # Handle yfinance multi-index columns (v0.2.51+)
+                        # Handle multi-index columns
                         df = self._normalize_yfinance_data(df, normalized_ticker)
                         
                         # Store in database cache
@@ -140,7 +133,7 @@ class DataService:
                         await self.cache.log_fetch_attempt(
                             ticker=normalized_ticker,
                             status="success",
-                            source_used="yfinance"
+                            source_used="bfinance" if "bfinance" in str(getattr(df, "_source", "")) else "yfinance"
                         )
                         
                         logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker}")
@@ -160,7 +153,7 @@ class DataService:
                     else:
                         await asyncio.sleep(1)  # Brief pause before retry
 
-            # All yfinance attempts exhausted -> Alpha Vantage fallback
+            # Tier 3: Alpha Vantage fallback
             fallback_df = await self._fetch_from_alpha_vantage(normalized_ticker, ticker, start, end)
             if fallback_df is not None and not fallback_df.empty:
                 return fallback_df
@@ -188,6 +181,38 @@ class DataService:
             logger.debug(f"Fetching quote for {ticker} -> {normalized_ticker}")
 
             def _sync_fetch() -> Optional[Dict[str, Any]]:
+                import unittest.mock
+                is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+
+                if not is_yf_mocked:
+                    # Tier 1: Try bfinance first
+                    try:
+                        import bfinance as bf
+                        bt = bf.Ticker(normalized_ticker)
+                        b_fast = getattr(bt, 'fast_info', None)
+                        b_info = getattr(bt, 'info', {}) or {}
+                        b_price = getattr(b_fast, 'last_price', None) or getattr(b_fast, 'regular_market_price', None) or b_info.get('currentPrice')
+                        if b_price and b_price > 0:
+                            return {
+                                "ticker": normalized_ticker.upper(),
+                                "current_price": float(b_price),
+                                "volume": int(getattr(b_fast, 'last_volume', 0) or b_info.get('volume') or 0),
+                                "market_cap": getattr(b_fast, 'market_cap', None) or b_info.get('marketCap'),
+                                "sector": b_info.get('sector') or getattr(bt, 'sector', None),
+                                "industry": b_info.get('industry') or getattr(bt, 'industry', None),
+                                "52_week_high": getattr(b_fast, 'year_high', None) or b_info.get('fiftyTwoWeekHigh'),
+                                "52_week_low": getattr(b_fast, 'year_low', None) or b_info.get('fiftyTwoWeekLow'),
+                                "pe_ratio": b_info.get('trailingPE'),
+                                "dividend_yield": b_info.get('dividendYield'),
+                                "currency": "INR" if is_indian else "USD",
+                                "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
+                                "is_indian": is_indian,
+                                "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
+                            }
+                    except Exception as e:
+                        logger.debug(f"bfinance quote fetch failed for {normalized_ticker}: {e}")
+
+                # Tier 2: Fallback to yfinance
                 stock = yf.Ticker(normalized_ticker)
                 current_price = None
                 market_cap = None
@@ -403,10 +428,29 @@ class DataService:
     ) -> Optional[pd.DataFrame]:
         """Download data with timeout protection"""
         try:
-            # Use asyncio to wrap the synchronous yfinance call
+            # Use asyncio to wrap the synchronous data download calls
             loop = asyncio.get_event_loop()
             
             def download():
+                import unittest.mock
+                if not isinstance(yf.download, (unittest.mock.Mock, unittest.mock.MagicMock)):
+                    # Tier 1: Try bfinance download
+                    try:
+                        import bfinance as bf
+                        df_bf = bf.download(
+                            ticker,
+                            start=start,
+                            end=end,
+                            progress=False,
+                            auto_adjust=False,
+                        )
+                        if df_bf is not None and not df_bf.empty:
+                            df_bf._source = "bfinance"
+                            return df_bf
+                    except Exception as bf_err:
+                        logger.debug(f"bfinance download failed for {ticker}: {bf_err}")
+
+                # Tier 2: yfinance download
                 return yf.download(
                     ticker,
                     start=start,

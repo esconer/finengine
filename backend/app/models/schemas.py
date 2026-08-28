@@ -412,4 +412,139 @@ class TailRiskResponse(BaseModel):
     as_of: str
     evt_var: EVTPOTVarMetrics
     tail_dependence_matrix: TailDependenceMatrix
+
+
+# Equity Research & Screener Schemas
+class CustomRatiosSchema(BaseModel):
+    """Custom forensic and valuation ratios"""
+    piotroski_score: int
+    graham_number: Optional[float] = None
+    graham_upside_pct: Optional[float] = None
+    enterprise_value_cr: Optional[float] = None
+    ev_to_ebitda: Optional[float] = None
+    interest_coverage: Optional[float] = None
+    cfo_to_pat_ratio: Optional[float] = None
+
+
+class PeerStockSchema(BaseModel):
+    """Peer comparison row"""
+    rank: Optional[int] = None
+    name: str
+    symbol: Optional[str] = None
+    cmp: Optional[float] = None
+    pe: Optional[float] = None
+    market_cap_cr: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    roce: Optional[float] = None
+
+
+class ConcallSchema(BaseModel):
+    """Earnings conference call record"""
+    date: str
+    quarter: Optional[str] = None
+    title: str
+    transcript_url: Optional[str] = None
+    audio_url: Optional[str] = None
+    presentation_url: Optional[str] = None
+
+
+class EquityResearchProfileResponse(BaseModel):
+    """Complete equity research profile response"""
+    symbol: str
+    ticker: str
+    name: str
+    about: Optional[str] = ""
+    website: Optional[str] = None
+    bse_code: Optional[str] = None
+    nse_symbol: Optional[str] = None
+    sector: Optional[str] = None
+    industry_group: Optional[str] = None
+    industry: Optional[str] = None
+    sub_industry: Optional[str] = None
+    indices: List[str] = []
+    current_price: float
+    market_cap_cr: Optional[float] = None
+    high_52w: Optional[float] = None
+    low_52w: Optional[float] = None
+    stock_pe: Optional[float] = None
+    book_value: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    roce: Optional[float] = None
+    roe: Optional[float] = None
+    face_value: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    peg_ratio: Optional[float] = None
+    eps_ttm: Optional[float] = None
+    promoter_holding: Optional[float] = None
+    promoter_pledged: Optional[float] = None
+    custom_ratios: CustomRatiosSchema
+    cagrs: Dict[str, Dict[str, str]] = {}
+    pros: List[str] = []
+    cons: List[str] = []
+    peers: List[Dict[str, Any]] = []
+    concall_count: int = 0
+    annual_reports: List[Dict[str, str]] = []
+    credit_ratings: List[Dict[str, str]] = []
+
+
+class ShareholdingBlock(BaseModel):
+    """Shareholding pattern data block"""
+    periods: List[str] = []
+    rows: Dict[str, List[Any]] = {}
+    chart_series: List[Dict[str, Any]] = []
+
+
+class ShareholdingResponse(BaseModel):
+    """Dual institutional shareholding response"""
+    ticker: str
+    quarterly: ShareholdingBlock
+    yearly: ShareholdingBlock
+
+
+class CustomRatiosResponse(BaseModel):
+    """Custom ratios response"""
+    ticker: str
+    piotroski_score: int
+    graham_number: Optional[float] = None
+    graham_upside_pct: Optional[float] = None
+    enterprise_value_cr: float = 0.0
+    ev_to_ebitda: Optional[float] = None
+    interest_coverage: Optional[float] = None
+    cfo_to_pat_ratio: Optional[float] = None
+    current_price: float
+    ratios_history: Dict[str, Any] = {}
+
+
+class ScreenerStockItem(BaseModel):
+    """Stock item returned by screener"""
+    symbol: str
+    ticker: str
+    name: str
+    price: float
+    market_cap_cr: float
+    pe_ratio: Optional[float] = None
+    roce_pct: Optional[float] = None
+    roe_pct: Optional[float] = None
+    dividend_yield_pct: Optional[float] = None
+    book_value: Optional[float] = None
+
+
+class ScreenerResponse(BaseModel):
+    """Screener result response"""
+    strategy: str
+    name: str
+    description: str
+    count: int
+    stocks: List[ScreenerStockItem]
+
+
+class CustomScreenRequest(BaseModel):
+    """Request schema for custom screener filters"""
+    min_roce: Optional[float] = None
+    min_roe: Optional[float] = None
+    max_pe: Optional[float] = None
+    min_mcap_cr: Optional[float] = None
+    min_div_yield: Optional[float] = None
+    max_stocks: Optional[int] = 50
+
 

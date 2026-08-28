@@ -21,34 +21,35 @@
 
 | Layer | Technologies & Libraries | Port / Mode |
 |---|---|---|
-| **Backend** | Python 3.12, FastAPI 0.120+, `uv`, SQLite (async SQLAlchemy + `aiosqlite`), `scipy`, `numpy`, `cvxpy`, `arch`, `quantstats`, `hmmlearn`, `stockstats`, `yfinance`, `httpx` | `http://localhost:8000/api/v1` |
+| **Backend** | Python 3.12, FastAPI 0.120+, `uv`, SQLite (async SQLAlchemy + `aiosqlite`), `bfinance`, `scipy`, `numpy`, `cvxpy`, `arch`, `quantstats`, `hmmlearn`, `stockstats`, `openpyxl`, `yfinance`, `httpx` | `http://localhost:8000/api/v1` |
 | **Frontend** | Bun 1.x, Next.js 16 (App Router), React 19, TypeScript 5.7+, Tailwind CSS, Recharts, Zustand 5.0, TanStack Table & Query, Lucide React, Vitest | `http://localhost:3000` (Dev) / `:3001` (Verify) |
-| **Data Vendors** | Primary: `yfinance` (auto-suffixed `.NS`/`.BO`), Fallback: Alpha Vantage (multi-key rotation pool) | Cached in SQLite `stock_timeseries` |
+| **Data Vendors** | Primary (Tier 1): `bfinance` (10-13Y Ind AS, concalls, fast quotes), Fallback (Tier 2): `yfinance` (.NS/.BO auto-suffix), Fallback (Tier 3): Alpha Vantage (rotating key pool) | Cached in SQLite `stock_timeseries` |
 
 ---
 
 ## 3. System Architecture & Data Flow
 
 ```
-yfinance (NSE: .NS, BSE: .BO)  ──[3 retries + timeout]──┐
-                                                         ├──► DataService ──► SQLite (`stock_timeseries` + `fetch_logs`)
-Alpha Vantage (Multi-Key Pool) ──[Automatic Fallback]───┘           │
-                                                                   ▼
-                                                         Analytics & Quant Services
-                                  ┌────────────────────────────────┴────────────────────────────────┐
-                                  ▼                                                                 ▼
-                         AnalyticsEngine                                                Specialized Quant Services
-                   (QuantStats Tear-Sheet, Realized,                              (Optimization, HMM Regime, Monte Carlo,
-                    Forecast Risk, Factor Exposures)                               Indicators, Company Data, Benchmark)
-                                  │                                                                 │
-                                  └────────────────────────────────┬────────────────────────────────┘
-                                                                   ▼
-                                                      FastAPI REST & WebSocket APIs
-                                                    (`/api/v1/{portfolio,data,analytics,ws}`)
-                                                                   │
-                                                                   ▼
-                                                        Next.js 16 Dashboard UI
-                                            (Zustand Stores, TanStack Query, Recharts, SVG)
+bfinance (Tier 1: Fast Quotes, 10-13Y Ind AS, Concalls) ──┐
+yfinance (Tier 2: Global & Timeseries Backup) ─────────────┼──► DataService ──► SQLite (`stock_timeseries` + `fetch_logs`)
+Alpha Vantage (Tier 3: Multi-Key Rotation Pool) ───────────┘           │
+                                                                       ▼
+                                                             Analytics & Quant Services
+                                   ┌───────────────────────────────────┴───────────────────────────────────┐
+                                   ▼                                                                       ▼
+                          AnalyticsEngine                                                      Specialized Quant Services
+                    (QuantStats Tear-Sheet, Realized,                                    (Equity Research, Screeners, AI Dossiers,
+                     Forecast Risk, Factor Exposures)                                     Optimization, HMM Regime, Monte Carlo,
+                                   │                                                      Indicators, Company Data, Benchmark)
+                                   │                                                                       │
+                                   └───────────────────────────────────┬───────────────────────────────────┘
+                                                                       ▼
+                                                         FastAPI REST & WebSocket APIs
+                                              (`/api/v1/{portfolio,data,analytics,ws,company,screens}`)
+                                                                       │
+                                                                       ▼
+                                                            Next.js 16 Dashboard UI
+                                                (Zustand Stores, TanStack Query, Recharts, SVG)
 ```
 
 ---
@@ -59,6 +60,7 @@ Alpha Vantage (Multi-Key Pool) ──[Automatic Fallback]───┘           
 finengine/
 ├── .agents/skills/           # Custom agent skills (caveman, brandkit, impeccable, etc.)
 ├── .scratch/                 # Local markdown issue tracking & project session logs
+│   ├── bfinance-integration/ # bfinance integration technical documentation and specs
 │   ├── project-state/        # Deep codebase audits (`current-state.md`)
 │   ├── advanced-analytics/   # Advanced analytics specification & ticket tracker
 │   │   ├── spec.md           # Product spec, decision maps, and filter rules
@@ -66,19 +68,22 @@ finengine/
 │   └── session-log-2025-08-25.md # Session chronology, key decisions, and historical context
 ├── backend/                  # FastAPI Application
 │   ├── app/
-│   │   ├── api/              # Routers: `portfolio.py`, `data.py`, `analytics.py`, `websocket.py`
+│   │   ├── api/              # Routers: `portfolio.py`, `data.py`, `analytics.py`, `websocket.py`, `equity_research.py`
 │   │   ├── db/               # Async database setup (`database.py`)
 │   │   ├── models/           # SQLAlchemy models (`database.py`) & Pydantic schemas (`schemas.py`)
 │   │   ├── services/         # Domain services:
-│   │   │   ├── analytics_engine.py      # Core realized/forecast metrics, factor OLS, stress testing
-│   │   │   ├── optimization_service.py  # HRP, Min Vol, Max Sharpe, Min CVaR via cvxpy/scipy
-│   │   │   ├── regime_service.py        # 3-state Gaussian HMM on NIFTY returns + 21d vol
-│   │   │   ├── monte_carlo_service.py   # StationaryBootstrap & Student-t goal simulation
-│   │   │   ├── benchmark_service.py     # ^NSEI benchmark data ingestion & caching
-│   │   │   ├── indicators_service.py    # stockstats indicators (TradingAgents adaptation)
-│   │   │   ├── company_data_service.py  # Fundamentals, statements, insider trades
-│   │   │   ├── alpha_vantage_service.py # Rotating multi-key API client with budget tracking
-│   │   │   ├── data_service.py          # yfinance market data fetcher & SQLite cache
+│   │   │   ├── equity_research_service.py # 360° company profiles, 12Q/11Y shareholding, concall MP3s, 8-tab Excel exporter
+│   │   │   ├── screener_service.py        # Coffee Can, Magic Formula, Debt-Free, High Div, Undervalued Growth, Custom screens
+│   │   │   ├── ai_dossier_service.py      # Initiation coverage memos, forensic audit prompts, token-dense LLM dossiers
+│   │   │   ├── analytics_engine.py        # Core realized/forecast metrics, factor OLS, stress testing
+│   │   │   ├── optimization_service.py    # HRP, Min Vol, Max Sharpe, Min CVaR via cvxpy/scipy
+│   │   │   ├── regime_service.py          # 3-state Gaussian HMM on NIFTY returns + 21d vol
+│   │   │   ├── monte_carlo_service.py     # StationaryBootstrap & Student-t goal simulation
+│   │   │   ├── benchmark_service.py       # ^NSEI benchmark data ingestion & caching
+│   │   │   ├── indicators_service.py      # stockstats indicators (TradingAgents adaptation)
+│   │   │   ├── company_data_service.py    # 10-13Y Ind AS statements, 4-level taxonomy, fundamentals
+│   │   │   ├── alpha_vantage_service.py   # Rotating multi-key API client with budget tracking
+│   │   │   ├── data_service.py            # 3-tier cascade data fetcher & SQLite cache
 │   │   │   └── currency_service.py      # USD/INR currency conversion and Indian formatting
 │   │   └── config.py         # Pydantic Settings (env configurations)
 │   ├── data/                 # SQLite storage (`daisy.db`)
@@ -88,9 +93,10 @@ finengine/
 ├── frontend/                 # Next.js 16 Client
 │   ├── src/
 │   │   ├── app/              # App Router pages:
-│   │   │   ├── dashboard/    # Main overview, realized-risk, forecast-risk, factor-exposure,
-│   │   │   │                 # concentration, liquidity, stress-testing, volatility-sizing,
-│   │   │   │                 # tear-sheet, risk-contribution, optimize, regime, monte-carlo
+│   │   │   ├── dashboard/    # Main overview, equity-research, screener-studio, realized-risk,
+│   │   │   │                 # forecast-risk, factor-exposure, concentration, liquidity,
+│   │   │   │                 # stress-testing, volatility-sizing, tear-sheet, risk-contribution,
+│   │   │   │                 # optimize, regime, monte-carlo
 │   │   │   └── portfolio/    # Portfolio management (`manage/page.tsx`)
 │   │   ├── components/       # Layout, Charts, Portfolio tables, MetricCards, Modals
 │   │   ├── hooks/            # `useAnalytics`, `useRealTime`, `usePortfolioAnalytics`
@@ -114,12 +120,16 @@ finengine/
 - **Gaussian HMM Regime**: 3-state Hidden Markov Model (`Calm Bull`, `Volatile / Correction`, `Crisis`) fit on NIFTY 50 (^NSEI) log-returns and 21-day realized volatility.
 - **Stationary Bootstrap**: Politis & Romano block-resampling technique that preserves autocorrelation and volatility clustering in financial return series.
 - **Student-t Innovation Engine**: Fat-tailed simulation modeling kurtosis by fitting degrees of freedom (\(\nu\)) directly from historical asset returns with analytic moment scaling.
+- **bfinance 3-Tier Fallback Cascade**: Primary market data and 10-13 year audited financial statements are pulled from `bfinance` (Tier 1), falling back to `yfinance` (Tier 2) and `Alpha Vantage` (Tier 3).
+- **Institutional Screeners**: Quantitative screening strategies (Coffee Can, Magic Formula, Debt-Free Compounders, High Dividend Champions, Undervalued Growth) computing true ROCE, ROE, P/E, and market cap filters across Indian equities.
 
 ---
 
 ## 6. Project Status & Feature Map
 
 ### Shipped & Verified
+- **bfinance Equity Research Terminal (`/dashboard/equity-research`)**: Full 360-degree company profile with 4-level taxonomy, Piotroski 9-point F-Score, Graham Number fair value, EV/EBITDA, 12Q/11Y Recharts institutional shareholding stacked area charts, 40+ concall MP3 streaming audio player, 10–13 year audited Ind AS statements, 8-tab Excel financial model exporter, and AI initiation memo / forensic prompts.
+- **Institutional Screener Studio (`/dashboard/screener-studio`)**: 5 prebuilt quantitative screening strategies + multi-parameter dynamic custom screener with TanStack sorting/pagination and 1-click `+ Add to Portfolio`.
 - **Holdings-Truth Plumbing (F1 / t01)**: All analytics endpoints read user DB positions dynamically with strict quantity source-of-truth.
 - **QuantStats Tear-Sheet (F2 / t06)**: `/dashboard/tear-sheet` with monthly returns heatmap and underwater drawdown curves vs NIFTY.
 - **Euler Risk Contribution (F3 / t07)**: `/dashboard/risk-contribution` with volatility and CVaR tail attributions, plus sector rollups.
@@ -133,8 +143,8 @@ finengine/
 - **Cointegration Pairs Scanner (F10 / t15)**: `CointegrationService` executing Engle-Granger and Johansen cointegration tests with Ornstein-Uhlenbeck mean-reversion speed/half-life estimation and spread z-scores.
 - **Technical Indicators & Company Data (t21)**: stockstats engine (13 indicators) + fundamentals/financials/insider trades.
 - **Alpha Vantage Fallback (t22)**: In-process multi-key rotation pool with rate-limit budget tracking.
-- **Backend Test Suite Hardening (80%+ Gate Reached)**: 249/249 tests passing (0 failures), 84.98% total line coverage across the entire backend.
-- **Frontend Test Suite (Vitest Foundation)**: 60/60 unit and component tests passing with zero TypeScript errors.
+- **Backend Test Suite Hardening (80%+ Gate Reached)**: 267/267 tests passing (0 failures), 81.90% total line coverage across the entire backend.
+- **Frontend Test Suite (Vitest Foundation)**: 62/62 unit and component tests passing with zero TypeScript errors.
 - **Production Hardening (QH-01 to QH-13)**: Native SQLite upserts, concurrent batch fetching, frontend memoization, type-safe API responses, structured error handling, and robust GitHub Actions CI workflow.
 
 ---

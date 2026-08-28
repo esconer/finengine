@@ -37,6 +37,8 @@ dependencies = [
     "quantlib>=1.40",
     "stockstats>=0.6.8",
     "hmmlearn>=0.3.3",
+    "bfinance>=0.1.0",
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]

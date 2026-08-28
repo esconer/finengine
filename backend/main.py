@@ -20,7 +20,7 @@ from typing import Callable, Dict, Any
 
 from app.config import settings
 from app.db.database import init_db
-from app.api import portfolio, data, analytics, websocket
+from app.api import portfolio, data, analytics, websocket, equity_research
 from app.utils.logger import setup_logger
 
 
@@ -138,6 +138,12 @@ app.include_router(
     websocket.router,
     prefix="/api/v1/ws",
     tags=["websocket"]
+)
+
+app.include_router(
+    equity_research.router,
+    prefix="/api/v1",
+    tags=["equity_research"]
 )
 
 # Health check endpoint
