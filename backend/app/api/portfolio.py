@@ -828,6 +828,7 @@ async def normalize_portfolio_weights(
 
 class RebalancePayload(BaseModel):
     new_weights: Dict[str, float]
+    dry_run: Optional[bool] = False
 
 
 @router.post("/rebalance")
@@ -836,7 +837,7 @@ async def rebalance_portfolio(
     db: AsyncSession = Depends(get_db_session)
 ) -> Dict[str, Any]:
     """
-    Execute portfolio rebalancing by applying target weights across all holdings atomically.
+    Execute portfolio rebalancing or simulate a dry-run without modifying the database.
     """
     try:
         if not payload.new_weights:
@@ -858,25 +859,72 @@ async def rebalance_portfolio(
         sum_weights = sum(payload.new_weights.values())
         normalized_weights = {k: v / sum_weights for k, v in payload.new_weights.items()} if sum_weights > 0 else payload.new_weights
         
-        updated_count = 0
+        simulated_orders = []
+        total_buy_inr = 0.0
+        total_sell_inr = 0.0
+        total_weight_delta = 0.0
+        
         for pos in positions:
             if pos.ticker in normalized_weights:
-                new_w = float(normalized_weights[pos.ticker])
-                pos.weight = round(new_w, 4)
-                if pos.last_price and pos.last_price > 0:
-                    target_mv = new_w * total_pv
-                    pos.quantity = max(1.0, round(target_mv / pos.last_price, 4))
-                    pos.market_value = round(pos.quantity * pos.last_price, 2)
-                pos.updated_on = datetime.utcnow()
-                updated_count += 1
+                curr_w = float(pos.weight or 0.0)
+                new_w = round(float(normalized_weights[pos.ticker]), 4)
+                w_delta = new_w - curr_w
+                price = float(pos.last_price or 100.0)
+                target_mv = new_w * total_pv
+                target_qty = max(1.0, round(target_mv / price, 4)) if price > 0 else 0.0
+                curr_qty = float(pos.quantity or 0.0)
+                shares_delta = int(round(target_qty - curr_qty))
+                cash_delta = round(w_delta * total_pv, 2)
+                
+                if cash_delta > 0:
+                    total_buy_inr += cash_delta
+                else:
+                    total_sell_inr += abs(cash_delta)
+                total_weight_delta += abs(w_delta)
+                
+                simulated_orders.append({
+                    "ticker": pos.ticker,
+                    "current_weight": curr_w,
+                    "target_weight": new_w,
+                    "weight_delta": round(w_delta, 4),
+                    "current_quantity": curr_qty,
+                    "target_quantity": target_qty,
+                    "shares_delta": shares_delta,
+                    "price": price,
+                    "cash_delta": cash_delta,
+                    "action": "Hold" if abs(w_delta) < 0.005 else "Buy" if w_delta > 0 else "Sell"
+                })
+                
+                if not payload.dry_run:
+                    pos.weight = new_w
+                    if pos.last_price and pos.last_price > 0:
+                        pos.quantity = target_qty
+                        pos.market_value = round(pos.quantity * pos.last_price, 2)
+                    pos.updated_on = datetime.utcnow()
         
-        await db.commit()
-        return {
-            "success": True,
-            "message": f"Successfully rebalanced {updated_count} positions",
-            "total_portfolio_value": round(total_pv, 2),
-            "weights": {p.ticker: p.weight for p in positions}
-        }
+        if not payload.dry_run:
+            await db.commit()
+            return {
+                "success": True,
+                "dry_run": False,
+                "message": f"Successfully rebalanced {len(simulated_orders)} live positions in database",
+                "total_portfolio_value": round(total_pv, 2),
+                "total_turnover_pct": round(total_weight_delta / 2.0, 4),
+                "weights": {p.ticker: p.weight for p in positions},
+                "orders": simulated_orders
+            }
+        else:
+            return {
+                "success": True,
+                "dry_run": True,
+                "message": "Simulation completed successfully (0 database records altered)",
+                "total_portfolio_value": round(total_pv, 2),
+                "total_turnover_pct": round(total_weight_delta / 2.0, 4),
+                "total_buy_inr": round(total_buy_inr, 2),
+                "total_sell_inr": round(total_sell_inr, 2),
+                "orders": simulated_orders,
+                "simulated_weights": normalized_weights
+            }
     except HTTPException:
         raise
     except Exception as e:

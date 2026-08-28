@@ -184,9 +184,33 @@ export const portfolioApi = {
     return response.data;
   },
 
-  // Rebalance portfolio
-  async rebalancePortfolio(new_weights: Record<string, number>): Promise<{ success: boolean; message: string; total_portfolio_value: number; weights: Record<string, number> }> {
-    const response = await apiClient.post('/portfolio/rebalance', { new_weights });
+  // Rebalance portfolio (live or dry-run simulation)
+  async rebalancePortfolio(
+    new_weights: Record<string, number>,
+    dry_run = false
+  ): Promise<{
+    success: boolean;
+    dry_run?: boolean;
+    message: string;
+    total_portfolio_value: number;
+    total_turnover_pct?: number;
+    total_buy_inr?: number;
+    total_sell_inr?: number;
+    weights?: Record<string, number>;
+    orders?: Array<{
+      ticker: string;
+      current_weight: number;
+      target_weight: number;
+      weight_delta: number;
+      current_quantity: number;
+      target_quantity: number;
+      shares_delta: number;
+      price: number;
+      cash_delta: number;
+      action: string;
+    }>;
+  }> {
+    const response = await apiClient.post('/portfolio/rebalance', { new_weights, dry_run });
     return response.data;
   },
 };

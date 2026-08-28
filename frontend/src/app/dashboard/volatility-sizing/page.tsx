@@ -326,17 +326,35 @@ export default function VolatilitySizingPage() {
     fetchSizingData();
   };
 
+  const [rebalanceMode, setRebalanceMode] = useState<'simulate' | 'live'>('simulate');
+  const [simulationData, setSimulationData] = useState<any | null>(null);
+
+  const handleRunSimulation = async () => {
+    if (!sizingData?.recommended_weights) return;
+    setRebalancingInProgress(true);
+    try {
+      const result = await portfolioApi.rebalancePortfolio(sizingData.recommended_weights, true);
+      setSimulationData(result);
+    } catch (err: any) {
+      console.error('Failed to run simulation:', err);
+      alert(`Simulation failed: ${err.message || 'Unknown error'}`);
+    } finally {
+      setRebalancingInProgress(false);
+    }
+  };
+
   const handleConfirmRebalance = async () => {
     if (!sizingData?.recommended_weights) return;
     setRebalancingInProgress(true);
     try {
-      const result = await portfolioApi.rebalancePortfolio(sizingData.recommended_weights);
+      const result = await portfolioApi.rebalancePortfolio(sizingData.recommended_weights, false);
       setRebalanceSuccessMsg(result.message || 'Portfolio rebalancing executed successfully!');
       await fetchPortfolio();
       await fetchSizingData();
       setTimeout(() => {
         setShowRebalanceModal(false);
         setRebalanceSuccessMsg(null);
+        setSimulationData(null);
       }, 2000);
     } catch (err: any) {
       console.error('Failed to execute rebalance:', err);
@@ -538,25 +556,58 @@ export default function VolatilitySizingPage() {
         />
       )}
 
-      {/* Rebalance Confirmation Modal */}
+      {/* Rebalance Confirmation & Simulation Modal */}
       {showRebalanceModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fadeIn">
           <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
             <button
-              onClick={() => setShowRebalanceModal(false)}
+              onClick={() => {
+                setShowRebalanceModal(false);
+                setSimulationData(null);
+              }}
               className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
             >
               <X className="w-5 h-5" />
             </button>
 
             <div className="flex items-center space-x-3 mb-4">
-              <div className="p-2 bg-amber-500/20 text-amber-400 rounded-lg">
+              <div className={`p-2 rounded-lg ${rebalanceMode === 'simulate' ? 'bg-teal-500/20 text-teal-400' : 'bg-amber-500/20 text-amber-400'}`}>
                 <ShieldCheck className="w-6 h-6" />
               </div>
               <div>
-                <h3 className="text-xl font-bold text-white">Execute Portfolio Rebalance</h3>
-                <p className="text-xs text-slate-400">Apply {selectedModel} inverse-volatility risk parity weights to your live portfolio database.</p>
+                <h3 className="text-xl font-bold text-white">
+                  {rebalanceMode === 'simulate' ? 'Simulate Rebalance (Dry-Run)' : 'Execute Live Rebalance'}
+                </h3>
+                <p className="text-xs text-slate-400">
+                  {rebalanceMode === 'simulate'
+                    ? 'Test risk parity allocations and review exact cash / share deltas with zero database mutations.'
+                    : 'Apply updated target weights atomically to your active portfolio database.'}
+                </p>
               </div>
+            </div>
+
+            {/* Mode Selector Tabs */}
+            <div className="flex rounded-lg bg-slate-800/80 p-1 mb-4 border border-slate-700">
+              <button
+                onClick={() => setRebalanceMode('simulate')}
+                className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all ${
+                  rebalanceMode === 'simulate'
+                    ? 'bg-teal-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                🧪 Dry-Run Simulation (Safe Sandbox)
+              </button>
+              <button
+                onClick={() => setRebalanceMode('live')}
+                className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all ${
+                  rebalanceMode === 'live'
+                    ? 'bg-amber-500 text-slate-950 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                ⚡ Live Database Commit
+              </button>
             </div>
 
             {rebalanceSuccessMsg ? (
@@ -582,12 +633,35 @@ export default function VolatilitySizingPage() {
                   </div>
                 </div>
 
-                <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">Proposed Allocation Changes:</h4>
+                {rebalanceMode === 'simulate' && simulationData && (
+                  <div className="p-3.5 bg-teal-950/30 border border-teal-800/50 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-teal-300">🧪 Simulation Analysis Results:</span>
+                      <span className="text-[11px] px-2 py-0.5 rounded bg-teal-900/60 text-teal-200 border border-teal-700/50">
+                        0 Database Changes
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-xs pt-1">
+                      <div className="p-2 rounded bg-slate-800/80 border border-slate-700">
+                        <span className="text-slate-400">Total Buy Capital:</span>
+                        <p className="font-mono font-bold text-emerald-400">{formatCurrency(simulationData.total_buy_inr)}</p>
+                      </div>
+                      <div className="p-2 rounded bg-slate-800/80 border border-slate-700">
+                        <span className="text-slate-400">Total Sell Capital:</span>
+                        <p className="font-mono font-bold text-rose-400">{formatCurrency(simulationData.total_sell_inr)}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                    {rebalanceMode === 'simulate' ? 'Simulated Order Ticket:' : 'Proposed Live Allocation Changes:'}
+                  </h4>
                   {positionData.map((p) => {
                     const action = Math.abs(p.weight_change) < 0.005 ? 'Hold' : p.weight_change > 0 ? 'Buy' : 'Sell';
                     return (
-                      <div key={p.ticker} className="flex items-center justify-between p-2 rounded bg-slate-800/50 border border-slate-700/40 text-xs">
+                      <div key={p.ticker} className="flex items-center justify-between p-2.5 rounded bg-slate-800/50 border border-slate-700/40 text-xs">
                         <div className="flex items-center space-x-2">
                           <span className="font-semibold text-slate-200 w-24">{p.ticker}</span>
                           <span className="text-slate-400 font-mono">{formatPercentage(p.current_weight)}</span>
@@ -595,6 +669,11 @@ export default function VolatilitySizingPage() {
                           <span className="text-teal-300 font-mono font-bold">{formatPercentage(p.recommended_weight)}</span>
                         </div>
                         <div className="flex items-center space-x-3">
+                          {p.shares_delta !== 0 && (
+                            <span className="text-slate-400 font-mono text-[11px]">
+                              {p.shares_delta > 0 ? `+${p.shares_delta}` : p.shares_delta} shs
+                            </span>
+                          )}
                           <span className={`font-mono ${getChangeColor(p.weight_change)}`}>
                             {p.weight_change > 0 ? '+' : ''}{formatPercentage(p.weight_change)}
                           </span>
@@ -610,31 +689,58 @@ export default function VolatilitySizingPage() {
                   })}
                 </div>
 
-                <div className="p-3 bg-amber-950/30 border border-amber-800/40 rounded-lg text-amber-200 text-xs leading-relaxed">
-                  ⚠️ <span className="font-semibold">Atomic Database Update:</span> Confirming will update position target weights and recalculate quantities in your active portfolio database.
-                </div>
+                {rebalanceMode === 'simulate' ? (
+                  <div className="p-3 bg-teal-950/20 border border-teal-800/30 rounded-lg text-teal-200 text-xs leading-relaxed">
+                    💡 <span className="font-semibold">Safe Sandbox Mode:</span> Running simulation calculates execution deltas without modifying the database. You can review all orders safely.
+                  </div>
+                ) : (
+                  <div className="p-3 bg-amber-950/30 border border-amber-800/40 rounded-lg text-amber-200 text-xs leading-relaxed">
+                    ⚠️ <span className="font-semibold">Live Database Execution:</span> Confirming will update position weights and quantities in your SQLite database.
+                  </div>
+                )}
 
                 <div className="flex items-center justify-end space-x-3 pt-4 border-t border-slate-800">
                   <button
-                    onClick={() => setShowRebalanceModal(false)}
+                    onClick={() => {
+                      setShowRebalanceModal(false);
+                      setSimulationData(null);
+                    }}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm transition-colors"
                   >
-                    Cancel
+                    Close
                   </button>
-                  <button
-                    onClick={handleConfirmRebalance}
-                    disabled={rebalancingInProgress}
-                    className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center"
-                  >
-                    {rebalancingInProgress ? (
-                      <>
-                        <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                        Executing...
-                      </>
-                    ) : (
-                      'Confirm & Rebalance Portfolio'
-                    )}
-                  </button>
+
+                  {rebalanceMode === 'simulate' ? (
+                    <button
+                      onClick={handleRunSimulation}
+                      disabled={rebalancingInProgress}
+                      className="px-5 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center"
+                    >
+                      {rebalancingInProgress ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                          Simulating...
+                        </>
+                      ) : (
+                        '🧪 Run Simulation Test'
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleConfirmRebalance}
+                      disabled={rebalancingInProgress}
+                      className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center"
+                    >
+                      {rebalancingInProgress ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                          Executing Live...
+                        </>
+                      ) : (
+                        '⚡ Confirm Live Rebalance'
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             )}
