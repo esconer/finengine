@@ -264,19 +264,26 @@ export default function VolatilitySizingPage() {
       });
       setSizingData(data);
       
-      // Convert data for table
-      const positionsList = positions.map(pos => {
-        const currentWeight = pos.weight;
-        const recommendedWeight = data.recommended_weights?.[pos.ticker] ?? currentWeight;
+      const currentWeights = data.current_weights || {};
+      const recommendedWeights = data.recommended_weights || {};
+      const allTickers = Array.from(new Set([
+        ...positions.map(p => p.ticker),
+        ...Object.keys(currentWeights),
+        ...Object.keys(recommendedWeights)
+      ]));
+
+      // Convert data for table and charts
+      const positionsList = allTickers.map(ticker => {
+        const pos = positions.find(p => p.ticker === ticker);
+        const currentWeight = pos ? pos.weight : (currentWeights[ticker] ?? 0.0);
+        const recommendedWeight = recommendedWeights[ticker] ?? currentWeight;
         const weightChange = recommendedWeight - currentWeight;
-        const sharesDelta = data.trades?.[pos.ticker]?.shares_delta || 0;
-        const amountDelta = data.trades?.[pos.ticker]?.amount || 0;
-        
-        // Volatility is already annualized from backend (e.g. 0.22 = 22%)
-        const rawVol = data.volatilities?.[pos.ticker] ?? 0.20;
+        const sharesDelta = data.trades?.[ticker]?.shares_delta || 0;
+        const amountDelta = data.trades?.[ticker]?.amount || 0;
+        const rawVol = data.volatilities?.[ticker] ?? 0.20;
         
         return {
-          ticker: pos.ticker,
+          ticker,
           current_weight: currentWeight,
           target_weight: recommendedWeight,
           recommended_weight: recommendedWeight,
@@ -296,15 +303,16 @@ export default function VolatilitySizingPage() {
   };
 
   useEffect(() => {
-    fetchPortfolio();
-    fetchSizingData();
+    const init = async () => {
+      await fetchPortfolio();
+      await fetchSizingData();
+    };
+    init();
   }, []);
 
   useEffect(() => {
-    if (positions.length > 0) {
-      fetchSizingData();
-    }
-  }, [positions, selectedModel, targetVolatility]);
+    fetchSizingData();
+  }, [selectedModel, targetVolatility]);
 
   const handleModelChange = (model: string) => {
     setSelectedModel(model);
