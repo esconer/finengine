@@ -278,6 +278,33 @@ export const dataApi = {
   },
 };
 
+// Company Data API
+export const companyDataApi = {
+  // Get company fundamentals
+  async getFundamentals(ticker: string): Promise<Record<string, any>> {
+    const response = await apiClient.get(`/data/fundamentals/${encodeURIComponent(ticker)}`);
+    return response.data;
+  },
+
+  // Get financial statements (10-13Y Ind AS statements)
+  async getFinancialStatements(
+    ticker: string,
+    statement: string = 'income',
+    freq: string = 'annual'
+  ): Promise<any> {
+    const response = await apiClient.get(`/data/financials/${encodeURIComponent(ticker)}`, {
+      params: { statement, freq },
+    });
+    return response.data;
+  },
+
+  // Get insider transactions
+  async getInsiderTransactions(ticker: string): Promise<{ ticker: string; count: number; transactions: any[] }> {
+    const response = await apiClient.get(`/data/insider/${encodeURIComponent(ticker)}`);
+    return response.data;
+  },
+};
+
 // Analytics API
 export const analyticsApi = {
   // Get realized risk metrics
