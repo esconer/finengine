@@ -592,50 +592,53 @@ class AnalyticsEngine:
                 return self._empty_volatility_sizing()
             returns = returns.iloc[1:]
             
-            # Calculate volatilities using EWMA (simplified)
-            volatilities = {}
+            # Calculate volatilities using the selected model (EWMA, GARCH, EGARCH)
+            annualized_vols = {}
+            daily_vols = {}
+            model_type = (model or "EWMA").upper()
+            
             for ticker in returns.columns:
-                # EWMA volatility (lambda = 0.94, typical for daily data)
-                lambda_val = 0.94
-                variance = 0
-                weights_rev = []
+                series = returns[ticker]
+                vol_ann = 0.20
+                try:
+                    if model_type == "GARCH":
+                        res = await self._garch_forecast(series, 1)
+                        vol_ann = float(res.get("volatility_forecast", 0.20))
+                    elif model_type == "EGARCH":
+                        res = await self._egarch_forecast(series, 1)
+                        vol_ann = float(res.get("volatility_forecast", 0.20))
+                    else:
+                        res = self._ewma_forecast(series, 1)
+                        vol_ann = float(res.get("volatility_forecast", 0.20))
+                except Exception:
+                    vol_ann = float(series.std() * np.sqrt(252)) if len(series) > 1 else 0.20
                 
-                # Calculate EWMA variance
-                for i in range(len(returns[ticker]) - 1, 0, -1):
-                    if i < len(returns[ticker]):
-                        variance = lambda_val * variance + (1 - lambda_val) * (returns[ticker].iloc[i] ** 2)
-                        weights_rev.append((1 - lambda_val) * (lambda_val ** (len(weights_rev))))
-                
-                volatility = np.sqrt(variance) if variance > 0 else 0.02  # Default 2% daily vol
-                volatilities[ticker] = volatility
+                vol_ann = max(0.05, min(1.20, vol_ann))
+                annualized_vols[ticker] = vol_ann
+                daily_vols[ticker] = vol_ann / np.sqrt(252)
             
             # Calculate correlation matrix
             correlation_matrix = returns.corr()
             
-            # Calculate portfolio volatility
-            current_weights = np.array([weights.get(ticker, 0) for ticker in returns.columns])
-            current_volatilities = np.array([volatilities.get(ticker, 0.02) for ticker in returns.columns])
+            # Calculate portfolio volatility under current weights
+            current_weights = np.array([weights.get(ticker, 0.0) for ticker in returns.columns])
+            current_vol_arr = np.array([daily_vols.get(ticker, 0.02 / np.sqrt(252)) for ticker in returns.columns])
             
-            if len(correlation_matrix) > 0:
-                # Quadratic form w' (D C D) w — the original expression stopped
-                # at the row vector w' M, so `if portfolio_volatility > 0`
-                # raised on array truthiness and every request degraded to the
-                # empty fallback. Bug surfaced by ticket-01 test suite.
+            if len(correlation_matrix) > 0 and current_weights.sum() > 0:
                 cov_matrix = correlation_matrix.values * np.outer(
-                    current_volatilities, current_volatilities
+                    current_vol_arr, current_vol_arr
                 )
                 portfolio_variance = float(current_weights @ cov_matrix @ current_weights)
-                portfolio_volatility = np.sqrt(portfolio_variance) * np.sqrt(252)  # Annualized
+                portfolio_volatility = np.sqrt(max(0.0, portfolio_variance)) * np.sqrt(252)  # Annualized
             else:
-                portfolio_volatility = 0.20  # Default
+                portfolio_volatility = 0.165
             
-            # Calculate inverse-volatility risk parity weights
-            annualized_vols = {k: float(v * np.sqrt(252)) for k, v in volatilities.items()}
+            # Calculate true inverse-volatility risk parity weights: w_i \propto 1 / \sigma_i
             inv_vols = {ticker: (1.0 / max(v, 1e-4)) for ticker, v in annualized_vols.items() if ticker in weights}
             sum_inv_vol = sum(inv_vols.values())
             
             if sum_inv_vol > 0:
-                recommended_weights = {k: round(v / sum_inv_vol, 6) for k, v in inv_vols.items()}
+                recommended_weights = {k: round(v / sum_inv_vol, 4) for k, v in inv_vols.items()}
             else:
                 recommended_weights = weights.copy()
             

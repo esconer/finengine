@@ -523,3 +523,61 @@ class TestPortfolioHelpers:
         mock_ds.fetch_quote = AsyncMock(side_effect=Exception("Quote error"))
         # Should not raise exception
         await _update_portfolio_prices([pos], mock_ds)
+
+    @pytest.mark.asyncio
+    async def test_rebalance_portfolio_success_and_errors(self, async_client, test_db: AsyncSession):
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+        # Seed two positions
+        pos1 = PortfolioPosition(
+            ticker="CIPLA.NS",
+            weight=0.5,
+            quantity=10.0,
+            buy_price=1400.0,
+            last_price=1400.0,
+            market_value=14000.0,
+            region="IN",
+            sector="Healthcare"
+        )
+        pos2 = PortfolioPosition(
+            ticker="NTPC.NS",
+            weight=0.5,
+            quantity=20.0,
+            buy_price=300.0,
+            last_price=300.0,
+            market_value=6000.0,
+            region="IN",
+            sector="Utilities"
+        )
+        test_db.add_all([pos1, pos2])
+        await test_db.commit()
+
+        # 1. Success rebalance
+        resp = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {"CIPLA.NS": 0.7, "NTPC.NS": 0.3}}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        assert data["weights"]["CIPLA.NS"] == 0.7
+        assert data["weights"]["NTPC.NS"] == 0.3
+
+        # 2. Empty weights error
+        resp_empty = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {}}
+        )
+        assert resp_empty.status_code == 400
+
+        # Clean up
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+        # 3. No positions in portfolio error
+        resp_nopos = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {"CIPLA.NS": 0.5}}
+        )
+        assert resp_nopos.status_code == 404

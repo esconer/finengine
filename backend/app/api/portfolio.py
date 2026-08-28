@@ -4,7 +4,8 @@ Portfolio API endpoints for portfolio management operations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
@@ -822,6 +823,65 @@ async def normalize_portfolio_weights(
     except Exception as e:
         logger.error(f"Error normalizing portfolio: {e}")
         await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+class RebalancePayload(BaseModel):
+    new_weights: Dict[str, float]
+
+
+@router.post("/rebalance")
+async def rebalance_portfolio(
+    payload: RebalancePayload,
+    db: AsyncSession = Depends(get_db_session)
+) -> Dict[str, Any]:
+    """
+    Execute portfolio rebalancing by applying target weights across all holdings atomically.
+    """
+    try:
+        if not payload.new_weights:
+            raise HTTPException(status_code=400, detail="New weights dictionary cannot be empty")
+        
+        result = await db.execute(select(PortfolioPosition))
+        positions = result.scalars().all()
+        
+        if not positions:
+            raise HTTPException(status_code=404, detail="No positions found in portfolio")
+        
+        total_pv = sum(
+            (p.market_value if (p.market_value and p.market_value > 0) else (p.quantity or 0.0) * (p.last_price or 0.0))
+            for p in positions
+        )
+        if total_pv <= 0:
+            total_pv = 100000.0
+            
+        sum_weights = sum(payload.new_weights.values())
+        normalized_weights = {k: v / sum_weights for k, v in payload.new_weights.items()} if sum_weights > 0 else payload.new_weights
+        
+        updated_count = 0
+        for pos in positions:
+            if pos.ticker in normalized_weights:
+                new_w = float(normalized_weights[pos.ticker])
+                pos.weight = round(new_w, 4)
+                if pos.last_price and pos.last_price > 0:
+                    target_mv = new_w * total_pv
+                    pos.quantity = max(1.0, round(target_mv / pos.last_price, 4))
+                    pos.market_value = round(pos.quantity * pos.last_price, 2)
+                pos.updated_on = datetime.utcnow()
+                updated_count += 1
+        
+        await db.commit()
+        return {
+            "success": True,
+            "message": f"Successfully rebalanced {updated_count} positions",
+            "total_portfolio_value": round(total_pv, 2),
+            "weights": {p.ticker: p.weight for p in positions}
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error rebalancing portfolio: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 

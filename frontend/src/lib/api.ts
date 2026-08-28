@@ -183,6 +183,12 @@ export const portfolioApi = {
     });
     return response.data;
   },
+
+  // Rebalance portfolio
+  async rebalancePortfolio(new_weights: Record<string, number>): Promise<{ success: boolean; message: string; total_portfolio_value: number; weights: Record<string, number> }> {
+    const response = await apiClient.post('/portfolio/rebalance', { new_weights });
+    return response.data;
+  },
 };
 
 // Data API
