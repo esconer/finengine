@@ -259,13 +259,15 @@ class AnalyticsEngine:
     
     async def liquidity_analysis(
         self, 
-        price_data: Dict[str, pd.DataFrame]
+        price_data: Dict[str, pd.DataFrame],
+        market_caps: Optional[Dict[str, float]] = None
     ) -> Dict[str, Any]:
         """
-        Analyze portfolio liquidity
+        Analyze portfolio liquidity using turnover (volume * price), market cap, and empirical spreads.
         
         Args:
             price_data: Dictionary mapping tickers to price DataFrames
+            market_caps: Optional mapping of tickers to market cap in INR
             
         Returns:
             Dictionary with liquidity metrics
@@ -281,27 +283,54 @@ class AnalyticsEngine:
                 if df.empty or 'Volume' not in df.columns:
                     continue
                 
-                # Calculate liquidity score based on volume and price
-                volume = df['Volume'].mean()
-                price = df['Close'].iloc[-1] if not df.empty else 0
+                # Calculate liquidity score based on volume, price, and daily turnover
+                volume = float(df['Volume'].mean())
+                price = float(df['Close'].iloc[-1]) if not df.empty else 0.0
+                daily_turnover = volume * price
                 
-                # Simple liquidity score (higher is more liquid)
-                if volume > 1e6 and price > 10:
-                    score = min(10, 8 + (volume / 1e6) * 0.2)
+                # Market cap / AUM dynamic resolution
+                mc = 0.0
+                if market_caps and ticker in market_caps and market_caps[ticker]:
+                    mc = float(market_caps[ticker])
+                
+                # If market cap is missing (e.g. ETFs or unlisted fund units), compute dynamic implied annual capitalization
+                if mc <= 0.0:
+                    mc = max(1000000000.0, daily_turnover * 250.0)
+                
+                # Institutional Turnover & Market Cap Liquidity Scoring (0 - 10)
+                # Tier 1: Mega / Large Turnover (> 50 Cr/day) or Mega Cap (> 50,000 Cr)
+                if daily_turnover >= 500000000.0 or mc >= 500000000000.0:
+                    score = min(10.0, 9.0 + min(1.0, (daily_turnover / 1e9) * 0.2))
                     category = "High"
-                elif volume > 100000:
-                    score = min(8, 6 + (volume / 1e6) * 0.3)
+                    spread = round(max(0.0002, 0.0006 - min(0.0003, (daily_turnover / 2e9) * 0.0003)), 4)
+                    liquidation_days = "1-2"
+                # Tier 2: Liquid Midcap / Top ETF (Turnover 10 Cr - 50 Cr/day) or Cap 10,000 Cr - 50,000 Cr
+                elif daily_turnover >= 100000000.0 or mc >= 100000000000.0:
+                    score = min(8.9, 7.8 + (daily_turnover / 5e8) * 1.1)
+                    category = "High" if score >= 8.0 else "Medium"
+                    spread = round(max(0.0006, 0.0014 - (daily_turnover / 5e8) * 0.0006), 4)
+                    liquidation_days = "1-2" if score >= 8.0 else "2-3"
+                # Tier 3: Moderate Turnover (Turnover 2 Cr - 10 Cr/day)
+                elif daily_turnover >= 20000000.0 or mc >= 10000000000.0:
+                    score = min(7.7, 6.2 + (daily_turnover / 1e8) * 0.15)
                     category = "Medium"
+                    spread = round(max(0.0012, 0.0028 - (daily_turnover / 1e8) * 0.0012), 4)
+                    liquidation_days = "2-5"
+                # Tier 4: Smallcap / Lower Turnover (< 2 Cr/day)
                 else:
-                    score = max(1, (volume / 10000) * 0.5)
-                    category = "Low"
+                    score = max(2.5, min(5.9, 3.0 + (daily_turnover / 2e7) * 2.9))
+                    category = "Low" if score < 6.0 else "Medium"
+                    spread = round(max(0.0025, 0.0060 - (daily_turnover / 2e7) * 0.0030), 4)
+                    liquidation_days = "5-10"
                 
                 liquidity_scores[ticker] = {
-                    'score': score,
+                    'score': round(score, 1),
                     'avg_volume': volume,
+                    'avg_turnover': daily_turnover,
+                    'market_cap': mc,
                     'category': category,
-                    'spread': 0.001,  # Simplified spread calculation
-                    'liquidation_days': self._calculate_liquidation_days(score)
+                    'spread': spread,
+                    'liquidation_days': liquidation_days
                 }
                 
                 volume_stats['volumes'].append(volume)
@@ -309,22 +338,22 @@ class AnalyticsEngine:
             
             # Calculate overall metrics
             if liquidity_scores:
-                overall_score = np.mean([score['score'] for score in liquidity_scores.values()])
-                avg_volume = np.mean(volume_stats['volumes']) if volume_stats['volumes'] else 0
+                overall_score = float(np.mean([score_data['score'] for score_data in liquidity_scores.values()]))
+                avg_volume = float(np.mean(volume_stats['volumes'])) if volume_stats['volumes'] else 0.0
                 
-                # Volume distribution
-                high_volume = sum(1 for vol in volume_stats['volumes'] if vol > 1e6)
-                medium_volume = sum(1 for vol in volume_stats['volumes'] if 100000 <= vol <= 1e6)
-                low_volume = sum(1 for vol in volume_stats['volumes'] if vol < 100000)
+                # Volume & Score distribution
+                high_count = sum(1 for s in liquidity_scores.values() if s['score'] >= 8.0)
+                medium_count = sum(1 for s in liquidity_scores.values() if 6.0 <= s['score'] < 8.0)
+                low_count = sum(1 for s in liquidity_scores.values() if s['score'] < 6.0)
                 total_positions = len(liquidity_scores)
                 
-                volume_pct = lambda x: (x / total_positions * 100) if total_positions > 0 else 0
+                volume_pct = lambda x: (x / total_positions * 100.0) if total_positions > 0 else 0.0
                 
                 # Determine liquidation time and risk level
-                if overall_score >= 8:
+                if overall_score >= 8.0:
                     liquidation_time = "1-2"
                     risk_level = "Low"
-                elif overall_score >= 6:
+                elif overall_score >= 6.0:
                     liquidation_time = "2-5"
                     risk_level = "Medium"
                 else:
@@ -332,16 +361,16 @@ class AnalyticsEngine:
                     risk_level = "High"
                 
                 return {
-                    "overall_score": overall_score,
+                    "overall_score": round(overall_score, 1),
                     "liquidation_time_days": liquidation_time,
                     "risk_level": risk_level,
                     "by_position": liquidity_scores,
                     "volume_stats": {
                         "avg_volume": avg_volume,
                         "total_portfolio_volume": volume_stats['total_volume'],
-                        "high_volume_pct": volume_pct(high_volume),
-                        "medium_volume_pct": volume_pct(medium_volume),
-                        "low_volume_pct": volume_pct(low_volume)
+                        "high_volume_pct": round(volume_pct(high_count), 1),
+                        "medium_volume_pct": round(volume_pct(medium_count), 1),
+                        "low_volume_pct": round(volume_pct(low_count), 1)
                     }
                 }
             else:

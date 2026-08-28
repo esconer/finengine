@@ -625,7 +625,7 @@ async def get_liquidity_metrics(
             }
         tickers = list(allocation.keys())
         
-        # Fetch price and volume data for liquidity analysis concurrently
+        # Fetch price and volume data + market caps for liquidity analysis concurrently
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
@@ -638,14 +638,19 @@ async def get_liquidity_metrics(
                         df = await res
                     else:
                         df = res
-                    return ticker, df
+                    quote = await data_service.fetch_quote(ticker)
+                    mc = quote.get('market_cap') if quote else None
+                    return ticker, df, mc
                 except Exception as e:
                     logger.error(f"Error in liquidity fetch for {ticker}: {e}")
-                    return ticker, None
+                    return ticker, None, None
 
         liq_results = await asyncio.gather(*[fetch_liq(t) for t in tickers])
         price_data_dict = {}
-        for ticker, df in liq_results:
+        market_caps_dict = {}
+        for ticker, df, mc in liq_results:
+            if mc:
+                market_caps_dict[ticker] = mc
             if df is not None and not df.empty:
                 price_col = 'adj_close' if 'adj_close' in df.columns else 'close'
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
@@ -665,7 +670,7 @@ async def get_liquidity_metrics(
             }
         
         # Calculate liquidity metrics using analytics engine
-        liquidity_result = await analytics_engine.liquidity_analysis(price_data_dict)
+        liquidity_result = await analytics_engine.liquidity_analysis(price_data_dict, market_caps=market_caps_dict)
         
         return {
             "overall_score": liquidity_result.get("overall_score", 7.8),
