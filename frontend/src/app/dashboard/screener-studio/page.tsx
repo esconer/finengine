@@ -128,7 +128,9 @@ export default function ScreenerStudioPage() {
       await portfolioApi.addPosition({
         ticker: stock.ticker,
         quantity: 1,
-        purchase_price: stock.price,
+        buy_price: stock.price || 0,
+        weight: 0,
+        region: 'IN',
       });
       setAddedStocks((prev) => ({ ...prev, [stock.symbol]: true }));
       setTimeout(() => {

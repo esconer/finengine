@@ -223,6 +223,10 @@ export class WebSocketClient {
         });
     }
 
+    updateOptions(options: WebSocketOptions): void {
+        this.options = { ...this.options, ...options };
+    }
+
     get readyState(): number {
         return this.ws?.readyState ?? WebSocket.CLOSED;
     }
@@ -239,11 +243,33 @@ export class WebSocketClient {
 // React hook for WebSocket
 export function useWebSocket(options: WebSocketOptions = {}) {
   const wsClientRef = useRef<WebSocketClient | null>(null);
+  const optionsRef = useRef<WebSocketOptions>(options);
+  optionsRef.current = options;
   const { liveDataMode } = useUIStore();
+  const [isConnected, setIsConnected] = useState(false);
+  const [readyState, setReadyState] = useState<number>(WebSocket.CLOSED);
 
-  // Initialize WebSocket client
+  // Initialize WebSocket client once
   if (!wsClientRef.current) {
-    wsClientRef.current = new WebSocketClient(options);
+    wsClientRef.current = new WebSocketClient({
+      ...options,
+      onConnect: () => {
+        setIsConnected(true);
+        setReadyState(WebSocket.OPEN);
+        optionsRef.current.onConnect?.();
+      },
+      onDisconnect: () => {
+        setIsConnected(false);
+        setReadyState(WebSocket.CLOSED);
+        optionsRef.current.onDisconnect?.();
+      },
+      onMessage: (msg) => {
+        optionsRef.current.onMessage?.(msg);
+      },
+      onError: (err) => {
+        optionsRef.current.onError?.(err);
+      }
+    });
   }
 
   const connect = useCallback(() => {
@@ -285,23 +311,23 @@ export function useWebSocket(options: WebSocketOptions = {}) {
     subscribe,
     unsubscribe,
     send,
-    isConnected: wsClientRef.current?.isConnected ?? false,
-    readyState: wsClientRef.current?.readyState ?? WebSocket.CLOSED,
-    clientId: (wsClientRef.current as any)?.clientId || ''
+    isConnected,
+    readyState,
+    clientId: wsClientRef.current?.clientId || ''
   };
 }
 
 // Hook for real-time analytics updates
 export function useRealTimeAnalytics() {
-    const [analyticsData, setAnalyticsData] = useState<any>({});
-    const [marketData, setMarketData] = useState<any>({});
-    const [portfolioData, setPortfolioData] = useState<any>({});
+    const [analyticsData, setAnalyticsData] = useState<any>(null);
+    const [marketData, setMarketData] = useState<any>(null);
+    const [portfolioData, setPortfolioData] = useState<any>(null);
     const [lastUpdate, setLastUpdate] = useState<string | null>(null);
 
     const handleMessage = useCallback((message: WebSocketMessage) => {
         switch (message.type) {
             case 'analytics_update':
-                setAnalyticsData((prev: any) => ({ ...prev, ...message.data }));
+                setAnalyticsData((prev: any) => ({ ...(prev || {}), ...message.data }));
                 break;
             case 'market_data_update':
                 setMarketData(message.data);
@@ -310,8 +336,6 @@ export function useRealTimeAnalytics() {
                 setPortfolioData(message.data);
                 break;
             case 'broadcast':
-                // Handle general broadcasts
-                console.log('Broadcast message:', message);
                 break;
         }
 
@@ -332,9 +356,11 @@ export function useRealTimeAnalytics() {
         }
 
         return () => {
-            unsubscribe('analytics');
-            unsubscribe('market_data');
-            unsubscribe('portfolio');
+            if (isConnected) {
+                unsubscribe('analytics');
+                unsubscribe('market_data');
+                unsubscribe('portfolio');
+            }
         };
     }, [isConnected, subscribe, unsubscribe]);
 

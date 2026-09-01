@@ -134,9 +134,13 @@ export const ExportProgressIndicator: React.FC = () => {
 export const ConnectionStatus: React.FC = () => {
     const { isConnected } = useEnhancedRealTimeAnalytics();
     const { showConnectionAlert } = useNotifications();
+    const prevConnectedRef = React.useRef<boolean | null>(null);
 
     useEffect(() => {
-        showConnectionAlert(isConnected);
+        if (prevConnectedRef.current !== null && prevConnectedRef.current !== isConnected) {
+            showConnectionAlert(isConnected);
+        }
+        prevConnectedRef.current = isConnected;
     }, [isConnected, showConnectionAlert]);
 
     if (!isConnected) {

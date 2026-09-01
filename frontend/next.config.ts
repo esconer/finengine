@@ -5,6 +5,11 @@ const nextConfig: NextConfig = {
   reactCompiler: false, // Disabled for stability
   compress: true,
   poweredByHeader: false,
+  productionBrowserSourceMaps: false,
+  onDemandEntries: {
+    maxInactiveAge: 15 * 1000,
+    pagesBufferLength: 2,
+  },
   experimental: {
     optimizePackageImports: [
       'lucide-react',
@@ -14,6 +19,9 @@ const nextConfig: NextConfig = {
       '@tanstack/react-query',
       'clsx',
       'tailwind-merge',
+      'papaparse',
+      'jspdf',
+      'xlsx',
     ],
   },
   // API proxy for FastAPI backend

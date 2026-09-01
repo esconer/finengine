@@ -53,6 +53,23 @@ export function formatPercentage(value: number, decimals: number = 2): string {
   return `${(value * 100).toFixed(decimals)}%`;
 }
 
+export const formatPercent = formatPercentage;
+
+/**
+ * Format Indian Rupees in Cr / L notation or standard INR
+ * @param value - Numeric value in rupees
+ * @returns Formatted Indian Rupee string
+ */
+export function formatIndianRupees(value: number): string {
+  if (value >= 1e7) {
+    return `₹${(value / 1e7).toFixed(2)} Cr`;
+  }
+  if (value >= 1e5) {
+    return `₹${(value / 1e5).toFixed(2)} L`;
+  }
+  return formatCurrency(value, 'INR');
+}
+
 /**
  * Format large numbers with K, M, B suffixes
  * @param value - Numeric value to format

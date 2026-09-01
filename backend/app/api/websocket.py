@@ -88,6 +88,12 @@ async def background_updates():
             # Wait 30 seconds between updates
             await asyncio.sleep(30)
 
+            # If no connections are active, stop the background loop
+            if not manager.active_connections:
+                break
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Error in background updates: {e}")
             await asyncio.sleep(5)  # Wait before retry
@@ -283,9 +289,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = 
             
     except WebSocketDisconnect:
         manager.disconnect(client_id)
+        if not manager.active_connections and update_task and not update_task.done():
+            update_task.cancel()
     except Exception as e:
         logger.error(f"WebSocket error for client {client_id}: {e}")
         manager.disconnect(client_id)
+        if not manager.active_connections and update_task and not update_task.done():
+            update_task.cancel()
 
 @router.get("/status")
 async def websocket_status():

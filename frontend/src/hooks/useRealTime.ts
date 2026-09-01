@@ -2,22 +2,24 @@
  * Enhanced hooks for real-time updates and auto-refresh functionality
  */
 
-import { useEffect, useRef, useCallback, useState } from 'react';
+import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import { useRealTimeAnalytics } from '@/lib/websocket';
 import { usePortfolioStore, useAnalyticsStore, useUIStore } from '@/lib/store';
 
 // Enhanced auto-refresh hook
 export function useAutoRefresh(enabled: boolean = true, interval: number = 300000) {
-    const { liveDataMode } = useUIStore();
-    const { fetchPortfolio } = usePortfolioStore();
-    const { updateRealTimeData } = useAnalyticsStore();
+    const liveDataMode = useUIStore(state => state.liveDataMode);
+    const fetchPortfolio = usePortfolioStore(state => state.fetchPortfolio);
+    const updateRealTimeData = useAnalyticsStore(state => state.updateRealTimeData);
     const intervalRef = useRef<NodeJS.Timeout | null>(null);
+    const isRefreshingRef = useRef(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
     const performRefresh = useCallback(async () => {
-        if (isRefreshing) return;
+        if (isRefreshingRef.current) return;
 
+        isRefreshingRef.current = true;
         setIsRefreshing(true);
         try {
             // Update portfolio
@@ -31,28 +33,30 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
 
             setLastRefresh(new Date());
 
-            // Simulate API call delay
             setTimeout(() => {
                 updateRealTimeData('analytics', {
                     refreshing: false,
                     timestamp: new Date().toISOString()
                 });
+                isRefreshingRef.current = false;
                 setIsRefreshing(false);
             }, 1000);
         } catch (error) {
             console.error('Auto-refresh failed:', error);
+            isRefreshingRef.current = false;
             setIsRefreshing(false);
             updateRealTimeData('analytics', {
                 refreshing: false,
                 error: error instanceof Error ? error.message : 'Unknown error'
             });
         }
-    }, [fetchPortfolio, updateRealTimeData, isRefreshing]);
+    }, [fetchPortfolio, updateRealTimeData]);
 
     useEffect(() => {
         // Stop existing interval
         if (intervalRef.current) {
             clearInterval(intervalRef.current);
+            intervalRef.current = null;
         }
 
         // Start new interval if enabled and live data mode is on
@@ -63,6 +67,7 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
         return () => {
             if (intervalRef.current) {
                 clearInterval(intervalRef.current);
+                intervalRef.current = null;
             }
         };
     }, [enabled, liveDataMode, interval, performRefresh]);
@@ -81,109 +86,143 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
 
 // Enhanced real-time analytics hook with automatic updates
 export function useEnhancedRealTimeAnalytics() {
-    const { realTimeData } = useAnalyticsStore();
-    const { fetchPortfolio } = usePortfolioStore();
+    const realTimeData = useAnalyticsStore(state => state.realTimeData);
+    const fetchPortfolio = usePortfolioStore(state => state.fetchPortfolio);
     const { portfolioData, analyticsData, marketData, lastUpdate, isConnected, subscribe, unsubscribe } = useRealTimeAnalytics();
-    const { liveDataMode } = useUIStore();
+    const liveDataMode = useUIStore(state => state.liveDataMode);
     const [dataFreshness, setDataFreshness] = useState<'fresh' | 'stale' | 'outdated'>('fresh');
     const [dataAge, setDataAge] = useState<number>(0);
 
-    // Update analytics store when WebSocket data changes
+    // Sync analytics store only when actual WebSocket data arrives
     useEffect(() => {
         if (portfolioData) {
             useAnalyticsStore.getState().updateRealTimeData('portfolio', portfolioData);
         }
+    }, [portfolioData]);
+
+    useEffect(() => {
         if (analyticsData) {
             useAnalyticsStore.getState().updateRealTimeData('analytics', analyticsData);
         }
+    }, [analyticsData]);
+
+    useEffect(() => {
         if (marketData) {
             useAnalyticsStore.getState().updateRealTimeData('market_data', marketData);
         }
-    }, [portfolioData, analyticsData, marketData]);
+    }, [marketData]);
 
-    // Check data freshness
+    // Check data freshness periodically without busy re-renders
     useEffect(() => {
-        if (!lastUpdate) {
+        const currentUpdate = lastUpdate || realTimeData.lastUpdate;
+        if (!currentUpdate) {
             setDataFreshness('outdated');
             setDataAge(0);
             return;
         }
 
-        const now = new Date();
-        const lastUpdateDate = new Date(lastUpdate);
-        const ageMinutes = (now.getTime() - lastUpdateDate.getTime()) / (1000 * 60);
+        const checkFreshness = () => {
+            const now = new Date();
+            const lastUpdateDate = new Date(currentUpdate);
+            const ageMinutes = (now.getTime() - lastUpdateDate.getTime()) / (1000 * 60);
 
-        setDataAge(ageMinutes);
+            setDataAge(ageMinutes);
 
-        if (ageMinutes < 1) {
-            setDataFreshness('fresh');
-        } else if (ageMinutes < 5) {
-            setDataFreshness('stale');
-        } else {
-            setDataFreshness('outdated');
-        }
-    }, [lastUpdate]);
+            if (ageMinutes < 1) {
+                setDataFreshness('fresh');
+            } else if (ageMinutes < 5) {
+                setDataFreshness('stale');
+            } else {
+                setDataFreshness('outdated');
+            }
+        };
 
-    // Auto-subscribe to topics when live mode is enabled
-    useEffect(() => {
-        if (liveDataMode && isConnected) {
-            subscribe('analytics');
-            subscribe('market_data');
-            subscribe('portfolio');
+        checkFreshness();
+        const freshnessTimer = setInterval(checkFreshness, 30000);
+        return () => clearInterval(freshnessTimer);
+    }, [lastUpdate, realTimeData.lastUpdate]);
 
-            // Ping every 30 seconds to keep connection alive
-            const pingInterval = setInterval(() => {
-                if (isConnected) {
-                    // Send ping via WebSocket
-                    console.log('Sending WebSocket ping');
-                }
-            }, 30000);
+    const refreshData = useCallback(() => {
+        fetchPortfolio();
+    }, [fetchPortfolio]);
 
-            return () => {
-                clearInterval(pingInterval);
-                unsubscribe('analytics');
-                unsubscribe('market_data');
-                unsubscribe('portfolio');
-            };
-        }
-    }, [liveDataMode, isConnected, subscribe, unsubscribe]);
+    const mergedPortfolio = useMemo(() => ({
+        ...realTimeData.portfolioData,
+        ...(portfolioData || {})
+    }), [realTimeData.portfolioData, portfolioData]);
 
-    return {
-        // Data
-        portfolioData: { ...realTimeData.portfolioData, ...portfolioData },
-        analyticsData: { ...realTimeData.analyticsData, ...analyticsData },
-        marketData: { ...realTimeData.marketData, ...marketData },
+    const mergedAnalytics = useMemo(() => ({
+        ...realTimeData.analyticsData,
+        ...(analyticsData || {})
+    }), [realTimeData.analyticsData, analyticsData]);
+
+    const mergedMarket = useMemo(() => ({
+        ...realTimeData.marketData,
+        ...(marketData || {})
+    }), [realTimeData.marketData, marketData]);
+
+    return useMemo(() => ({
+        portfolioData: mergedPortfolio,
+        analyticsData: mergedAnalytics,
+        marketData: mergedMarket,
         lastUpdate: lastUpdate || realTimeData.lastUpdate,
         isConnected: isConnected || realTimeData.isConnected,
-
-        // Status
         dataFreshness,
         dataAge,
         isLive: liveDataMode,
+        refreshData,
+        connectionStatus: (isConnected || realTimeData.isConnected) ? ('connected' as const) : ('disconnected' as const),
+    }), [
+        mergedPortfolio,
+        mergedAnalytics,
+        mergedMarket,
+        lastUpdate,
+        realTimeData.lastUpdate,
+        isConnected,
+        realTimeData.isConnected,
+        dataFreshness,
+        dataAge,
+        liveDataMode,
+        refreshData
+    ]);
+}
 
-        // Actions
-        refreshData: useCallback(() => {
-            fetchPortfolio();
-        }, [fetchPortfolio]),
+export interface Notification {
+    id: string;
+    type: 'success' | 'error' | 'warning' | 'info';
+    title: string;
+    message: string;
+    timestamp: Date;
+    autoHide?: boolean;
+    duration?: number;
+}
 
-        // Connection status
-        connectionStatus: isConnected ? 'connected' : 'disconnected',
-    };
+// Module-level shared store for notifications to prevent duplicate state and re-render loops
+let globalNotifications: Notification[] = [];
+const notificationListeners = new Set<() => void>();
+
+function notifyNotificationListeners() {
+    notificationListeners.forEach(listener => listener());
 }
 
 // Notification hook for alerts and updates
 export function useNotifications() {
-    interface Notification {
-        id: string;
-        type: 'success' | 'error' | 'warning' | 'info';
-        title: string;
-        message: string;
-        timestamp: Date;
-        autoHide?: boolean;
-        duration?: number;
-    }
+    const [notifications, setNotifications] = useState<Notification[]>(globalNotifications);
 
-    const [notifications, setNotifications] = useState<Notification[]>([]);
+    useEffect(() => {
+        const listener = () => {
+            setNotifications([...globalNotifications]);
+        };
+        notificationListeners.add(listener);
+        return () => {
+            notificationListeners.delete(listener);
+        };
+    }, []);
+
+    const removeNotification = useCallback((id: string) => {
+        globalNotifications = globalNotifications.filter(n => n.id !== id);
+        notifyNotificationListeners();
+    }, []);
 
     const addNotification = useCallback((
         type: 'success' | 'error' | 'warning' | 'info',
@@ -204,24 +243,23 @@ export function useNotifications() {
             duration
         };
 
-        setNotifications(prev => [...prev, notification]);
+        globalNotifications = [...globalNotifications, notification];
+        notifyNotificationListeners();
 
         // Auto-hide notification if enabled
         if (autoHide) {
             setTimeout(() => {
-                removeNotification(id);
+                globalNotifications = globalNotifications.filter(n => n.id !== id);
+                notifyNotificationListeners();
             }, duration);
         }
 
         return id;
     }, []);
 
-    const removeNotification = useCallback((id: string) => {
-        setNotifications(prev => prev.filter(n => n.id !== id));
-    }, []);
-
     const clearAll = useCallback(() => {
-        setNotifications([]);
+        globalNotifications = [];
+        notifyNotificationListeners();
     }, []);
 
     // Risk alerts
@@ -267,25 +305,42 @@ export function useNotifications() {
     };
 }
 
+export interface ExportJob {
+    id: string;
+    filename: string;
+    progress: number;
+    status: 'pending' | 'processing' | 'completed' | 'error';
+    error?: string;
+    startedAt: Date;
+    completedAt?: Date;
+}
+
+let globalExportJobs: Record<string, ExportJob> = {};
+const exportListeners = new Set<() => void>();
+
+function notifyExportListeners() {
+    exportListeners.forEach(l => l());
+}
+
 // Export progress tracking hook
 export function useExportProgress() {
-    interface ExportJob {
-        id: string;
-        filename: string;
-        progress: number;
-        status: 'pending' | 'processing' | 'completed' | 'error';
-        error?: string;
-        startedAt: Date;
-        completedAt?: Date;
-    }
+    const [exportJobs, setExportJobs] = useState<Record<string, ExportJob>>(globalExportJobs);
 
-    const [exportJobs, setExportJobs] = useState<Record<string, ExportJob>>({});
+    useEffect(() => {
+        const listener = () => {
+            setExportJobs({ ...globalExportJobs });
+        };
+        exportListeners.add(listener);
+        return () => {
+            exportListeners.delete(listener);
+        };
+    }, []);
 
     const startExport = useCallback((filename: string, format: string) => {
         const id = `export_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        setExportJobs(prev => ({
-            ...prev,
+        globalExportJobs = {
+            ...globalExportJobs,
             [id]: {
                 id,
                 filename: `${filename}.${format}`,
@@ -293,54 +348,61 @@ export function useExportProgress() {
                 status: 'pending',
                 startedAt: new Date()
             }
-        }));
+        };
+        notifyExportListeners();
 
         return id;
     }, []);
 
     const updateExportProgress = useCallback((id: string, progress: number) => {
-        setExportJobs(prev => ({
-            ...prev,
+        if (!globalExportJobs[id]) return;
+        globalExportJobs = {
+            ...globalExportJobs,
             [id]: {
-                ...prev[id],
+                ...globalExportJobs[id],
                 progress,
                 status: progress >= 100 ? 'completed' : 'processing'
             }
-        }));
+        };
+        notifyExportListeners();
 
         // Mark as completed
         if (progress >= 100) {
             setTimeout(() => {
-                setExportJobs(prev => ({
-                    ...prev,
-                    [id]: {
-                        ...prev[id],
-                        status: 'completed',
-                        completedAt: new Date()
-                    }
-                }));
+                if (globalExportJobs[id]) {
+                    globalExportJobs = {
+                        ...globalExportJobs,
+                        [id]: {
+                            ...globalExportJobs[id],
+                            status: 'completed',
+                            completedAt: new Date()
+                        }
+                    };
+                    notifyExportListeners();
+                }
             }, 500);
         }
     }, []);
 
     const completeExport = useCallback((id: string, error?: string) => {
-        setExportJobs(prev => ({
-            ...prev,
+        if (!globalExportJobs[id]) return;
+        globalExportJobs = {
+            ...globalExportJobs,
             [id]: {
-                ...prev[id],
+                ...globalExportJobs[id],
                 status: error ? 'error' : 'completed',
-                progress: error ? prev[id].progress : 100,
+                progress: error ? globalExportJobs[id].progress : 100,
                 error,
                 completedAt: new Date()
             }
-        }));
+        };
+        notifyExportListeners();
     }, []);
 
     const removeExport = useCallback((id: string) => {
-        setExportJobs(prev => {
-            const { [id]: removed, ...rest } = prev;
-            return rest;
-        });
+        const { [id]: removed, ...rest } = globalExportJobs;
+        globalExportJobs = rest;
+        notifyExportListeners();
     }, []);
 
     const getActiveExports = useCallback(() => {
