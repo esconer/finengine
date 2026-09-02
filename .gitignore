@@ -61,4 +61,7 @@ htmlcov/
 _shot_*.png
 frontend/test-results.xml
 backend/_diag_rc.py
+.zcode/
+frontend/assets/
+frontend/html.meta.json.gz
 

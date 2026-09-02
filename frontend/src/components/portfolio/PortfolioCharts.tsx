@@ -30,6 +30,7 @@ interface PortfolioChartsProps {
   positions: PortfolioPosition[];
   currency: Currency;
   summary: PortfolioSummary | null;
+  performanceData?: { date: string; value: number }[];
 }
 
 const COLORS = [
@@ -37,7 +38,34 @@ const COLORS = [
   '#06B6D4', '#84CC16', '#F97316', '#EC4899', '#6366F1'
 ];
 
-export function PortfolioCharts({ positions, currency, summary }: PortfolioChartsProps) {
+interface PortfolioTooltipProps {
+  active?: boolean;
+  payload?: any[];
+  label?: string;
+  currency?: Currency;
+}
+
+const PortfolioChartsCustomTooltip = ({ active, payload, label, currency = 'INR' }: PortfolioTooltipProps) => {
+  if (active && payload && payload.length) {
+    const symbol = currency === 'INR' ? '₹' : '$';
+    return (
+      <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg">
+        <p className="text-sm font-medium text-gray-900 dark:text-white">{label}</p>
+        {payload.map((entry: any, index: number) => {
+          const formattedVal = `${symbol}${Number(entry.value).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+          return (
+            <p key={index} className="text-sm" style={{ color: entry.color }}>
+              {entry.name}: {entry.name?.includes('%') ? entry.value + '%' : formattedVal}
+            </p>
+          );
+        })}
+      </div>
+    );
+  }
+  return null;
+};
+
+export function PortfolioCharts({ positions, currency, summary, performanceData: customPerformanceData }: PortfolioChartsProps) {
   // Format currency
   const formatCurrency = (amount: number) => {
     const symbol = currency === 'INR' ? '₹' : '$';
@@ -63,37 +91,10 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
       gainLossPct: pos.unrealized_gain_loss_pct
     }));
 
-  // Prepare performance data (mock historical data for demonstration)
-  const performanceData = [
-    { date: '2024-01', value: 100000 },
-    { date: '2024-02', value: 102500 },
-    { date: '2024-03', value: 98500 },
-    { date: '2024-04', value: 107800 },
-    { date: '2024-05', value: 115200 },
-    { date: '2024-06', value: 118900 },
-    { date: '2024-07', value: 125400 },
-    { date: '2024-08', value: 122800 },
-    { date: '2024-09', value: 128900 },
-    { date: '2024-10', value: 132400 },
-    { date: '2024-11', value: 135600 }
-  ];
-
-  // Custom tooltip for charts
-  const CustomTooltip = ({ active, payload, label }: any) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg">
-          <p className="text-sm font-medium text-gray-900 dark:text-white">{label}</p>
-          {payload.map((entry: any, index: number) => (
-            <p key={index} className="text-sm" style={{ color: entry.color }}>
-              {entry.name}: {entry.name.includes('%') ? entry.value + '%' : formatCurrency(entry.value)}
-            </p>
-          ))}
-        </div>
-      );
-    }
-    return null;
-  };
+  const currentTotal = summary?.total_value || positions.reduce((sum, p) => sum + (p.current_value || 0), 0);
+  const performanceData = customPerformanceData || (currentTotal > 0 ? [
+    { date: 'Current', value: currentTotal }
+  ] : []);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -122,7 +123,7 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
                 fontSize={12}
                 tickFormatter={formatCurrency}
               />
-              <Tooltip content={<CustomTooltip />} />
+              <Tooltip content={<PortfolioChartsCustomTooltip currency={currency} />} />
               <Area
                 type="monotone"
                 dataKey="value"
@@ -150,7 +151,7 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
                 cx="50%"
                 cy="50%"
                 labelLine={false}
-                label={({ name, allocation }) => `${name} ${allocation}`}
+                label={({ name, percent }: any) => `${name} ${((percent || 0) * 100).toFixed(1)}%`}
                 outerRadius={80}
                 fill="#8884d8"
                 dataKey="value"
@@ -160,7 +161,7 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
                 ))}
               </Pie>
               <Tooltip 
-                formatter={(value: number) => [`${value.toFixed(1)}%`, 'Allocation']}
+                formatter={(value: any) => [`${Number(value ?? 0).toFixed(1)}%`, 'Allocation']}
               />
             </PieChart>
           </ResponsiveContainer>
@@ -190,7 +191,7 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
                   fontSize={12}
                   width={60}
                 />
-                <Tooltip content={<CustomTooltip />} />
+                <Tooltip content={<PortfolioChartsCustomTooltip currency={currency} />} />
                 <Bar dataKey="value" fill="#3B82F6" />
               </BarChart>
             </ResponsiveContainer>
@@ -218,7 +219,7 @@ export function PortfolioCharts({ positions, currency, summary }: PortfolioChart
                   fontSize={12}
                   tickFormatter={formatCurrency}
                 />
-                <Tooltip content={<CustomTooltip />} />
+                <Tooltip content={<PortfolioChartsCustomTooltip currency={currency} />} />
                 <Bar 
                   dataKey="gainLoss" 
                   fill="#10B981"

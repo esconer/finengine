@@ -244,53 +244,62 @@ export class WebSocketClient {
 export function useWebSocket(options: WebSocketOptions = {}) {
   const wsClientRef = useRef<WebSocketClient | null>(null);
   const optionsRef = useRef<WebSocketOptions>(options);
-  optionsRef.current = options;
   const { liveDataMode } = useUIStore();
   const [isConnected, setIsConnected] = useState(false);
   const [readyState, setReadyState] = useState<number>(WebSocket.CLOSED);
+  const [clientId, setClientId] = useState<string>('');
 
-  // Initialize WebSocket client once
-  if (!wsClientRef.current) {
-    wsClientRef.current = new WebSocketClient({
-      ...options,
-      onConnect: () => {
-        setIsConnected(true);
-        setReadyState(WebSocket.OPEN);
-        optionsRef.current.onConnect?.();
-      },
-      onDisconnect: () => {
-        setIsConnected(false);
-        setReadyState(WebSocket.CLOSED);
-        optionsRef.current.onDisconnect?.();
-      },
-      onMessage: (msg) => {
-        optionsRef.current.onMessage?.(msg);
-      },
-      onError: (err) => {
-        optionsRef.current.onError?.(err);
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
+
+  const getClient = useCallback(() => {
+    if (!wsClientRef.current) {
+      wsClientRef.current = new WebSocketClient({
+        ...optionsRef.current,
+        onConnect: () => {
+          setIsConnected(true);
+          setReadyState(WebSocket.OPEN);
+          optionsRef.current.onConnect?.();
+        },
+        onDisconnect: () => {
+          setIsConnected(false);
+          setReadyState(WebSocket.CLOSED);
+          optionsRef.current.onDisconnect?.();
+        },
+        onMessage: (msg) => {
+          optionsRef.current.onMessage?.(msg);
+        },
+        onError: (err) => {
+          optionsRef.current.onError?.(err);
+        }
+      });
+      if (wsClientRef.current.clientId) {
+        setClientId(wsClientRef.current.clientId);
       }
-    });
-  }
+    }
+    return wsClientRef.current;
+  }, []);
 
   const connect = useCallback(() => {
-    return wsClientRef.current?.connect();
-  }, []);
+    return getClient().connect();
+  }, [getClient]);
 
   const disconnect = useCallback(() => {
     wsClientRef.current?.disconnect();
   }, []);
 
   const subscribe = useCallback((topic: string) => {
-    wsClientRef.current?.subscribe(topic);
-  }, []);
+    getClient().subscribe(topic);
+  }, [getClient]);
 
   const unsubscribe = useCallback((topic: string) => {
     wsClientRef.current?.unsubscribe(topic);
   }, []);
 
   const send = useCallback((message: any) => {
-    wsClientRef.current?.send(message);
-  }, []);
+    getClient().send(message);
+  }, [getClient]);
 
   // Auto-connect when liveDataMode is enabled
   useEffect(() => {
@@ -313,7 +322,7 @@ export function useWebSocket(options: WebSocketOptions = {}) {
     send,
     isConnected,
     readyState,
-    clientId: wsClientRef.current?.clientId || ''
+    clientId
   };
 }
 

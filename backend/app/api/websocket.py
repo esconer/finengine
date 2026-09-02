@@ -140,12 +140,26 @@ async def send_analytics_update():
                 return
 
             tickers = [p.ticker for p in positions]
-            weights = {p.ticker: (p.weight or 0.0) for p in positions}
-            w_sum = sum(weights.values())
-            if w_sum > 0:
-                weights = {k: v / w_sum for k, v in weights.items()}
+            # Prefer live market-value weights (quantity x last_price); fall back to
+            # stored weights, then equal weights — mirrors _load_portfolio_allocation
+            mv_weights = {}
+            total_mv = 0.0
+            for p in positions:
+                mv = p.market_value or 0.0
+                if mv <= 0:
+                    mv = (p.quantity or 0.0) * (p.last_price or 0.0)
+                mv_weights[p.ticker] = mv
+                total_mv += mv
+
+            if total_mv > 0:
+                weights = {t: v / total_mv for t, v in mv_weights.items()}
             else:
-                weights = {t: 1.0 / len(tickers) for t in tickers}
+                weights = {p.ticker: (p.weight or 0.0) for p in positions}
+                w_sum = sum(weights.values())
+                if w_sum > 0:
+                    weights = {k: v / w_sum for k, v in weights.items()}
+                else:
+                    weights = {t: 1.0 / len(tickers) for t in tickers}
 
             # Lookback limited to 1 year (~252 trading days) to prevent unbounded memory growth
             cutoff_date = datetime.utcnow().date() - timedelta(days=365)
@@ -167,7 +181,10 @@ async def send_analytics_update():
                 data_dict = {}
                 for r in rows:
                     data_dict.setdefault(r.ticker, {})[r.date] = r.adj_close or r.close
-                price_df = pd.DataFrame(data_dict).dropna()
+                # Defensive alignment: ffill/bfill instead of dropna so a
+                # recently listed asset cannot truncate the shared history
+                # of longer-established holdings (CONTEXT.md gotcha #7).
+                price_df = pd.DataFrame(data_dict).sort_index().ffill().bfill().dropna(how="all")
                 if not price_df.empty and len(price_df) > 5:
                     engine = AnalyticsEngine()
                     metrics = await engine.calculate_portfolio_metrics(price_df, weights)

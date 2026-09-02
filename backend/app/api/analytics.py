@@ -562,7 +562,9 @@ async def get_concentration_metrics(
                 "top_10": 0.0,
                 "herfindahl_index": 0.0,
                 "effective_positions": 0.0,
+                "diversification_score": 0.0,
                 "diversification_ratio": 1.0,
+                "gini_coefficient": 0.0,
                 "by_weight": {},
                 "by_sector": {},
                 "error": "No portfolio positions found"
@@ -787,8 +789,14 @@ async def get_volatility_sizing(
                 (p.market_value if (p.market_value and p.market_value > 0) else (p.quantity or 0.0) * (p.last_price or 0.0))
                 for p in positions_list
             )
-            if resolved_pv <= 0:
-                resolved_pv = 100000.0
+        if resolved_pv is None or resolved_pv <= 0:
+            return {
+                "current_weights": weights,
+                "recommended_weights": weights,
+                "trades": {ticker: {"shares_delta": 0, "amount": 0.0} for ticker in weights.keys()},
+                "target_volatility": target_volatility,
+                "error": "Portfolio market value unavailable; pass an explicit portfolio_value or refresh position prices"
+            }
         
         # Fetch price data for volatility sizing concurrently
         end = datetime.now().strftime('%Y-%m-%d')

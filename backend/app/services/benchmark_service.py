@@ -55,6 +55,18 @@ class BenchmarkService:
             BENCHMARK_SYMBOL, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
         )
 
+    async def get_benchmark_df(self, days: int = 1100) -> Optional[pd.DataFrame]:
+        """Date-indexed OHLCV DataFrame of the benchmark."""
+        df = await self.ensure_history(days=days)
+        if df is None or df.empty:
+            return None
+        out = df.copy()
+        for dcol in ("date", "Date"):
+            if dcol in out.columns:
+                out.index = pd.to_datetime(out[dcol], errors="coerce")
+                break
+        return out.dropna(subset=["close"] if "close" in out.columns else [])
+
     async def get_returns(
         self,
         start: Optional[str] = None,

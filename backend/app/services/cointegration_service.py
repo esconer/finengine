@@ -51,6 +51,10 @@ def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional
     dz = z[1:] - z[:-1]
     z_lag = z[:-1]
 
+    # Guard against zero or degenerate variance in spread series
+    if float(np.var(z_lag)) < 1e-12:
+        return None, None
+
     # Linear regression: dz = a + gamma * z_lag
     try:
         # np.polyfit returns [gamma, a] for degree 1

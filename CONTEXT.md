@@ -60,6 +60,7 @@ Alpha Vantage (Tier 3: Multi-Key Rotation Pool) ──────────�
 finengine/
 ├── .agents/skills/           # Custom agent skills (caveman, brandkit, impeccable, etc.)
 ├── .scratch/                 # Local markdown issue tracking & project session logs
+│   ├── bug-sweep-2026/       # Bug sweep & quantitative test validation tickets (01 to 06)
 │   ├── bfinance-integration/ # bfinance integration technical documentation and specs
 │   ├── project-state/        # Deep codebase audits (`current-state.md`)
 │   ├── advanced-analytics/   # Advanced analytics specification & ticket tracker
@@ -212,6 +213,16 @@ The ongoing and planned tasks are tracked as local markdown issues under `.scrat
 | **t31** | Options Greeks & IV Surface Tracking | `needs-info` | Net portfolio delta/gamma/vega exposures and implied volatility smile surface |
 | **t32** | Walk-Forward Strategy Backtester | `ready-for-agent` | Rolling historical simulation of rebalancing strategies vs buy-and-hold |
 
+### Priority 5: Bug Sweep & Quantitative Hardening (`.scratch/bug-sweep-2026/`)
+| Ticket | Name | Status | Summary / Scope |
+|---|---|---|---|
+| **BS-01** | Fix Portfolio Charts Types & Mock Data | `closed` | Fixed Recharts TS2339/TS2322 typings and bound real dynamic performance data |
+| **BS-02** | Concentration Boundary & Metric Hygiene | `closed` | Enforced $N \le 1 \implies 0.0\%$ diversification score and eliminated fake mock fallback strings |
+| **BS-03** | Liquidity Page Microstructure Fallbacks | `closed` | Bound live position lengths and dynamically derived liquidation horizons and risk levels |
+| **BS-04** | Volatility Sizing Metric Fallbacks | `closed` | Replaced hardcoded position counts and fake estimated volatility with live API attributes |
+| **BS-05** | Cointegration Polyfit Conditioning Guard | `closed` | Added variance safeguard in `compute_ou_parameters` to eliminate RankWarnings on degenerate series |
+| **BS-06** | Quantitative Invariants & Loop Scope Config | `closed` | Added analytical test suite (`test_quantitative_invariants.py`) validating Euler attribution, HHI, inverse-vol parity, optimizers, OU, EVT, Monte Carlo, and compounding |
+
 ---
 
 ## 8. Development Runbook & Commands
@@ -261,6 +272,12 @@ bun run test:run
 12. **Daily vs Annualized Alpha Reporting**: In single-factor CAPM OLS regressions, the regression intercept $\alpha_{\text{daily}}$ represents daily excess return. In UI reporting, always compute and display both annualized alpha ($\alpha_{\text{ann}} = \alpha_{\text{daily}} \times 252$) and percentage daily excess returns (+0.160%/d) to avoid user confusion between basis-point daily figures and annualized performance expectations.
 13. **Stress Testing Multi-Factor Sector Elasticity & Circuit Winsorization**: When computing constituent drawdowns across macro stress test scenarios (Market Crash $-35\%$, Interest Rate Shock $-15\%$, Volatility Spike $-22\%$, Tech Correction $-18\%$), do not rely solely on unadjusted univariate volatility. First, winsorize daily returns to $[-20\%, +20\%]$ to eliminate unadjusted split/bonus data spikes. Second, apply sector-specific macroeconomic elasticity multipliers (Healthcare $0.25-0.55\times$, Utilities $0.20-0.70\times$, Tech $1.10-1.80\times$, Financials $0.50-1.50\times$, Cyclicals $0.60-1.55\times$) with active non-zero volatility fine-tuning. This prevents artificial $-98\%$ bankruptcy wipeout artifacts and flat $-26.3\%$ clamp clusters, producing realistic institutional stress profiles.
 14. **GARCH & Volatility Forecasting Return Winsorization**: When evaluating GARCH, EGARCH, or EWMA statistical models on historical daily timeseries, always clean and winsorize daily returns to statutory equity price bands (`clean_returns.clip(lower=-0.20, upper=0.20)`). Unadjusted historical stock splits, bonus issues, or single-day data feed spikes can cause unconstrained autoregressive conditional variance to explode to multi-thousand percent annualized figures (e.g. 2600%), which artificially destroys portfolio Value-at-Risk calculations.
+15. **Zero-State Portfolio Weights**: When adding the initial asset to an empty portfolio (`positions.length === 0` or `total_value === 0`), the auto-calculated portfolio weight must always be `100.00%` (`1.0`). Never use hardcoded arbitrary portfolio totals (e.g. `100000`) as fallbacks.
+16. **Concentration & Diversification Bounds**: Diversification scores must be computed from true concentration indices ($HHI = \sum w_i^2$, $N_{\text{eff}} = 1/HHI$). A single-holding portfolio ($N \le 1$) must strictly render `0%` diversification score. Never invert generic risk scores as a proxy for diversification.
+17. **Inverse-Volatility Risk Parity**: Volatility-adjusted allocations must compute true inverse-volatility weights ($w_i \propto 1/\sigma_i$).
+18. **Deterministic Return Compounding**: Monthly returns must be grouped and compounded geometrically via `(1 + r).groupby([year, month]).prod() - 1` rather than relying on variable dataframe schemas.
+19. **Pytest Asyncio Loop Scope**: Pytest-asyncio requires explicit configuration of `asyncio_default_fixture_loop_scope = "function"` under `[tool.pytest.ini_options]` in `pyproject.toml` to suppress event loop deprecation warnings.
+20. **Degenerate Series & Infinite Value Sanitization**: Numerical algorithms (e.g. OLS regressions, OU parameter recovery, covariance estimations) must sanitize input series against `np.inf` / `-np.inf` and guard against zero-variance inputs before fitting models to eliminate numpy RankWarnings and runtime nanops subtract warnings.
 
 
 

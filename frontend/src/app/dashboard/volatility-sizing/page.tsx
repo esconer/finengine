@@ -760,7 +760,7 @@ export default function VolatilitySizingPage() {
               </span>
             </div>
             <p className="text-teal-100 max-w-2xl text-sm leading-relaxed">
-              Volatility-adjusted position sizing, risk budget scaling, and inverse-volatility parity recommendations across all {positions.length || 14} active positions.
+              Volatility-adjusted position sizing, risk budget scaling, and inverse-volatility parity recommendations across all {positions.length} active positions.
             </p>
             <div className="flex flex-wrap items-center mt-4 gap-3">
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-teal-100 text-xs font-medium border border-white/10">
@@ -770,7 +770,7 @@ export default function VolatilitySizingPage() {
                 Model: <span className="font-bold text-white ml-1">{selectedModel}</span>
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-teal-100 text-xs font-medium border border-white/10">
-                Est. Portfolio Vol: <span className="font-bold text-white ml-1">{sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : '16.5%'}</span>
+                Est. Portfolio Vol: <span className="font-bold text-white ml-1">{sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : 'N/A'}</span>
               </div>
             </div>
           </div>
@@ -807,7 +807,7 @@ export default function VolatilitySizingPage() {
         <div className="relative group">
           <MetricCard
             title="Estimated Portfolio Vol"
-            value={sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : '16.5%'}
+            value={sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : 'N/A'}
             icon={Activity}
             loading={loading}
           />
@@ -831,7 +831,7 @@ export default function VolatilitySizingPage() {
         <div className="relative group">
           <MetricCard
             title="Total Positions"
-            value={String(positions.length || 14)}
+            value={String(positions.length)}
             icon={Zap}
             loading={loading}
           />

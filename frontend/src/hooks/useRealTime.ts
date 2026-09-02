@@ -485,11 +485,11 @@ export function useDashboardPreferences() {
 
 // Date range selection hook
 export function useDateRangeSelection() {
-    const [dateRange, setDateRange] = useState({
+    const [dateRange, setDateRange] = useState(() => ({
         start: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000), // 90 days ago
         end: new Date(),
         preset: '3M' // '1D', '1W', '1M', '3M', '6M', '1Y', 'ALL'
-    });
+    }));
 
     const [isSelecting, setIsSelecting] = useState(false);
 

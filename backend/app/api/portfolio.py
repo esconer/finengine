@@ -3,6 +3,7 @@ Portfolio API endpoints for portfolio management operations
 """
 
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ import csv
 import io
 
 from app.db.database import get_db_session
-from app.services.data_service import GlobalDataService, DataService
+from app.services.data_service import GlobalDataService, DataService, canonical_ticker
 from app.models.database import PortfolioPosition
 from app.models.schemas import (
     PortfolioPositionCreate, PortfolioPositionUpdate, PortfolioPositionResponse,
@@ -24,6 +25,11 @@ from app.services.currency_service import get_currency_service
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+# Valid ticker format: alphanumeric scrip codes with hyphens/ampersands and
+# optional exchange suffixes (3MINDIA.NS, BAJAJ-AUTO.NS, 500112.BO, BRK.B).
+# Mirrors the frontend regex in AddPositionModalSimple.
+_TICKER_PATTERN = re.compile(r"^[A-Z0-9\-\&\.]{1,20}$")
 
 # Create router
 router = APIRouter()
@@ -182,16 +188,20 @@ async def add_portfolio_position(
                 }
             )
         
+        # Canonicalize the ticker (e.g. RELIANCE -> RELIANCE.NS) so the same
+        # scrip cannot be stored twice under different spellings. Both sides
+        # are canonicalized so legacy rows stored without a suffix still match.
+        canonical = canonical_ticker(position.ticker)
+
         # Check if ticker already exists in portfolio
-        existing = await db.execute(
-            select(PortfolioPosition).where(PortfolioPosition.ticker == position.ticker.upper())
-        )
-        if existing.scalar_one_or_none():
+        existing = await db.execute(select(PortfolioPosition.ticker))
+        existing_set = {canonical_ticker(t) for t in existing.scalars().all()}
+        if canonical in existing_set:
             raise HTTPException(
                 status_code=409,
-                detail=f"Ticker {position.ticker} already exists in portfolio"
+                detail=f"Ticker {canonical} already exists in portfolio"
             )
-        
+
         # Fetch current price and metadata
         quote_data = await data_service.fetch_quote(position.ticker)
         if quote_data is None:
@@ -199,11 +209,11 @@ async def add_portfolio_position(
                 status_code=400,
                 detail=f"Could not fetch price data for {position.ticker}"
             )
-        
+
         # Create position
         current_value = position.quantity * quote_data["current_price"]
         new_position = PortfolioPosition(
-            ticker=position.ticker.upper(),
+            ticker=canonical,
             weight=position.weight,
             quantity=position.quantity,
             buy_price=position.buy_price,
@@ -293,8 +303,9 @@ async def bulk_add_positions(
             if not (0 < pos_data.weight <= 1):
                 position_errors.append(f"Position {i+1}: weight must be between 0 and 1")
             
-            # Business rule: ticker must be valid format
-            if not pos_data.ticker or len(pos_data.ticker) > 10:
+            # Business rule: ticker must be valid format (NSE/BSE scrip codes incl.
+            # hyphens, digits and exchange suffixes, e.g. BAJAJ-AUTO.NS, 500112.BO)
+            if not pos_data.ticker or not _TICKER_PATTERN.match(pos_data.ticker.upper()):
                 position_errors.append(f"Position {i+1}: invalid ticker format")
             
             if position_errors:
@@ -321,29 +332,30 @@ async def bulk_add_positions(
                 detail=f"Invalid tickers (do not exist): {', '.join(invalid_tickers)}"
             )
         
-        # STEP 3: Check for duplicates in existing portfolio
+        # STEP 3: Check for duplicates in existing portfolio (canonical forms on
+        # both sides, so RELIANCE / RELIANCE.NS / legacy bare rows all collide)
         existing_tickers = await db.execute(
             select(PortfolioPosition.ticker)
         )
-        existing_set = set(existing_tickers.scalars().all())
-        
+        existing_set = {canonical_ticker(t) for t in existing_tickers.scalars().all()}
+
         duplicate_tickers = []
         for pos_data in validated_positions:
-            if pos_data.ticker.upper() in existing_set:
-                duplicate_tickers.append(pos_data.ticker)
-        
+            if canonical_ticker(pos_data.ticker) in existing_set:
+                duplicate_tickers.append(canonical_ticker(pos_data.ticker))
+
         if duplicate_tickers:
             logger.warning(f"Duplicate tickers found: {duplicate_tickers}")
             # Filter out duplicates but continue with valid positions
             validated_positions = [pos for pos in validated_positions
-                                 if pos.ticker.upper() not in duplicate_tickers]
+                                 if canonical_ticker(pos.ticker) not in duplicate_tickers]
         
         # STEP 4: Create position objects and fetch quotes concurrently (IN MEMORY ONLY)
         sem = asyncio.Semaphore(5)
         
         async def fetch_pos_quote(pos_data):
             async with sem:
-                ticker = pos_data.ticker.upper()
+                ticker = canonical_ticker(pos_data.ticker)
                 try:
                     quote = await data_service.fetch_quote(ticker)
                     return pos_data, quote, None
@@ -354,7 +366,7 @@ async def bulk_add_positions(
         quote_results = await asyncio.gather(*[fetch_pos_quote(pos) for pos in validated_positions])
 
         for pos_data, quote_data, error_obj in quote_results:
-            ticker = pos_data.ticker.upper()
+            ticker = canonical_ticker(pos_data.ticker)
             if error_obj is not None or quote_data is None:
                 logger.error(f"Failed to fetch quote for {ticker}")
                 failed_positions.append({"ticker": ticker, "reason": str(error_obj) if error_obj else "Quote fetch failed"})
@@ -397,7 +409,7 @@ async def bulk_add_positions(
         normalized = False
         if request.auto_normalize and added_positions:
             total_weight = sum(pos.weight for pos in added_positions)
-            if total_weight > 1.0:
+            if total_weight > 0 and abs(total_weight - 1.0) > 1e-9:
                 normalized = True
                 for position in added_positions:
                     position.weight = position.weight / total_weight
@@ -500,7 +512,7 @@ def _validate_portfolio_position(position: PortfolioPosition) -> bool:
     """
     try:
         # Business rule validations
-        if not position.ticker or len(position.ticker) > 10:
+        if not position.ticker or not _TICKER_PATTERN.match(position.ticker.upper()):
             return False
         if not (0 < position.weight <= 1):
             return False
@@ -854,7 +866,10 @@ async def rebalance_portfolio(
             for p in positions
         )
         if total_pv <= 0:
-            total_pv = 100000.0
+            raise HTTPException(
+                status_code=400,
+                detail="Portfolio market value is unavailable (zero or missing prices); rebalancing requires live position values"
+            )
             
         sum_weights = sum(payload.new_weights.values())
         normalized_weights = {k: v / sum_weights for k, v in payload.new_weights.items()} if sum_weights > 0 else payload.new_weights
@@ -871,7 +886,8 @@ async def rebalance_portfolio(
                 w_delta = new_w - curr_w
                 price = float(pos.last_price or 100.0)
                 target_mv = new_w * total_pv
-                target_qty = max(1.0, round(target_mv / price, 4)) if price > 0 else 0.0
+                # A zero target weight must fully exit the position (qty 0), not hold 1 share
+                target_qty = round(target_mv / price, 4) if price > 0 else 0.0
                 curr_qty = float(pos.quantity or 0.0)
                 shares_delta = int(round(target_qty - curr_qty))
                 cash_delta = round(w_delta * total_pv, 2)

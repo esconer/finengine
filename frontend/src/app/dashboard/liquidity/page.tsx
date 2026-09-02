@@ -523,7 +523,7 @@ export default function LiquidityPage() {
         const data = row.original || row;
         return (
           <div className="text-slate-300 font-medium">
-            {data.liquidation_days || '1-2'} days
+            {data.liquidation_days ? `${data.liquidation_days} days` : 'N/A'}
           </div>
         );
       },
@@ -552,17 +552,17 @@ export default function LiquidityPage() {
               </span>
             </div>
             <p className="text-cyan-100 max-w-2xl text-sm leading-relaxed">
-              Real-time constituent market depth, daily rupee turnover analysis, execution timelines, and trading constraints across all {positions.length || 14} active positions.
+              Real-time constituent market depth, daily rupee turnover analysis, execution timelines, and trading constraints across all {positions.length} active positions.
             </p>
             <div className="flex flex-wrap items-center mt-4 gap-3">
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
                 Overall Score: <span className="font-bold text-white ml-1">{formatScore(overallScore)}</span>
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
-                Risk Level: <span className="font-bold text-white ml-1">{liquidityData?.risk_level || 'Medium'}</span>
+                Risk Level: <span className="font-bold text-white ml-1">{liquidityData?.risk_level || (positions.length > 0 ? 'Low' : 'N/A')}</span>
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
-                Est. Liquidation: <span className="font-bold text-white ml-1">{liquidityData?.liquidation_time_days || '1-2'} days</span>
+                Est. Liquidation: <span className="font-bold text-white ml-1">{liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : (positions.length > 0 ? '< 1 day' : 'N/A')}</span>
               </div>
             </div>
           </div>
@@ -617,7 +617,7 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="Avg. Days to Liquidate"
-              value={`${liquidityData?.liquidation_time_days || '1-2'} days`}
+              value={liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : (positions.length > 0 ? '< 1 day' : 'N/A')}
               icon={Clock}
               loading={loading}
             />
@@ -629,7 +629,7 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="Liquidity Risk"
-              value={liquidityData?.risk_level || 'Low'}
+              value={liquidityData?.risk_level || (positions.length > 0 ? 'Low' : 'N/A')}
               icon={AlertTriangle}
               loading={loading}
             />

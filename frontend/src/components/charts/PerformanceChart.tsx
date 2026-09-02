@@ -29,6 +29,49 @@ interface PerformanceChartProps {
   currency?: string;
 }
 
+interface TooltipProps {
+  active?: boolean;
+  payload?: any[];
+  label?: string;
+  currency?: string;
+}
+
+const PerformanceCustomTooltip = ({ active, payload, label, currency = 'INR' }: TooltipProps) => {
+  if (active && payload && payload.length) {
+    const isINR = currency === 'INR';
+    const formattedDate = new Date(label || '').toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+    });
+    return (
+      <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg">
+        <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+          {formattedDate}
+        </p>
+        {payload.map((entry: any, index: number) => {
+          const formattedVal = new Intl.NumberFormat(isINR ? 'en-IN' : 'en-US', {
+            style: 'currency',
+            currency: currency || 'INR',
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 0,
+          }).format(entry.value);
+          return (
+            <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
+              {entry.name}: {formattedVal}
+              {entry.data && entry.data.return && (
+                <span className="text-gray-500 ml-1">
+                  ({entry.data.return > 0 ? '+' : ''}{(entry.data.return * 100).toFixed(2)}%)
+                </span>
+              )}
+            </p>
+          );
+        })}
+      </div>
+    );
+  }
+  return null;
+};
+
 export const PerformanceChart: React.FC<PerformanceChartProps> = ({
   data,
   loading = false,
@@ -51,29 +94,6 @@ export const PerformanceChart: React.FC<PerformanceChartProps> = ({
       month: 'short',
       day: 'numeric',
     });
-  };
-
-  const CustomTooltip = ({ active, payload, label }: any) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg">
-          <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
-            {formatDate(label)}
-          </p>
-          {payload.map((entry: any, index: number) => (
-            <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
-              {entry.name}: {formatCurrency(entry.value)}
-              {entry.data && entry.data.return && (
-                <span className="text-gray-500 ml-1">
-                  ({entry.data.return > 0 ? '+' : ''}{(entry.data.return * 100).toFixed(2)}%)
-                </span>
-              )}
-            </p>
-          ))}
-        </div>
-      );
-    }
-    return null;
   };
 
   if (loading) {
@@ -134,7 +154,7 @@ export const PerformanceChart: React.FC<PerformanceChartProps> = ({
               className="text-gray-600 dark:text-gray-400"
               fontSize={12}
             />
-            <Tooltip content={<CustomTooltip />} />
+            <Tooltip content={<PerformanceCustomTooltip currency={currency} />} />
             
             {/* Reference line at 100% for normalized returns */}
             <ReferenceLine 

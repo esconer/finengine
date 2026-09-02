@@ -23,52 +23,62 @@ from app.config import settings
 
 logger = setup_logger(__name__)
 
+# Indian market defaults
+DEFAULT_REGION = 'IN'  # Default to India
+INDIAN_EXCHANGES = ['.NS', '.BO']  # NSE and BSE
+POPULAR_INDIAN_STOCKS = [
+    'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ITC.NS',
+    'BHARTIARTL.NS', 'LT.NS', 'KOTAKBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS',
+    'HCLTECH.NS', 'WIPRO.NS', 'ULTRACEMCO.NS', 'TATAMOTORS.NS', 'NESTLEIND.NS',
+    'BAJFINANCE.NS', 'HINDUNILVR.NS', 'POWERGRID.NS', 'NTPC.NS', 'ONGC.NS'
+]
+
+
+def canonical_ticker(ticker: str) -> str:
+    """Canonical form of a ticker (used for quotes, caching, and storage).
+
+    Callers storing positions must persist this form so the same scrip cannot
+    be stored twice under different spellings (e.g. RELIANCE vs RELIANCE.NS).
+    """
+    ticker = ticker.upper().strip()
+
+    # Yahoo-native symbols (^NSEI indices, INR=X fx) pass through untouched;
+    # appending .NS to an index would fabricate a nonexistent ticker.
+    if ticker.startswith("^") or ticker.endswith("=X"):
+        return ticker
+
+    # If already has exchange suffix, return as is
+    if '.NS' in ticker or '.BO' in ticker:
+        return ticker
+
+    # Known Indian scrips and bare symbols default to NSE
+    return f"{ticker}.NS"
+
 
 class DataService:
     """Main data service for fetching market data"""
-    
+
     def __init__(self, db_session: AsyncSession):
         self.db = db_session
         self.cache = CacheService(db_session, settings.cache_ttl_minutes)
         self.yfinance_timeout = settings.yfinance_timeout
-        
+
         # Indian market defaults
-        self.default_region = 'IN'  # Default to India
-        self.indian_exchanges = ['.NS', '.BO']  # NSE and BSE
-        self.popular_indian_stocks = [
-            'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ITC.NS',
-            'BHARTIARTL.NS', 'LT.NS', 'KOTAKBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS',
-            'HCLTECH.NS', 'WIPRO.NS', 'ULTRACEMCO.NS', 'TATAMOTORS.NS', 'NESTLEIND.NS',
-            'BAJFINANCE.NS', 'HINDUNILVR.NS', 'POWERGRID.NS', 'NTPC.NS', 'ONGC.NS'
-        ]
-    
+        self.default_region = DEFAULT_REGION
+        self.indian_exchanges = INDIAN_EXCHANGES
+        self.popular_indian_stocks = POPULAR_INDIAN_STOCKS
+
     def _normalize_indian_ticker(self, ticker: str) -> str:
         """
         Normalize ticker to Indian format if it looks like an Indian stock
-        
+
         Args:
             ticker: Raw ticker symbol
-            
+
         Returns:
             Normalized ticker with proper exchange suffix
         """
-        ticker = ticker.upper().strip()
-
-        # Yahoo-native symbols (^NSEI indices, INR=X fx) pass through untouched;
-        # appending .NS to an index would fabricate a nonexistent ticker.
-        if ticker.startswith("^") or ticker.endswith("=X"):
-            return ticker
-
-        # If already has exchange suffix, return as is
-        if '.NS' in ticker or '.BO' in ticker:
-            return ticker
-            
-        # If it's a known Indian stock, add .NS suffix
-        if ticker in [t.replace('.NS', '') for t in self.popular_indian_stocks]:
-            return f"{ticker}.NS"
-            
-        # Default to NSE for Indian market
-        return f"{ticker}.NS"
+        return canonical_ticker(ticker)
     
     def _is_indian_ticker(self, ticker: str) -> bool:
         """Check if ticker is an Indian stock"""

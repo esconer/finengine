@@ -136,7 +136,7 @@ class TestAnalyticsEngine:
         result = await engine.concentration_analysis({})
         
         assert result["error"] == "No position data available"
-        assert result["herfindahl_index"] == 0.15
+        assert result["herfindahl_index"] == 0.0
     
     @pytest.mark.asyncio
     async def test_factor_exposure_analysis(self, mock_price_dataframe):

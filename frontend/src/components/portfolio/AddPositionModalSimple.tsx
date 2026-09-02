@@ -5,7 +5,7 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { X, Plus, Loader } from 'lucide-react';
 import { PortfolioCreateRequest, Currency } from '@/types';
 import { portfolioApi } from '@/lib/api';
@@ -32,14 +32,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
   const [existingCount, setExistingCount] = useState(0);
 
-  // Fetch total portfolio value
-  useEffect(() => {
-    if (isOpen) {
-      fetchTotalPortfolioValue();
-    }
-  }, [isOpen]);
-
-  const fetchTotalPortfolioValue = async () => {
+  const fetchTotalPortfolioValue = useCallback(async () => {
     try {
       const data = await portfolioApi.getPortfolio({ currency });
       const posList = data.positions || [];
@@ -50,7 +43,14 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       setTotalPortfolioValue(0);
       setExistingCount(0);
     }
-  };
+  }, [currency]);
+
+  // Fetch total portfolio value
+  useEffect(() => {
+    if (isOpen) {
+      fetchTotalPortfolioValue();
+    }
+  }, [isOpen, fetchTotalPortfolioValue]);
 
   // Reset form when modal opens
   useEffect(() => {
@@ -131,7 +131,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
   // Handle input change
   const handleInputChange = (field: keyof PortfolioCreateRequest, value: string | number) => {
-    let updatedFormData = { ...formData, [field]: value };
+    const updatedFormData = { ...formData, [field]: value };
     if (field === 'ticker' && typeof value === 'string') {
       const trimmed = value.trim().toUpperCase();
       if (trimmed.endsWith('.NS') || trimmed.endsWith('.BO')) {

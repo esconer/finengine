@@ -264,8 +264,11 @@ class TestDirectUnitRoutes:
 
         # Add position
         mock_db_result.scalar_one_or_none.return_value = None
+        # add_portfolio_position selects the ticker column, so scalars() yields strings
+        mock_scalars.all.return_value = []
         res_add = await add_portfolio_position(
             position=PortfolioPositionCreate(ticker="INFY.NS", weight=0.5, quantity=10.0, buy_price=1400.0),
+            currency="INR",
             db=mock_db, data_service=mock_ds
         )
         assert res_add is not None
@@ -293,10 +296,13 @@ class TestDirectUnitRoutes:
             auto_normalize=True
         )
         mock_db_result.scalar_one_or_none.return_value = None
+        # bulk_add's duplicate check also selects the ticker column (strings)
+        mock_scalars.all.return_value = ["INFY.NS"]
         res_bulk = await bulk_add_positions(request=bulk_req, db=mock_db, data_service=mock_ds)
         assert res_bulk is not None
 
-        # Normalize weights
+        # Normalize weights (selects full PortfolioPosition rows again)
+        mock_scalars.all.return_value = [pos]
         res_norm = await normalize_portfolio_weights(method="proportional", db=mock_db)
         assert res_norm.success is True
 

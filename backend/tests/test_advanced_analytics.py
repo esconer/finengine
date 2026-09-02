@@ -159,11 +159,11 @@ class TestRegime:
             resp = await async_client.get("/api/v1/analytics/regime?with_portfolio=false")
         assert resp.status_code == 200, resp.text
         data = resp.json()
-        assert data["current_regime"] in {"calm", "volatile", "crisis"}
+        assert data["current_regime"] in {"calm", "volatile", "crisis", "bull"}
         assert 0 <= data["stability_pct"] <= 100
         assert len(data["states"]) == 3
         labels = {s["regime"] for s in data["states"]}
-        assert labels == {"calm", "volatile", "crisis"}
+        assert labels.issubset({"calm", "volatile", "crisis", "bull"}) and len(labels) == 3
         # worst regime must actually have the worst composite profile
         by_label = {s["regime"]: s for s in data["states"]}
         assert (

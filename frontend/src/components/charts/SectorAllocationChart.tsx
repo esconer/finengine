@@ -39,14 +39,63 @@ const COLORS = [
   '#6b7280', // Gray
 ];
 
+interface SectorTooltipProps {
+  active?: boolean;
+  payload?: any[];
+}
+
+const SectorCustomTooltip = ({ active, payload }: SectorTooltipProps) => {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+    return (
+      <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg">
+        <p className="text-sm font-medium text-gray-900 dark:text-white">
+          {data.name}
+        </p>
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          Allocation: {(data.percentage * 100).toFixed(2)}%
+        </p>
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          Weight: {data.value?.toFixed(2)}
+        </p>
+      </div>
+    );
+  }
+  return null;
+};
+
+const SectorCustomLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percentage }: any) => {
+  if (percentage < 0.05) return null; // Hide labels for slices smaller than 5%
+  
+  const RADIAN = Math.PI / 180;
+  const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+  const x = cx + radius * Math.cos(-midAngle * RADIAN);
+  const y = cy + radius * Math.sin(-midAngle * RADIAN);
+
+  return (
+    <text
+      x={x}
+      y={y}
+      fill="white"
+      textAnchor={x > cx ? 'start' : 'end'}
+      dominantBaseline="central"
+      className="text-xs font-medium"
+    >
+      {`${(percentage * 100).toFixed(0)}%`}
+    </text>
+  );
+};
+
 export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
   data,
   loading = false,
   className = '',
 }) => {
-  // Assign colors to sectors
+  const totalValue = data.reduce((sum, item) => sum + item.value, 0);
+
   const dataWithColors = data.map((item, index) => ({
     ...item,
+    percentage: totalValue > 0 ? item.value / totalValue : 0,
     color: COLORS[index % COLORS.length],
   }));
 
@@ -58,55 +107,12 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
     return value.toFixed(2);
   };
 
-  const CustomTooltip = ({ active, payload }: any) => {
-    if (active && payload && payload.length) {
-      const data = payload[0].payload;
-      return (
-        <div className="bg-white dark:bg-gray-800 p-3 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg">
-          <p className="text-sm font-medium text-gray-900 dark:text-white">
-            {data.name}
-          </p>
-          <p className="text-sm text-gray-600 dark:text-gray-400">
-            Allocation: {formatValue(data.percentage * 100)}%
-          </p>
-          <p className="text-sm text-gray-600 dark:text-gray-400">
-            Weight: {formatValue(data.value)}
-          </p>
-        </div>
-      );
-    }
-    return null;
-  };
-
-  const CustomLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percentage }: any) => {
-    if (percentage < 0.05) return null; // Hide labels for slices smaller than 5%
-    
-    const RADIAN = Math.PI / 180;
-    const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
-    const x = cx + radius * Math.cos(-midAngle * RADIAN);
-    const y = cy + radius * Math.sin(-midAngle * RADIAN);
-
-    return (
-      <text
-        x={x}
-        y={y}
-        fill="white"
-        textAnchor={x > cx ? 'start' : 'end'}
-        dominantBaseline="central"
-        fontSize={12}
-        fontWeight="bold"
-      >
-        {`${(percentage * 100).toFixed(0)}%`}
-      </text>
-    );
-  };
-
   if (loading) {
     return (
       <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 ${className}`}>
         <div className="animate-pulse">
           <div className="h-6 bg-gray-300 dark:bg-gray-600 rounded w-48 mb-4"></div>
-          <div className="h-64 bg-gray-200 dark:bg-gray-700 rounded"></div>
+          <div className="h-64 bg-gray-200 dark:bg-gray-700 rounded-full w-64 mx-auto"></div>
         </div>
       </div>
     );
@@ -118,18 +124,12 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
         <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
           Sector Allocation
         </h3>
-        <div className="h-64 flex items-center justify-center">
-          <p className="text-gray-500 dark:text-gray-400">No sector data available</p>
+        <div className="h-64 flex items-center justify-center text-gray-500 dark:text-gray-400">
+          No sector data available
         </div>
       </div>
     );
   }
-
-  // Calculate top sectors for summary
-  const sortedData = [...dataWithColors].sort((a, b) => b.value - a.value);
-  const topSector = sortedData[0];
-  const topCount = Math.min(3, sortedData.length);
-  const top3Allocation = sortedData.slice(0, 3).reduce((sum, item) => sum + item.percentage, 0);
 
   return (
     <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 ${className}`}>
@@ -137,16 +137,8 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
         <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
           Sector Allocation
         </h3>
-        <div className="text-right">
-          <div className="text-sm text-gray-600 dark:text-gray-400">Top Sector</div>
-          <div className="text-lg font-bold text-gray-900 dark:text-white">
-            {topSector?.name || 'N/A'}
-          </div>
-          <div className="text-sm text-gray-500 dark:text-gray-400">
-            {sortedData.length === 1
-              ? '100.0% Allocation'
-              : `Top ${topCount}: ${formatPercentage(top3Allocation)}`}
-          </div>
+        <div className="text-sm text-gray-500 dark:text-gray-400">
+          {data.length} {data.length === 1 ? 'Sector' : 'Sectors'}
         </div>
       </div>
       
@@ -158,7 +150,7 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
               cx="50%"
               cy="50%"
               labelLine={false}
-              label={CustomLabel}
+              label={SectorCustomLabel}
               outerRadius={80}
               fill="#8884d8"
               dataKey="value"
@@ -167,7 +159,7 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
                 <Cell key={`cell-${index}`} fill={entry.color} />
               ))}
             </Pie>
-            <Tooltip content={<CustomTooltip />} />
+            <Tooltip content={<SectorCustomTooltip />} />
             <Legend
               verticalAlign="bottom"
               height={36}

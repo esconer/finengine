@@ -59,8 +59,8 @@ class AnalyticsEngine:
                 return self._empty_metrics()
             
             # Calculate returns with defensive forward/back filling for mixed inception dates
-            cleaned_prices = price_data.sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index().ffill().bfill()
+            returns = cleaned_prices.pct_change(fill_method=None).replace([np.inf, -np.inf], 0.0).fillna(0.0)
             if returns.empty or len(returns) < 2:
                 return self._empty_metrics()
             returns = returns.iloc[1:]
@@ -650,8 +650,10 @@ class AnalyticsEngine:
                 weight_delta = recommended_weight - current_weight
                 
                 current_price = float(price_data[ticker].iloc[-1]) if ticker in price_data.columns else 100.0
-                estimated_portfolio_value = portfolio_value if (portfolio_value is not None and portfolio_value > 0) else 100000.0
-                
+                # Without a real portfolio value, trade sizes cannot be computed;
+                # report zero-delta trades rather than fabricating a total
+                estimated_portfolio_value = portfolio_value if (portfolio_value is not None and portfolio_value > 0) else 0.0
+
                 weight_value_delta = weight_delta * estimated_portfolio_value
                 shares_delta = weight_value_delta / current_price if current_price > 0 else 0
                 
@@ -905,13 +907,13 @@ class AnalyticsEngine:
             for ticker in returns.columns:
                 # Use raw active price series if available to avoid artificial zero-dilution on newly listed assets
                 if raw_prices is not None and ticker in raw_prices.columns:
-                    raw_s = raw_prices[ticker].dropna()
+                    raw_s = raw_prices[ticker].replace([np.inf, -np.inf], np.nan).dropna()
                     if len(raw_s) >= 2:
-                        ticker_returns = raw_s.pct_change(fill_method=None).dropna()
+                        ticker_returns = raw_s.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
                     else:
-                        ticker_returns = returns[ticker].dropna()
+                        ticker_returns = returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
                 else:
-                    ticker_returns = returns[ticker].dropna()
+                    ticker_returns = returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
 
                 if not ticker_returns.empty:
                     data_points = len(ticker_returns)
@@ -1287,13 +1289,16 @@ class AnalyticsEngine:
     
     def _empty_concentration(self) -> Dict[str, Any]:
         return {
-            "largest_position": 0.20,
-            "top_3": 0.50,
-            "top_5": 0.70,
-            "top_10": 1.0,
-            "herfindahl_index": 0.15,
-            "effective_positions": 6.7,
-            "diversification_ratio": 1.5,
+            "largest_position": 0.0,
+            "top_3": 0.0,
+            "top_5": 0.0,
+            "top_10": 0.0,
+            "herfindahl_index": 0.0,
+            "effective_positions": 0.0,
+            "diversification_score": 0.0,
+            "diversification_ratio": 1.0,
+            "gini_coefficient": 0.0,
+            "by_weight": {},
             "error": "No position data available"
         }
     

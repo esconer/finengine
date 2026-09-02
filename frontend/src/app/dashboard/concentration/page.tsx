@@ -566,9 +566,9 @@ export default function ConcentrationPage() {
     .filter(s => s.weight > 0.01)
     .sort((a, b) => b.weight - a.weight) : [];
 
-  const divScore = concentrationData?.diversification_score ?? 
-    (positions.length > 1 && concentrationData?.herfindahl_index ? 
-      Number((((1 - concentrationData.herfindahl_index) / (1 - 1 / positions.length)) * 100).toFixed(1)) : 98.3);
+  const divScore = positions.length <= 1 ? 0.0 : (concentrationData?.diversification_score ?? 
+    (concentrationData?.herfindahl_index ? 
+      Number((((1 - concentrationData.herfindahl_index) / (1 - 1 / positions.length)) * 100).toFixed(1)) : 0.0));
 
   return (
     <div className="space-y-6">
@@ -596,7 +596,7 @@ export default function ConcentrationPage() {
             <div className="flex flex-wrap items-center mt-3 gap-4 text-xs text-purple-200">
               <div className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                Effective Positions: <strong className="text-white">{concentrationData?.effective_positions?.toFixed(1) || '11.5'} of {positions.length}</strong>
+                Effective Positions: <strong className="text-white">{concentrationData?.effective_positions?.toFixed(1) || (positions.length > 0 ? '1.0' : '0.0')} of {positions.length}</strong>
               </div>
               <div>•</div>
               <div className="flex items-center gap-1">
@@ -624,7 +624,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Largest Position"
-            value={concentrationData?.largest_position ? formatPercentage(concentrationData.largest_position) : '13.9%'}
+            value={concentrationData?.largest_position !== undefined ? formatPercentage(concentrationData.largest_position) : 'N/A'}
             icon={Target}
             loading={loading}
           />
@@ -636,7 +636,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Top 3 Holdings"
-            value={concentrationData?.top_3 ? formatPercentage(concentrationData.top_3) : '37.7%'}
+            value={concentrationData?.top_3 !== undefined ? formatPercentage(concentrationData.top_3) : 'N/A'}
             icon={BarChart3}
             loading={loading}
           />
@@ -648,7 +648,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Herfindahl Index"
-            value={concentrationData?.herfindahl_index ? formatRatio(concentrationData.herfindahl_index) : '0.09'}
+            value={concentrationData?.herfindahl_index !== undefined ? formatRatio(concentrationData.herfindahl_index) : 'N/A'}
             icon={AlertTriangle}
             loading={loading}
           />
@@ -660,7 +660,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Effective Positions"
-            value={concentrationData?.effective_positions ? formatRatio(concentrationData.effective_positions) : '11.47'}
+            value={concentrationData?.effective_positions !== undefined ? formatRatio(concentrationData.effective_positions) : 'N/A'}
             icon={TrendingUp}
             loading={loading}
           />

@@ -9,18 +9,18 @@ afterEach(() => {
 })
 
 // Mock WebSocket
-const MockWebSocket = vi.fn().mockImplementation(() => ({
-    send: vi.fn(),
-    close: vi.fn(),
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    readyState: 1, // OPEN
-})) as any
-MockWebSocket.CONNECTING = 0
-MockWebSocket.OPEN = 1
-MockWebSocket.CLOSING = 2
-MockWebSocket.CLOSED = 3
-global.WebSocket = MockWebSocket
+class MockWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSING = 2
+    static CLOSED = 3
+    send = vi.fn()
+    close = vi.fn()
+    addEventListener = vi.fn()
+    removeEventListener = vi.fn()
+    readyState = 1 // OPEN
+}
+global.WebSocket = MockWebSocket as any
 
 // Mock fetch
 global.fetch = vi.fn()
@@ -50,18 +50,20 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 // Mock ResizeObserver
-global.ResizeObserver = vi.fn().mockImplementation(() => ({
-    observe: vi.fn(),
-    unobserve: vi.fn(),
-    disconnect: vi.fn(),
-}))
+class MockResizeObserver {
+    observe = vi.fn()
+    unobserve = vi.fn()
+    disconnect = vi.fn()
+}
+global.ResizeObserver = MockResizeObserver as any
 
 // Mock IntersectionObserver
-global.IntersectionObserver = vi.fn().mockImplementation(() => ({
-    observe: vi.fn(),
-    unobserve: vi.fn(),
-    disconnect: vi.fn(),
-}))
+class MockIntersectionObserver {
+    observe = vi.fn()
+    unobserve = vi.fn()
+    disconnect = vi.fn()
+}
+global.IntersectionObserver = MockIntersectionObserver as any
 
 // Mock console methods to reduce noise in tests
 global.console = {

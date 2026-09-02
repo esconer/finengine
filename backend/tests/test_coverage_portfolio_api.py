@@ -469,8 +469,13 @@ class TestPortfolioHelpers:
         )
         assert _validate_portfolio_position(pos) is True
 
-        # Invalid ticker length
-        pos.ticker = "TOOLONGTICKERNAME"
+        # Invalid ticker: disallowed characters
+        pos.ticker = "BAD TICKER!"
+        assert _validate_portfolio_position(pos) is False
+        pos.ticker = "AAPL"
+
+        # Invalid ticker: exceeds the 20-char NSE/BSE-compatible limit
+        pos.ticker = "TOOLONGTICKERNAMEEXCEEDS20"
         assert _validate_portfolio_position(pos) is False
         pos.ticker = "AAPL"
 

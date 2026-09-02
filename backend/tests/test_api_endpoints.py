@@ -166,7 +166,8 @@ class TestPortfolioAPI:
             })
         assert resp.status_code == 200, resp.text
         data = resp.json()
-        assert data["ticker"] == "TEST"
+        # Bare tickers are stored in canonical NSE form (e.g. TEST -> TEST.NS)
+        assert data["ticker"] == "TEST.NS"
         assert data["last_price"] == 150.0
         await test_db.execute(delete(PortfolioPosition))
         await test_db.commit()
