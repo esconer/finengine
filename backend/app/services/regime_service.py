@@ -125,7 +125,7 @@ def classify(
         rows.append({
             "state": s,
             "ann_ret": float(feats["ret"].values[mask].mean() * 252),
-            "ann_vol": float(feats["vol"].values[mask].mean() * np.sqrt(252)),
+            "ann_vol": float(feats["vol"].values[mask].mean()),
             "days_pct": float(mask.mean() * 100),
         })
     stats_df = pd.DataFrame(rows).set_index("state")

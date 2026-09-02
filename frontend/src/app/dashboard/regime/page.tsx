@@ -86,10 +86,24 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   portfolio_in_regime: {
     title: 'Portfolio Performance Inside Active Regime',
     what: 'Your actual portfolio\'s annualized return and realized volatility during days when NIFTY was in the active market regime.',
-    howInferred: 'Evaluates your book\'s returns filtered strictly to the 72 overlapping trading days of the current Calm regime.',
+    howInferred: 'Evaluates your book\'s returns filtered strictly to the overlapping trading days of the current regime.',
     whyImportant: 'Validates whether your portfolio is effectively capturing upside or defending capital under the prevailing macro conditions.',
-    howToInfer: 'Your portfolio annualized +45.3% return with only 13.2% volatility in Calm conditions, massively outperforming the benchmark (+4.6%).',
+    howToInfer: 'Your portfolio annualized +45.3% return with low volatility in Calm conditions, outperforming the benchmark.',
     benchmark: 'Alpha generation benchmark: Portfolio Return > Benchmark Return with lower relative drawdowns.'
+  },
+  regime_probabilities: {
+    title: 'Real-Time Posterior Regime Probabilities',
+    what: 'The exact mathematical probability distribution across all 3 market regimes inferred for today\'s session.',
+    howInferred: 'Computed via Bayesian state inference: P(State_k | Returns, High/Low Range, EWMA Volatility) from the fitted Gaussian HMM.',
+    whyImportant: 'Provides continuous early-warning detection: you can see crisis probability rising from 2% to 25% days before a discrete regime flip occurs.',
+    howToInfer: 'If Calm probability > 70%, standard allocations apply; if Crisis probability climbs > 20%, initiate defensive hedges.'
+  },
+  intraday_volatility: {
+    title: 'Intraday Range (Parkinson) vs EWMA Volatility',
+    what: 'Real-time diagnostic comparing intraday High-Low price excursion volatility against fast-decay exponential volatility.',
+    howInferred: 'Parkinson vol evaluates ln(High/Low)^2 / (4 ln 2) to capture true intraday swings; EWMA vol uses an exponential decay factor (span=10).',
+    whyImportant: 'Solves the "close-to-close blindness" where intraday panic swings (e.g. -1.0% intraday dip) are hidden by a modest closing change (-0.5%).',
+    howToInfer: 'If Parkinson Vol exceeds 15%, active intraday chop is elevated regardless of whether the net close looks flat.'
   }
 };
 
@@ -176,6 +190,9 @@ interface RegimeData {
   as_of: string;
   current_regime: string;
   stability_pct: number;
+  regime_probabilities?: Record<string, number>;
+  realtime_ewma_vol?: number | null;
+  realtime_parkinson_vol?: number | null;
   states: {
     regime: string;
     ann_ret: number;
@@ -439,6 +456,109 @@ export default function RegimePage() {
             </div>
           </div>
 
+          {/* Real-Time Regime Probabilities & Intraday Volatility Diagnostics */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* 1. Real-Time Posterior Probabilities Bar */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center space-x-2">
+                    <Zap className="w-5 h-5 text-sky-400" />
+                    <h3 className="text-base font-bold text-white">Real-Time Posterior Probability Distribution</h3>
+                    <HelpBtn onClick={() => setActiveExplainer('regime_probabilities')} />
+                  </div>
+                  <span className="text-xs px-2.5 py-0.5 rounded-full bg-sky-950/60 border border-sky-800/60 text-sky-300 font-mono">
+                    Bayesian State Vector
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mb-4">
+                  Continuous probability distribution across all 3 market states for today's trading session.
+                </p>
+
+                {data.regime_probabilities && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-emerald-400 flex items-center">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 mr-1.5" />
+                        Calm: <strong className="ml-1 text-white">{data.regime_probabilities.calm ?? 0}%</strong>
+                      </span>
+                      <span className="text-blue-400 flex items-center">
+                        <span className="w-2 h-2 rounded-full bg-blue-500 mr-1.5" />
+                        Bull Rally: <strong className="ml-1 text-white">{data.regime_probabilities.bull ?? 0}%</strong>
+                      </span>
+                      <span className="text-rose-400 flex items-center">
+                        <span className="w-2 h-2 rounded-full bg-rose-500 mr-1.5" />
+                        Crisis: <strong className="ml-1 text-white">{data.regime_probabilities.crisis ?? 0}%</strong>
+                      </span>
+                    </div>
+
+                    <div className="w-full bg-slate-950 rounded-full h-3 overflow-hidden flex border border-slate-800">
+                      <div
+                        className="bg-emerald-500 transition-all duration-500"
+                        style={{ width: `${data.regime_probabilities.calm ?? 0}%` }}
+                        title={`Calm: ${data.regime_probabilities.calm ?? 0}%`}
+                      />
+                      <div
+                        className="bg-blue-500 transition-all duration-500"
+                        style={{ width: `${data.regime_probabilities.bull ?? 0}%` }}
+                        title={`Bull Rally: ${data.regime_probabilities.bull ?? 0}%`}
+                      />
+                      <div
+                        className="bg-rose-500 transition-all duration-500"
+                        style={{ width: `${data.regime_probabilities.crisis ?? 0}%` }}
+                        title={`Crisis: ${data.regime_probabilities.crisis ?? 0}%`}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="mt-4 pt-3 border-t border-slate-800 flex items-center space-x-2 text-xs text-slate-400">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>Provides early-warning detection if crisis probability starts climbing before a discrete regime shift.</span>
+              </div>
+            </div>
+
+            {/* 2. Intraday Parkinson vs EWMA Volatility */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center space-x-2">
+                    <Waves className="w-5 h-5 text-indigo-400" />
+                    <h3 className="text-base font-bold text-white">Intraday Range (Parkinson) vs EWMA Vol</h3>
+                    <HelpBtn onClick={() => setActiveExplainer('intraday_volatility')} />
+                  </div>
+                  <span className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-950/60 border border-indigo-800/60 text-indigo-300 font-mono">
+                    High-Low Range vs Close
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mb-4">
+                  Evaluates true intraday High-Low price swings alongside fast-decay exponential volatility.
+                </p>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
+                    <p className="text-xs text-slate-400 font-semibold mb-1">Parkinson Range Vol</p>
+                    <p className="text-lg font-bold text-indigo-300 font-mono">
+                      {fmtPct(data.realtime_parkinson_vol)}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Captures intraday high-low swings</p>
+                  </div>
+                  <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
+                    <p className="text-xs text-slate-400 font-semibold mb-1">Fast EWMA Vol (10D)</p>
+                    <p className="text-lg font-bold text-sky-300 font-mono">
+                      {fmtPct(data.realtime_ewma_vol)}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">3x faster reaction than 21D rolling</p>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 pt-3 border-t border-slate-800 flex items-center space-x-2 text-xs text-slate-400">
+                <Info className="w-4 h-4 text-sky-400 shrink-0" />
+                <span>Incorporates high-low volatility directly into regime classification to prevent close-to-close blindness.</span>
+              </div>
+            </div>
+          </div>
+
           {/* HMM State Table */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl shadow-sm overflow-hidden">
             <div className="p-5 border-b border-slate-800 flex items-center justify-between">
@@ -451,6 +571,7 @@ export default function RegimePage() {
                 Gaussian HMM
               </span>
             </div>
+
             <div className="overflow-x-auto">
               <table className="min-w-full tabular-nums text-xs">
                 <thead className="bg-slate-950/80 border-b border-slate-800">
