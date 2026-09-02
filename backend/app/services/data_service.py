@@ -640,6 +640,14 @@ class DataService:
                     else:
                         logger.info(f"Cache miss for {ticker}: cached has {len(records)} records from {earliest_cached.date()}, requested from {req_start.date()}")
                         return None
+
+            # Check if cached data is stale at the end (missing latest 3+ days when req_end is recent)
+            latest_cached = pd.to_datetime(records[-1].date)
+            if (req_end - latest_cached).days >= 3 and (datetime.utcnow() - req_end).days <= 2:
+                latest_fetched = max((r.fetched_on for r in records if r.fetched_on), default=None)
+                if not latest_fetched or (datetime.utcnow() - latest_fetched).total_seconds() >= 3600:
+                    logger.info(f"Cache stale for {ticker}: latest cached date is {latest_cached.date()}, requested up to {req_end.date()}")
+                    return None
             
             # Convert to DataFrame
             data = []

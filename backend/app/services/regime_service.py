@@ -54,7 +54,7 @@ def classify(
     bench_data: Any,
     n_components: int = 3,
 ) -> Optional[Dict[str, Any]]:
-    """Fit the HMM with hybrid EWMA + Parkinson intraday range volatility."""
+    """Fit the canonical 3-state Gaussian HMM with real-time tactical volatility overlays."""
     from hmmlearn.hmm import GaussianHMM
     from sklearn.preprocessing import StandardScaler
 
@@ -73,34 +73,25 @@ def classify(
         close = df[price_col].astype(float)
         ret = close.pct_change().dropna()
 
-        # Rapid-response EWMA volatility
-        ewma_vol = (ret.ewm(span=10).std() * np.sqrt(252)).dropna()
-
-        # Parkinson intraday range volatility if High & Low exist
+        # Real-time diagnostic overlays
+        ewma_vol = float((ret.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret) > 10 else None
         if high_col and low_col:
             high = df[high_col].astype(float)
             low = df[low_col].astype(float)
             log_hl = np.log((high / low).clip(lower=1.00001))
             parkinson_daily = np.sqrt((log_hl ** 2) / (4 * np.log(2))) * np.sqrt(252)
-            parkinson_vol = parkinson_daily.rolling(10, min_periods=3).mean().dropna()
-
-            common_idx = ret.index.intersection(parkinson_vol.index).intersection(ewma_vol.index)
-            hybrid_vol = (0.5 * ewma_vol.loc[common_idx] + 0.5 * parkinson_vol.loc[common_idx]).rename("vol")
-            feats = pd.concat([ret.loc[common_idx].rename("ret"), hybrid_vol], axis=1).dropna()
-            latest_parkinson = float(parkinson_vol.iloc[-1]) if len(parkinson_vol) > 0 else None
+            parkinson_vol = float(parkinson_daily.rolling(10, min_periods=3).mean().iloc[-1])
         else:
-            common_idx = ret.index.intersection(ewma_vol.index)
-            feats = pd.concat([ret.loc[common_idx].rename("ret"), ewma_vol.loc[common_idx].rename("vol")], axis=1).dropna()
-            latest_parkinson = None
-
-        latest_ewma = float(ewma_vol.iloc[-1]) if len(ewma_vol) > 0 else None
+            parkinson_vol = None
     else:
         ret = bench_data.dropna()
-        ewma_vol = (ret.ewm(span=10).std() * np.sqrt(252)).dropna()
-        common_idx = ret.index.intersection(ewma_vol.index)
-        feats = pd.concat([ret.loc[common_idx].rename("ret"), ewma_vol.loc[common_idx].rename("vol")], axis=1).dropna()
-        latest_ewma = float(ewma_vol.iloc[-1]) if len(ewma_vol) > 0 else None
-        latest_parkinson = None
+        ewma_vol = float((ret.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret) > 10 else None
+        parkinson_vol = None
+
+    # Canonical macro HMM features: daily return + 21-day rolling volatility
+    vol21 = ret.rolling(21).std().dropna()
+    common = ret.index.intersection(vol21.index)
+    feats = pd.concat([ret.loc[common].rename("ret"), vol21.loc[common].rename("vol")], axis=1).dropna()
 
     if len(feats) < MIN_OBSERVATIONS:
         return None
@@ -125,7 +116,7 @@ def classify(
         rows.append({
             "state": s,
             "ann_ret": float(feats["ret"].values[mask].mean() * 252),
-            "ann_vol": float(feats["vol"].values[mask].mean()),
+            "ann_vol": float(feats["vol"].values[mask].mean() * np.sqrt(252)),
             "days_pct": float(mask.mean() * 100),
         })
     stats_df = pd.DataFrame(rows).set_index("state")
@@ -142,13 +133,18 @@ def classify(
         for ts, s in zip(feats.index[-120:], states[-120:])
     ]
 
+    all_regimes = {
+        (ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]): label_map[int(s)]
+        for ts, s in zip(feats.index, states)
+    }
+
     return {
         "as_of": feats.index[-1].strftime("%Y-%m-%d") if hasattr(feats.index[-1], "strftime") else str(feats.index[-1]),
         "current_regime": label_map[int(states[-1])],
         "stability_pct": round(float((1 - flips) * 100), 1),
         "regime_probabilities": current_probs,
-        "realtime_ewma_vol": round(latest_ewma, 4) if latest_ewma is not None else None,
-        "realtime_parkinson_vol": round(latest_parkinson, 4) if latest_parkinson is not None else None,
+        "realtime_ewma_vol": round(ewma_vol, 4) if ewma_vol is not None else None,
+        "realtime_parkinson_vol": round(parkinson_vol, 4) if parkinson_vol is not None else None,
         "states": [
             {
                 "regime": label_map[int(row.state)],
@@ -159,6 +155,7 @@ def classify(
             for row in stats_df.reset_index().itertuples(index=False)
         ],
         "recent_history": history,
+        "all_regimes": all_regimes,
         "observations": int(len(feats)),
     }
 
@@ -186,22 +183,25 @@ async def detect_regime(
     if result is None:
         raise ValueError("Regime classification produced no result")
 
-    # Conditional portfolio behavior inside the CURRENT regime, when provided.
-    if portfolio_returns is not None:
+    # Conditional portfolio behavior inside the CURRENT regime across FULL history.
+    if portfolio_returns is not None and "all_regimes" in result:
+        all_regimes = result.pop("all_regimes")
         pr = portfolio_returns.dropna()
         pr.index = pd.to_datetime(pr.index)
-        hist = pd.DataFrame(result["recent_history"])
-        hist.index = pd.to_datetime(hist["date"])
+        reg_series = pd.Series(all_regimes)
+        reg_series.index = pd.to_datetime(reg_series.index)
         current = result["current_regime"]
-        mask = hist["regime"] == current
-        common = pr.index.intersection(hist.index[mask])
-        if len(common) > 20:
+        mask = reg_series == current
+        common = pr.index.intersection(reg_series.index[mask])
+        if len(common) >= 5:
             sub = pr.loc[common]
             result["portfolio_in_current_regime"] = {
                 "days": int(len(common)),
                 "ann_ret": round(float(sub.mean() * 252), 4),
                 "ann_vol": round(float(sub.std() * np.sqrt(252)), 4),
             }
+    elif "all_regimes" in result:
+        result.pop("all_regimes")
 
     result["generated_at"] = datetime.utcnow().isoformat()
     return result
