@@ -17,25 +17,36 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-REGIME_LABELS_WORST_TO_BEST = ["crisis", "volatile", "calm"]
+REGIME_LABELS_WORST_TO_BEST = ["crisis", "calm", "bull"]
 RISK_AVERSION_LAMBDA = 0.5
 MIN_OBSERVATIONS = 200
 
 
 def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
-    """Map raw HMM states to labels, worst regime first.
+    """Map raw HMM states to economic regime labels: crisis, calm (normal), and bull (expansion).
 
-    Riskiness = ann_ret - lambda * ann_vol (mean-variance composite), so a
-    high-vol HIGH-return boom state is not mislabeled 'crisis'.
+    - Crisis: state with lowest / negative return and elevated volatility (bear crash).
+    - Calm: state with lowest annualized volatility (steady rangebound normal market).
+    - Bull: state with high positive return & momentum (expansion rally).
     """
-    scored = state_stats.assign(
-        _score=state_stats["ann_ret"] - RISK_AVERSION_LAMBDA * state_stats["ann_vol"]
-    ).sort_values("_score", ascending=True)
     mapping: Dict[int, str] = {}
-    for rank, state_id in enumerate(scored.index):
-        mapping[state_id] = REGIME_LABELS_WORST_TO_BEST[
-            min(rank, len(REGIME_LABELS_WORST_TO_BEST) - 1)
-        ]
+    remaining = set(state_stats.index)
+
+    # 1. Identify Crisis (lowest annualized return, typically severe negative)
+    crisis_id = int(state_stats["ann_ret"].idxmin())
+    mapping[crisis_id] = "crisis"
+    remaining.discard(crisis_id)
+
+    # 2. Between remaining states, the one with lowest volatility is Calm (Normal)
+    rem_df = state_stats.loc[list(remaining)]
+    calm_id = int(rem_df["ann_vol"].idxmin())
+    mapping[calm_id] = "calm"
+    remaining.discard(calm_id)
+
+    # 3. The remaining state with high momentum is Bull / Expansion
+    bull_id = int(list(remaining)[0])
+    mapping[bull_id] = "bull" if state_stats.loc[bull_id, "ann_ret"] > 0.15 else "volatile"
+
     return mapping
 
 
