@@ -166,8 +166,9 @@ class TestPortfolioAPI:
             })
         assert resp.status_code == 200, resp.text
         data = resp.json()
-        # Bare tickers are stored in canonical NSE form (e.g. TEST -> TEST.NS)
-        assert data["ticker"] == "TEST.NS"
+        # Unknown bare tickers pass through unmodified (P0-7: never
+        # fabricate NSE listings); known Indian scrips still gain .NS.
+        assert data["ticker"] == "TEST"
         assert data["last_price"] == 150.0
         await test_db.execute(delete(PortfolioPosition))
         await test_db.commit()
