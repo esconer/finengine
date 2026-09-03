@@ -203,7 +203,21 @@ interface RegimeData {
   recent_history: { date: string; regime: string }[];
   observations: number;
   label_overrides?: { crash_veto_days: number; crash_veto_threshold: number };
-  portfolio_in_current_regime?: { days: number; ann_ret: number; ann_vol: number };
+  portfolio_in_current_regime?: {
+    days: number;
+    ann_ret: number | null;
+    ann_vol: number | null;
+    total_ret?: number | null;
+    annualized?: boolean;
+    history_coverage?: {
+      effective_start: string | null;
+      oldest_holding: string | null;
+      covered_days: number;
+      truncated: boolean;
+      annualized: boolean;
+      requested_start: string | null;
+    } | null;
+  };
 }
 
 const REGIME_STYLES: Record<string, { label: string; chip: string; dot: string; bg: string }> = {
@@ -276,6 +290,16 @@ export default function RegimePage() {
 
   const current = data ? regimeStyle(data.current_regime) : null;
 
+  const portBlock = data?.portfolio_in_current_regime;
+  const portShowTotal = portBlock?.annualized === false;
+  const portRetValue = portShowTotal ? (portBlock?.total_ret ?? null) : (portBlock?.ann_ret ?? null);
+  const portRetClass =
+    portRetValue === null || portRetValue === undefined
+      ? 'text-slate-300'
+      : portRetValue >= 0
+        ? 'text-emerald-400'
+        : 'text-rose-400';
+
   // Export CSV
   const handleExportCSV = () => {
     if (!data) return;
@@ -298,8 +322,8 @@ export default function RegimePage() {
     if (data.portfolio_in_current_regime) {
       rows.push('Portfolio Behavior Inside Current Regime');
       rows.push(`Overlap Days,${data.portfolio_in_current_regime.days}`);
-      rows.push(`Portfolio Annualized Return,${(data.portfolio_in_current_regime.ann_ret * 100).toFixed(2)}%`);
-      rows.push(`Portfolio Realized Volatility,${(data.portfolio_in_current_regime.ann_vol * 100).toFixed(2)}%`);
+      rows.push(`Portfolio Annualized Return,${data.portfolio_in_current_regime.ann_ret !== null && data.portfolio_in_current_regime.ann_ret !== undefined ? (data.portfolio_in_current_regime.ann_ret * 100).toFixed(2) + '%' : 'N/A (short history)'}`);
+      rows.push(`Portfolio Realized Volatility,${data.portfolio_in_current_regime.ann_vol !== null && data.portfolio_in_current_regime.ann_vol !== undefined ? (data.portfolio_in_current_regime.ann_vol * 100).toFixed(2) + '%' : 'N/A'}`);
       rows.push('');
     }
     rows.push('Recent Daily Regime History (Last 120 Days)');
@@ -701,6 +725,7 @@ export default function RegimePage() {
               <HelpBtn onClick={() => setActiveExplainer('portfolio_in_regime')} />
             </div>
             {data.portfolio_in_current_regime ? (
+              <>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 p-4 rounded-xl bg-slate-950/60 border border-slate-800">
                 <div>
                   <p className="text-xs uppercase font-semibold tracking-wider text-slate-400 mb-1">
@@ -712,16 +737,12 @@ export default function RegimePage() {
                 </div>
                 <div>
                   <p className="text-xs uppercase font-semibold tracking-wider text-slate-400 mb-1">
-                    Your Annualized Return
+                    {portShowTotal
+                      ? `Your Total Return (${portBlock?.days ?? 0}d)`
+                      : 'Your Annualized Return'}
                   </p>
-                  <p
-                    className={`text-2xl font-bold font-mono tabular-nums ${
-                      data.portfolio_in_current_regime.ann_ret >= 0
-                        ? 'text-emerald-400'
-                        : 'text-rose-400'
-                    }`}
-                  >
-                    {fmtPct(data.portfolio_in_current_regime.ann_ret)}
+                  <p className={`text-2xl font-bold font-mono tabular-nums ${portRetClass}`}>
+                    {fmtPct(portRetValue)}
                   </p>
                 </div>
                 <div>
@@ -733,6 +754,17 @@ export default function RegimePage() {
                   </p>
                 </div>
               </div>
+              {data.portfolio_in_current_regime.history_coverage?.truncated && (
+                <p className="text-xs text-slate-400 mt-3">
+                  Based on {data.portfolio_in_current_regime.history_coverage.covered_days} days
+                  of actual holding history
+                  {data.portfolio_in_current_regime.history_coverage.oldest_holding
+                    ? ` since ${data.portfolio_in_current_regime.history_coverage.oldest_holding}`
+                    : ''}
+                  ; pre-import history excluded.
+                </p>
+              )}
+              </>
             ) : (
               <p className="text-xs text-slate-400">
                 Add holdings to your portfolio to see how your book historically behaves in{' '}

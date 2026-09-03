@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from app.services.benchmark_service import BenchmarkService
+from app.utils.holdings import portfolio_regime_summary
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -330,15 +331,7 @@ async def detect_regime(
         mask = reg_series == current
         common = pr.index.intersection(reg_series.index[mask])
         if len(common) >= 5:
-            sub = pr.loc[common]
-            cum_p = float(np.prod(1.0 + sub.values))
-            port_cagr = float((cum_p ** (252.0 / len(sub))) - 1.0) if cum_p > 0 else float(sub.mean() * 252)
-            ann_v = float(sub.std() * np.sqrt(252)) if len(sub) > 1 and not np.isnan(sub.std()) else 0.0
-            result["portfolio_in_current_regime"] = {
-                "days": int(len(common)),
-                "ann_ret": round(port_cagr, 4),
-                "ann_vol": round(ann_v, 4),
-            }
+            result["portfolio_in_current_regime"] = portfolio_regime_summary(pr.loc[common])
     elif "all_regimes" in result:
         result.pop("all_regimes")
 

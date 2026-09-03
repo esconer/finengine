@@ -41,7 +41,8 @@ class TestDeepAnalyticsRoutes:
             last_price=3500.0,
             market_value=52500.0,
             region="IN",
-            sector="Technology"
+            sector="Technology",
+            added_on=datetime(2020, 1, 1),
         )
         pos2 = PortfolioPosition(
             ticker="INFY.NS",
@@ -51,7 +52,8 @@ class TestDeepAnalyticsRoutes:
             last_price=1600.0,
             market_value=40000.0,
             region="IN",
-            sector="Technology"
+            sector="Technology",
+            added_on=datetime(2020, 1, 1),
         )
         test_db.add_all([pos1, pos2])
         await test_db.commit()

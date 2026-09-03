@@ -29,6 +29,12 @@ from app.models.schemas import (
 )
 from app.services.correlation_service import analyze_correlation_stability
 from app.services.cointegration_service import CointegrationService
+from app.utils.holdings import (
+    apply_annualization_gate,
+    coerce_holding_date,
+    holding_coverage,
+    mask_to_holding,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -252,9 +258,14 @@ async def get_realized_risk(
                 "error": "No price data available"
             }
         
-        # Combine price data
+        # Combine price data, restricted to actual holding history so
+        # pre-purchase price action is never attributed to the portfolio.
         price_data = pd.DataFrame(price_data_dict)
-        
+        holding_starts = await resolve_holding_starts(db, ticker_list)
+        price_data = mask_to_holding(price_data, holding_starts)
+        covered_days = int(len(price_data))
+        history_coverage = holding_coverage(holding_starts, start, end, covered_days)
+
         # Calculate portfolio metrics using analytics engine
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         
@@ -295,12 +306,24 @@ async def get_realized_risk(
                 "is_limited_history": is_limited,
                 "history_warning": pos_metrics.get("history_warning")
             }
-        
+
+        # Short holding history must not annualize into triple-digit artefacts.
+        apply_annualization_gate(
+            portfolio_metrics,
+            ["annual_return", "annual_volatility", "sharpe_ratio", "sortino_ratio"],
+            covered_days,
+        )
+        for pos_payload in positions.values():
+            apply_annualization_gate(
+                pos_payload, ["annual_return", "annual_volatility", "sharpe_ratio"], covered_days
+            )
+
         return {
             "portfolio": portfolio_metrics,
             "positions": positions,
             "warnings": warnings_list,
             "data_range": {"start": start, "end": end},
+            "history_coverage": history_coverage,
             "methodology": "Real-time calculations using quantstats and statistical models"
         }
         
@@ -498,9 +521,14 @@ async def get_factor_exposure(
                 "error": "No price data available for factor analysis"
             }
         
-        # Combine price data
+        # Combine price data, restricted to actual holding history.
         price_data = pd.DataFrame(price_data_dict)
-        
+        holding_starts = await resolve_holding_starts(db, ticker_list)
+        price_data = mask_to_holding(price_data, holding_starts)
+        history_coverage = holding_coverage(
+            holding_starts, start, end, int(len(price_data))
+        )
+
         # Fetch benchmark returns via BenchmarkService (^NSEI)
         benchmark_returns = None
         try:
@@ -533,6 +561,7 @@ async def get_factor_exposure(
             "r_squared": factor_result.get("r_squared", 0.0),
             "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
             "data_range": {"start": start, "end": end},
+            "history_coverage": history_coverage,
             "lookback_days": lookback_days,
             "methodology": "Statistical factor model with market benchmark regression"
         }
@@ -874,12 +903,18 @@ async def get_risk_score(
                 "error": "No price data available for risk scoring"
             }
         
-        # Combine price data
+        # Combine price data, restricted to actual holding history.
         price_data = pd.DataFrame(price_data_dict)
-        
+        holding_starts = await resolve_holding_starts(db, list(weights.keys()))
+        price_data = mask_to_holding(price_data, holding_starts)
+        history_coverage = holding_coverage(
+            holding_starts, start, end, int(len(price_data))
+        )
+
         # Calculate risk score using analytics engine
         risk_result = await analytics_engine.risk_scoring(price_data, weights)
-        
+        risk_result["history_coverage"] = history_coverage
+
         return risk_result
         
     except Exception as e:
@@ -945,15 +980,19 @@ async def get_analytics_summary(
                 "error": "No price data available for summary"
             }
         
-        # Combine price data
+        # Combine price data, restricted to actual holding history.
         price_data = pd.DataFrame(price_data_dict)
-        
+        holding_starts = await resolve_holding_starts(db, list(weights.keys()))
+        price_data = mask_to_holding(price_data, holding_starts)
+        covered_days = int(len(price_data))
+        history_coverage = holding_coverage(holding_starts, start, end, covered_days)
+
         # Calculate portfolio metrics for summary
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         concentration_result = await analytics_engine.concentration_analysis(weights)
         risk_result = await analytics_engine.risk_scoring(price_data, weights)
         
-        # Generate summary
+        # Generate summary (annualized ratios suppressed on short history).
         summary = {
             "portfolio_value": round(portfolio_value, 2),
             "total_positions": len(weights),
@@ -966,9 +1005,11 @@ async def get_analytics_summary(
             "liquidity_score": 7.8,
             "concentration_score": concentration_result.get("herfindahl_index", 0.25) * 100,
             "last_updated": datetime.utcnow().isoformat(),
+            "history_coverage": history_coverage,
             "methodology": "Real-time portfolio analytics summary with multi-factor risk assessment"
         }
-        
+        apply_annualization_gate(summary, ["realized_volatility", "sharpe_ratio"], covered_days)
+
         return summary
         
     except Exception as e:
@@ -1020,7 +1061,14 @@ async def get_performance_history(
         if not price_data_dict:
             return []
 
-        price_df = pd.DataFrame(price_data_dict).ffill().bfill().dropna(how="all")
+        price_df = pd.DataFrame(price_data_dict)
+        # Drop pre-holding dates: quantity x past-price before import is phantom value.
+        holding_starts = {
+            t: coerce_holding_date(getattr(db_positions.get(t), "added_on", None))
+            for t in ticker_list
+            if t in db_positions
+        }
+        price_df = mask_to_holding(price_df, holding_starts).ffill().bfill().dropna(how="all")
         if price_df.empty:
             return []
 
@@ -1076,17 +1124,42 @@ async def _build_wide_returns(
     start: str,
     end: str,
     data_service: DataService,
+    active_from: Optional[Dict[str, Optional[str]]] = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Wide per-asset returns frame + weighted portfolio return series."""
+    """Wide per-asset returns frame + weighted portfolio return series.
+
+    When active_from (ticker -> holding-start ISO date) is given, rows
+    before the current composition existed are dropped: realized analytics
+    must never attribute pre-purchase price action to the portfolio.
+    Hypothetical tools (optimize/backtest/monte-carlo) omit it on purpose.
+    """
     price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
     if not price_data_dict:
         raise ValueError("No price data available for the requested window")
     prices = pd.DataFrame(price_data_dict).sort_index().ffill().bfill()
+    prices = mask_to_holding(prices, active_from)
+    if prices.empty:
+        raise ValueError("No price data within actual holding period")
     returns_df = prices.pct_change(fill_method=None).fillna(0.0)
     if len(returns_df) > 1:
         returns_df = returns_df.iloc[1:]
     portfolio_returns = (returns_df * pd.Series(weights)).sum(axis=1)
     return returns_df, portfolio_returns
+
+
+async def resolve_holding_starts(
+    db: AsyncSession,
+    tickers: List[str],
+) -> Dict[str, Optional[str]]:
+    """{ticker: holding-start ISO date or None} for DB positions.
+
+    Tickers absent from the DB (ad-hoc universes) are missing from the map
+    and never constrain the window — those paths stay hypothetical.
+    """
+    if not tickers:
+        return {}
+    result = await db.execute(select(PortfolioPosition).where(PortfolioPosition.ticker.in_(tickers)))
+    return {p.ticker: coerce_holding_date(getattr(p, "added_on", None)) for p in result.scalars().all()}
 
 
 @router.get("/tear-sheet")
@@ -1115,7 +1188,12 @@ async def get_tear_sheet(
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
-        returns_df, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+        holding_starts = await resolve_holding_starts(db, ticker_list)
+        returns_df, port_ret = await _build_wide_returns(
+            ticker_list, weights, start, end, data_service,
+            active_from=holding_starts,
+        )
+        history_coverage = holding_coverage(holding_starts, start, end, len(port_ret))
 
         bench_ret = await benchmark.get_returns(start=start, end=end, days=756)
 
@@ -1132,6 +1210,9 @@ async def get_tear_sheet(
             "skew": _q(qs.stats.skew, port_ret),
             "kurtosis": _q(qs.stats.kurtosis, port_ret),
         }
+        apply_annualization_gate(
+            metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(port_ret)
+        )
 
         relative: Dict[str, Any] = {}
         if bench_ret is not None and len(bench_ret) > 20:
@@ -1177,6 +1258,7 @@ async def get_tear_sheet(
             "relative_vs_nifty": relative,
             "monthly_returns": monthly,
             "underwater": underwater,
+            "history_coverage": history_coverage,
             "methodology": "quantstats metric suite over cached OHLCV adj-close returns",
         }
     except HTTPException:
@@ -1210,7 +1292,12 @@ async def get_risk_contribution(
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
-        returns_df, port_ret = await _build_wide_returns(ticker_list, weights, start, end, data_service)
+        holding_starts = await resolve_holding_starts(db, ticker_list)
+        returns_df, port_ret = await _build_wide_returns(
+            ticker_list, weights, start, end, data_service,
+            active_from=holding_starts,
+        )
+        history_coverage = holding_coverage(holding_starts, start, end, len(port_ret))
         assets = list(returns_df.columns)
         w = np.array([weights.get(a, 0.0) for a in assets])
 
@@ -1247,7 +1334,7 @@ async def get_risk_contribution(
                     )
                 sector_rollup[model_name] = roll
 
-        return {
+        result = {
             "window": {"start": start, "end": end},
             "positions": {
                 "volatility": vol_rc,
@@ -1257,8 +1344,10 @@ async def get_risk_contribution(
             "portfolio_volatility_annualized": round(sigma_p, 4),
             "portfolio_var_95_daily": round(var_95, 6),
             "portfolio_cvar_95_daily": round(float(port_ret[tail].mean()), 6) if tail.any() else None,
+            "history_coverage": history_coverage,
             "methodology": "Euler decomposition (volatility) + historical tail attribution (CVaR)",
         }
+        return apply_annualization_gate(result, ["portfolio_volatility_annualized"], len(port_ret))
     except HTTPException:
         raise
     except Exception as e:
@@ -1415,16 +1504,26 @@ async def get_regime(
     """
     try:
         port_ret: Optional[pd.Series] = None
+        history_coverage: Optional[Dict[str, Any]] = None
         if with_portfolio:
             try:
                 _, weights = await resolve_allocation(None, db)
                 end = datetime.now().strftime("%Y-%m-%d")
                 start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-                _, port_ret = await _build_wide_returns(list(weights.keys()), weights, start, end, data_service)
+                holding_starts = await resolve_holding_starts(db, list(weights.keys()))
+                _, port_ret = await _build_wide_returns(
+                    list(weights.keys()), weights, start, end, data_service,
+                    active_from=holding_starts,
+                )
+                history_coverage = holding_coverage(
+                    holding_starts, start, end, len(port_ret) if port_ret is not None else 0
+                )
             except (ValueError, HTTPException):
                 port_ret = None
 
         result = await detect_regime(db, lookback_days=lookback_days, portfolio_returns=port_ret)
+        if history_coverage is not None and "portfolio_in_current_regime" in result:
+            result["portfolio_in_current_regime"]["history_coverage"] = history_coverage
         return result
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))

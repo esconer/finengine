@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pandas as pd
 import numpy as np
 import pytest
+from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete
 
@@ -44,7 +45,8 @@ class TestAnalyticsAllRoutesWithData:
             last_price=3500.0,
             market_value=35000.0,
             region="IN",
-            sector="Technology"
+            sector="Technology",
+            added_on=datetime(2020, 1, 1),
         )
         pos2 = PortfolioPosition(
             ticker="INFY.NS",
@@ -54,7 +56,8 @@ class TestAnalyticsAllRoutesWithData:
             last_price=1600.0,
             market_value=32000.0,
             region="IN",
-            sector="Technology"
+            sector="Technology",
+            added_on=datetime(2020, 1, 1),
         )
         test_db.add_all([pos1, pos2])
         await test_db.commit()

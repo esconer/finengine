@@ -98,7 +98,8 @@ class TestAPIBranchesCoverage:
     async def test_analytics_branches_coverage(self, async_client, test_db: AsyncSession):
         pos = PortfolioPosition(
             ticker="SBIN.NS", weight=1.0, quantity=100.0, buy_price=500.0,
-            last_price=600.0, market_value=60000.0, region="IN", sector="Financial Services"
+            last_price=600.0, market_value=60000.0, region="IN", sector="Financial Services",
+            added_on=datetime(2020, 1, 1),
         )
         test_db.add(pos)
         await test_db.commit()

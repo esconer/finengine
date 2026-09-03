@@ -345,7 +345,21 @@ export interface RegimeResponse {
   recent_history: { date: string; regime: string }[];
   observations: number;
   label_overrides?: { crash_veto_days: number; crash_veto_threshold: number };
-  portfolio_in_current_regime?: { days: number; ann_ret: number; ann_vol: number };
+  portfolio_in_current_regime?: {
+    days: number;
+    ann_ret: number | null;
+    ann_vol: number | null;
+    total_ret?: number | null;
+    annualized?: boolean;
+    history_coverage?: {
+      effective_start: string | null;
+      oldest_holding: string | null;
+      covered_days: number;
+      truncated: boolean;
+      annualized: boolean;
+      requested_start: string | null;
+    } | null;
+  };
 }
 
 export interface RiskContributionResponse {

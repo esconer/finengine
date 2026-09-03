@@ -95,8 +95,8 @@ class TestDirectUnitRoutes:
         mock_cache.get_cached_data = AsyncMock(return_value=None)
         mock_cache.set_cached_data = AsyncMock(return_value=True)
 
-        pos1 = PortfolioPosition(id=1, ticker="TCS.NS", weight=0.6, quantity=10.0, buy_price=3000.0, last_price=3200.0, market_value=32000.0, region="IN", sector="Tech", industry="IT Services", added_on=datetime.utcnow(), updated_on=datetime.utcnow())
-        pos2 = PortfolioPosition(id=2, ticker="INFY.NS", weight=0.4, quantity=20.0, buy_price=1400.0, last_price=1500.0, market_value=30000.0, region="IN", sector="Tech", industry="IT Services", added_on=datetime.utcnow(), updated_on=datetime.utcnow())
+        pos1 = PortfolioPosition(id=1, ticker="TCS.NS", weight=0.6, quantity=10.0, buy_price=3000.0, last_price=3200.0, market_value=32000.0, region="IN", sector="Tech", industry="IT Services", added_on=datetime(2020, 1, 1), updated_on=datetime(2020, 1, 1))
+        pos2 = PortfolioPosition(id=2, ticker="INFY.NS", weight=0.4, quantity=20.0, buy_price=1400.0, last_price=1500.0, market_value=30000.0, region="IN", sector="Tech", industry="IT Services", added_on=datetime(2020, 1, 1), updated_on=datetime(2020, 1, 1))
         
         mock_db = AsyncMock()
         mock_scalars = MagicMock()

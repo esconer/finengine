@@ -141,6 +141,7 @@ class TestEmptyToPopulatedTransition:
                 market_value=36000.0,
                 region="IN",
                 sector="Technology",
+                added_on=datetime(2020, 1, 1),
             )
             pos2 = PortfolioPosition(
                 ticker="INFY.NS",
@@ -151,6 +152,7 @@ class TestEmptyToPopulatedTransition:
                 market_value=32000.0,
                 region="IN",
                 sector="Technology",
+                added_on=datetime(2020, 1, 1),
             )
             test_db.add_all([pos1, pos2])
             await test_db.commit()

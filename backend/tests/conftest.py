@@ -114,17 +114,25 @@ def ohlcv_frame_factory():
 
 @pytest_asyncio.fixture
 async def seeded_positions(test_db: AsyncSession):
-    """Two real PortfolioPosition rows; cleaned up afterwards."""
+    """Two real PortfolioPosition rows; cleaned up afterwards.
+
+    added_on is deliberately old: analytics tests use 2023-2025 synthetic
+    price frames, and holding-aware truncation drops pre-holding history.
+    """
+    from datetime import datetime as _dt
+    _old = _dt(2020, 1, 1)
     positions = [
         PortfolioPosition(
             ticker="AAPL", weight=0.4, quantity=100, buy_price=150.0,
             last_price=180.0, market_value=18_000.0,
             sector="Technology", industry="Hardware",
+            added_on=_old,
         ),
         PortfolioPosition(
             ticker="MSFT", weight=0.6, quantity=50, buy_price=300.0,
             last_price=420.0, market_value=21_000.0,
             sector="Technology", industry="Software",
+            added_on=_old,
         ),
     ]
     test_db.add_all(positions)
@@ -235,7 +243,7 @@ def client() -> Generator[TestClient, None, None]:
 # Factory fixtures for creating test data
 @pytest.fixture
 def portfolio_position_factory():
-    """Factory for creating test portfolio positions"""
+    """Factory for creating test portfolio positions (long-held: 2020)."""
     def create_position(
         ticker: str = "AAPL",
         weight: float = 0.1,
@@ -252,7 +260,8 @@ def portfolio_position_factory():
             market_value=10000.0,
             sector=sector,
             industry=industry,
-            custom_name=""
+            custom_name="",
+            added_on=datetime(2020, 1, 1),
         )
     
     return create_position
