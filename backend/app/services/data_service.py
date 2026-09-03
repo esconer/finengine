@@ -33,26 +33,36 @@ POPULAR_INDIAN_STOCKS = [
     'BAJFINANCE.NS', 'HINDUNILVR.NS', 'POWERGRID.NS', 'NTPC.NS', 'ONGC.NS'
 ]
 
+# Bare scrip names known to be Indian (suffixless user input maps to NSE).
+_BARE_INDIAN_SCRIPS = frozenset(t.replace('.NS', '') for t in POPULAR_INDIAN_STOCKS)
+
 
 def canonical_ticker(ticker: str) -> str:
     """Canonical form of a ticker (used for quotes, caching, and storage).
 
     Callers storing positions must persist this form so the same scrip cannot
     be stored twice under different spellings (e.g. RELIANCE vs RELIANCE.NS).
+
+    Bare symbols are suffixed with .NS only when they are known Indian
+    scrips; anything else passes through untouched so US/global tickers
+    (e.g. AAPL) are never fabricated into NSE listings (AAPL.NS).
     """
-    ticker = ticker.upper().strip()
+    t = ticker.upper().strip()
 
     # Yahoo-native symbols (^NSEI indices, INR=X fx) pass through untouched;
     # appending .NS to an index would fabricate a nonexistent ticker.
-    if ticker.startswith("^") or ticker.endswith("=X"):
-        return ticker
+    if t.startswith("^") or t.endswith("=X"):
+        return t
 
-    # If already has exchange suffix, return as is
-    if '.NS' in ticker or '.BO' in ticker:
-        return ticker
+    # Already has an exchange suffix (suffix check, not substring).
+    if t.endswith(".NS") or t.endswith(".BO"):
+        return t
 
-    # Known Indian scrips and bare symbols default to NSE
-    return f"{ticker}.NS"
+    # Known Indian scrips given bare default to NSE.
+    if t in _BARE_INDIAN_SCRIPS:
+        return f"{t}.NS"
+
+    return t
 
 
 class DataService:
@@ -82,7 +92,8 @@ class DataService:
     
     def _is_indian_ticker(self, ticker: str) -> bool:
         """Check if ticker is an Indian stock"""
-        return '.NS' in ticker or '.BO' in ticker or ticker in [t.replace('.NS', '') for t in self.popular_indian_stocks]
+        t = ticker.upper().strip()
+        return t.endswith((".NS", ".BO")) or t in _BARE_INDIAN_SCRIPS
     
     _in_memory_df_cache: Dict[str, Any] = {}
 

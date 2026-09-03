@@ -203,7 +203,7 @@ class TestAlphaVantageServiceComprehensive:
 class TestCompanyDataServiceComprehensive:
     def test_normalize_and_yf_retry(self):
         assert _normalize("INFY") == "INFY.NS"
-        assert _normalize("AAPL") == "AAPL.NS"
+        assert _normalize("AAPL") == "AAPL"
 
         # yf_retry success
         assert _yf_retry(lambda: 42) == 42
