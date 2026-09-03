@@ -344,6 +344,7 @@ export interface RegimeResponse {
   }[];
   recent_history: { date: string; regime: string }[];
   observations: number;
+  label_overrides?: { crash_veto_days: number; crash_veto_threshold: number };
   portfolio_in_current_regime?: { days: number; ann_ret: number; ann_vol: number };
 }
 
