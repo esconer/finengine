@@ -7,6 +7,7 @@ crisis so downstream UI never sees raw integer state ids. Persistence
 """
 
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -43,9 +44,29 @@ def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
     }
 
 
+def _looks_like_returns(series: pd.Series) -> bool:
+    """Heuristic: return series are small, centered ~0 with negatives.
+
+    Prices (e.g. NIFTY levels) are large positives with no negatives;
+    daily returns have a sub-0.5 median and a material negative fraction.
+    Used to route `detect_regime`'s return-Series fallback away from the
+    price path (`pct_change` of returns is nonsense).
+    """
+    probe = pd.Series(series).dropna()
+    if len(probe) == 0:
+        return False
+    try:
+        median = float(probe.median())
+        neg_frac = float((probe < 0).mean())
+    except (TypeError, ValueError):
+        return False
+    return abs(median) < 0.5 and neg_frac > 0.25
+
+
 def classify(
     bench_data: Any,
     n_components: int = 3,
+    is_returns: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Fit a Sticky-Prior Gaussian HMM over signed volatility and 200 DMA distance.
 
@@ -93,8 +114,15 @@ def classify(
         else:
             parkinson_vol = None
     else:
-        close = bench_data.astype(float)
-        ret_1d = close.pct_change().dropna()
+        raw = bench_data.astype(float).dropna()
+        if is_returns or _looks_like_returns(raw):
+            # Return-Series path: reconstruct a price level for the
+            # ret21/vol21 geometry instead of pct_change-ing returns.
+            ret_1d = raw
+            close = (1.0 + raw).cumprod()
+        else:
+            close = raw
+            ret_1d = close.pct_change().dropna()
         ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
         parkinson_vol = None
 
@@ -228,6 +256,7 @@ async def detect_regime(
     """Fetch benchmark history through the shared cache and classify regimes."""
     bench = BenchmarkService(db_session)
     bench_df = await bench.get_benchmark_df(days=lookback_days)
+    use_returns = False
     if bench_df is None or len(bench_df) < MIN_OBSERVATIONS:
         rets = await bench.get_returns(days=lookback_days)
         if rets is None or len(rets) < MIN_OBSERVATIONS:
@@ -236,10 +265,11 @@ async def detect_regime(
                 f"(need >= {MIN_OBSERVATIONS})"
             )
         bench_data = rets
+        use_returns = True
     else:
         bench_data = bench_df
 
-    result = await __import__("asyncio").to_thread(classify, bench_data)
+    result = await __import__("asyncio").to_thread(partial(classify, bench_data, n_components=3, is_returns=use_returns))
     if result is None:
         raise ValueError("Regime classification produced no result")
 
