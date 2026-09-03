@@ -5,6 +5,7 @@ High Dividend Yield, and Undervalued Growth.
 """
 
 import asyncio
+import hashlib
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
@@ -13,6 +14,27 @@ import bfinance as bf
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+# Debt-free enforcement: Screener.in-style D/E ceiling. Applied as a
+# finengine-side post-filter because the upstream bfinance
+# debt_free_compounders definition does not check debt (logged for bfinance).
+DEBT_FREE_MAX_DE_RATIO = 0.2
+
+
+def _screen_ticker(sym: str) -> str:
+    """Map a screen Symbol to a Yahoo ticker: numeric BSE scrips keep .BO."""
+    s = str(sym).upper().strip()
+    if s.endswith((".NS", ".BO")):
+        return s
+    if s.isdigit():
+        return f"{s}.BO"
+    return f"{s}.NS"
+
+
+def _universe_cache_token(universe: Optional[List[str]]) -> str:
+    if not universe:
+        return "default"
+    return hashlib.sha1("|".join(sorted(u.upper().strip() for u in universe)).encode("utf-8")).hexdigest()[:12]
 
 
 async def _to_thread(func, *args, **kwargs):
@@ -38,7 +60,7 @@ class ScreenerService:
         },
         "debt_free": {
             "name": "Debt Free Compounders",
-            "description": "High return on capital (ROCE >= 20%) with strong balance sheets and Market Cap > ₹10,000 Cr",
+            "description": "Negligible leverage (D/E <= 0.2), ROCE >= 20% and Market Cap > ₹10,000 Cr",
             "screen_getter": lambda: bf.screens.debt_free_compounders,
         },
         "high_dividend": {
@@ -79,8 +101,9 @@ class ScreenerService:
 
         strategy_meta = self.STRATEGIES[strat_key]
 
-        # Check in-memory cache
-        cache_key = f"{strat_key}_{max_stocks}"
+        # Check in-memory cache (universe is part of the key: a custom
+        # universe must never be served default-universe results).
+        cache_key = f"{strat_key}_{max_stocks}_{_universe_cache_token(universe)}"
         now_ts = time.time()
         if cache_key in self._cache:
             ts, cached_res = self._cache[cache_key]
@@ -89,14 +112,17 @@ class ScreenerService:
 
         def _execute():
             screen = strategy_meta["screen_getter"]()
-            df = screen.run(universe=universe, max_stocks=max_stocks or 25)
+            # Scan the FULL universe: upstream slices symbols[:max_stocks]
+            # before filtering, so passing max_stocks would silently skip
+            # the tail of the universe. Cap the ranked results below.
+            df = screen.run(universe=universe, max_stocks=None)
             results = []
             if not df.empty:
                 for _, row in df.iterrows():
                     sym = str(row.get("Symbol", ""))
                     results.append({
                         "symbol": sym,
-                        "ticker": f"{sym}.NS",
+                        "ticker": _screen_ticker(sym),
                         "name": str(row.get("Name", sym)),
                         "price": float(row["Price"]) if pd.notna(row.get("Price")) else 0.0,
                         "market_cap_cr": float(row["MarketCap_Cr"]) if pd.notna(row.get("MarketCap_Cr")) else 0.0,
@@ -110,6 +136,12 @@ class ScreenerService:
 
         try:
             results = await _to_thread(_execute)
+            if strat_key == "debt_free":
+                # Upstream debt_free_compounders does not check debt; enforce
+                # D/E here (fail-closed: unknown leverage is excluded) so the
+                # strategy name is not a mislabel.
+                results = await self._enforce_debt_free(results)
+            results = results[: max_stocks or 50]
             response_data = {
                 "strategy": strat_key,
                 "name": strategy_meta["name"],
@@ -122,6 +154,26 @@ class ScreenerService:
         except Exception as e:
             logger.error(f"Error running screener {strategy}: {e}")
             raise ValueError(f"Screen execution failed: {e}")
+
+    async def _enforce_debt_free(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only matches with D/E <= ceiling (fail-closed on unknown)."""
+        def _check():
+            kept = []
+            for r in results:
+                try:
+                    info = bf.Ticker(r.get("symbol", "")).info or {}
+                    de = info.get("debtToEquity")
+                    if de is not None and float(de) <= DEBT_FREE_MAX_DE_RATIO:
+                        kept.append(r)
+                except Exception:
+                    continue
+            return kept
+
+        try:
+            return await _to_thread(_check)
+        except Exception as e:
+            logger.error(f"Debt-free enforcement failed: {e}")
+            return []
 
     async def run_custom_screen(
         self,
@@ -165,14 +217,14 @@ class ScreenerService:
                 description="Custom multi-parameter equity screen",
                 filter_fn=_filter,
             )
-            df = custom_screen.run(max_stocks=max_stocks)
+            df = custom_screen.run(max_stocks=None)
             results = []
             if not df.empty:
                 for _, row in df.iterrows():
                     sym = str(row.get("Symbol", ""))
                     results.append({
                         "symbol": sym,
-                        "ticker": f"{sym}.NS",
+                        "ticker": _screen_ticker(sym),
                         "name": str(row.get("Name", sym)),
                         "price": float(row["Price"]) if pd.notna(row.get("Price")) else 0.0,
                         "market_cap_cr": float(row["MarketCap_Cr"]) if pd.notna(row.get("MarketCap_Cr")) else 0.0,
@@ -185,6 +237,7 @@ class ScreenerService:
 
         try:
             results = await _to_thread(_execute)
+            results = results[: max_stocks or 50]
             return {
                 "strategy": "custom",
                 "name": "Custom Filter",
