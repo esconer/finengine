@@ -636,15 +636,15 @@ async def get_liquidity_metrics(
             async with sem:
                 try:
                     res = data_service.fetch_historical_data(ticker, start, end)
-                    if asyncio.iscoroutine(res) or inspect.isawaitable(res):
+                    if asyncio.iscoroutine(res):
                         df = await res
                     else:
                         df = res
-                    
+
                     mc = None
                     if hasattr(data_service, 'fetch_quote'):
                         q_res = data_service.fetch_quote(ticker)
-                        if asyncio.iscoroutine(q_res) or inspect.isawaitable(q_res):
+                        if asyncio.iscoroutine(q_res):
                             quote = await q_res
                         elif isinstance(q_res, dict):
                             quote = q_res
@@ -1468,7 +1468,12 @@ async def run_monte_carlo(
         else:
             result = await db.execute(select(PortfolioPosition))
             positions = result.scalars().all()
-            initial_value = sum(float(p.market_value or 0.0) for p in positions)
+            initial_value = sum(
+                float(p.market_value)
+                if (p.market_value and float(p.market_value) > 0)
+                else float(p.quantity or 0.0) * float(p.last_price or 0.0)
+                for p in positions
+            )
             if initial_value <= 0:
                 raise HTTPException(
                     status_code=404,
@@ -1490,7 +1495,7 @@ async def run_monte_carlo(
             target_value=target_value,
             horizon_years=horizon_years,
             method=str(body.get("method", "gbm")).lower(),
-            num_paths=int(body.get("num_paths", 2000)),
+            num_paths=min(max(int(body.get("num_paths", 2000)), 100), 20000),
             seed=body.get("seed"),
         )
     except HTTPException:
@@ -1659,7 +1664,7 @@ async def get_delivery_anomalies(
         if tickers:
             symbol_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
         else:
-            allocation = await _load_portfolio_allocation(db)
+            allocation = await _load_portfolio_allocation(db) or {}
             symbol_list = list(allocation.keys())
 
         if not symbol_list:
