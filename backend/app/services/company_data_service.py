@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from app.services.data_service import DataService
+from app.services.data_service import canonical_ticker
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -30,7 +30,7 @@ logger = setup_logger(__name__)
 
 def _normalize(ticker: str) -> str:
     """Reuse the project's NSE/BSE suffix logic (no session needed)."""
-    return DataService(None)._normalize_indian_ticker(ticker)
+    return canonical_ticker(ticker)
 
 
 def _yf_retry(func, max_retries: int = 3, base_delay: float = 2.0):

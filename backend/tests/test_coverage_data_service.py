@@ -50,8 +50,8 @@ class TestDataServiceNormalizationAndBasics:
         assert service._normalize_indian_ticker("INFY") == "INFY.NS"
         assert service._normalize_indian_ticker("HDFCBANK") == "HDFCBANK.NS"
         
-        # Default suffix addition
-        assert service._normalize_indian_ticker("SOMEUNKNOWN") == "SOMEUNKNOWN.NS"
+        # Unknown bare symbols pass through (never fabricate NSE listings)
+        assert service._normalize_indian_ticker("SOMEUNKNOWN") == "SOMEUNKNOWN"
 
     async def test_is_indian_ticker(self, test_db: AsyncSession):
         service = DataService(test_db)

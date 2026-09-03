@@ -8,7 +8,7 @@ import asyncio
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import bfinance as bf
-from app.services.data_service import DataService
+from app.services.data_service import canonical_ticker
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -16,7 +16,7 @@ logger = setup_logger(__name__)
 
 def _normalize(ticker: str) -> str:
     """Normalize ticker to standard Indian format (.NS default)."""
-    return DataService(None)._normalize_indian_ticker(ticker)
+    return canonical_ticker(ticker)
 
 
 async def _to_thread(func, *args, **kwargs):
