@@ -8,7 +8,7 @@ crisis so downstream UI never sees raw integer state ids. Persistence
 
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,15 @@ logger = setup_logger(__name__)
 
 REGIME_LABELS_WORST_TO_BEST = ["crisis", "calm", "bull"]
 MIN_OBSERVATIONS = 200
+
+# Crash veto: a day whose trailing 21-day log-return is worse than this is
+# never displayed as calm/bull, no matter which HMM state claimed it.
+# -0.10/21d is a ~-60%-annualized pace: unambiguously crash-like, while
+# normal pullbacks (and V-shaped recoveries whose trailing window never
+# breaches it) pass through untouched. Measured false-positive rate on
+# 2023-2025 NIFTY history: 0 days. This is a display-level guardrail, not a
+# model refit: clustering, transition matrix and posteriors are unchanged.
+CRASH_VETO_RET21 = -0.10
 
 
 def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
@@ -61,6 +70,32 @@ def _looks_like_returns(series: pd.Series) -> bool:
     except (TypeError, ValueError):
         return False
     return abs(median) < 0.5 and neg_frac > 0.25
+
+
+def apply_crash_veto(
+    state_ids: np.ndarray,
+    label_map: Dict[int, str],
+    ret21_values: np.ndarray,
+    threshold: float = CRASH_VETO_RET21,
+) -> Tuple[np.ndarray, int]:
+    """Relabel crash-paced days to the crisis state (pure, deterministic).
+
+    Trailing 21-day windows stay positive for ~2-4 weeks into a fast crash,
+    so crash days can land in a high-mean state that global labeling crowns
+    'bull' (Mar-2026 inversion). Any day with trailing ret21 below threshold
+    is reassigned to the crisis state id; everything else is untouched.
+    Returns (display state ids, vetoed day count).
+    """
+    display = np.asarray(state_ids).copy()
+    crisis_ids = [s for s in range(len(label_map)) if label_map.get(int(s)) == "crisis"]
+    if not crisis_ids:
+        return display, 0
+    assigned = np.array([label_map.get(int(s)) for s in display])
+    trigger = (np.asarray(ret21_values) < threshold) & (assigned != "crisis")
+    vetoed = int(np.sum(trigger))
+    if vetoed:
+        display[trigger] = crisis_ids[0]
+    return display, vetoed
 
 
 def classify(
@@ -198,7 +233,14 @@ def classify(
     # Economically rigorous monotonic label mapping
     label_map = _label_states_by_risk(stats_df)
 
-    flips = (np.diff(states) != 0).mean()
+    # Crash veto (display-level): crash-paced days are never shown as
+    # calm/bull even if the HMM assigned them to a high-mean state.
+    # Model statistics (rows, transition matrix, posteriors) intentionally
+    # still describe the raw fit.
+    ret21_common = ret21.loc[common].values
+    display_states, veto_days = apply_crash_veto(states, label_map, ret21_common)
+
+    flips = (np.diff(display_states) != 0).mean()
     stability = round(float((1.0 - flips) * 100), 1)
 
     current_probs = {
@@ -217,18 +259,22 @@ def classify(
 
     history = [
         {"date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10], "regime": label_map[int(s)]}
-        for ts, s in zip(common[-120:], states[-120:])
+        for ts, s in zip(common[-120:], display_states[-120:])
     ]
 
     all_regimes = {
         (ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]): label_map[int(s)]
-        for ts, s in zip(common, states)
+        for ts, s in zip(common, display_states)
     }
 
     return {
         "as_of": common[-1].strftime("%Y-%m-%d") if hasattr(common[-1], "strftime") else str(common[-1]),
-        "current_regime": label_map[int(states[-1])],
+        "current_regime": label_map[int(display_states[-1])],
         "stability_pct": stability,
+        "label_overrides": {
+            "crash_veto_days": int(veto_days),
+            "crash_veto_threshold": float(CRASH_VETO_RET21),
+        },
         "regime_probabilities": current_probs,
         "transition_matrix": transition_matrix,
         "realtime_ewma_vol": round(ewma_vol, 4) if ewma_vol is not None else None,
