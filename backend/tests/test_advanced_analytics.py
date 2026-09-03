@@ -124,7 +124,9 @@ class TestOptimizerEndpoint:
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert set(data["weights"].keys()) == {"RELIANCE.NS", "TCS.NS", "INFY.NS"}
-        assert abs(sum(data["weights"].values()) - 1.0) < 1e-6
+        # 6dp weight rounding leaves up to N*5e-7 residual; project
+        # convention (CONTEXT gotcha #5) is ~1e-4, not 1e-6.
+        assert abs(sum(data["weights"].values()) - 1.0) < 1e-4
         assert "trades_required" in data
 
     @pytest.mark.asyncio
