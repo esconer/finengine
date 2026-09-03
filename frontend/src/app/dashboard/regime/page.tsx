@@ -9,6 +9,7 @@
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
+import { useUIStore } from '@/lib/store';
 import {
   Radar,
   AlertTriangle,
@@ -201,6 +202,7 @@ interface RegimeData {
   }[];
   recent_history: { date: string; regime: string }[];
   observations: number;
+  label_overrides?: { crash_veto_days: number; crash_veto_threshold: number };
   portfolio_in_current_regime?: { days: number; ann_ret: number; ann_vol: number };
 }
 
@@ -255,6 +257,7 @@ export default function RegimePage() {
     try {
       const result = await analyticsApi.getRegime();
       setData(result);
+      useUIStore.getState().updateLastUpdated();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to detect market regime');
     } finally {
@@ -282,6 +285,9 @@ export default function RegimePage() {
     rows.push(`Observations Analyzed,${data.observations} trading days`);
     rows.push(`Current Active Regime,${current?.label || data.current_regime}`);
     rows.push(`Regime Stability,${data.stability_pct.toFixed(1)}%`);
+    if (data.label_overrides && data.label_overrides.crash_veto_days > 0) {
+      rows.push(`Crash-Guard Relabeled Days,${data.label_overrides.crash_veto_days}`);
+    }
     rows.push('');
     rows.push('HMM Latent State Parameters');
     rows.push('Regime,Annualized Return (%),Annualized Volatility (%),Share of History (%)');
@@ -673,6 +679,17 @@ export default function RegimePage() {
                 <span>{data.recent_history[0].date}</span>
                 <span>{data.recent_history[data.recent_history.length - 1].date}</span>
               </div>
+              {data.label_overrides && data.label_overrides.crash_veto_days > 0 && (
+                <p className="flex items-center gap-1.5 text-xs text-amber-300/90 mt-3">
+                  <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    Crash guard active: {data.label_overrides.crash_veto_days} day
+                    {data.label_overrides.crash_veto_days !== 1 ? 's' : ''} with trailing
+                    21-day return below {(data.label_overrides.crash_veto_threshold * 100).toFixed(0)}%{' '}
+                    {data.label_overrides.crash_veto_days !== 1 ? 'were' : 'was'} relabeled to Crisis.
+                  </span>
+                </p>
+              )}
             </div>
           )}
 
