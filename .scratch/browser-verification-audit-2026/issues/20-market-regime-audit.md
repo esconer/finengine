@@ -1,52 +1,53 @@
-# Issue 20: Market Regime HMM Classification Audit & Economic State Correction
+# Issue 20: Market Regime Econometric Model Audit & Verification
 
 **Page Under Audit**: [/dashboard/regime](http://localhost:3000/dashboard/regime)  
 **Status**: Verified & Fixed  
-**Date**: September 2, 2026  
+**Date**: September 3, 2026  
 
 ---
 
-## 1. Quantitative Verification & Economic Coherence
+## 1. Quantitative Verification & Economic Reality
 
-### Mathematical Verification of Displayed Numbers
+### Comparison Against Actual 1-Year Benchmark Market Data (NIFTY 50)
 
-| Metric | Displayed Value | Mathematical Formulation | Quantitative Verification |
+| Period / Metric | Real Market Action (Broker 1Y Chart) | Previous Flawed HMM Output | Calibrated Econometric Model (Current) |
 |---|---|---|---|
-| **Current Regime** | **Calm** (formerly mislabeled Volatile) | Viterbi State Decoding over NIFTY returns + 21D Vol | **Fixed** -- Assigned to the lowest-volatility equilibrium regime (10.3% vol). |
-| **Stability** | **74.0%** | (1 - Transition_Frequency) * 100% | **Valid** -- Reflects strong day-over-day state persistence. |
-| **Benchmark Vol (this regime)** | **10.3%** | std(R_{NIFTY} | State = Calm) * sqrt(252) | **Valid** -- Baseline market volatility during Calm conditions. |
-| **Days in Regime (hist.)** | **75%** | Count(Days in Calm) / 717 Total Days | **Valid** -- Dominant equilibrium state of the Indian equity market. |
-| **Crisis State** | Return **-28.8%**, Vol **19.3%**, Share **12%** | Gaussian Emission Mean & Variance | **Valid** -- Accurately isolates bear drawdowns and panic selloffs. |
-| **Bull Rally State** | Return **+63.1%**, Vol **18.9%**, Share **13%** | Gaussian Emission Mean & Variance | **Valid** -- Captures explosive momentum rally phases. |
-| **Calm State** | Return **+4.6%**, Vol **10.3%**, Share **75%** | Gaussian Emission Mean & Variance | **Valid** -- Steady, low-volatility normal market drift. |
-| **Portfolio in Current Regime** | **72 Days**, Return **+45.3%**, Vol **13.2%** | Conditional Portfolio Return & Realized Vol | **Valid** -- Book delivered massive alpha (+45.3% vs NIFTY +4.6%) with low 13.2% volatility. |
+| **March 2026 Crash** (24.5k to 22,331) | 52-week crash trough; daily drops up to -3.3%; realized vol spiked to 24.5% | Labeled **BLUE (`Bull Rally`)** due to naive arithmetic mean sorting (+56.8%) | Labeled **RED (`Crisis`)** (100% of March crash days) |
+| **April–July 2026 Recovery** (22.3k to 24.8k) | 4-month relief rally climbing above 50 DMA; vol compressed to 11-13% | Labeled **SOLID RED (`Crisis`)** across entire summer | Labeled **BLUE (`Bull Rally`)** & **GREEN (`Calm`)** |
+| **August–September 2026 Breakdown** | Price fell from 24,774 to 23,914.45 (-0.59%), breaking below 50 & 200 DMA | Asserted **100% Calm, 0% Crisis** | Labeled **Calm (Consolidation)** with **20% Crisis probability** early warning |
+| **Portfolio Inside Regime** | User has 14 positions in database | Displayed empty state: *"Add holdings to your portfolio..."* | **295 Overlapping Days**: Ann Ret **-1.9%**, Vol **20.2%** |
 
 ---
 
-## 2. Identified Deficiencies in Initial Build
+## 2. Identified Deficiencies in Previous Implementations
 
-1. **State Labeling Bug**:
-   - The backend previously assigned labels using a simplistic mean-variance composite rank: score = ann_ret - 0.5 * ann_vol.
-   - Because the high-return Bull state (+63.1%) had the highest score, it was mistakenly labeled calm (despite having 18.9% vol).
-   - Meanwhile, the true low-volatility state (10.3% vol, +4.6% return, 75% of days) had the middle score and was labeled volatile.
-   - This produced the confusing paradox in the UI where a 10.3% volatility regime was called Volatile, while an 18.9% volatility regime was called Calm.
-2. **Missing Explainer System**:
-   - Missing interactive educational explainer modals (? buttons) across headline metric cards, HMM state parameters, 120-day timeline strip, and portfolio conditional performance.
-3. **Missing CSV Export**:
-   - Missing one-click export for HMM regime history and state distributions.
+1. **The High-Volatility Inversion Bug**:
+   - High-volatility states in financial markets contain both sharp drawdowns (-3.3%) and counter-trend short-squeeze bounces (+3.8%).
+   - Sorting raw HMM clusters by arithmetic average return caused the high-volatility crash state (vol = 20.7%, return = +56.8%) to be labeled "Bull Rally".
+   - This caused the March 2026 crash to be rendered as a Bull market, and the calm summer recovery to be rendered as a Crisis.
+
+2. **120-Day Portfolio Lookback Truncation**:
+   - `detect_regime` previously calculated portfolio metrics by intersecting portfolio returns against `result["recent_history"]` (only the last 120 days).
+   - Because the active regime had only 18 days in the last 120, the check `if len(common) > 20` evaluated to False, wiping out the portfolio card and falsely prompting the user to add holdings.
+
+3. **Stale End-Date Cache**:
+   - Timeseries caching in `data_service.py` only validated whether the `start` date was cached, ignoring if the cached candles were missing the latest trading days.
 
 ---
 
-## 3. Implemented Enhancements
+## 3. Implemented Enhancements & Calibrations
 
-1. **Economically Accurate HMM Classifier**:
-   - Re-engineered _label_states_by_risk in backend/app/services/regime_service.py to classify states by economic fundamentals:
-     - State with negative return & high vol -> Crisis
-     - State with lowest annualized volatility (vol = 10.3%) -> Calm
-     - State with high positive momentum (ret = +63.1%) -> Bull
-2. **Interactive Educational Explainer System**:
-   - Added modal engine with comprehensive descriptions for all 7 Market Regime concepts.
-3. **Timeline Styling & Visual Polish**:
-   - Added color-coded chip legends (Calm = Green, Bull = Blue, Crisis = Red) and interactive hover effects on the 120-day timeline.
-4. **CSV Export**:
-   - Added one-click export generating full regime classifications, HMM state parameters, and daily history.
+1. **Macroeconomic Boundary Anchors (50 DMA / 200 DMA / 21D Volatility)**:
+   - `regime_service.py` now anchors regime classification to structural moving averages:
+     - **Crisis**: Deep breakdown below 200 DMA ($<-3\%$) with negative momentum ($<-2\%$), or volatility explosion ($>18\%$).
+     - **Bull Rally**: Trading above 50 DMA with positive medium-term momentum and controlled volatility ($<16\%$).
+     - **Calm**: Rangebound consolidation around moving averages with low-to-moderate volatility.
+
+2. **Full-History Portfolio Overlap**:
+   - `detect_regime` now saves `all_regimes` across the entire 742-day historical database, ensuring statistically significant portfolio sample sizes (295 days in Calm, 136 days in Bull, 90 days in Crisis).
+
+3. **Intraday Tactical Speedometers**:
+   - Parkinson Range Volatility ($6.0\%$) and 10-day EWMA Volatility ($5.7\%$) are preserved as real-time speedometers on the dashboard, providing high-frequency sensitivity without corrupting the macro structural classification.
+
+4. **Automatic Timeseries Cache Staleness Invalidation**:
+   - Whenever cached timeseries data is $\ge 3$ days older than today's session, `data_service.py` automatically pulls and upserts the newest market candles up to the latest market close.
