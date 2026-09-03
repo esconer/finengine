@@ -103,13 +103,12 @@ def classify(
     n_components: int = 3,
     is_returns: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Fit a Sticky-Prior Gaussian HMM over signed volatility and 200 DMA distance.
+    """Fit a Sticky-Prior Gaussian HMM over 21-day return and realized volatility.
 
     Econometric Architecture (Fox et al., 2011; Hamilton, 1989):
     1. Features:
-       - Signed 21-day Realized Volatility: sign(R_21D) * sigma_21D. Unambiguously separates
-         high-volatility crashes (-20%) from calm baselines (+9%) and bull breakouts (+16%).
-       - Distance to 200 DMA: (P_t - SMA_200) / SMA_200. Macro structural anchor.
+       - 21-day log holding return: log(P_t / P_{t-21}).
+       - 21-day realized volatility: rolling 21d std of daily returns, annualized.
     2. Sticky Transition Prior (96% diagonal persistence):
        - Enforces true regime persistence (mean duration 20-35 trading days).
        - Eliminates high-frequency 1-day chattering between crisis and bull states.
@@ -161,22 +160,12 @@ def classify(
         ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
         parkinson_vol = None
 
-    # Macroeconomic features: Signed 21-day realized volatility and distance to 200 DMA
+    # Macroeconomic continuous features: 21-day holding return and 21-day realized volatility
     ret21 = np.log(close / close.shift(21)).dropna()
     vol21 = (ret_1d.rolling(21).std() * np.sqrt(252)).dropna()
-    sma200 = close.rolling(200, min_periods=100).mean()
-    d200 = ((close - sma200) / sma200).dropna()
 
-    common = ret21.index.intersection(vol21.index).intersection(d200.index)
-    if len(common) < MIN_OBSERVATIONS:
-        common = ret21.index.intersection(vol21.index)
-        if len(common) < MIN_OBSERVATIONS:
-            return None
-        signed_vol = np.sign(ret21.loc[common]) * vol21.loc[common]
-        feats = pd.concat([signed_vol.rename("signed_vol"), ret21.loc[common].rename("ret21")], axis=1).dropna()
-    else:
-        signed_vol = np.sign(ret21.loc[common]) * vol21.loc[common]
-        feats = pd.concat([signed_vol.rename("signed_vol"), d200.loc[common].rename("d200")], axis=1).dropna()
+    common = ret21.index.intersection(vol21.index)
+    feats = pd.concat([ret21.loc[common].rename("ret21"), vol21.loc[common].rename("vol21")], axis=1).dropna()
 
     if len(feats) < MIN_OBSERVATIONS:
         return None
@@ -196,7 +185,7 @@ def classify(
         covariance_type="full",
         init_params="mc",
         params="mc",
-        random_state=42,
+        random_state=100,
         n_iter=200,
         tol=1e-4,
     )
@@ -219,13 +208,11 @@ def classify(
         else:
             cagr = 0.0
         ann_v = float(vol21.loc[common].values[mask].mean()) if n_sub > 0 else 0.0
-        s_vol = float(signed_vol.loc[common].values[mask].mean()) if n_sub > 0 else 0.0
         rows.append({
             "state": s,
             "ann_ret": cagr,
             "cagr": cagr,
             "ann_vol": ann_v,
-            "signed_vol": s_vol,
             "days_pct": float(mask.mean() * 100),
         })
     stats_df = pd.DataFrame(rows).set_index("state")
