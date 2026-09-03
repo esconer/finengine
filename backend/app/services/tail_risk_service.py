@@ -51,20 +51,13 @@ class TailRiskService:
 
         n_total = len(r)
         if n_total < 20:
-            # Fallback for insufficient sample size
-            return {
-                "confidence_level": confidence_level,
-                "evt_pot_var_99": -0.0385,
-                "evt_pot_es_99": -0.0492,
-                "historical_var_99": -0.0312,
-                "historical_es_99": -0.0415,
-                "threshold_u": 0.0185,
-                "gpd_shape_xi": 0.18,
-                "gpd_scale_beta": 0.0075,
-                "exceedances_count": 0,
-                "total_observations": n_total,
-                "is_fat_tailed": True,
-            }
+            # Never fabricate tail numbers: EVT-POT needs enough data to
+            # clear the 95% threshold with fittable exceedances. Callers map
+            # this to 400/insufficient-data (the /tails route already guards
+            # len(port_ret) < 30 and translates ValueError to 400).
+            raise ValueError(
+                f"Insufficient observations for EVT-POT (need >= 20, got {n_total})"
+            )
 
         # Daily loss series: positive values are losses
         losses = -r
