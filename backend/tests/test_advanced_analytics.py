@@ -37,8 +37,13 @@ def patch_market():
             side_effect=lambda t, s, e, force_refresh=False: _fetch(t, s, e, force_refresh)
         )
         bench = Mock()
+        # detect_regime awaits get_benchmark_df FIRST: it must be async and
+        # miss (None) so the fallback get_returns path is exercised.
+        bench.get_benchmark_df = AsyncMock(return_value=None)
         if bench_returns is not None:
             bench.get_returns = AsyncMock(return_value=bench_returns)
+        else:
+            bench.get_returns = AsyncMock(return_value=None)
 
         ctx1 = patch("app.api.analytics.GlobalDataService", return_value=service)
         
@@ -177,6 +182,7 @@ class TestRegime:
     async def test_insufficient_history_409(self, async_client):
         # regime_service imports its own BenchmarkService - patch THERE
         with patch("app.services.regime_service.BenchmarkService") as rb:
+            rb.return_value.get_benchmark_df = AsyncMock(return_value=None)
             rb.return_value.get_returns = AsyncMock(return_value=_bench_series(days=50))
             resp = await async_client.get("/api/v1/analytics/regime?with_portfolio=false")
         assert resp.status_code == 409

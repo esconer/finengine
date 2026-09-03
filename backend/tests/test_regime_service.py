@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.regime_service import _label_states_by_risk, classify, detect_regime, MIN_OBSERVATIONS
 
 
@@ -17,6 +18,15 @@ def test_label_states_by_risk():
     assert mapping[0] == 'crisis'
     assert mapping[1] == 'calm'
     assert mapping[2] == 'bull'
+
+
+def test_label_states_non_three_state_no_crash():
+    df = pd.DataFrame([
+        {'cagr': -0.10, 'ann_vol': 0.20},
+        {'cagr': 0.25, 'ann_vol': 0.15},
+    ])
+    mapping = _label_states_by_risk(df)
+    assert mapping == {0: 'state_0', 1: 'state_1'}
 
 
 def test_classify_insufficient_data():
@@ -53,3 +63,19 @@ def test_classify_synthetic_series():
     assert res is not None
     assert res['current_regime'] in ['calm', 'bull', 'crisis']
     assert res['realtime_parkinson_vol'] is None
+
+
+async def test_detect_regime_naive_tz_portfolio():
+    dates = pd.date_range('2023-01-01', periods=300, freq='B')
+    rng = np.random.default_rng(3)
+    rets = pd.Series(rng.normal(0.0005, 0.012, 300), index=dates)
+    port = pd.Series(rng.normal(0.0006, 0.015, 300), index=dates)
+    assert port.index.tz is None
+    with patch("app.services.regime_service.BenchmarkService") as cls:
+        inst = cls.return_value
+        inst.get_benchmark_df = AsyncMock(return_value=None)
+        inst.get_returns = AsyncMock(return_value=rets)
+        res = await detect_regime(MagicMock(), lookback_days=1100, portfolio_returns=port)
+    assert res["current_regime"] in {"calm", "bull", "crisis"}
+    assert "portfolio_in_current_regime" in res
+    assert res["portfolio_in_current_regime"]["days"] >= 5

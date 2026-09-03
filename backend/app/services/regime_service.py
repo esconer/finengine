@@ -1,11 +1,12 @@
 """
 Market-regime detection via a 3-state Gaussian HMM over NIFTY 50 returns.
 
-States are ordered by risk (return/vol profile) and labeled calm / volatile /
-crisis so downstream UI never sees raw integer state ids. Persistence
+States are ordered by risk (return/vol profile) and labeled crisis / calm /
+bull so downstream UI never sees raw integer state ids. Persistence
 (day-over-day stability) is reported so consumers can distrust a flapping fit.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
@@ -32,16 +33,17 @@ CRASH_VETO_RET21 = -0.10
 
 
 def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
-    """Map raw HMM states to economic regime labels: crisis, calm (normal), and bull (expansion).
+    """Map raw HMM states to economic regime labels: crisis, calm, and bull.
 
-    States are mapped monotonically by signed volatility / economic growth:
-    1. Lowest signed volatility / deepest drawdown -> Crisis (bear markets, drawdowns, crash).
-    2. Middle signed volatility -> Calm (normal equilibrium above 200 DMA with lowest vol).
-    3. Highest signed volatility -> Bull Rally (strong upside momentum).
+    States are mapped monotonically by geometric CAGR (worst -> crisis,
+    middle -> calm, best -> bull). With a non-3-state fit there is no
+    crisis/calm/bull ordering, so states keep generic labels instead of
+    raising IndexError.
     """
-    if "signed_vol" in state_stats.columns:
-        sorted_indices = state_stats.sort_values("signed_vol").index.tolist()
-    elif "cagr" in state_stats.columns:
+    ids = [int(s) for s in state_stats.index.tolist()]
+    if len(ids) != 3:
+        return {s: f"state_{s}" for s in ids}
+    if "cagr" in state_stats.columns:
         sorted_indices = state_stats.sort_values("cagr").index.tolist()
     else:
         sorted_indices = state_stats.sort_values("ann_ret").index.tolist()
@@ -103,15 +105,17 @@ def classify(
     n_components: int = 3,
     is_returns: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Fit a Sticky-Prior Gaussian HMM over 21-day return and realized volatility.
+    """Fit a 3-state Gaussian HMM over 21-day return and realized volatility.
 
-    Econometric Architecture (Fox et al., 2011; Hamilton, 1989):
+    Architecture (Hamilton, 1989):
     1. Features:
        - 21-day log holding return: log(P_t / P_{t-21}).
        - 21-day realized volatility: rolling 21d std of daily returns, annualized.
-    2. Sticky Transition Prior (96% diagonal persistence):
-       - Enforces true regime persistence (mean duration 20-35 trading days).
-       - Eliminates high-frequency 1-day chattering between crisis and bull states.
+    2. Persistence-friendly initialization (96% diagonal transition matrix,
+       balanced start probabilities). These are EM starting values, not
+       fixed priors: Baum-Welch re-estimates them, and on NIFTY data the
+       fitted diagonal stays ≈0.96, i.e. the persistence is in the data.
+       (A sticky HDP-HMM in the Fox et al., 2011 sense is out of scope.)
     3. Compound CAGR & Realized Volatility:
        - Computes geometric CAGR for each state to eliminate arithmetic Jensen's inequality skew.
     """
@@ -302,7 +306,7 @@ async def detect_regime(
     else:
         bench_data = bench_df
 
-    result = await __import__("asyncio").to_thread(partial(classify, bench_data, n_components=3, is_returns=use_returns))
+    result = await asyncio.to_thread(partial(classify, bench_data, n_components=3, is_returns=use_returns))
     if result is None:
         raise ValueError("Regime classification produced no result")
 
@@ -311,9 +315,17 @@ async def detect_regime(
         all_regimes = result.pop("all_regimes")
         pr = portfolio_returns.dropna()
         # Ensure timezone-naive normalized dates for bulletproof intersection
-        pr.index = pd.to_datetime(pr.index).tz_localize(None).normalize()
+        # (tz_localize(None) raises on already-naive indexes in pandas 2.x,
+        # so only strip when tz-aware).
+        pr_idx = pd.to_datetime(pr.index)
+        if pr_idx.tz is not None:
+            pr_idx = pr_idx.tz_localize(None)
+        pr.index = pr_idx.normalize()
         reg_series = pd.Series(all_regimes)
-        reg_series.index = pd.to_datetime(reg_series.index).tz_localize(None).normalize()
+        reg_idx = pd.to_datetime(reg_series.index)
+        if reg_idx.tz is not None:
+            reg_idx = reg_idx.tz_localize(None)
+        reg_series.index = reg_idx.normalize()
         current = result["current_regime"]
         mask = reg_series == current
         common = pr.index.intersection(reg_series.index[mask])
