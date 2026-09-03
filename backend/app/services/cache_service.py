@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from app.models.database import AnalyticsCache, FetchLog
 from app.utils.logger import setup_logger
 
@@ -60,11 +60,25 @@ class CacheService:
         calculation_date: datetime,
         model_params: Dict[str, Any] = None
     ) -> None:
-        """Set cached analytics data"""
+        """Set cached analytics data (upsert on ticker+metric).
+
+        Replaces any existing row for the key instead of blind-inserting:
+        duplicates previously made `get_cached_analytics` raise
+        MultipleResultsFound (caught -> perpetual miss). Delete-then-insert
+        keeps this portable across SQLite/Postgres without requiring a
+        UNIQUE constraint migration (P1 follow-up: add UQ(ticker,
+        metric_name) + native ON CONFLICT upsert).
+        """
         try:
             # Calculate expiration
             expires_at = datetime.utcnow() + timedelta(minutes=self.ttl_minutes)
-            
+
+            await self.db.execute(
+                delete(AnalyticsCache).where(
+                    AnalyticsCache.ticker == ticker,
+                    AnalyticsCache.metric_name == metric_name,
+                )
+            )
             cache_entry = AnalyticsCache(
                 ticker=ticker,
                 metric_name=metric_name,
