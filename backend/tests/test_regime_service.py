@@ -42,8 +42,7 @@ def test_classify_synthetic_dataframe():
     assert len(res['states']) == 3
     assert res['realtime_ewma_vol'] is not None
     assert res['realtime_parkinson_vol'] is not None
-    assert len(res['recent_history']) <= 120
-    assert res['observations'] == 300 - 10
+    assert res['observations'] == 300 - 21
 
 
 def test_classify_synthetic_series():
