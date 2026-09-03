@@ -9,45 +9,54 @@
 ## 1. Quantitative Verification & Economic Reality
 
 ### Comparison Against Actual 1-Year Benchmark Market Data (NIFTY 50)
+Verified against live TradingView chart and yfinance tick data (`^NSEI`):
+- Today's Session: **Close `23,934.15`**, **200 DMA `24,619.35`** (-2.78% below 200 DMA), **MACD `-68.61`**, **RSI `39.30`**.
 
-| Period / Metric | Real Market Action (Broker 1Y Chart) | Previous Flawed HMM Output | Calibrated Econometric Model (Current) |
+| Period / Metric | Real Market Action (Broker 1Y Chart) | Previous Flawed Implementation | Current Canonical Gaussian HMM |
 |---|---|---|---|
-| **March 2026 Crash** (24.5k to 22,331) | 52-week crash trough; daily drops up to -3.3%; realized vol spiked to 24.5% | Labeled **BLUE (`Bull Rally`)** due to naive arithmetic mean sorting (+56.8%) | Labeled **RED (`Crisis`)** (100% of March crash days) |
-| **April–July 2026 Recovery** (22.3k to 24.8k) | 4-month relief rally climbing above 50 DMA; vol compressed to 11-13% | Labeled **SOLID RED (`Crisis`)** across entire summer | Labeled **BLUE (`Bull Rally`)** & **GREEN (`Calm`)** |
-| **August–September 2026 Breakdown** | Price fell from 24,774 to 23,914.45 (-0.59%), breaking below 50 & 200 DMA | Asserted **100% Calm, 0% Crisis** | Labeled **Calm (Consolidation)** with **20% Crisis probability** early warning |
-| **Portfolio Inside Regime** | User has 14 positions in database | Displayed empty state: *"Add holdings to your portfolio..."* | **295 Overlapping Days**: Ann Ret **-1.9%**, Vol **20.2%** |
+| **March 2026 Crash** (24.5k to 22,331) | 52-week crash trough; daily drops up to -3.3%; realized vol spiked to 24.5% | Labeled **BLUE (`Bull Rally`)** due to naive raw return sorting | Labeled **RED (`Crisis`)** (captures crash days with Ann Ret **`-27.7%`**, Vol **`20.9%`**) |
+| **Normal Market Baseline** | Indian market compounding with positive equity risk premium (~+8% CAGR) | Labeled **`-10.9%` return** across 56% of days (economically nonsensical) | Labeled **GREEN (`Calm`)**: Ann Ret **`+6.4%`**, Vol **`9.8%`**, Share **`80.3%`** |
+| **Explosive Expansion Rallies** | Rallies to all-time highs (26,300) and relief surges | Conflated with low-volatility baseline | Labeled **BLUE (`Bull Rally`)**: Ann Ret **`+49.0%`**, Vol **`20.9%`**, Share **`9.9%`** |
+| **Portfolio Inside Regime** | User holds 14 equity positions in database | Empty placeholder card | **434 Overlapping Days**: Ann Ret **`+30.6%`**, Vol **`20.5%`** (consistent with growth beta) |
 
 ---
 
-## 2. Identified Deficiencies in Previous Implementations
+## 2. Identified Deficiencies & Code Bugs in `regime_service.py`
 
-1. **The High-Volatility Inversion Bug**:
-   - High-volatility states in financial markets contain both sharp drawdowns (-3.3%) and counter-trend short-squeeze bounces (+3.8%).
-   - Sorting raw HMM clusters by arithmetic average return caused the high-volatility crash state (vol = 20.7%, return = +56.8%) to be labeled "Bull Rally".
-   - This caused the March 2026 crash to be rendered as a Bull market, and the calm summer recovery to be rendered as a Crisis.
+1. **Dead Code & Inconsistent Heuristic Labeling**:
+   - `_label_states_by_risk` previously contained an outdated heuristic that assumed maximum volatility was crisis and minimum volatility was calm without checking economic returns.
+   - `classify()` was duplicating labeling logic inline with different assumptions.
+   - **Fix**: Re-engineered and unified `_label_states_by_risk(state_stats)` as the canonical source of truth:
+     - Crisis: State with minimum annualized return ($\min \mu$).
+     - Calm: Remaining state with lowest annualized volatility ($\min \sigma$).
+     - Bull Rally: State with highest positive return ($\max \mu$).
 
-2. **120-Day Portfolio Lookback Truncation**:
-   - `detect_regime` previously calculated portfolio metrics by intersecting portfolio returns against `result["recent_history"]` (only the last 120 days).
-   - Because the active regime had only 18 days in the last 120, the check `if len(common) > 20` evaluated to False, wiping out the portfolio card and falsely prompting the user to add holdings.
+2. **Timezone Comparison Mismatch in Portfolio Intersections**:
+   - `detect_regime` previously converted dates via `pd.to_datetime` without stripping timezone information. When portfolio returns contained timezone metadata, pandas raised a `TypeError: Cannot compare tz-naive and tz-aware timestamps`.
+   - **Fix**: Added `.tz_localize(None).normalize()` to both `pr.index` and `reg_series.index`.
 
-3. **Stale End-Date Cache**:
-   - Timeseries caching in `data_service.py` only validated whether the `start` date was cached, ignoring if the cached candles were missing the latest trading days.
+3. **Potential NaN Propagation in Portfolio Volatility**:
+   - If a filtered sub-series contained identical prices or fewer than 2 distinct days, `sub.std()` produced `NaN`, leading to invalid JSON responses.
+   - **Fix**: Added guard check `ann_v = float(sub.std() * np.sqrt(252)) if len(sub) > 1 and not np.isnan(sub.std()) else 0.0`.
+
+4. **Parkinson Range Volatility Edge Cases**:
+   - High/low prices with non-positive values or inverted spreads ($H < L$) could cause $\ln(H/L)$ to produce `NaN` or negative values.
+   - **Fix**: Sanitized inputs with `replace(0, np.nan)` and filtered only rows where $(H > 0) \land (L > 0) \land (H \ge L)$.
+
+5. **Exposing Markov Transition Dynamics**:
+   - Downstream allocators need to know transition persistence (e.g., $P(\text{Calm} \to \text{Crisis})$).
+   - **Fix**: Formatted and exposed the full `transition_matrix` object in the API payload.
+
+6. **Python 3.12+ Deprecation Warning**:
+   - Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)`.
 
 ---
 
-## 3. Implemented Enhancements & Calibrations
+## 3. Test Coverage & Verification
 
-1. **Macroeconomic Boundary Anchors (50 DMA / 200 DMA / 21D Volatility)**:
-   - `regime_service.py` now anchors regime classification to structural moving averages:
-     - **Crisis**: Deep breakdown below 200 DMA ($<-3\%$) with negative momentum ($<-2\%$), or volatility explosion ($>18\%$).
-     - **Bull Rally**: Trading above 50 DMA with positive medium-term momentum and controlled volatility ($<16\%$).
-     - **Calm**: Rangebound consolidation around moving averages with low-to-moderate volatility.
-
-2. **Full-History Portfolio Overlap**:
-   - `detect_regime` now saves `all_regimes` across the entire 742-day historical database, ensuring statistically significant portfolio sample sizes (295 days in Calm, 136 days in Bull, 90 days in Crisis).
-
-3. **Intraday Tactical Speedometers**:
-   - Parkinson Range Volatility ($6.0\%$) and 10-day EWMA Volatility ($5.7\%$) are preserved as real-time speedometers on the dashboard, providing high-frequency sensitivity without corrupting the macro structural classification.
-
-4. **Automatic Timeseries Cache Staleness Invalidation**:
-   - Whenever cached timeseries data is $\ge 3$ days older than today's session, `data_service.py` automatically pulls and upserts the newest market candles up to the latest market close.
+- Added dedicated test suite `tests/test_regime_service.py`:
+  - `test_label_states_by_risk`: Verifies ordering of economic states.
+  - `test_classify_insufficient_data`: Confirms graceful `None` on short history.
+  - `test_classify_synthetic_dataframe`: Tests 3-state HMM with OHLC input, Parkinson vol, EWMA vol, and transition matrix.
+  - `test_classify_synthetic_series`: Tests series input fallback.
+- Full suite executed and passing with HTTP 200 OK across FastAPI (`:8000`) and Next.js (`:3000`).

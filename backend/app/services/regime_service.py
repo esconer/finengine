@@ -6,7 +6,7 @@ crisis so downstream UI never sees raw integer state ids. Persistence
 (day-over-day stability) is reported so consumers can distrust a flapping fit.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -18,7 +18,6 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 REGIME_LABELS_WORST_TO_BEST = ["crisis", "calm", "bull"]
-RISK_AVERSION_LAMBDA = 0.5
 MIN_OBSERVATIONS = 200
 
 
@@ -26,29 +25,17 @@ def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
     """Map raw HMM states to economic regime labels: crisis, calm (normal), and bull (expansion).
 
     In empirical asset pricing & regime-switching econometrics:
-    - Crisis / Shock: State with highest volatility (panic drawdowns, flash crashes, high dispersion).
-    - Calm: State with lowest volatility (steady, low-dispersion baseline equilibrium).
-    - Bull Rally: State with moderate volatility and positive economic drift / expansion.
+    1. Crisis: State with lowest annualized return (severe drawdowns, panic selloffs).
+    2. Calm: State with lowest annualized volatility among remaining (steady baseline equilibrium).
+    3. Bull Rally: State with highest annualized return / momentum expansion.
     """
-    mapping: Dict[int, str] = {}
-    remaining = set(state_stats.index)
-
-    # 1. Crisis is identified by highest volatility (stress / panic / crash regime)
-    crisis_id = int(state_stats["ann_vol"].idxmax())
-    mapping[crisis_id] = "crisis"
-    remaining.discard(crisis_id)
-
-    # 2. Calm is the state with the lowest annualized volatility (quiet equilibrium)
+    crisis_id = int(state_stats["ann_ret"].idxmin())
+    remaining = set(state_stats.index) - {crisis_id}
     rem_df = state_stats.loc[list(remaining)]
     calm_id = int(rem_df["ann_vol"].idxmin())
-    mapping[calm_id] = "calm"
-    remaining.discard(calm_id)
+    bull_id = int((remaining - {calm_id}).pop())
 
-    # 3. The remaining state is Bull (expansion drift)
-    bull_id = int(list(remaining)[0])
-    mapping[bull_id] = "bull"
-
-    return mapping
+    return {crisis_id: "crisis", calm_id: "calm", bull_id: "bull"}
 
 
 def classify(
@@ -82,11 +69,15 @@ def classify(
         # Real-time diagnostic overlays
         ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
         if high_col and low_col:
-            high = df[high_col].astype(float)
-            low = df[low_col].astype(float)
-            log_hl = np.log((high / low).clip(lower=1.00001))
-            parkinson_daily = np.sqrt((log_hl ** 2) / (4 * np.log(2))) * np.sqrt(252)
-            parkinson_vol = float(parkinson_daily.rolling(10, min_periods=3).mean().iloc[-1])
+            high = df[high_col].astype(float).replace(0, np.nan)
+            low = df[low_col].astype(float).replace(0, np.nan)
+            valid_hl = (high > 0) & (low > 0) & (high >= low)
+            if valid_hl.sum() >= 10:
+                log_hl = np.log((high[valid_hl] / low[valid_hl]).clip(lower=1.00001))
+                parkinson_daily = np.sqrt((log_hl ** 2) / (4 * np.log(2))) * np.sqrt(252)
+                parkinson_vol = float(parkinson_daily.rolling(10, min_periods=3).mean().iloc[-1])
+            else:
+                parkinson_vol = None
         else:
             parkinson_vol = None
     else:
@@ -131,17 +122,8 @@ def classify(
         })
     stats_df = pd.DataFrame(rows).set_index("state")
 
-    # Economically rigorous label mapping:
-    # 1. State with lowest return -> Crisis (severe crash, drawdowns)
-    # 2. State with lowest volatility -> Calm (normal equilibrium, positive steady return)
-    # 3. State with highest return -> Bull Rally (momentum expansion)
-    crisis_id = int(stats_df["ann_ret"].idxmin())
-    rem = set(stats_df.index) - {crisis_id}
-    rem_df = stats_df.loc[list(rem)]
-    calm_id = int(rem_df["ann_vol"].idxmin())
-    bull_id = int((rem - {calm_id}).pop())
-
-    label_map = {crisis_id: "crisis", calm_id: "calm", bull_id: "bull"}
+    # Economically rigorous label mapping
+    label_map = _label_states_by_risk(stats_df)
 
     flips = (np.diff(states) != 0).mean()
     stability = round(float((1.0 - flips) * 100), 1)
@@ -150,6 +132,15 @@ def classify(
         label_map[int(s)]: round(float(posteriors[-1, s]) * 100, 1)
         for s in range(n_components)
     }
+
+    # Extract Markov transition matrix
+    transition_matrix = {}
+    for i in range(n_components):
+        from_lbl = label_map[int(i)]
+        transition_matrix[from_lbl] = {
+            label_map[int(j)]: round(float(hmm.transmat_[i, j]) * 100, 1)
+            for j in range(n_components)
+        }
 
     history = [
         {"date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10], "regime": label_map[int(s)]}
@@ -166,6 +157,7 @@ def classify(
         "current_regime": label_map[int(states[-1])],
         "stability_pct": stability,
         "regime_probabilities": current_probs,
+        "transition_matrix": transition_matrix,
         "realtime_ewma_vol": round(ewma_vol, 4) if ewma_vol is not None else None,
         "realtime_parkinson_vol": round(parkinson_vol, 4) if parkinson_vol is not None else None,
         "states": [
@@ -181,8 +173,6 @@ def classify(
         "all_regimes": all_regimes,
         "observations": int(len(common)),
     }
-
-
 
 
 async def detect_regime(
@@ -212,21 +202,24 @@ async def detect_regime(
     if portfolio_returns is not None and "all_regimes" in result:
         all_regimes = result.pop("all_regimes")
         pr = portfolio_returns.dropna()
-        pr.index = pd.to_datetime(pr.index)
+        # Ensure timezone-naive normalized dates for bulletproof intersection
+        pr.index = pd.to_datetime(pr.index).tz_localize(None).normalize()
         reg_series = pd.Series(all_regimes)
-        reg_series.index = pd.to_datetime(reg_series.index)
+        reg_series.index = pd.to_datetime(reg_series.index).tz_localize(None).normalize()
         current = result["current_regime"]
         mask = reg_series == current
         common = pr.index.intersection(reg_series.index[mask])
         if len(common) >= 5:
             sub = pr.loc[common]
+            ann_v = float(sub.std() * np.sqrt(252)) if len(sub) > 1 and not np.isnan(sub.std()) else 0.0
             result["portfolio_in_current_regime"] = {
                 "days": int(len(common)),
                 "ann_ret": round(float(sub.mean() * 252), 4),
-                "ann_vol": round(float(sub.std() * np.sqrt(252)), 4),
+                "ann_vol": round(ann_v, 4),
             }
     elif "all_regimes" in result:
         result.pop("all_regimes")
 
-    result["generated_at"] = datetime.utcnow().isoformat()
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
     return result
+
