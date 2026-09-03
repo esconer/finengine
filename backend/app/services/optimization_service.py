@@ -43,9 +43,31 @@ def _as_matrices(returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndar
     return mu, cov, list(returns.columns)
 
 
+def _cluster_var(cov_ord: np.ndarray, items: list[int]) -> float:
+    """Inverse-variance-weighted cluster variance for HRP bisection.
+
+    Lopez de Prado (2016): allocate between sibling clusters in inverse
+    proportion to their aggregated variances, where each cluster's variance
+    is computed under its own inverse-variance (IVP) allocation.
+    """
+    sub = cov_ord[np.ix_(items, items)]
+    diag = np.diag(sub)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ivp = 1.0 / diag
+    ivp = np.where(np.isfinite(ivp) & (ivp > 0), ivp, np.nan)
+    if np.isnan(ivp).all():
+        ivp = np.ones(len(items)) / len(items)
+    else:
+        ivp = np.where(np.isnan(ivp), 0.0, ivp)
+        total = ivp.sum()
+        ivp = ivp / total if total > 0 else np.ones(len(items)) / len(items)
+    return float(ivp @ sub @ ivp)
+
+
 def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
     """Lopez de Prado HRP via public scipy APIs only."""
-    corr = returns.corr()
+    corr = returns.corr().fillna(0.0)
+    np.fill_diagonal(corr.values, 1.0)
     # distance matrix for linkage: sqrt(0.5 * (1 - r))
     dist = np.sqrt(np.clip(0.5 * (1.0 - corr.values), 0.0, 1.0))
     condensed = squareform(dist, checks=False)
@@ -74,28 +96,38 @@ def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
     ordered = _quasi_diag(link)
     labels = corr.index[ordered].tolist()
 
-    cov = returns.cov().loc[labels, labels].values
-    ivp = 1.0 / np.diag(cov)
-    ivp /= ivp.sum()
-    weights = pd.Series(ivp, index=labels)
+    cov_ord = np.asarray(returns.cov().loc[labels, labels].values, dtype=float)
+    cov_ord = np.where(np.isfinite(cov_ord), cov_ord, 0.0)
+    variances = np.diag(cov_ord)
+    valid = variances[np.isfinite(variances) & (variances > 1e-12)]
+    fill = float(np.mean(valid)) if valid.size else 1.0
+    variances = np.where(np.isfinite(variances) & (variances > 1e-12), variances, fill)
+    np.fill_diagonal(cov_ord, variances)
 
-    clusters = [labels]
-    while len(clusters) > 0:
-        clusters = [
-            j
-            for i in clusters
-            for j in ([i[k : k + len(i) // 2] for k in range(0, len(i), len(i) // 2)])
-            if len(j) > 1
-        ]
-        for sub in range(0, len(clusters), 2):
-            left = clusters[sub]
-            right = clusters[sub + 1]
-            w_left = weights[left].sum()
-            w_right = weights[right].sum()
-            denom = w_left + w_right
-            if denom > 0:
-                weights.loc[left] *= 1 - w_left / denom
-                weights.loc[right] *= 1 - w_right / denom
+    weights = pd.Series(1.0, index=labels)
+
+    clusters: list[list[int]] = [list(range(len(labels)))]
+    while clusters:
+        nxt: list[list[int]] = []
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            mid = len(cluster) // 2
+            left, right = cluster[:mid], cluster[mid:]
+            var_left = _cluster_var(cov_ord, left)
+            var_right = _cluster_var(cov_ord, right)
+            denom = var_left + var_right
+            if not np.isfinite(denom) or denom <= 0:
+                alpha = 0.5
+            else:
+                alpha = 1.0 - var_left / denom
+            weights.iloc[left] *= alpha
+            weights.iloc[right] *= (1.0 - alpha)
+            if len(left) > 1:
+                nxt.append(left)
+            if len(right) > 1:
+                nxt.append(right)
+        clusters = nxt
 
     return weights / weights.sum()
 
