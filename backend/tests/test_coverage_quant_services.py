@@ -46,9 +46,8 @@ def _sample_prices(days=300):
 class TestTailRiskService:
     def test_evt_pot_var_es_basic_and_fallback(self):
         short_series = pd.Series([0.01, -0.02, 0.005])
-        res_short = TailRiskService.calculate_evt_pot_var_es(short_series)
-        assert res_short["total_observations"] == 3
-        assert res_short["evt_pot_var_99"] < 0
+        with pytest.raises(ValueError, match="Insufficient observations"):
+            TailRiskService.calculate_evt_pot_var_es(short_series)
 
         rets = pd.Series(np.random.normal(0.0002, 0.02, 300))
         res = TailRiskService.calculate_evt_pot_var_es(rets, confidence_level=0.99, threshold_quantile=0.95)
