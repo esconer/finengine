@@ -5,6 +5,7 @@ Ornstein-Uhlenbeck (OU) mean-reversion speed/half-life, spread z-scores, and cac
 """
 
 from datetime import datetime, timedelta
+from hashlib import sha1
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -23,6 +24,20 @@ logger = setup_logger(__name__)
 # In-memory TTL cache for cointegration computations
 _IN_MEMORY_COINT_CACHE: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
 CACHE_TTL_HOURS = 24
+
+# DB cache namespace. AnalyticsCache.ticker is String(10) and metric_name is
+# String(50), so full tickers cannot be embedded: the pair identity is a
+# stable sha1 digest of "A|B" (order-sensitive; scan_pairs emits sorted
+# combos so keys are canonical). Previously f"{a[:4]}_{b[:4]}" collided
+# (e.g. RELIANCE/RELCAP) and metric coint_{date} was shared by every pair,
+# so each write evicted all other pairs of the day (last-write-wins).
+COINT_DB_TICKER = "COINT"
+
+
+def _db_cache_keys(ticker_a: str, ticker_b: str, last_date: str) -> Tuple[str, str]:
+    """Collision-free (ticker, metric_name) for a pair-day within column sizes."""
+    digest = sha1(f"{ticker_a}|{ticker_b}".encode("utf-8")).hexdigest()[:8]
+    return COINT_DB_TICKER, f"coint_{digest}_{last_date}"
 
 
 def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
@@ -246,9 +261,10 @@ class CointegrationService:
         # 2. Database check
         if self.cache_service is not None:
             try:
+                db_ticker, metric_name = _db_cache_keys(ticker_a, ticker_b, last_date)
                 cached = await self.cache_service.get_cached_analytics(
-                    ticker=f"{ticker_a[:4]}_{ticker_b[:4]}",
-                    metric_name=f"coint_{last_date}",
+                    ticker=db_ticker,
+                    metric_name=metric_name,
                 )
                 if cached and cached.get("model_params"):
                     pair_data = cached["model_params"]
@@ -278,9 +294,10 @@ class CointegrationService:
         # 2. Database store
         if self.cache_service is not None:
             try:
+                db_ticker, metric_name = _db_cache_keys(ticker_a, ticker_b, last_date)
                 await self.cache_service.set_cached_analytics(
-                    ticker=f"{ticker_a[:4]}_{ticker_b[:4]}",
-                    metric_name=f"coint_{last_date}",
+                    ticker=db_ticker,
+                    metric_name=metric_name,
                     metric_value=float(result.engle_granger_pvalue),
                     calculation_date=datetime.utcnow(),
                     model_params=pair_dict,
