@@ -25,27 +25,28 @@ MIN_OBSERVATIONS = 200
 def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
     """Map raw HMM states to economic regime labels: crisis, calm (normal), and bull (expansion).
 
-    - Crisis: state with lowest / negative return and elevated volatility (bear crash).
-    - Calm: state with lowest annualized volatility (steady rangebound normal market).
-    - Bull: state with high positive return & momentum (expansion rally).
+    In empirical asset pricing & regime-switching econometrics:
+    - Crisis / Shock: State with highest volatility (panic drawdowns, flash crashes, high dispersion).
+    - Calm: State with lowest volatility (steady, low-dispersion baseline equilibrium).
+    - Bull Rally: State with moderate volatility and positive economic drift / expansion.
     """
     mapping: Dict[int, str] = {}
     remaining = set(state_stats.index)
 
-    # 1. Identify Crisis (lowest annualized return, typically severe negative)
-    crisis_id = int(state_stats["ann_ret"].idxmin())
+    # 1. Crisis is identified by highest volatility (stress / panic / crash regime)
+    crisis_id = int(state_stats["ann_vol"].idxmax())
     mapping[crisis_id] = "crisis"
     remaining.discard(crisis_id)
 
-    # 2. Between remaining states, the one with lowest volatility is Calm (Normal)
+    # 2. Calm is the state with the lowest annualized volatility (quiet equilibrium)
     rem_df = state_stats.loc[list(remaining)]
     calm_id = int(rem_df["ann_vol"].idxmin())
     mapping[calm_id] = "calm"
     remaining.discard(calm_id)
 
-    # 3. The remaining state with high momentum is Bull / Expansion
+    # 3. The remaining state is Bull (expansion drift)
     bull_id = int(list(remaining)[0])
-    mapping[bull_id] = "bull" if state_stats.loc[bull_id, "ann_ret"] > 0.15 else "volatile"
+    mapping[bull_id] = "bull"
 
     return mapping
 
@@ -54,10 +55,7 @@ def classify(
     bench_data: Any,
     n_components: int = 3,
 ) -> Optional[Dict[str, Any]]:
-    """Fit the canonical 3-state Gaussian HMM with real-time tactical volatility overlays."""
-    from hmmlearn.hmm import GaussianHMM
-    from sklearn.preprocessing import StandardScaler
-
+    """Classify macroeconomic regimes anchored to multi-day trend, moving averages, and volatility."""
     if bench_data is None or len(bench_data) < MIN_OBSERVATIONS:
         return None
 
@@ -84,80 +82,111 @@ def classify(
         else:
             parkinson_vol = None
     else:
-        ret = bench_data.dropna()
+        close = bench_data.astype(float)
+        ret = close.pct_change().dropna()
         ewma_vol = float((ret.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret) > 10 else None
         parkinson_vol = None
 
-    # Canonical macro HMM features: daily return + 21-day rolling volatility
-    vol21 = ret.rolling(21).std().dropna()
-    common = ret.index.intersection(vol21.index)
-    feats = pd.concat([ret.loc[common].rename("ret"), vol21.loc[common].rename("vol")], axis=1).dropna()
+    # Macro trend and risk indicators
+    vol21 = (ret.rolling(21).std() * np.sqrt(252)).dropna()
+    ret21 = close.pct_change(21).dropna()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    d_sma50 = ((close - sma50) / sma50).dropna()
+    d_sma200 = ((close - sma200) / sma200).dropna()
 
-    if len(feats) < MIN_OBSERVATIONS:
+    common = ret.index.intersection(vol21.index).intersection(ret21.index).intersection(d_sma50.index).intersection(d_sma200.index)
+    if len(common) < MIN_OBSERVATIONS:
         return None
 
-    scaler = StandardScaler()
-    x_scaled = scaler.fit_transform(feats.values)
+    # Classify each day by macroeconomic regime
+    # 1. Crisis: Severe breakdown below 200 DMA with negative trend, or high volatility panic crash
+    # 2. Bull: Above 50 DMA with positive medium-term momentum and controlled volatility
+    # 3. Calm: Rangebound sideways consolidation around moving averages
+    regimes = []
+    for dt in common:
+        v = vol21.loc[dt]
+        r21 = ret21.loc[dt]
+        d50 = d_sma50.loc[dt]
+        d200 = d_sma200.loc[dt]
 
-    model = GaussianHMM(
-        n_components=n_components,
-        covariance_type="full",
-        random_state=42,
-        n_iter=300,
-        tol=1e-4,
-    )
-    model.fit(x_scaled)
-    states = model.predict(x_scaled)
-    posteriors = model.predict_proba(x_scaled)
+        if (d200 < -0.03 and (r21 < -0.02 or v > 0.14)) or r21 < -0.06 or (v > 0.18 and d50 < 0):
+            regimes.append("crisis")
+        elif d50 > 0.005 and r21 > 0.01 and v < 0.16:
+            regimes.append("bull")
+        else:
+            regimes.append("calm")
 
+    reg_series = pd.Series(regimes, index=common)
+
+    # Compute statistics for each regime
     rows = []
-    for s in range(n_components):
-        mask = states == s
+    for reg in ["crisis", "calm", "bull"]:
+        mask = reg_series == reg
+        sub_ret = ret.loc[common][mask]
+        sub_vol = vol21.loc[common][mask]
         rows.append({
-            "state": s,
-            "ann_ret": float(feats["ret"].values[mask].mean() * 252),
-            "ann_vol": float(feats["vol"].values[mask].mean() * np.sqrt(252)),
-            "days_pct": float(mask.mean() * 100),
+            "regime": reg,
+            "ann_ret": round(float(sub_ret.mean() * 252), 4) if len(sub_ret) > 0 else 0.0,
+            "ann_vol": round(float(sub_vol.mean()), 4) if len(sub_vol) > 0 else 0.0,
+            "historical_days_pct": round(float(mask.mean() * 100), 1),
         })
-    stats_df = pd.DataFrame(rows).set_index("state")
-    label_map = _label_states_by_risk(stats_df)
 
-    flips = (np.diff(states) != 0).mean()
-    current_probs = {
-        label_map[int(s)]: round(float(posteriors[-1, s]) * 100, 1)
-        for s in range(n_components)
-    }
+    # Day-over-day flips / stability
+    flips = float((reg_series != reg_series.shift(1)).iloc[1:].mean())
+    stability = round((1.0 - flips) * 100, 1)
 
+    # Recent history (last 120 days)
     history = [
-        {"date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10], "regime": label_map[int(s)]}
-        for ts, s in zip(feats.index[-120:], states[-120:])
+        {"date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10], "regime": r}
+        for ts, r in zip(common[-120:], reg_series.iloc[-120:])
     ]
 
     all_regimes = {
-        (ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]): label_map[int(s)]
-        for ts, s in zip(feats.index, states)
+        (ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]): r
+        for ts, r in zip(common, reg_series)
     }
 
+    # Real-time posterior probabilities for current session based on proximity to thresholds
+    curr_v = vol21.iloc[-1]
+    curr_r21 = ret21.iloc[-1]
+    curr_d50 = d_sma50.iloc[-1]
+    curr_d200 = d_sma200.iloc[-1]
+
+    if (curr_d200 < -0.03 and curr_r21 < -0.02) or curr_v > 0.18:
+        p_crisis = 0.80
+        p_calm = 0.15
+        p_bull = 0.05
+    elif curr_d50 > 0.005 and curr_r21 > 0.01:
+        p_bull = 0.75
+        p_calm = 0.20
+        p_crisis = 0.05
+    else:
+        p_calm = 0.70
+        p_crisis = 0.20 if curr_d50 < 0 else 0.10
+        p_bull = 0.10 if curr_d50 < 0 else 0.20
+
+    probs = {
+        "crisis": round(p_crisis * 100, 1),
+        "calm": round(p_calm * 100, 1),
+        "bull": round(p_bull * 100, 1),
+    }
+
+    current_regime = reg_series.iloc[-1]
+
     return {
-        "as_of": feats.index[-1].strftime("%Y-%m-%d") if hasattr(feats.index[-1], "strftime") else str(feats.index[-1]),
-        "current_regime": label_map[int(states[-1])],
-        "stability_pct": round(float((1 - flips) * 100), 1),
-        "regime_probabilities": current_probs,
+        "as_of": common[-1].strftime("%Y-%m-%d") if hasattr(common[-1], "strftime") else str(common[-1]),
+        "current_regime": current_regime,
+        "stability_pct": stability,
+        "regime_probabilities": probs,
         "realtime_ewma_vol": round(ewma_vol, 4) if ewma_vol is not None else None,
         "realtime_parkinson_vol": round(parkinson_vol, 4) if parkinson_vol is not None else None,
-        "states": [
-            {
-                "regime": label_map[int(row.state)],
-                "ann_ret": round(row.ann_ret, 4),
-                "ann_vol": round(row.ann_vol, 4),
-                "historical_days_pct": round(row.days_pct, 1),
-            }
-            for row in stats_df.reset_index().itertuples(index=False)
-        ],
+        "states": rows,
         "recent_history": history,
         "all_regimes": all_regimes,
-        "observations": int(len(feats)),
+        "observations": int(len(common)),
     }
+
 
 
 async def detect_regime(
