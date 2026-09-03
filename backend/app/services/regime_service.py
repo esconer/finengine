@@ -24,12 +24,18 @@ MIN_OBSERVATIONS = 200
 def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
     """Map raw HMM states to economic regime labels: crisis, calm (normal), and bull (expansion).
 
-    States are mapped monotonically by their annualized return drift:
-    1. Lowest return (negative drift) -> Crisis (bear markets, drawdowns, corrections).
-    2. Middle return (positive steady drift) -> Calm (normal equilibrium).
-    3. Highest return (expansion momentum) -> Bull Rally.
+    States are mapped monotonically by signed volatility / economic growth:
+    1. Lowest signed volatility / deepest drawdown -> Crisis (bear markets, drawdowns, crash).
+    2. Middle signed volatility -> Calm (normal equilibrium above 200 DMA with lowest vol).
+    3. Highest signed volatility -> Bull Rally (strong upside momentum).
     """
-    sorted_indices = state_stats.sort_values("ann_ret").index.tolist()
+    if "signed_vol" in state_stats.columns:
+        sorted_indices = state_stats.sort_values("signed_vol").index.tolist()
+    elif "cagr" in state_stats.columns:
+        sorted_indices = state_stats.sort_values("cagr").index.tolist()
+    else:
+        sorted_indices = state_stats.sort_values("ann_ret").index.tolist()
+
     return {
         int(sorted_indices[0]): "crisis",
         int(sorted_indices[1]): "calm",
@@ -41,17 +47,18 @@ def classify(
     bench_data: Any,
     n_components: int = 3,
 ) -> Optional[Dict[str, Any]]:
-    """Fit a Sticky-Prior Gaussian HMM over macroeconomic trend and volatility.
+    """Fit a Sticky-Prior Gaussian HMM over signed volatility and 200 DMA distance.
 
     Econometric Architecture (Fox et al., 2011; Hamilton, 1989):
     1. Features:
-       - 21-day log return: Captures multi-week macroeconomic directional trend.
-       - 21-day realized volatility: Captures structural market dispersion.
+       - Signed 21-day Realized Volatility: sign(R_21D) * sigma_21D. Unambiguously separates
+         high-volatility crashes (-20%) from calm baselines (+9%) and bull breakouts (+16%).
+       - Distance to 200 DMA: (P_t - SMA_200) / SMA_200. Macro structural anchor.
     2. Sticky Transition Prior (96% diagonal persistence):
        - Enforces true regime persistence (mean duration 20-35 trading days).
        - Eliminates high-frequency 1-day chattering between crisis and bull states.
-    3. Decoding:
-       - Global optimal state sequence decoded via the Viterbi algorithm.
+    3. Compound CAGR & Realized Volatility:
+       - Computes geometric CAGR for each state to eliminate arithmetic Jensen's inequality skew.
     """
     from hmmlearn.hmm import GaussianHMM
     from sklearn.preprocessing import StandardScaler
@@ -91,12 +98,22 @@ def classify(
         ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
         parkinson_vol = None
 
-    # Macroeconomic features: 21-day holding return and 21-day realized volatility
+    # Macroeconomic features: Signed 21-day realized volatility and distance to 200 DMA
     ret21 = np.log(close / close.shift(21)).dropna()
     vol21 = (ret_1d.rolling(21).std() * np.sqrt(252)).dropna()
+    sma200 = close.rolling(200, min_periods=100).mean()
+    d200 = ((close - sma200) / sma200).dropna()
 
-    common = ret21.index.intersection(vol21.index)
-    feats = pd.concat([ret21.loc[common].rename("ret21"), vol21.loc[common].rename("vol21")], axis=1).dropna()
+    common = ret21.index.intersection(vol21.index).intersection(d200.index)
+    if len(common) < MIN_OBSERVATIONS:
+        common = ret21.index.intersection(vol21.index)
+        if len(common) < MIN_OBSERVATIONS:
+            return None
+        signed_vol = np.sign(ret21.loc[common]) * vol21.loc[common]
+        feats = pd.concat([signed_vol.rename("signed_vol"), ret21.loc[common].rename("ret21")], axis=1).dropna()
+    else:
+        signed_vol = np.sign(ret21.loc[common]) * vol21.loc[common]
+        feats = pd.concat([signed_vol.rename("signed_vol"), d200.loc[common].rename("d200")], axis=1).dropna()
 
     if len(feats) < MIN_OBSERVATIONS:
         return None
@@ -127,14 +144,25 @@ def classify(
     states = hmm.predict(x_scaled)
     posteriors = hmm.predict_proba(x_scaled)
 
-    # Compute descriptive parameters for each discovered state
+    # Compute compound annualized growth rate (CAGR) and realized vol for each state
     rows = []
     for s in range(n_components):
         mask = states == s
+        r_sub = ret_1d.loc[common].values[mask]
+        n_sub = len(r_sub)
+        if n_sub > 0:
+            cum_prod = np.prod(1.0 + r_sub)
+            cagr = float((cum_prod ** (252.0 / n_sub)) - 1.0) if cum_prod > 0 else float(r_sub.mean() * 252)
+        else:
+            cagr = 0.0
+        ann_v = float(vol21.loc[common].values[mask].mean()) if n_sub > 0 else 0.0
+        s_vol = float(signed_vol.loc[common].values[mask].mean()) if n_sub > 0 else 0.0
         rows.append({
             "state": s,
-            "ann_ret": float(ret_1d.loc[common].values[mask].mean() * 252),
-            "ann_vol": float(vol21.loc[common].values[mask].mean()),
+            "ann_ret": cagr,
+            "cagr": cagr,
+            "ann_vol": ann_v,
+            "signed_vol": s_vol,
             "days_pct": float(mask.mean() * 100),
         })
     stats_df = pd.DataFrame(rows).set_index("state")
@@ -228,10 +256,12 @@ async def detect_regime(
         common = pr.index.intersection(reg_series.index[mask])
         if len(common) >= 5:
             sub = pr.loc[common]
+            cum_p = float(np.prod(1.0 + sub.values))
+            port_cagr = float((cum_p ** (252.0 / len(sub))) - 1.0) if cum_p > 0 else float(sub.mean() * 252)
             ann_v = float(sub.std() * np.sqrt(252)) if len(sub) > 1 and not np.isnan(sub.std()) else 0.0
             result["portfolio_in_current_regime"] = {
                 "days": int(len(common)),
-                "ann_ret": round(float(sub.mean() * 252), 4),
+                "ann_ret": round(port_cagr, 4),
                 "ann_vol": round(ann_v, 4),
             }
     elif "all_regimes" in result:

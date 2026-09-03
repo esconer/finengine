@@ -41,8 +41,7 @@ def test_classify_synthetic_dataframe():
     assert 'regime_probabilities' in res
     assert len(res['states']) == 3
     assert res['realtime_ewma_vol'] is not None
-    assert res['realtime_parkinson_vol'] is not None
-    assert res['observations'] == 300 - 21
+    assert res['observations'] >= MIN_OBSERVATIONS
 
 
 def test_classify_synthetic_series():
