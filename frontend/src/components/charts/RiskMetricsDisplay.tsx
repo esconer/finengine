@@ -16,8 +16,8 @@ import {
 interface RiskMetricsData {
   risk_score: number;
   risk_level: string;
-  annual_volatility: number;
-  sharpe_ratio: number;
+  annual_volatility: number | null;
+  sharpe_ratio: number | null;
   max_drawdown: number;
   var_95: number;
   cvar_95: number;
@@ -146,7 +146,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
 
         <MetricCard
           title="Sharpe Ratio"
-          value={metrics.sharpe_ratio.toFixed(2)}
+          value={metrics.sharpe_ratio === null || metrics.sharpe_ratio === undefined ? 'N/A' : metrics.sharpe_ratio.toFixed(2)}
           icon={Target}
           loading={loading}
         />

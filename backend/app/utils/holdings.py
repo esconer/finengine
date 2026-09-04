@@ -3,15 +3,16 @@ Holding-aware helpers: realized analytics must never attribute pre-purchase
 price action to the portfolio.
 
 A portfolio bulk-imported 7 days ago has 7 days of true history, even when
-the requested window spans a year. Every helper here is pure (no DB, no I/O)
-except resolve_holding_starts; all are deterministic and unit-tested.
+the requested window spans a year. `resolve_holdings` (DB layer) lives in
+`app/api/analytics.py`; everything else here is pure, deterministic and
+unit-tested.
 
 Deliberately NOT applied to hypothetical tools (optimize, backtest,
 monte-carlo, stress-test, scenario, universe scans): those model "what if we
 held X", where full-history simulation is the documented assumption.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,26 +28,118 @@ def effective_start(active_from: Optional[Dict[str, Optional[str]]]) -> Optional
 
     Intersection semantics: the current composition only existed since the
     most recently added position. Ad-hoc tickers (not in DB) carry None and
-    never constrain the window — their paths stay hypothetical.
+    never constrain the window — those paths stay hypothetical.
     """
     known = [d for d in (active_from or {}).values() if d]
     return max(known) if known else None
 
 
-def mask_to_holding(frame: pd.DataFrame, active_from: Optional[Dict[str, Optional[str]]]) -> pd.DataFrame:
-    """Drop rows before the current composition existed. No-op when unknown.
+def implied_start_from_price(
+    price_series: Optional[pd.Series],
+    buy_price: Any,
+    added_on: Optional[str],
+    tolerance: float = 0.02,
+) -> Optional[str]:
+    """Most recent pre-import date when close was within tolerance of buy_price.
 
-    Only applies to DatetimeIndex frames; anything else passes through
-    untouched (documented, never guessed).
+    Import stamps (`added_on`) reset on delete+re-import while users re-type
+    the original cost basis, so `added_on` alone backdates young rows and
+    forward-dates old ones. The buy-implied date repairs the old-holding
+    case; biased toward understating (most-recent match wins). Returns None
+    when buy_price is missing/invalid, no bar matches, or splits/dividends
+    broke comparability (unadjusted cost vs adjusted closes) — callers fall
+    back to `added_on`.
     """
-    if frame is None or frame.empty:
-        return frame
-    eff = effective_start(active_from)
-    if eff is None or not isinstance(frame.index, pd.DatetimeIndex):
-        return frame
-    cutoff = pd.Timestamp(eff).normalize()
-    mask = frame.index.normalize() >= cutoff
-    return frame.loc[mask]
+    try:
+        target = float(buy_price)
+    except (TypeError, ValueError):
+        return None
+    if not target or target <= 0 or price_series is None or len(price_series) == 0:
+        return None
+    try:
+        frame = pd.DataFrame({"close": pd.to_numeric(price_series, errors="coerce")})
+        frame.index = pd.to_datetime(price_series.index, errors="coerce")
+        frame = frame.dropna()
+        if getattr(frame.index, "tz", None) is not None:
+            frame.index = frame.index.tz_localize(None)
+        frame.index = frame.index.normalize()
+        if added_on is not None:
+            cutoff = pd.Timestamp(added_on).normalize()
+            frame = frame[frame.index < cutoff]
+        rel = (frame["close"] - target).abs() / target
+        hits = frame[rel <= tolerance]
+        if hits.empty:
+            return None
+        return hits.index.max().date().isoformat()
+    except Exception:
+        return None
+
+
+def effective_starts(
+    holdings: Optional[Dict[str, Dict[str, Any]]],
+    frames: Optional[Dict[str, pd.Series]],
+    tolerance: float = 0.02,
+) -> Dict[str, Optional[str]]:
+    """Per-ticker effective start = min(added_on, buy-implied), or None.
+
+    `holdings` maps ticker -> {"added_on": ISO|None, "buy_price": float|None};
+    `frames` maps ticker -> raw (unfilled) price series. Tickers missing from
+    either map keep whatever date is known (usually just `added_on`).
+    """
+    out: Dict[str, Optional[str]] = {}
+    for ticker, info in (holdings or {}).items():
+        info = info or {}
+        added = info.get("added_on")
+        implied = None
+        if frames is not None and ticker in frames:
+            implied = implied_start_from_price(frames[ticker], info.get("buy_price"), added, tolerance)
+        cands = [d for d in (added, implied) if d]
+        out[ticker] = min(cands) if cands else None
+    return out
+
+
+def holding_window(
+    price_data_dict: Optional[Dict[str, pd.Series]],
+    holdings: Optional[Dict[str, Dict[str, Any]]],
+) -> Tuple[Dict[str, pd.Series], Dict[str, Optional[str]]]:
+    """Mask every series to the shared effective start (intersection).
+
+    Returns (masked dict, per-ticker effective starts). Empty when nothing
+    held in-window. The cutoff applies to the whole dict: portfolio math
+    needs aligned dates, so a hypothetical ticker analyzed alongside owned
+    holdings shares the owned window. Pure ad-hoc calls (holdings empty)
+    pass through fully hypothetical.
+    """
+    effectives = effective_starts(holdings, price_data_dict)
+    eff = effective_start(effectives)
+    if not price_data_dict:
+        return {}, effectives
+    if eff is None:
+        return dict(price_data_dict), effectives
+    try:
+        cutoff = pd.Timestamp(eff).normalize()
+    except Exception:
+        return dict(price_data_dict), effectives
+    masked: Dict[str, pd.Series] = {}
+    for ticker, series in price_data_dict.items():
+        if series is None or len(series) == 0:
+            continue
+        if not isinstance(series.index, pd.DatetimeIndex):
+            # Dateless frames carry no holding information: pass through
+            # untouched (same rule as mask_to_holding), never guessed.
+            masked[ticker] = series
+            continue
+        try:
+            idx = series.index
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+            keep = idx.normalize() >= cutoff  # ndarray bool mask
+            s = series.loc[keep]
+            if len(s):
+                masked[ticker] = s
+        except Exception:
+            masked[ticker] = series
+    return masked, effectives
 
 
 def holding_coverage(

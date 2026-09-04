@@ -9,6 +9,7 @@
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
+import { useUIStore } from '@/lib/store';
 import {
   PieChart,
   AlertTriangle,
@@ -256,6 +257,7 @@ export default function RiskContributionPage() {
     try {
       const result = await analyticsApi.getRiskContribution();
       setData(result);
+      useUIStore.getState().updateLastUpdated();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load risk contribution data');
     } finally {

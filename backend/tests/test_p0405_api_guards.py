@@ -69,7 +69,7 @@ async def test_delivery_anomalies_empty_portfolio_no_crash():
 
 async def test_monte_carlo_initial_value_qty_price_fallback():
     rets = pd.Series([0.001] * 100)
-    with patch("app.api.analytics._build_wide_returns", new=AsyncMock(return_value=(None, rets))), \
+    with patch("app.api.analytics._build_wide_returns", new=AsyncMock(return_value=(None, rets, {}))), \
          patch("app.api.analytics.simulate_goal", return_value={"ok": True}) as sim:
         await run_monte_carlo(
             body={"target_value": 20000.0, "horizon_years": 3},
@@ -92,7 +92,7 @@ async def test_monte_carlo_num_paths_clamped():
         body = {"target_value": 20000.0, "horizon_years": 3, "initial_value": 10000.0}
         if n is not None:
             body["num_paths"] = n
-        with patch("app.api.analytics._build_wide_returns", new=AsyncMock(return_value=(None, rets))), \
+        with patch("app.api.analytics._build_wide_returns", new=AsyncMock(return_value=(None, rets, {}))), \
              patch("app.api.analytics.simulate_goal", side_effect=_fake_sim):
             await run_monte_carlo(body=body, tickers="TCS.NS", db=_mock_db([_pos()]), data_service=Mock())
 

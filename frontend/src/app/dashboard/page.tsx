@@ -113,8 +113,8 @@ export default function DashboardSummary() {
     averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
     topSector: sectorData.length > 0 ? sectorData[0]?.name || 'N/A' : 'N/A',
     riskScore: analyticsData.riskScore?.overall_score || 0,
-    volatility: analyticsData.summary?.realized_volatility || 0,
-    sharpeRatio: analyticsData.summary?.sharpe_ratio || 0,
+    volatility: analyticsData.summary?.realized_volatility ?? null,
+    sharpeRatio: analyticsData.summary?.sharpe_ratio ?? null,
     maxDrawdown: analyticsData.summary?.max_drawdown || 0,
     diversificationScore,
   };
@@ -310,7 +310,7 @@ export default function DashboardSummary() {
         />
         <MetricCard
           title="Annual Volatility"
-          value={`${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
+          value={portfolioMetrics.volatility === null ? 'N/A' : `${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
           icon={Activity}
           loading={analyticsLoading}
         />

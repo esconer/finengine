@@ -330,8 +330,11 @@ async def detect_regime(
         current = result["current_regime"]
         mask = reg_series == current
         common = pr.index.intersection(reg_series.index[mask])
-        if len(common) >= 5:
-            result["portfolio_in_current_regime"] = portfolio_regime_summary(pr.loc[common])
+        # Always emit when return history exists: short overlaps report days
+        # + holding-period total with annualized ratios suppressed, so young
+        # books see their (thin) regime behavior instead of "add holdings".
+        # Omission now strictly means no positions or no price data.
+        result["portfolio_in_current_regime"] = portfolio_regime_summary(pr.loc[common])
     elif "all_regimes" in result:
         result.pop("all_regimes")
 

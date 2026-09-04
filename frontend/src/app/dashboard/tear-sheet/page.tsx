@@ -8,6 +8,7 @@
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
+import { useUIStore } from '@/lib/store';
 import {
   Newspaper,
   AlertTriangle,
@@ -245,6 +246,14 @@ interface TearSheetData {
   monthly_returns: Record<string, Record<string, number>>;
   underwater: { date: string; drawdown: number }[];
   methodology: string;
+  history_coverage?: {
+    effective_start: string | null;
+    oldest_holding: string | null;
+    covered_days: number;
+    truncated: boolean;
+    annualized: boolean;
+    requested_start: string | null;
+  } | null;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -261,6 +270,7 @@ export default function TearSheetPage() {
     try {
       const result = await analyticsApi.getTearSheet();
       setData(result);
+      useUIStore.getState().updateLastUpdated();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load tear-sheet data');
     } finally {
@@ -392,6 +402,11 @@ export default function TearSheetPage() {
                 <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-emerald-100 text-xs font-medium border border-white/10">
                   Benchmark: <span className="font-bold text-white ml-1">NIFTY 50 (^NSEI)</span>
                 </div>
+                {data.history_coverage?.truncated && (
+                  <div className="bg-amber-500/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-amber-100 text-xs font-medium border border-amber-300/20">
+                    Holding history: <span className="font-bold text-white ml-1">{data.history_coverage.covered_days}d since {data.history_coverage.effective_start}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -537,7 +552,9 @@ export default function TearSheetPage() {
                     <HelpBtn onClick={() => setActiveExplainer('alpha_annualized')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-emerald-300">
-                    +{fmt(data.relative_vs_nifty.alpha_annualized, 2, '%')}
+                    {data.relative_vs_nifty.alpha_annualized == null
+                      ? 'N/A'
+                      : `${data.relative_vs_nifty.alpha_annualized > 0 ? '+' : ''}${fmt(data.relative_vs_nifty.alpha_annualized, 2, '%')}`}
                   </p>
                   <span className="text-[10px] text-emerald-400/80 mt-0.5 block">Active Outperformance</span>
                 </div>
@@ -678,7 +695,7 @@ export default function TearSheetPage() {
                         {m}
                       </th>
                     ))}
-                    <th className="text-right text-xs font-bold text-emerald-400 pb-3 pl-4">Year Total</th>
+                    <th className="text-right text-xs font-bold text-emerald-400 pb-3 pl-4">{data.history_coverage?.truncated ? 'Holding Total' : 'Year Total'}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/50">

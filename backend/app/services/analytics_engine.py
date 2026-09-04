@@ -915,7 +915,7 @@ class AnalyticsEngine:
                         "weight": weights.get(ticker, 0),
                         "data_points": data_points,
                         "is_limited_history": is_limited,
-                        "history_warning": f"Only {data_points} trading days available on exchange feed" if is_limited else None
+                        "history_warning": f"Only {data_points} trading days in the analyzed window" if is_limited else None
                     }
             
             return position_metrics
@@ -1084,7 +1084,7 @@ class AnalyticsEngine:
                                 'annualized_alpha': round(alpha * 252.0, 4),
                                 'market': round(beta, 4),
                                 'is_limited_history': is_limited,
-                                'history_warning': f"Only {data_pts} active trading days on exchange feed" if is_limited else None,
+                                'history_warning': f"Only {data_pts} active trading days in the analyzed window" if is_limited else None,
                                 'data_points': data_pts
                             }
                         except Exception:

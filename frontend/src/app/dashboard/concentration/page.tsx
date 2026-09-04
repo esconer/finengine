@@ -19,7 +19,7 @@ import {
   Legend,
 } from 'recharts';
 import { analyticsApi } from '@/lib/api';
-import { usePortfolioStore } from '@/lib/store';
+import { usePortfolioStore, useUIStore } from '@/lib/store';
 import {
   BarChart3,
   Target,
@@ -383,6 +383,7 @@ export default function ConcentrationPage() {
     try {
       const data = await analyticsApi.getConcentrationMetrics();
       setConcentrationData(data);
+      useUIStore.getState().updateLastUpdated();
 
       // Convert by_weight data for table with real sector and pre-calculated cumulative weights
       let cumWeight = 0;

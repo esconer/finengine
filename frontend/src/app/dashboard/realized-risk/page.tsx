@@ -137,7 +137,8 @@ export default function RealizedRiskPage() {
   };
 
   const formatRatio = (value: number | undefined | null, decimals = 2) => {
-    return (value || 0).toFixed(decimals);
+    if (value === undefined || value === null || Number.isNaN(value)) return 'N/A';
+    return value.toFixed(decimals);
   };
 
   // DataTable columns
@@ -315,25 +316,25 @@ export default function RealizedRiskPage() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Annual Return"
-          value={hasData && realizedRisk?.portfolio?.annual_return !== undefined ? formatPercentage(realizedRisk.portfolio.annual_return) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.annual_return != null ? formatPercentage(realizedRisk.portfolio.annual_return) : 'N/A'}
           icon={TrendingUp}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Annual Volatility"
-          value={hasData && realizedRisk?.portfolio?.annual_volatility !== undefined ? formatPercentage(realizedRisk.portfolio.annual_volatility) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.annual_volatility != null ? formatPercentage(realizedRisk.portfolio.annual_volatility) : 'N/A'}
           icon={Activity}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Sharpe Ratio"
-          value={hasData && realizedRisk?.portfolio?.sharpe_ratio !== undefined ? formatRatio(realizedRisk.portfolio.sharpe_ratio) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.sharpe_ratio != null ? formatRatio(realizedRisk.portfolio.sharpe_ratio) : 'N/A'}
           icon={Target}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Sortino Ratio"
-          value={hasData && realizedRisk?.portfolio?.sortino_ratio !== undefined ? formatRatio(realizedRisk.portfolio.sortino_ratio) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.sortino_ratio != null ? formatRatio(realizedRisk.portfolio.sortino_ratio) : 'N/A'}
           icon={BarChart3}
           loading={analyticsLoading}
         />

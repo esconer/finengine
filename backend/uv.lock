@@ -329,7 +329,7 @@ wheels = [
 
 [[package]]
 name = "bfinance"
-version = "0.1.0"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -340,9 +340,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "tabulate" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4c/2b/ff4386345e110607b75cee5f34e5da870018107bf9ba320814e46831ee2e/bfinance-0.1.0.tar.gz", hash = "sha256:a57bf7cc143ddc6622dfb26c66ab25cf5fe4cedcf1dad649ed903425795bfcff", size = 292224, upload-time = "2026-08-28T08:05:38.945Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/f6/1d4c0ea6471a5df061694a850e3e2c45a98ea613d4afaef752e2f270dc62/bfinance-0.1.2.tar.gz", hash = "sha256:ed0023c22872779a02922f8b6c62b745161f07deae276fcf1a58387d0d696110", size = 208940, upload-time = "2026-08-28T18:23:26.317Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/ba/f5d737e24d8352e6bb37b6ecf6c28e245feaa9295161b0e37c532cb15429/bfinance-0.1.0-py3-none-any.whl", hash = "sha256:a9891882c7524d3e0049864af99a8d16db6078f5f3ef6841ee4e6b982a206f02", size = 57964, upload-time = "2026-08-28T08:05:36.597Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/3a/36bd444d6ac7cc14ed273c162735785340c66774f5802f3fc7fbca7b706a/bfinance-0.1.2-py3-none-any.whl", hash = "sha256:e15d030f343f5db788b2fec2b3de467510523b8f65855d3ea766fe3f677cd86b", size = 58843, upload-time = "2026-08-28T18:23:25.319Z" },
 ]
 
 [[package]]
