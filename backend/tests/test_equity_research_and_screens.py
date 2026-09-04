@@ -4,7 +4,7 @@ and REST endpoints in equity_research.py.
 """
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 from httpx import AsyncClient, ASGITransport
 import pandas as pd
 import bfinance as bf

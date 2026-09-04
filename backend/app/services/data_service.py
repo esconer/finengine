@@ -8,7 +8,6 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import pandas as pd
-import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -688,8 +687,6 @@ class DataService:
     async def _store_timeseries_data(self, ticker: str, df: pd.DataFrame, source_used: str = "yfinance") -> None:
         """Store timeseries data in database with upsert operations"""
         try:
-            from sqlalchemy.dialects.sqlite import insert
-            from sqlalchemy import update
             
             logger.info(f"Storing {len(df)} records for {ticker} with upsert logic")
             
@@ -844,16 +841,16 @@ class DataService:
             # Check for specific data issues
             if "UNIQUE constraint failed" in str(error):
                 logger.error(f"  Issue: Duplicate records attempted for {ticker}")
-                logger.error(f"  This might indicate data processing issues or race conditions")
+                logger.error("  This might indicate data processing issues or race conditions")
             elif "NOT NULL constraint failed" in str(error):
-                logger.error(f"  Issue: Missing required data in some records")
-                logger.error(f"  Check for null values in OHLCV data")
+                logger.error("  Issue: Missing required data in some records")
+                logger.error("  Check for null values in OHLCV data")
             elif "CHECK constraint failed" in str(error):
-                logger.error(f"  Issue: Data validation failed (negative values, invalid ranges)")
-                logger.error(f"  Check for negative prices or volumes")
+                logger.error("  Issue: Data validation failed (negative values, invalid ranges)")
+                logger.error("  Check for negative prices or volumes")
             else:
-                logger.error(f"  Issue: Unexpected database error")
-                logger.error(f"  Please check data format and database connectivity")
+                logger.error("  Issue: Unexpected database error")
+                logger.error("  Please check data format and database connectivity")
                 
         except Exception as analysis_error:
             logger.error(f"Error in storage error analysis: {analysis_error}")

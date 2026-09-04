@@ -3,14 +3,9 @@ API endpoint tests for Daisy Risk Engine
 """
 
 import pytest
-import json
 from unittest.mock import AsyncMock, patch, Mock
-from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
 
 from fastapi.testclient import TestClient
-from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 

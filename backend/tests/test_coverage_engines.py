@@ -3,16 +3,14 @@ Comprehensive engine-level unit tests for AnalyticsEngine, IndicatorsService,
 OptimizationService, RegimeService, and AlphaVantageService.
 """
 
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, Mock, patch
 import numpy as np
 import pandas as pd
 import pytest
 
 from app.services.analytics_engine import AnalyticsEngine
-from app.services.indicators_service import IndicatorsService, _compute_sync
+from app.services.indicators_service import _compute_sync
 from app.services.optimization_service import optimize
-from app.services.regime_service import classify, detect_regime
+from app.services.regime_service import classify
 
 
 def _synth_df(days=252, n_assets=3):

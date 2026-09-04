@@ -14,7 +14,7 @@ import pandas as pd
 from app.db.database import get_db_session
 from app.models.database import PortfolioPosition
 from app.services.benchmark_service import BenchmarkService
-from app.services.optimization_service import STRATEGIES, optimize
+from app.services.optimization_service import optimize
 from app.services.backtest_service import run_walk_forward_backtest
 from app.services.regime_service import detect_regime
 from app.services.monte_carlo_service import simulate_goal
@@ -22,10 +22,7 @@ from app.services.data_service import GlobalDataService, DataService
 from app.services.cache_service import GlobalCacheService, CacheService
 from app.services.analytics_engine import GlobalAnalyticsEngine, AnalyticsEngine
 from app.models.schemas import (
-    RealizedRiskMetrics, ForecastRiskMetrics, FactorExposure, ConcentrationMetrics,
-    LiquidityMetrics, RiskScore, StressTestRequest, StressTestResponse,
-    VolatilitySizingRequest, VolatilitySizingResponse,
-    CorrelationStabilityResponse, CointScannerResponse
+    StressTestRequest, CorrelationStabilityResponse, CointScannerResponse
 )
 from app.services.correlation_service import analyze_correlation_stability
 from app.services.cointegration_service import CointegrationService

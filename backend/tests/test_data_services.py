@@ -4,7 +4,6 @@ indicators_service (pure compute on frames) and company_data_service
 (yfinance seam mocked — no network).
 """
 
-from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np

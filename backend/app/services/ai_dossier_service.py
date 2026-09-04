@@ -5,7 +5,7 @@ earnings concall summaries, and token-dense LLM contexts via bfinance.ai.
 """
 
 import asyncio
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import bfinance as bf
 from app.services.data_service import canonical_ticker

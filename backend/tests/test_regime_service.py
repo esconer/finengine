@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.regime_service import _label_states_by_risk, classify, detect_regime, MIN_OBSERVATIONS
 

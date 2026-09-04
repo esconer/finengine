@@ -2,7 +2,6 @@
 Database configuration and initialization for Daisy Risk Engine
 """
 
-import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import event
@@ -37,7 +36,6 @@ async def init_db() -> None:
     """
     async with engine.begin() as conn:
         # Import all models to ensure they're registered
-        from app.models import database
         
         # Create all tables
         await conn.run_sync(Base.metadata.create_all)

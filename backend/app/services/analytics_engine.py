@@ -3,29 +3,18 @@ Real-time Analytics Engine for Portfolio Risk Calculations
 Implements comprehensive financial analytics using quantstats, arch, and statsmodels
 """
 
-import asyncio
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
-from scipy import stats
-from sklearn.decomposition import PCA
+from typing import Dict, Optional, Any
 import warnings
 
 warnings.filterwarnings('ignore')
 
 # Financial analytics libraries
-import quantstats as qs
 from arch import arch_model
 import statsmodels.api as sm
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from app.utils.logger import setup_logger
-from app.models.schemas import (
-    StressTestRequest, StressTestResponse, 
-    VolatilitySizingRequest, VolatilitySizingResponse
-)
 
 logger = setup_logger(__name__)
 

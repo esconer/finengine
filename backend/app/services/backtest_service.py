@@ -3,11 +3,11 @@ Walk-Forward Strategy Backtester Service.
 Evaluates dynamic portfolio rebalancing strategies out-of-sample over historical daily returns.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any
 import numpy as np
 import pandas as pd
 
-from app.services.optimization_service import optimize, STRATEGIES
+from app.services.optimization_service import optimize
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)

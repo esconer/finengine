@@ -7,7 +7,7 @@ High Dividend Yield, and Undervalued Growth.
 import asyncio
 import hashlib
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 import bfinance as bf

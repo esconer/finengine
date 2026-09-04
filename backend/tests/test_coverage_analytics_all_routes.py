@@ -226,7 +226,7 @@ class TestAnalyticsAllRoutesWithData:
             assert res13.status_code in [200, 400, 404, 500]
 
             res14 = await async_client.get("/api/v1/analytics/regime?tickers=AAPL")
-            assert True
+            assert res14.status_code in [200, 400, 404, 409, 500]
 
             res15 = await async_client.post("/api/v1/analytics/monte-carlo", json={"tickers": ["AAPL"], "initial_value": 1000, "target_value": 2000})
-            assert True
+            assert res15.status_code in [200, 400, 404, 422, 500]

@@ -2,8 +2,6 @@
 Comprehensive test suite for app.api.analytics helper methods and empty portfolio / edge case handling.
 """
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest

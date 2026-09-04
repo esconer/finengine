@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from app.services.regime_service import _looks_like_returns, classify, detect_regime
 

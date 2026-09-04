@@ -3,7 +3,7 @@ Deep API endpoint coverage tests for app.api.portfolio and app.api.analytics.
 """
 
 from unittest.mock import AsyncMock, Mock, patch
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import pytest

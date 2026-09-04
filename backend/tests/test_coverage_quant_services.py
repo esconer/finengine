@@ -2,11 +2,9 @@
 Comprehensive test suite for TailRiskService, VolatilityService, CointegrationService, and CorrelationService.
 """
 
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest
-from unittest.mock import AsyncMock, patch
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.tail_risk_service import TailRiskService
@@ -19,8 +17,7 @@ from app.services.cointegration_service import (
 )
 from app.services.correlation_service import (
     CorrelationService,
-    compute_rolling_avg_correlation,
-    analyze_correlation_stability
+    compute_rolling_avg_correlation
 )
 
 

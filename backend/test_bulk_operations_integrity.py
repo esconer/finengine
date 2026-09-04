@@ -4,20 +4,16 @@ Test script for bulk operations transaction integrity fixes
 """
 
 import asyncio
-import json
 import sys
-from typing import Dict, Any
 
 # Add backend to path
 sys.path.append('/home/esco/code/finengine/backend')
 
 from app.api.portfolio import bulk_add_positions
 from app.models.schemas import BulkAddRequest, PortfolioPositionBase
-from app.db.database import get_db_session, create_database_engine
+from app.db.database import create_database_engine
 from app.services.data_service import GlobalDataService
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-import pytest
 
 class BulkOperationTester:
     """Test bulk operations for transaction integrity"""

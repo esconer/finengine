@@ -4,7 +4,6 @@ Tests caching, upsert, failovers, fallback quotes, batching, validation, storage
 """
 
 import asyncio
-from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import numpy as np
 import pandas as pd
@@ -12,7 +11,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
-from app.models.database import StockTimeseries, FetchLog
+from app.models.database import StockTimeseries
 from app.services.data_service import DataService, GlobalDataService
 
 

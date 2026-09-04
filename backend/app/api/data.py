@@ -4,7 +4,6 @@ Data API endpoints for market data fetching and management
 
 from datetime import datetime, timedelta
 from typing import List, Optional
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,7 +11,7 @@ from app.db.database import get_db_session
 from app.services.data_service import GlobalDataService, DataService
 from app.services.cache_service import GlobalCacheService, CacheService
 from app.services.indicators_service import IndicatorsService, SUPPORTED_INDICATORS, StaleMarketDataError
-from app.services.company_data_service import CompanyDataService, get_company_data_service
+from app.services.company_data_service import get_company_data_service
 from app.models.schemas import (
     StockDataResponse, StockQuoteResponse, BatchStockDataRequest, BatchStockDataResponse,
     ValidateTickerRequest, ValidateTickerResponse, APIConfigResponse
@@ -42,8 +41,7 @@ def get_indicators_service(db: AsyncSession = Depends(get_db_session)) -> Indica
 
 
 from app.models.schemas import (
-    StockDataResponse, StockTimeseriesResponse, StockQuoteResponse, BatchStockDataRequest, BatchStockDataResponse,
-    ValidateTickerRequest, ValidateTickerResponse, APIConfigResponse
+    StockTimeseriesResponse
 )
 
 @router.get("/indicators/{ticker}")

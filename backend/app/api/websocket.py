@@ -5,10 +5,8 @@ WebSocket API for real-time updates
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Set
+from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from fastapi.websockets import WebSocketState
-import logging
 
 from sqlalchemy import select
 import pandas as pd

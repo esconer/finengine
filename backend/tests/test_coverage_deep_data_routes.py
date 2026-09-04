@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime
 import pandas as pd
 import pytest
-from app.services.indicators_service import StaleMarketDataError
 
 
 @pytest.mark.api

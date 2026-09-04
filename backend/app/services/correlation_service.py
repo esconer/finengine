@@ -3,9 +3,8 @@ Correlation Stability and Regime Break Monitor Service
 Calculates rolling 60-day average pairwise correlation and detects diversification breakdown.
 """
 
-from datetime import datetime
 from itertools import combinations
-from typing import Dict, List, Optional, Tuple, Any
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 

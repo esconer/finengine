@@ -4,8 +4,7 @@ Tests all endpoints: get_portfolio, add, bulk_add, get single, update, delete, n
 including all validation paths, filters, currencies, error branches, and helper methods.
 """
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
-from datetime import datetime
+from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete

@@ -5,12 +5,8 @@ Configured with INR as the default currency for Indian market focus
 """
 
 import asyncio
-import aiohttp
 from datetime import datetime, timedelta
 from typing import Optional, Dict
-from decimal import Decimal
-import json
-import os
 
 from app.utils.logger import setup_logger
 

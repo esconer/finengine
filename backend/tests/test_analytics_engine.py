@@ -5,11 +5,9 @@ Unit tests for Analytics Engine
 import pytest
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch, Mock
+from unittest.mock import patch, Mock
 
 from app.services.analytics_engine import AnalyticsEngine, GlobalAnalyticsEngine
-from app.models.schemas import StressTestRequest, VolatilitySizingRequest
 
 
 @pytest.mark.unit

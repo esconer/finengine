@@ -3,10 +3,8 @@ India Market Microstructure, NSE Ingestion, and ADV Liquidity Service
 """
 
 import os
-import io
-import csv
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 import numpy as np
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,8 +13,6 @@ from sqlalchemy import select, func, and_, desc
 from app.models.database import (
     NSEBhavcopy,
     NSEInstitutionalFlow,
-    NSEBulkBlockDeal,
-    NSEShareholdingPattern,
     PortfolioPosition
 )
 from app.utils.logger import setup_logger

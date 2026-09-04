@@ -4,7 +4,7 @@ Peaks-Over-Threshold (POT) Generalized Pareto Distribution modeling for 99% VaR/
 and Bivariate Student-t / Empirical Copula Lower-Tail Dependence Matrix.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy import stats

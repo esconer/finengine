@@ -17,6 +17,9 @@ Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
 - All `uv` commands (`uv run`, `uv sync`, `uv tool run`, `uvx`) are pre-approved and should run non-interactively without user confirmation prompts.
 - Always include `-y` or `--yes` when executing `uv tool run` or `uvx` tools.
 - Prefer adding permanent unit and regression tests in `tests/` over running one-off throwaway debug scripts.
+- Pre-commit hook (`.githooks`, enabled via `git config core.hooksPath .githooks`) runs `ruff check` (E9+F) on staged backend Python only. Keep commits hook-green; full `pytest`/`tsc`/`vitest` stay manual + CI (too slow for commit time).
+- Backend env has TWO tool tables: `[project.optional-dependencies] dev` (pytest stack, `--extra dev`) and `[dependency-groups] dev` (ruff, `--group dev`). After editing either, resync with `uv sync --extra dev --group dev` or tools silently vanish.
+- Ruff rule scope is deliberately narrow (`E9`,`F` in `backend/pyproject.toml`); widen only via dedicated cleanup PRs, never drive-by.
 
 ## Quantitative & Terminal UI Invariants
 

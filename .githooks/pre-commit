@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pre-commit: ruff (syntax errors + pyflakes, per backend/pyproject.toml)
+# on staged backend Python files only. Fast by design (<10s): full
+# pytest/tsc/vitest stay in CI and manual runs.
+# Prerequisites: uv on PATH (this repo's standard toolchain).
+# One-time local enable:  git config core.hooksPath .githooks
+set -u
+
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM | grep '^backend/.*\.py$' || true)
+if [ -z "$STAGED_PY" ]; then
+  exit 0
+fi
+
+# shellcheck disable=SC2086
+if uv run --project backend --no-sync ruff check --output-format=concise $STAGED_PY; then
+  exit 0
+fi
+echo "pre-commit: ruff found Python errors above - fix them or run 'uv run ruff check --fix <file>' from backend/"
+exit 1

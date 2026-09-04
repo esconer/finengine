@@ -9,7 +9,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete
+from sqlalchemy import select
 import csv
 import io
 
@@ -159,12 +159,12 @@ async def add_portfolio_position(
     """
     try:
         # CRITICAL: Log incoming request for 422 debugging
-        logger.info(f"=== ADD POSITION REQUEST RECEIVED ===")
+        logger.info("=== ADD POSITION REQUEST RECEIVED ===")
         logger.info(f"Raw request data: {position}")
         logger.info(f"Request type: {type(position)}")
         logger.info(f"Position dict: {position.dict() if hasattr(position, 'dict') else 'N/A'}")
         logger.info(f"Currency: {currency}")
-        logger.info(f"=== END REQUEST DATA ===")
+        logger.info("=== END REQUEST DATA ===")
         
         # Validate ticker exists with enhanced error handling and suggestions
         if not await data_service.validate_ticker(position.ticker):

@@ -19,7 +19,6 @@ from app.api.analytics import (
 )
 from app.models.database import PortfolioPosition
 from app.utils.holdings import (
-    MIN_ANNUALIZE_DAYS,
     apply_annualization_gate,
     coerce_holding_date,
     effective_start,

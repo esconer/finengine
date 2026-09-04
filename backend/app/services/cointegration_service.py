@@ -10,7 +10,6 @@ from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from sqlalchemy.ext.asyncio import AsyncSession

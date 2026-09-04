@@ -8,13 +8,10 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select, delete
 from app.models.database import PortfolioPosition
-from app.services.data_service import GlobalDataService
 from app.services.volatility_service import VolatilityService
 from app.services.tail_risk_service import TailRiskService
 from app.services.correlation_service import analyze_correlation_stability
 from app.services.cointegration_service import CointegrationService
-from app.services.analytics_engine import AnalyticsEngine
-from app.api.analytics import _assign_price, _build_wide_returns
 
 
 @pytest.mark.asyncio

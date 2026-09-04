@@ -2,31 +2,28 @@
 Global test configuration and fixtures for Daisy Risk Engine tests
 """
 
-import asyncio
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, Mock
 from typing import Generator, AsyncGenerator
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
-import tempfile
 import os
 
 # FastAPI and testing
 from fastapi.testclient import TestClient
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy import MetaData, create_engine
 from sqlalchemy.pool import StaticPool
 
 # Application imports
 from main import app
 from app.db.database import get_db_session, Base
-from app.services.data_service import DataService, GlobalDataService
-from app.services.analytics_engine import AnalyticsEngine, GlobalAnalyticsEngine
-from app.services.cache_service import CacheService, GlobalCacheService
-from app.models.database import PortfolioPosition, StockTimeseries, AnalyticsCache, FetchLog
+from app.services.data_service import DataService
+from app.services.analytics_engine import AnalyticsEngine
+from app.services.cache_service import CacheService
+from app.models.database import PortfolioPosition, StockTimeseries
 
 # Test configuration
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -456,7 +453,6 @@ class AsyncContextManager:
 
 # Export commonly used fixtures
 __all__ = [
-    "event_loop",
     "test_db", 
     "async_client",
     "client",

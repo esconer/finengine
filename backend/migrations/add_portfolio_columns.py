@@ -3,7 +3,6 @@ Database migration to add quantity and buy_price columns to portfolio_positions 
 """
 
 import sqlite3
-import os
 from pathlib import Path
 
 def migrate_database():

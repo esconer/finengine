@@ -4,16 +4,14 @@ and full Empty -> Populated portfolio lifecycle transitions.
 """
 
 from unittest.mock import AsyncMock, Mock, patch
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import delete
 
 from app.models.database import PortfolioPosition, StockTimeseries
 from app.services.currency_service import CurrencyConversionService
-from app.services.benchmark_service import BenchmarkService
 from app.services.analytics_engine import AnalyticsEngine
 
 

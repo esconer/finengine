@@ -3,17 +3,14 @@ Comprehensive test suite for CurrencyService, CacheService, BenchmarkService, an
 """
 
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
 
-from app.models.database import AnalyticsCache, FetchLog
 from app.services.currency_service import (
     CurrencyConversionService,
-    get_currency_service,
     convert_portfolio_value,
     format_portfolio_value,
     format_portfolio_value_indian,

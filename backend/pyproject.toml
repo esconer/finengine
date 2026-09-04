@@ -62,6 +62,20 @@ python-downloads = "automatic"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = [
+    "ruff>=0.16.6",
+]
+
+[tool.ruff]
+# Pre-commit gate scope: syntax errors (E9) + pyflakes (F: undefined names,
+# unused imports/variables). Deliberately narrow — the repo has hundreds of
+# pre-existing UP/RUF/I/SIM/DTZ hits; widen only via dedicated cleanup PRs.
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
 

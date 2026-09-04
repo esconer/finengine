@@ -5,8 +5,6 @@ API-based test for bulk operations transaction integrity
 
 import asyncio
 import aiohttp
-import json
-from typing import Dict, Any
 
 class BulkOperationIntegrityTester:
     """Test bulk operations via API endpoints"""

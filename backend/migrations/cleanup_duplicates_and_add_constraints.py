@@ -3,9 +3,6 @@ Database cleanup migration script to remove duplicate records and add constraint
 """
 
 import sqlite3
-import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
 import logging
 from datetime import datetime
 import os
@@ -250,8 +247,8 @@ class DatabaseCleanupManager:
         if result["success"]:
             logger.info("✅ CLEANUP SUCCESSFUL")
             logger.info(f"✅ Removed {cleanup_result['deleted_records']} duplicate records")
-            logger.info(f"✅ Added UNIQUE constraints")
-            logger.info(f"✅ Database integrity restored")
+            logger.info("✅ Added UNIQUE constraints")
+            logger.info("✅ Database integrity restored")
         else:
             logger.error("❌ CLEANUP FAILED")
             logger.error(f"❌ Remaining duplicates: {validation['remaining_duplicates']}")
@@ -270,12 +267,12 @@ def main():
         print("\n🎉 Database cleanup completed successfully!")
         print(f"📊 Records removed: {result['cleanup_result']['deleted_records']}")
         print(f"💾 Backup created: {result['backup_created']}")
-        print(f"🔒 UNIQUE constraints added")
-        print(f"✅ Database is now ready for production use")
+        print("🔒 UNIQUE constraints added")
+        print("✅ Database is now ready for production use")
     else:
         print("\n❌ Database cleanup failed!")
         print(f"❌ Issues found: {result['validation']}")
-        print(f"💡 Please review the logs and address any issues")
+        print("💡 Please review the logs and address any issues")
     
     return result
 

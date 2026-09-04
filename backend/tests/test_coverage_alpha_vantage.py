@@ -3,11 +3,10 @@ Comprehensive test suite for AlphaVantageService, KeyPool, and CompanyDataServic
 """
 
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
-from datetime import date, datetime
+from datetime import date
 import pandas as pd
 import pytest
 import time
-import requests
 from yfinance.exceptions import YFRateLimitError
 
 from app.services.alpha_vantage_service import (

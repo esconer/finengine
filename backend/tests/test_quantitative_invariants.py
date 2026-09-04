@@ -18,13 +18,8 @@ from app.services.optimization_service import (
 )
 from app.services.cointegration_service import compute_ou_parameters
 from app.services.tail_risk_service import TailRiskService
-from app.services.volatility_service import VolatilityService
 from app.services.monte_carlo_service import (
     simulate_goal,
-    _simulate_gbm,
-    _simulate_student_t,
-    _simulate_bootstrap,
-    _fan_from_paths,
 )
 
 

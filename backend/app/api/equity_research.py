@@ -5,8 +5,8 @@ Provides REST routes for full company profile, 12Q/11Y institutional shareholdin
 """
 
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import Response, JSONResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 
 from app.services.equity_research_service import get_equity_research_service
 from app.services.screener_service import get_screener_service

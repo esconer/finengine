@@ -5,7 +5,6 @@ SQLAlchemy database models for Daisy Risk Engine
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, JSON, Index, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from datetime import datetime
 from app.db.database import Base
 
 

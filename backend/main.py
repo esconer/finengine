@@ -12,11 +12,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import logging
 import os
 import time
 from starlette.middleware.base import BaseHTTPMiddleware
-from typing import Callable, Dict, Any
+from typing import Callable, Any
 
 from app.config import settings
 from app.db.database import init_db

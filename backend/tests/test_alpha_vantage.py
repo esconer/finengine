@@ -7,7 +7,6 @@ rotation on daily-limit, retire-until-midnight, frequency cooldown,
 local budget guard (no wasted calls), no-key no-op, symbol bridge.
 """
 
-import asyncio
 
 import pytest
 

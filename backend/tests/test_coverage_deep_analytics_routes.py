@@ -3,7 +3,7 @@ Comprehensive API test suite for app.api.analytics covering all endpoints and ed
 """
 
 from unittest.mock import AsyncMock, Mock, patch
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import pytest

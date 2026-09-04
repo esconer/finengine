@@ -2,8 +2,6 @@
 Cache service for data storage and retrieval
 """
 
-import asyncio
-import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
