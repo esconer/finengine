@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import {
   Filter,
@@ -42,6 +42,10 @@ export default function ScreenerStudioPage() {
   const [screenerData, setScreenerData] = useState<ScreenerStrategyResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  // Escalating feedback for cold-cache runs: the first screen can take up to a
+  // minute server-side; after 8s of pending, surface an explanation below the spinner.
+  const [slowRunHint, setSlowRunHint] = useState<boolean>(false);
+  const slowHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Custom filters
   const [showCustomFilters, setShowCustomFilters] = useState(false);
@@ -79,9 +83,30 @@ export default function ScreenerStudioPage() {
     fetchStrategies();
   }, []);
 
+  const startSlowHintTimer = () => {
+    setSlowRunHint(false);
+    if (slowHintTimerRef.current) clearTimeout(slowHintTimerRef.current);
+    slowHintTimerRef.current = setTimeout(() => setSlowRunHint(true), 8000);
+  };
+
+  const clearSlowHintTimer = () => {
+    if (slowHintTimerRef.current) {
+      clearTimeout(slowHintTimerRef.current);
+      slowHintTimerRef.current = null;
+    }
+    setSlowRunHint(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (slowHintTimerRef.current) clearTimeout(slowHintTimerRef.current);
+    };
+  }, []);
+
   const runScreen = async (stratKey: string) => {
     setLoading(true);
     setError(null);
+    startSlowHintTimer();
     try {
       const result = await screenerApi.runScreen(stratKey, 50);
       setScreenerData(result);
@@ -90,6 +115,7 @@ export default function ScreenerStudioPage() {
       setError(err?.response?.data?.detail || err.message || 'Screen execution failed');
     } finally {
       setLoading(false);
+      clearSlowHintTimer();
     }
   };
 
@@ -104,6 +130,7 @@ export default function ScreenerStudioPage() {
     setLoading(true);
     setError(null);
     setActiveStrategy('custom');
+    startSlowHintTimer();
     try {
       const result = await screenerApi.runCustomScreen({
         min_roce: Number(minRoce),
@@ -119,6 +146,7 @@ export default function ScreenerStudioPage() {
       setError(err?.response?.data?.detail || err.message || 'Custom screen failed');
     } finally {
       setLoading(false);
+      clearSlowHintTimer();
     }
   };
 
@@ -549,6 +577,11 @@ export default function ScreenerStudioPage() {
           <div className="flex flex-col items-center justify-center py-20 space-y-3">
             <RefreshCw className="w-7 h-7 text-indigo-400 animate-spin" />
             <p className="text-xs text-slate-400">Scanning Indian equity universe with 10-year audited metrics...</p>
+            {slowRunHint && (
+              <p className="text-xs text-slate-500 text-center max-w-md leading-relaxed">
+                First run audits 10 years of audited fundamentals per stock — this can take up to a minute. Subsequent runs are cached and instant.
+              </p>
+            )}
           </div>
         ) : error ? (
           <div className="p-6 text-center text-red-300 text-xs">

@@ -90,10 +90,17 @@ class CompanyDataService:
         ("free_cash_flow", "freeCashflow"),
     ]
 
-    async def get_fundamentals(self, ticker: str) -> Dict[str, Any]:
+    async def get_fundamentals(
+        self, ticker: str, source_order: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """Curated fundamentals snapshot.
         Pulls rich 4-level taxonomy and ratios from bfinance first,
         falling back to yfinance for US/global equities.
+
+        Args:
+            ticker: Raw scrip symbol.
+            source_order: Vendor cascade honoring the user's primary-source
+                preference (defaults to bfinance -> yfinance).
 
         Raises:
             ValueError: ticker has no fundamentals (404 semantics).
@@ -104,100 +111,118 @@ class CompanyDataService:
         import unittest.mock
         import yfinance as yf
 
+        order = source_order or ["bfinance", "yfinance"]
+
         # If yfinance.Ticker is explicitly mocked in a unit test, prioritize mock without network
         is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
 
-        if not is_yf_mocked:
-            # Tier 1: Attempt bfinance for live Indian equities
-            def _fetch_bf() -> Optional[Dict[str, Any]]:
-                try:
-                    import bfinance as bf
-                    t = bf.Ticker(norm_ticker)
-                    profile = t._ensure_profile()
-                    if not profile or not profile.name:
-                        return None
-                    r = profile.ratios
-                    info = getattr(t, 'info', {}) or {}
-                    
-                    out = {
-                        "ticker": norm_ticker.upper(),
-                        "name": profile.name or info.get("longName") or norm_ticker,
-                        "sector": profile.sector or info.get("sector"),
-                        "industry_group": profile.industry_group,
-                        "industry": profile.industry or info.get("industry"),
-                        "sub_industry": profile.sub_industry,
-                        "indices": profile.indices or [],
-                        "about": profile.about,
-                        "market_cap": r.market_cap or info.get("marketCap"),
-                        "pe_ratio_ttm": r.stock_pe or info.get("trailingPE"),
-                        "forward_pe": info.get("forwardPE"),
-                        "peg_ratio": r.peg_ratio or info.get("pegRatio"),
-                        "price_to_book": r.price_to_book or info.get("priceToBook") or (r.current_price / r.book_value if r.current_price and r.book_value else None),
-                        "eps_ttm": r.eps_ttm or info.get("trailingEps"),
-                        "forward_eps": info.get("forwardEps"),
-                        "dividend_yield": r.dividend_yield if r.dividend_yield is not None else info.get("dividendYield"),
-                        "week_52_high": r.high_52w or info.get("fiftyTwoWeekHigh"),
-                        "week_52_low": r.low_52w or info.get("fiftyTwoWeekLow"),
-                        "return_on_equity": r.roe if r.roe is not None else info.get("returnOnEquity"),
-                        "return_on_capital_employed": r.roce,
-                        "debt_to_equity": r.debt_to_equity or info.get("debtToEquity"),
-                        "book_value": r.book_value or info.get("bookValue"),
-                        "face_value": r.face_value,
-                        "piotroski_score": getattr(t, 'piotroski_score', None),
-                        "graham_number": getattr(t, 'graham_number', None),
-                        "enterprise_value_cr": getattr(t, 'enterprise_value', None),
-                        "ev_to_ebitda": getattr(t, 'ev_to_ebitda', None),
-                        "interest_coverage": getattr(t, 'interest_coverage', None),
-                        "pros": profile.analysis.pros if profile.analysis else [],
-                        "cons": profile.analysis.cons if profile.analysis else [],
-                    }
-                    filtered = {k: v for k, v in out.items() if v is not None}
-                    return filtered if len(filtered) > 2 else None
-                except Exception as e:
-                    logger.debug(f"bfinance fundamentals fetch skipped for {norm_ticker}: {e}")
+        def _fetch_bf() -> Optional[Dict[str, Any]]:
+            try:
+                import bfinance as bf
+                t = bf.Ticker(norm_ticker)
+                profile = t._ensure_profile()
+                if not profile or not profile.name:
                     return None
+                r = profile.ratios
+                info = getattr(t, 'info', {}) or {}
 
-            bf_res = await _to_thread(_fetch_bf)
-            if bf_res is not None:
-                return bf_res
+                out = {
+                    "ticker": norm_ticker.upper(),
+                    "name": profile.name or info.get("longName") or norm_ticker,
+                    "sector": profile.sector or info.get("sector"),
+                    "industry_group": profile.industry_group,
+                    "industry": profile.industry or info.get("industry"),
+                    "sub_industry": profile.sub_industry,
+                    "indices": profile.indices or [],
+                    "about": profile.about,
+                    "market_cap": r.market_cap or info.get("marketCap"),
+                    "pe_ratio_ttm": r.stock_pe or info.get("trailingPE"),
+                    "forward_pe": info.get("forwardPE"),
+                    "peg_ratio": r.peg_ratio or info.get("pegRatio"),
+                    "price_to_book": r.price_to_book or info.get("priceToBook") or (r.current_price / r.book_value if r.current_price and r.book_value else None),
+                    "eps_ttm": r.eps_ttm or info.get("trailingEps"),
+                    "forward_eps": info.get("forwardEps"),
+                    "dividend_yield": r.dividend_yield if r.dividend_yield is not None else info.get("dividendYield"),
+                    "week_52_high": r.high_52w or info.get("fiftyTwoWeekHigh"),
+                    "week_52_low": r.low_52w or info.get("fiftyTwoWeekLow"),
+                    "return_on_equity": r.roe if r.roe is not None else info.get("returnOnEquity"),
+                    "return_on_capital_employed": r.roce,
+                    "debt_to_equity": r.debt_to_equity or info.get("debtToEquity"),
+                    "book_value": r.book_value or info.get("bookValue"),
+                    "face_value": r.face_value,
+                    "piotroski_score": getattr(t, 'piotroski_score', None),
+                    "graham_number": getattr(t, 'graham_number', None),
+                    "enterprise_value_cr": getattr(t, 'enterprise_value', None),
+                    "ev_to_ebitda": getattr(t, 'ev_to_ebitda', None),
+                    "interest_coverage": getattr(t, 'interest_coverage', None),
+                    "pros": profile.analysis.pros if profile.analysis else [],
+                    "cons": profile.analysis.cons if profile.analysis else [],
+                }
+                filtered = {k: v for k, v in out.items() if v is not None}
+                return filtered if len(filtered) > 2 else None
+            except Exception as e:
+                logger.debug(f"bfinance fundamentals fetch skipped for {norm_ticker}: {e}")
+                return None
 
-        # Tier 2: Fallback to yfinance
-        def _fetch() -> Dict[str, Any]:
-            t = yf.Ticker(norm_ticker)
-            return _yf_retry(lambda: t.info)
+        async def _fetch_yf() -> Dict[str, Any]:
+            def _fetch() -> Dict[str, Any]:
+                t = yf.Ticker(norm_ticker)
+                return _yf_retry(lambda: t.info)
 
-        try:
-            info = await _to_thread(_fetch)
-        except Exception as e:
-            # Yahoo occasionally rejects .info with 401 Invalid-Crumb; treat
-            # as temporary upstream outage rather than missing ticker.
-            raise RuntimeError(f"Fundamentals upstream unavailable: {type(e).__name__}: {e}") from e
+            try:
+                info = await _to_thread(_fetch)
+            except Exception as e:
+                # Yahoo occasionally rejects .info with 401 Invalid-Crumb; treat
+                # as temporary upstream outage rather than missing ticker.
+                raise RuntimeError(f"Fundamentals upstream unavailable: {type(e).__name__}: {e}") from e
 
-        if not info:
-            raise ValueError(f"No fundamentals returned for {ticker}")
+            if not info:
+                raise ValueError(f"No fundamentals returned for {ticker}")
 
-        out: Dict[str, Any] = {"ticker": norm_ticker.upper()}
-        fallback_map = {
-            "longName": ["shortName", "companyName"],
-            "fiftyTwoWeekHigh": ["52WeekHigh", "fifty_two_week_high", "yearHigh"],
-            "fiftyTwoWeekLow": ["52WeekLow", "fifty_two_week_low", "yearLow"],
-            "trailingPE": ["pe_ratio", "trailing_pe", "trailingPe"],
-            "marketCap": ["market_cap", "totalMarketCap"],
-            "returnOnEquity": ["roe", "return_on_equity"],
-        }
-        for our_key, yf_key in self.FUNDAMENTAL_FIELDS:
-            val = info.get(yf_key)
-            if val is None and yf_key in fallback_map:
-                for alt_key in fallback_map[yf_key]:
-                    val = info.get(alt_key)
-                    if val is not None:
-                        break
-            if val is not None:
-                out[our_key] = val
+            out: Dict[str, Any] = {"ticker": norm_ticker.upper()}
+            fallback_map = {
+                "longName": ["shortName", "companyName"],
+                "fiftyTwoWeekHigh": ["52WeekHigh", "fifty_two_week_high", "yearHigh"],
+                "fiftyTwoWeekLow": ["52WeekLow", "fifty_two_week_low", "yearLow"],
+                "trailingPE": ["pe_ratio", "trailing_pe", "trailingPe"],
+                "marketCap": ["market_cap", "totalMarketCap"],
+                "returnOnEquity": ["roe", "return_on_equity"],
+            }
+            for our_key, yf_key in self.FUNDAMENTAL_FIELDS:
+                val = info.get(yf_key)
+                if val is None and yf_key in fallback_map:
+                    for alt_key in fallback_map[yf_key]:
+                        val = info.get(alt_key)
+                        if val is not None:
+                            break
+                if val is not None:
+                    out[our_key] = val
 
-        if len(out) <= 1:  # only ticker -> stub info dict
-            raise ValueError(f"No fundamental fields returned for {ticker}")
-        return out
+            if len(out) <= 1:  # only ticker -> stub info dict
+                raise ValueError(f"No fundamental fields returned for {ticker}")
+            return out
+
+        # Cascade per the user's preferred vendor order. Vendor failures fall
+        # through to the next tier; the deepest error keeps its original 404
+        # (ValueError) / 503 (RuntimeError) semantics once all tiers are spent.
+        last_error: Optional[Exception] = None
+        for vendor in order:
+            if vendor == "bfinance":
+                if is_yf_mocked:
+                    continue  # mocked-yf tests must not hit real network vendors
+                bf_res = await _to_thread(_fetch_bf)
+                if bf_res is not None:
+                    return bf_res
+            else:
+                try:
+                    return await _fetch_yf()
+                except (RuntimeError, ValueError) as e:
+                    last_error = e
+                    logger.warning(f"yfinance fundamentals unavailable for {norm_ticker}: {e}")
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError(f"No fundamentals returned for {ticker}")
 
     # ----------------------------------------------------------- statements
 

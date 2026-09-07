@@ -119,13 +119,21 @@ export default function IndiaFlowsPage() {
                                         if (val >= 100000) return `₹${(val / 100000).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} L`;
                                         return `₹${val.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
                                     };
+                                    // Sub-0.1 day liquidation windows are real but round to "0d";
+                                    // only a zero market value is a true 0-day position.
+                                    const formatDays = (days: number | null | undefined, marketValue: number, adv: number) => {
+                                        const d = typeof days === 'number' && !isNaN(days) ? days : 0;
+                                        if (d > 0 && d < 0.1) return '<0.1d';
+                                        if (d === 0 && marketValue > 0 && adv > 0) return '<0.1d';
+                                        return `${d}d`;
+                                    };
                                     return (
                                         <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/30">
                                             <td className="px-4 py-3 font-semibold text-gray-900 dark:text-white">{p.ticker}</td>
                                             <td className="px-4 py-3 font-mono">₹{p.position_value.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</td>
                                             <td className="px-4 py-3 font-mono font-medium text-slate-900 dark:text-slate-200">{formatInr(p.adv_30d_rupees)}</td>
-                                            <td className="px-4 py-3 font-medium">{p.days_to_liquidate_10pct_adv}d</td>
-                                            <td className="px-4 py-3 font-medium">{p.days_to_liquidate_20pct_adv}d</td>
+                                            <td className="px-4 py-3 font-medium">{formatDays(p.days_to_liquidate_10pct_adv, p.position_value, p.adv_30d_rupees)}</td>
+                                            <td className="px-4 py-3 font-medium">{formatDays(p.days_to_liquidate_20pct_adv, p.position_value, p.adv_30d_rupees)}</td>
                                             <td className="px-4 py-3">
                                                 <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${p.liquidity_tier === 'HIGHLY_LIQUID' ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300' : (p.liquidity_tier === 'MODERATE_LIQUIDITY' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300' : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300')}`}>
                                                     {p.liquidity_tier}

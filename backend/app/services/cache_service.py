@@ -204,3 +204,81 @@ class GlobalCacheService:
     
     def get_service(self) -> CacheService:
         return self._cache_service
+
+
+# ---------------------------------------------------------------- cache purge
+
+async def clear_market_data_cache(db: AsyncSession) -> Dict[str, Any]:
+    """Wipe every cached market-data store so fresh data is pulled on next use.
+
+    Deletes SQLite cache tables (timeseries, analytics, fetch logs, NSE
+    microstructure) and resets in-process memo caches. User-owned portfolio
+    truth (`portfolio_positions`: tickers, quantities, avg buy prices,
+    weights) is NEVER touched.
+
+    Returns per-store cleared row counts.
+    """
+    from app.models.database import (
+        StockTimeseries, AnalyticsCache, FetchLog,
+        NSEBhavcopy, NSEInstitutionalFlow, NSEBulkBlockDeal, NSEShareholdingPattern,
+    )
+    from app.services.data_service import DataService
+    from app.services.screener_service import ScreenerService
+    from app.services.currency_service import get_currency_service
+    from sqlalchemy import func
+
+    cleared: Dict[str, Any] = {}
+    total = 0
+
+    table_stores = {
+        "stock_timeseries": StockTimeseries,
+        "analytics_cache": AnalyticsCache,
+        "fetch_logs": FetchLog,
+        "nse_bhavcopy": NSEBhavcopy,
+        "nse_institutional_flows": NSEInstitutionalFlow,
+        "nse_bulk_block_deals": NSEBulkBlockDeal,
+        "nse_shareholding_patterns": NSEShareholdingPattern,
+    }
+
+    try:
+        for name, model in table_stores.items():
+            count_result = await db.execute(select(func.count()).select_from(model))
+            count = count_result.scalar() or 0
+            await db.execute(delete(model))
+            cleared[name] = count
+            total += count
+
+        await db.commit()
+    except Exception as e:
+        logger.error(f"Error clearing market data cache tables: {e}")
+        await db.rollback()
+        raise
+
+    # In-process memo caches (would otherwise outlive the DB wipe)
+    in_memory_reset = []
+    try:
+        DataService._in_memory_df_cache.clear()
+        in_memory_reset.append("data_service_frames")
+    except Exception as e:
+        logger.warning(f"Could not reset data service in-memory cache: {e}")
+    try:
+        ScreenerService._cache.clear()
+        in_memory_reset.append("screener_results")
+    except Exception as e:
+        logger.warning(f"Could not reset screener cache: {e}")
+    try:
+        currency = get_currency_service()
+        currency._exchange_rates.clear()
+        currency._last_updated = None
+        in_memory_reset.append("fx_rates")
+    except Exception as e:
+        logger.warning(f"Could not reset currency cache: {e}")
+
+    cleared["in_memory_caches"] = len(in_memory_reset)
+    logger.info(f"Market data cache cleared: {total} rows purged; portfolio positions preserved")
+
+    return {
+        "cleared": cleared,
+        "total_rows_cleared": total,
+        "portfolio_preserved": True,
+    }

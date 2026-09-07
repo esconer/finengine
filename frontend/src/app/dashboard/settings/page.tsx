@@ -1,21 +1,39 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useUIStore, usePortfolioStore } from '@/lib/store';
+import { dataApi } from '@/lib/api';
 import {
     Settings,
     DollarSign,
-    TrendingUp,
-    Clock,
     Shield,
-    Database,
     RefreshCw,
     CheckCircle2,
     Sliders,
     Server,
-    Zap,
-    Cpu
+    HardDrive,
+    Trash2,
+    AlertTriangle
 } from 'lucide-react';
+
+type PrimarySource = 'bfinance' | 'yfinance';
+
+interface CacheClearResult {
+    cleared: Record<string, number>;
+    total_rows_cleared: number;
+    portfolio_preserved: boolean;
+}
+
+const SOURCE_META: Record<PrimarySource, { label: string; blurb: string }> = {
+    bfinance: {
+        label: 'bfinance (Recommended)',
+        blurb: 'Fast quotes, 10-13Y Ind AS statements, Indian market depth',
+    },
+    yfinance: {
+        label: 'yfinance',
+        blurb: 'Yahoo Finance feed — global coverage, .NS/.BO auto-suffix',
+    },
+};
 
 export default function SettingsPage() {
     const { darkMode, toggleDarkMode } = useUIStore();
@@ -26,37 +44,88 @@ export default function SettingsPage() {
     const [lookbackDays, setLookbackDays] = useState<number>(756);
     const [riskFreeRate, setRiskFreeRate] = useState<number>(7.0);
     const [targetVol, setTargetVol] = useState<number>(15.0);
+    const [primarySource, setPrimarySource] = useState<PrimarySource>('bfinance');
     const [isSaving, setIsSaving] = useState(false);
     const [saveSuccess, setSaveSuccess] = useState(false);
+    const [saveError, setSaveError] = useState<string | null>(null);
     const [isClearingCache, setIsClearingCache] = useState(false);
     const [cacheMessage, setCacheMessage] = useState<string | null>(null);
+    const [cacheClearedSummary, setCacheClearedSummary] = useState<CacheClearResult | null>(null);
 
-    const handleSavePreferences = (e: React.FormEvent) => {
+    // Load the persisted primary source so the selector reflects backend truth
+    useEffect(() => {
+        let cancelled = false;
+        dataApi.getConfig()
+            .then((cfg) => {
+                if (!cancelled && cfg?.primary_source) {
+                    setPrimarySource(cfg.primary_source);
+                }
+            })
+            .catch(() => {
+                /* keep default bfinance on failure — backend falls back identically */
+            });
+        return () => { cancelled = true; };
+    }, []);
+
+    const fallbackChain =
+        primarySource === 'bfinance'
+            ? 'bfinance → yfinance → Alpha Vantage (last resort)'
+            : 'yfinance → bfinance → Alpha Vantage (last resort)';
+
+    const handleSavePreferences = async (e: React.FormEvent) => {
         e.preventDefault();
         setIsSaving(true);
         setSaveSuccess(false);
+        setSaveError(null);
 
-        setTimeout(() => {
-            setIsSaving(false);
+        try {
+            // Persist the data-source preference; the backend cascade honors
+            // it on every subsequent fetch (no restart needed).
+            await dataApi.updateConfig({ primary_source: primarySource });
             setSaveSuccess(true);
             setTimeout(() => setSaveSuccess(false), 3000);
-        }, 400);
+        } catch (err) {
+            setSaveError('Could not save the data-source preference. Is the backend running?');
+            setTimeout(() => setSaveError(null), 5000);
+        } finally {
+            setIsSaving(false);
+        }
     };
 
     const handleClearCache = async () => {
+        const confirmed = window.confirm(
+            'Purge all cached market data (price history, analytics, fetch logs, NSE microstructure)?\n\n' +
+            'Fresh data will be pulled from the configured vendor chain on next use.\n' +
+            'Your portfolio holdings (tickers, quantities, avg buy prices) are NOT affected.'
+        );
+        if (!confirmed) return;
+
         setIsClearingCache(true);
         setCacheMessage(null);
+        setCacheClearedSummary(null);
         try {
+            const result = await dataApi.clearCache();
+            setCacheClearedSummary(result);
+            setCacheMessage(
+                `Cleared ${result.total_rows_cleared.toLocaleString('en-IN')} cached rows. ` +
+                'Portfolio holdings preserved.'
+            );
+            // Refresh live views so stale numbers vanish immediately
             await fetchPortfolio();
-            setCacheMessage('Local and quantitative model cache invalidated successfully.');
-            setTimeout(() => setCacheMessage(null), 4000);
-        } catch (err: any) {
-            setCacheMessage('Cache refresh completed.');
-            setTimeout(() => setCacheMessage(null), 4000);
+            setTimeout(() => setCacheMessage(null), 6000);
+        } catch (err) {
+            setCacheMessage('Cache purge failed. Is the backend running?');
+            setTimeout(() => setCacheMessage(null), 5000);
         } finally {
             setIsClearingCache(false);
         }
     };
+
+    const nonZeroCleared = cacheClearedSummary
+        ? Object.entries(cacheClearedSummary.cleared).filter(
+            ([key, count]) => key !== 'in_memory_caches' && count > 0
+        )
+        : [];
 
     return (
         <div className="space-y-8 pb-16 max-w-5xl">
@@ -78,10 +147,24 @@ export default function SettingsPage() {
                 </div>
             )}
 
+            {saveError && (
+                <div className="p-4 bg-red-950/40 border border-red-800/60 rounded-xl flex items-center space-x-3 text-red-300 text-sm">
+                    <AlertTriangle className="h-5 w-5 text-red-400 shrink-0" />
+                    <span>{saveError}</span>
+                </div>
+            )}
+
             {cacheMessage && (
-                <div className="p-4 bg-blue-950/40 border border-blue-800/60 rounded-xl flex items-center space-x-3 text-blue-300 text-sm">
-                    <CheckCircle2 className="h-5 w-5 text-blue-400 shrink-0" />
-                    <span>{cacheMessage}</span>
+                <div className="p-4 bg-blue-950/40 border border-blue-800/60 rounded-xl flex items-start space-x-3 text-blue-300 text-sm">
+                    <CheckCircle2 className="h-5 w-5 text-blue-400 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                        <span>{cacheMessage}</span>
+                        {cacheClearedSummary && nonZeroCleared.length > 0 && (
+                            <p className="text-[11px] text-blue-400/80">
+                                {nonZeroCleared.map(([store, count]) => `${store}: ${count.toLocaleString('en-IN')}`).join(' · ')}
+                            </p>
+                        )}
+                    </div>
                 </div>
             )}
 
@@ -194,16 +277,65 @@ export default function SettingsPage() {
                     </div>
                 </div>
 
-                {/* 3. Data Pipelines & Engine Connectivity */}
+                {/* 3. Data Sources & Engine Connectivity */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
                     <h2 className="text-base font-semibold text-white flex items-center space-x-2 mb-4">
                         <Server className="h-5 w-5 text-amber-400" />
                         <span>Data Feed Architecture & Infrastructure</span>
                     </h2>
+
+                    {/* Primary data source selector */}
+                    <div className="mb-6">
+                        <label className="block text-xs font-medium text-slate-300 mb-2">
+                            Primary Data Source
+                        </label>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            {(Object.keys(SOURCE_META) as PrimarySource[]).map((source) => {
+                                const selected = primarySource === source;
+                                return (
+                                    <button
+                                        key={source}
+                                        type="button"
+                                        onClick={() => setPrimarySource(source)}
+                                        className={`text-left p-4 rounded-lg border transition ${
+                                            selected
+                                                ? 'border-blue-500 bg-blue-950/40 shadow-lg shadow-blue-900/20'
+                                                : 'border-slate-800 bg-slate-950/60 hover:border-slate-600'
+                                        }`}
+                                    >
+                                        <div className="flex items-center justify-between mb-1">
+                                            <span className={`text-sm font-medium ${selected ? 'text-blue-300' : 'text-slate-300'}`}>
+                                                {SOURCE_META[source].label}
+                                            </span>
+                                            {selected && (
+                                                <span className="flex items-center space-x-1 text-xs text-blue-400">
+                                                    <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+                                                    <span>Primary</span>
+                                                </span>
+                                            )}
+                                        </div>
+                                        <p className="text-[11px] text-slate-500">{SOURCE_META[source].blurb}</p>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <div className="mt-3 flex items-center space-x-2 text-xs text-slate-400 bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
+                            <HardDrive className="w-4 h-4 text-slate-500 shrink-0" />
+                            <span>
+                                Fallback chain: <span className="text-slate-200 font-mono">{fallbackChain}</span>
+                                {' '}— the other vendor is always the fallback; Alpha Vantage is the last resort.
+                            </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-2">
+                            Applies to price history, live quotes, and fundamentals. Concall audio, audited
+                            statements, and screeners remain bfinance-exclusive; USD/INR FX remains yfinance-only.
+                        </p>
+                    </div>
+
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                         <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
                             <div className="flex items-center justify-between mb-1">
-                                <span className="text-xs font-medium text-slate-300">Yahoo Finance Feed</span>
+                                <span className="text-xs font-medium text-slate-300">Market Price Feed</span>
                                 <span className="flex items-center space-x-1 text-xs text-emerald-400">
                                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                                     <span>Active</span>
@@ -238,15 +370,25 @@ export default function SettingsPage() {
 
                 {/* Save & Cache Controls */}
                 <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-slate-800">
-                    <button
-                        type="button"
-                        onClick={handleClearCache}
-                        disabled={isClearingCache}
-                        className="flex items-center space-x-2 px-4 py-2.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition disabled:opacity-50"
-                    >
-                        <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin text-blue-400' : ''}`} />
-                        <span>Purge Cache & Recompute Models</span>
-                    </button>
+                    <div className="flex flex-col items-center sm:items-start gap-1">
+                        <button
+                            type="button"
+                            onClick={handleClearCache}
+                            disabled={isClearingCache}
+                            className="flex items-center space-x-2 px-4 py-2.5 text-xs font-medium text-red-300 bg-red-950/40 hover:bg-red-950/70 border border-red-900/60 rounded-lg transition disabled:opacity-50"
+                        >
+                            {isClearingCache ? (
+                                <RefreshCw className="w-4 h-4 animate-spin text-red-400" />
+                            ) : (
+                                <Trash2 className="w-4 h-4" />
+                            )}
+                            <span>Clear Market Data Cache</span>
+                        </button>
+                        <p className="text-[11px] text-slate-500 flex items-center gap-1">
+                            <Shield className="w-3 h-3" />
+                            Portfolio holdings (tickers, quantities, avg buy prices) are never touched.
+                        </p>
+                    </div>
 
                     <button
                         type="submit"

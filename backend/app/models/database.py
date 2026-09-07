@@ -200,4 +200,16 @@ class NSEShareholdingPattern(Base):
     )
     
     def __repr__(self):
-        return f"<NSEShareholdingPattern(symbol='{self.symbol}', period='{self.period_ended}', promoter={self.promoter_pct}%, pledged={self.promoter_pledged_pct}%)>"
+        return f"<NSEShareholdingPattern(symbol='{self.symbol}', period='{self.period_ended}', promoter={self.promoter_pct}%, pledged={self.promoter_pledged_pct}%)>"
+
+
+class AppSetting(Base):
+    """Single-row-per-key application settings (e.g. primary data source)"""
+    __tablename__ = "app_settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(256), nullable=False)
+    updated_on = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<AppSetting(key='{self.key}', value='{self.value}')>"

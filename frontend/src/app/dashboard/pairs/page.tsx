@@ -99,8 +99,8 @@ export default function PairsScannerPage() {
                                             {p.current_spread_zscore.toFixed(2)}σ
                                         </td>
                                         <td className="px-4 py-3">
-                                            <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${p.signal === 'NEUTRAL' ? 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>
-                                                {p.signal}
+                                            <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${p.signal === 'NEUTRAL' || p.signal === 'NOT_COINTEGRATED' ? 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>
+                                                {p.signal === 'NOT_COINTEGRATED' ? 'Not cointegrated' : p.signal}
                                             </span>
                                         </td>
                                     </tr>

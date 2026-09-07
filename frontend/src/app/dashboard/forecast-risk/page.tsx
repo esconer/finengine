@@ -686,6 +686,9 @@ export default function ForecastRiskPage() {
             icon={Activity}
             loading={loading}
           />
+          <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            {selectedModel} forward projection · {forecastHorizon}d horizon — differs from Volatility Sizing (current conditional) &amp; Realized Risk (trailing realized) by model + window
+          </p>
           <div className="absolute top-4 right-4 z-10">
             <HelpBtn explainerKey="volatility" onOpen={setActiveExplainer} />
           </div>

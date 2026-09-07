@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from app.utils.logger import setup_logger
 from app.services.cache_service import CacheService
 from app.services.alpha_vantage_service import get_alpha_vantage_service
+from app.services.source_preference_service import get_primary_source, source_order_for
 from app.models.database import StockTimeseries
 from app.config import settings
 
@@ -72,6 +73,13 @@ class DataService:
         self.cache = CacheService(db_session, settings.cache_ttl_minutes)
         self.yfinance_timeout = settings.yfinance_timeout
 
+        # Batch fetches run several concurrent workers that share this one
+        # AsyncSession. SQLAlchemy sessions are not concurrency-safe: parallel
+        # commits/rollbacks on one session collide ("commit() can't be called
+        # here", "transaction is closed", ...). Network calls stay parallel;
+        # only DB operations are serialized through this gate.
+        self._db_lock = asyncio.Lock()
+
         # Indian market defaults
         self.default_region = DEFAULT_REGION
         self.indian_exchanges = INDIAN_EXCHANGES
@@ -93,25 +101,40 @@ class DataService:
         """Check if ticker is an Indian stock"""
         t = ticker.upper().strip()
         return t.endswith((".NS", ".BO")) or t in _BARE_INDIAN_SCRIPS
-    
+
+    async def _resolve_source_order(self) -> List[str]:
+        """Effective vendor cascade for OHLCV/quote fetches, honoring the user's
+        primary-source preference. Alpha Vantage is appended last by callers."""
+        async with self._db_lock:
+            primary = await get_primary_source(self.db)
+        return source_order_for(primary)
+
+    @staticmethod
+    def _source_of_df(df: Optional[pd.DataFrame]) -> str:
+        """Actual vendor that produced a downloaded frame (bfinance marks its output)."""
+        return "bfinance" if getattr(df, "_source", "") == "bfinance" else "yfinance"
+
     _in_memory_df_cache: Dict[str, Any] = {}
 
     async def fetch_historical_data(
-        self, 
-        ticker: str, 
-        start: str, 
-        end: str, 
-        force_refresh: bool = False
+        self,
+        ticker: str,
+        start: str,
+        end: str,
+        force_refresh: bool = False,
+        source_order: Optional[List[str]] = None
     ) -> Optional[pd.DataFrame]:
         """
         Fetch historical OHLCV data for a ticker
-        
+
         Args:
             ticker: Stock ticker symbol
             start: Start date (YYYY-MM-DD)
             end: End date (YYYY-MM-DD)
             force_refresh: Force refresh from yfinance
-            
+            source_order: Pre-resolved vendor cascade (batch callers resolve
+                once per batch); resolved from the user preference when None
+
         Returns:
             DataFrame with OHLCV data or None if failed
         """
@@ -128,48 +151,58 @@ class DataService:
                     return cached_df.copy()
 
             logger.info(f"Fetching historical data for {ticker} -> {normalized_ticker} from {start} to {end}")
-            
+
             # Check SQLite database cache
             if not force_refresh:
-                cached_data = await self._get_cached_data(normalized_ticker, start, end)
+                async with self._db_lock:
+                    cached_data = await self._get_cached_data(normalized_ticker, start, end)
                 if cached_data is not None:
                     self._in_memory_df_cache[cache_key] = (now_ts, cached_data)
                     return cached_data
-            
-            # Download data with retry logic (Tier 1: bfinance -> Tier 2: yfinance inside _download_with_timeout)
+
+            # Vendor cascade per user preference: [primary, secondary], Alpha Vantage last
+            if source_order is None:
+                source_order = await self._resolve_source_order()
+
+            # Download data with retry logic (Tier 1/2 per preference inside _download_with_timeout)
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    df = await self._download_with_timeout(normalized_ticker, start, end)
-                    
+                    df = await self._download_with_timeout(normalized_ticker, start, end, source_order)
+
                     if df is not None and not df.empty:
+                        # Read vendor marker before normalization (reset_index
+                        # creates a new frame and drops instance attributes)
+                        actual_source = self._source_of_df(df)
+
                         # Handle multi-index columns
                         df = self._normalize_yfinance_data(df, normalized_ticker)
-                        
-                        # Store in database cache
-                        await self._store_timeseries_data(normalized_ticker, df)
-                        
-                        # Log successful fetch
-                        await self.cache.log_fetch_attempt(
-                            ticker=normalized_ticker,
-                            status="success",
-                            source_used="bfinance" if "bfinance" in str(getattr(df, "_source", "")) else "yfinance"
-                        )
-                        
-                        logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker}")
+
+                        # Store in database cache + log the attempt; both touch
+                        # the shared session, so keep them inside the DB gate
+                        async with self._db_lock:
+                            await self._store_timeseries_data(normalized_ticker, df, source_used=actual_source)
+                            await self.cache.log_fetch_attempt(
+                                ticker=normalized_ticker,
+                                status="success",
+                                source_used=actual_source
+                            )
+
+                        logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker} via {actual_source}")
                         self._in_memory_df_cache[cache_key] = (now_ts, df)
                         return df
-                    
+
                 except Exception as e:
                     logger.warning(f"Attempt {attempt + 1} failed for {normalized_ticker}: {e}")
                     if attempt == max_retries - 1:
                         # Log failed fetch
-                        await self.cache.log_fetch_attempt(
-                            ticker=normalized_ticker,
-                            status="failed",
-                            error_message=str(e),
-                            source_used="yfinance"
-                        )
+                        async with self._db_lock:
+                            await self.cache.log_fetch_attempt(
+                                ticker=normalized_ticker,
+                                status="failed",
+                                error_message=str(e),
+                                source_used=source_order[0]
+                            )
                     else:
                         await asyncio.sleep(1)  # Brief pause before retry
 
@@ -200,39 +233,38 @@ class DataService:
             is_indian = self._is_indian_ticker(normalized_ticker)
             logger.debug(f"Fetching quote for {ticker} -> {normalized_ticker}")
 
-            def _sync_fetch() -> Optional[Dict[str, Any]]:
-                import unittest.mock
-                is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+            # Vendor cascade per user preference: [primary, secondary]
+            source_order = await self._resolve_source_order()
 
-                if not is_yf_mocked:
-                    # Tier 1: Try bfinance first
-                    try:
-                        import bfinance as bf
-                        bt = bf.Ticker(normalized_ticker)
-                        b_fast = getattr(bt, 'fast_info', None)
-                        b_info = getattr(bt, 'info', {}) or {}
-                        b_price = getattr(b_fast, 'last_price', None) or getattr(b_fast, 'regular_market_price', None) or b_info.get('currentPrice')
-                        if b_price and b_price > 0:
-                            return {
-                                "ticker": normalized_ticker.upper(),
-                                "current_price": float(b_price),
-                                "volume": int(getattr(b_fast, 'last_volume', 0) or b_info.get('volume') or 0),
-                                "market_cap": getattr(b_fast, 'market_cap', None) or b_info.get('marketCap'),
-                                "sector": b_info.get('sector') or getattr(bt, 'sector', None),
-                                "industry": b_info.get('industry') or getattr(bt, 'industry', None),
-                                "52_week_high": getattr(b_fast, 'year_high', None) or b_info.get('fiftyTwoWeekHigh'),
-                                "52_week_low": getattr(b_fast, 'year_low', None) or b_info.get('fiftyTwoWeekLow'),
-                                "pe_ratio": b_info.get('trailingPE'),
-                                "dividend_yield": b_info.get('dividendYield'),
-                                "currency": "INR" if is_indian else "USD",
-                                "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
-                                "is_indian": is_indian,
-                                "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
-                            }
-                    except Exception as e:
-                        logger.debug(f"bfinance quote fetch failed for {normalized_ticker}: {e}")
+            def _fetch_bf_quote() -> Optional[Dict[str, Any]]:
+                try:
+                    import bfinance as bf
+                    bt = bf.Ticker(normalized_ticker)
+                    b_fast = getattr(bt, 'fast_info', None)
+                    b_info = getattr(bt, 'info', {}) or {}
+                    b_price = getattr(b_fast, 'last_price', None) or getattr(b_fast, 'regular_market_price', None) or b_info.get('currentPrice')
+                    if b_price and b_price > 0:
+                        return {
+                            "ticker": normalized_ticker.upper(),
+                            "current_price": float(b_price),
+                            "volume": int(getattr(b_fast, 'last_volume', 0) or b_info.get('volume') or 0),
+                            "market_cap": getattr(b_fast, 'market_cap', None) or b_info.get('marketCap'),
+                            "sector": b_info.get('sector') or getattr(bt, 'sector', None),
+                            "industry": b_info.get('industry') or getattr(bt, 'industry', None),
+                            "52_week_high": getattr(b_fast, 'year_high', None) or b_info.get('fiftyTwoWeekHigh'),
+                            "52_week_low": getattr(b_fast, 'year_low', None) or b_info.get('fiftyTwoWeekLow'),
+                            "pe_ratio": b_info.get('trailingPE'),
+                            "dividend_yield": b_info.get('dividendYield'),
+                            "currency": "INR" if is_indian else "USD",
+                            "exchange": "NSE" if ".NS" in normalized_ticker else "BSE" if ".BO" in normalized_ticker else "Other",
+                            "is_indian": is_indian,
+                            "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
+                        }
+                except Exception as e:
+                    logger.debug(f"bfinance quote fetch failed for {normalized_ticker}: {e}")
+                return None
 
-                # Tier 2: Fallback to yfinance
+            def _fetch_yf_quote() -> Optional[Dict[str, Any]]:
                 stock = yf.Ticker(normalized_ticker)
                 current_price = None
                 market_cap = None
@@ -302,6 +334,23 @@ class DataService:
                     "timestamp": datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
                 }
 
+            def _sync_fetch() -> Optional[Dict[str, Any]]:
+                import unittest.mock
+                # Under mocked yfinance (unit tests), skip real network vendors
+                # and let the yfinance mock serve regardless of preference order.
+                is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+
+                for source in source_order:
+                    if source == "bfinance":
+                        if is_yf_mocked:
+                            continue
+                        quote = _fetch_bf_quote()
+                    else:
+                        quote = _fetch_yf_quote()
+                    if quote:
+                        return quote
+                return None
+
             quote_data = await asyncio.to_thread(_sync_fetch)
             if quote_data:
                 logger.debug(f"Successfully fetched quote for {normalized_ticker}: {quote_data['current_price']}")
@@ -335,21 +384,29 @@ class DataService:
             Dictionary mapping ticker to DataFrame and list of failed tickers
         """
         logger.info(f"Fetching batch data for {len(tickers)} tickers")
-        
+
         # Calculate date range if not provided
         resolved_end = end_date or datetime.now().strftime('%Y-%m-%d')
         resolved_start = start_date or (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-        
+
+        # Resolve the vendor cascade once per batch: one preference read
+        # instead of N, and every ticker in the batch uses the same chain
+        # even if the user flips the setting mid-batch.
+        batch_source_order = await self._resolve_source_order()
+
         results = {}
         failed_tickers = []
-        
+
         # Process tickers with controlled concurrency (max 5 simultaneous requests)
         sem = asyncio.Semaphore(5)
-        
+
         async def fetch_one(ticker: str):
             async with sem:
                 try:
-                    df = await self.fetch_historical_data(ticker, resolved_start, resolved_end, force_refresh=force_refresh)
+                    df = await self.fetch_historical_data(
+                        ticker, resolved_start, resolved_end,
+                        force_refresh=force_refresh, source_order=batch_source_order
+                    )
                     return ticker, df
                 except Exception as e:
                     logger.error(f"Error in batch fetch for {ticker}: {e}")
@@ -384,18 +441,34 @@ class DataService:
             # Normalize ticker for Indian market
             normalized_ticker = self._normalize_indian_ticker(ticker)
             logger.debug(f"Validating ticker: {ticker} -> {normalized_ticker}")
-            
-            # Try to fetch recent data
-            stock = yf.Ticker(normalized_ticker)
-            hist = stock.history(period="5d")
-            
-            if not hist.empty:
-                logger.info(f"Ticker {normalized_ticker} is valid")
-                return True
-            else:
-                logger.warning(f"Ticker {normalized_ticker} has no data")
-                return False
-                
+
+            source_order = await self._resolve_source_order()
+
+            for source in source_order:
+                try:
+                    if source == "bfinance":
+                        def _bf_validate() -> bool:
+                            import bfinance as bf
+                            bt = bf.Ticker(normalized_ticker)
+                            b_fast = getattr(bt, 'fast_info', None)
+                            price = getattr(b_fast, 'last_price', None) or getattr(b_fast, 'regular_market_price', None)
+                            return bool(price and price > 0)
+                        valid = await asyncio.to_thread(_bf_validate)
+                    else:
+                        stock = yf.Ticker(normalized_ticker)
+                        hist = stock.history(period="5d")
+                        valid = not hist.empty
+
+                    if valid:
+                        logger.info(f"Ticker {normalized_ticker} is valid (source: {source})")
+                        return True
+                    logger.debug(f"Ticker {normalized_ticker} has no data from {source}")
+                except Exception as e:
+                    logger.debug(f"Ticker validation via {source} failed for {normalized_ticker}: {e}")
+
+            logger.warning(f"Ticker {normalized_ticker} has no data from any source")
+            return False
+
         except Exception as e:
             logger.error(f"Error validating ticker {ticker}: {e}")
             return False
@@ -441,50 +514,59 @@ class DataService:
         }
     
     async def _download_with_timeout(
-        self, 
-        ticker: str, 
-        start: str, 
-        end: str
+        self,
+        ticker: str,
+        start: str,
+        end: str,
+        source_order: Optional[List[str]] = None
     ) -> Optional[pd.DataFrame]:
-        """Download data with timeout protection"""
+        """Download data with timeout protection, trying vendors in the user's
+        preferred order (source_order defaults to bfinance -> yfinance)."""
         try:
+            order = source_order or ["bfinance", "yfinance"]
             # Use asyncio to wrap the synchronous data download calls
             loop = asyncio.get_event_loop()
-            
+
             def download():
                 import unittest.mock
-                if not isinstance(yf.download, (unittest.mock.Mock, unittest.mock.MagicMock)):
-                    # Tier 1: Try bfinance download
-                    try:
-                        import bfinance as bf
-                        df_bf = bf.download(
-                            ticker,
-                            start=start,
-                            end=end,
-                            progress=False,
-                            auto_adjust=False,
-                        )
-                        if df_bf is not None and not df_bf.empty:
-                            df_bf._source = "bfinance"
-                            return df_bf
-                    except Exception as bf_err:
-                        logger.debug(f"bfinance download failed for {ticker}: {bf_err}")
+                is_yf_mocked = isinstance(yf.download, (unittest.mock.Mock, unittest.mock.MagicMock))
 
-                # Tier 2: yfinance download
-                return yf.download(
-                    ticker,
-                    start=start,
-                    end=end,
-                    progress=False,
-                    auto_adjust=False  # Keep original OHLCV
-                )
-            
+                for source in order:
+                    try:
+                        if source == "bfinance":
+                            if is_yf_mocked:
+                                continue  # mocked yfinance tests must not hit real vendors
+                            import bfinance as bf
+                            df_src = bf.download(
+                                ticker,
+                                start=start,
+                                end=end,
+                                progress=False,
+                                auto_adjust=False,
+                            )
+                        else:
+                            df_src = yf.download(
+                                ticker,
+                                start=start,
+                                end=end,
+                                progress=False,
+                                auto_adjust=False  # Keep original OHLCV
+                            )
+
+                        if df_src is not None and not df_src.empty:
+                            if source == "bfinance":
+                                df_src._source = "bfinance"
+                            return df_src
+                    except Exception as src_err:
+                        logger.debug(f"{source} download failed for {ticker}: {src_err}")
+                return None
+
             # Run with timeout
             df = await asyncio.wait_for(
                 loop.run_in_executor(None, download),
                 timeout=self.yfinance_timeout
             )
-            
+
             return df
             
         except asyncio.TimeoutError:
@@ -514,14 +596,15 @@ class DataService:
         if df is None or df.empty:
             return None
 
-        await self.cache.log_fetch_attempt(
-            ticker=normalized_ticker,
-            status="success",
-            primary_attempt=False,
-            fallback_attempt=True,
-            source_used="alphavantage",
-        )
-        await self._store_timeseries_data(normalized_ticker, df, source_used="alphavantage")
+        async with self._db_lock:
+            await self.cache.log_fetch_attempt(
+                ticker=normalized_ticker,
+                status="success",
+                primary_attempt=False,
+                fallback_attempt=True,
+                source_used="alphavantage",
+            )
+            await self._store_timeseries_data(normalized_ticker, df, source_used="alphavantage")
         logger.info(
             f"Fallback succeeded via Alpha Vantage for {normalized_ticker}: {len(df)} records"
         )
@@ -544,13 +627,14 @@ class DataService:
         if not q:
             return None
 
-        await self.cache.log_fetch_attempt(
-            ticker=normalized_ticker,
-            status="success",
-            primary_attempt=False,
-            fallback_attempt=True,
-            source_used="alphavantage",
-        )
+        async with self._db_lock:
+            await self.cache.log_fetch_attempt(
+                ticker=normalized_ticker,
+                status="success",
+                primary_attempt=False,
+                fallback_attempt=True,
+                source_used="alphavantage",
+            )
         q.setdefault("is_indian", ".BSE" in normalized_ticker.upper())
         return q
     
@@ -803,29 +887,22 @@ class DataService:
         return errors
     
     async def _log_storage_metrics(self, ticker: str, stored_count: int, replaced_count: int) -> None:
-        """Log storage metrics for monitoring"""
+        """Log storage-metric warnings.
+
+        Deliberately does NOT write a FetchLog row: the success path already
+        records one via log_fetch_attempt with the real source_used, and this
+        second hardcoded-yfinance row duplicated it (two rows per fetch, the
+        extra one mislabeled).
+        """
         try:
-            from app.models.database import FetchLog
-            
             total_operations = stored_count + replaced_count
             replacement_ratio = replaced_count / total_operations if total_operations > 0 else 0
-            
+
             # Log high replacement ratio as warning
             if replacement_ratio > 0.5:
                 logger.warning(f"High replacement ratio for {ticker}: {replacement_ratio:.2%} "
                              f"({replaced_count}/{total_operations} operations)")
-            
-            # Create a log entry for this storage operation
-            log_entry = FetchLog(
-                ticker=ticker,
-                primary_attempt=True,
-                fallback_attempt=False,
-                status="success",
-                source_used="yfinance",
-                timestamp=datetime.utcnow()
-            )
-            self.db.add(log_entry)
-            
+
         except Exception as e:
             logger.error(f"Error logging storage metrics: {e}")
     

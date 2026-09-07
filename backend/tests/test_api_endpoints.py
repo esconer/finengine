@@ -121,7 +121,9 @@ class TestDataAPI:
         """Regression: /config was shadowed by /{ticker} route order."""
         resp = await async_client.get("/api/v1/data/config")
         assert resp.status_code == 200, resp.text
-        assert resp.json()["primary_source"] == "yfinance"
+        # Default primary source is bfinance (legacy Tier-1 vendor); the
+        # user-configurable preference persists in app_settings (DSP feature).
+        assert resp.json()["primary_source"] == "bfinance"
 
 
 @pytest.mark.api

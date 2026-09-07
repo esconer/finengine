@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db_session
 from app.services.data_service import GlobalDataService, DataService
-from app.services.cache_service import GlobalCacheService, CacheService
+from app.services.cache_service import GlobalCacheService, CacheService, clear_market_data_cache
+from app.services.source_preference_service import get_primary_source, set_primary_source, source_order_for
 from app.services.indicators_service import IndicatorsService, SUPPORTED_INDICATORS, StaleMarketDataError
 from app.services.company_data_service import get_company_data_service
 from app.models.schemas import (
@@ -100,13 +101,19 @@ async def get_verified_snapshot(
 
 
 @router.get("/fundamentals/{ticker}")
-async def get_fundamentals(ticker: str):
+async def get_fundamentals(
+    ticker: str,
+    db: AsyncSession = Depends(get_db_session),
+):
     """
-    Curated fundamentals snapshot for a ticker (yfinance).
+    Curated fundamentals snapshot.
+    Vendor cascade honors the user's primary-source preference
+    (bfinance <-> yfinance per setting; Alpha Vantage N/A for fundamentals).
     Field list adapted from TauricResearch/TradingAgents (Apache-2.0).
     """
     try:
-        return await get_company_data_service().get_fundamentals(ticker)
+        source_order = source_order_for(await get_primary_source(db))
+        return await get_company_data_service().get_fundamentals(ticker, source_order=source_order)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -150,10 +157,11 @@ async def get_insider_transactions(ticker: str):
 
 @router.get("/config", response_model=APIConfigResponse)
 async def get_api_config(
+    db: AsyncSession = Depends(get_db_session),
     cache_service: CacheService = Depends(get_cache_service)
 ) -> APIConfigResponse:
     """
-    Get API configuration and cache settings.
+    Get API configuration: user-selected primary data source and cache settings.
 
     Declared BEFORE the dynamic /{ticker} route - route order previously
     shadowed this path with a 404.
@@ -161,18 +169,21 @@ async def get_api_config(
     try:
         # Get cache stats
         cache_stats = await cache_service.get_cache_stats()
+        primary_source = await get_primary_source(db)
 
         return APIConfigResponse(
-            primary_source="yfinance",
+            primary_source=primary_source,
             cache_ttl_minutes=cache_stats.get("ttl_minutes", 60),
             enable_cache=True
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting API config: {e}")
         # Return default config on error
         return APIConfigResponse(
-            primary_source="yfinance",
+            primary_source="bfinance",
             cache_ttl_minutes=60,
             enable_cache=True
         )
@@ -180,17 +191,27 @@ async def get_api_config(
 
 @router.put("/config")
 async def update_api_config(
+    primary_source: Optional[str] = Query(None, description="Primary data vendor: bfinance | yfinance"),
     cache_ttl_minutes: Optional[int] = Query(None, ge=1, le=1440),
     enable_cache: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db_session),
     cache_service: CacheService = Depends(get_cache_service)
 ):
     """
-    Update API configuration (placeholder for future implementation)
-    """
-    # This is a placeholder endpoint - in a real implementation,
-    # you would update settings and persist them
+    Update API configuration.
 
+    `primary_source` swaps the vendor cascade order per user preference:
+        bfinance primary -> bfinance, yfinance, Alpha Vantage (always last)
+        yfinance primary -> yfinance, bfinance, Alpha Vantage (always last)
+    """
     updated_settings = {}
+
+    if primary_source is not None:
+        try:
+            saved = await set_primary_source(db, primary_source)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        updated_settings["primary_source"] = saved
 
     if cache_ttl_minutes is not None:
         updated_settings["cache_ttl_minutes"] = cache_ttl_minutes
@@ -203,6 +224,26 @@ async def update_api_config(
         "settings": updated_settings,
         "message": "Configuration updated successfully"
     }
+
+
+@router.post("/cache/clear")
+async def clear_cache(
+    db: AsyncSession = Depends(get_db_session)
+):
+    """
+    Purge all cached market data (timeseries, analytics, fetch logs, NSE
+    microstructure tables) plus in-process memo caches so fresh data is
+    pulled from the configured vendor chain.
+
+    Portfolio holdings (tickers, quantities, avg buy prices, weights) are
+    user-owned truth and are never touched.
+    """
+    try:
+        result = await clear_market_data_cache(db)
+        return result
+    except Exception as e:
+        logger.error(f"Error clearing market data cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
 
 
 @router.get("/{ticker}", response_model=StockTimeseriesResponse)

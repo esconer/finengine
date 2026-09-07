@@ -806,11 +806,16 @@ export default function VolatilitySizingPage() {
 
         <div className="relative group">
           <MetricCard
-            title="Estimated Portfolio Vol"
+            title="Est. Portfolio Vol"
             value={sizingData?.current_volatility ? formatPercentage(sizingData.current_volatility) : 'N/A'}
             icon={Activity}
             loading={loading}
           />
+          <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            {selectedModel === 'EWMA'
+              ? 'EWMA conditional estimate (RiskMetrics λ=0.94) · 252d window — current vol for sizing; differs from Forecast Risk (forward projection) & Realized Risk (trailing realized)'
+              : `${selectedModel} conditional estimate · 252d window — current vol for sizing; differs from Forecast Risk (forward projection) & Realized Risk (trailing realized)`}
+          </p>
           <div className="absolute top-4 right-4 z-10">
             <HelpBtn onClick={() => setActiveExplainer('estimated_portfolio_vol')} />
           </div>

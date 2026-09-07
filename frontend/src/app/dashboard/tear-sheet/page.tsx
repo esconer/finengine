@@ -242,6 +242,10 @@ interface TearSheetData {
   window: { start: string; end: string };
   holdings: Record<string, number>;
   metrics: Record<string, number | null>;
+  full_history?: {
+    metrics: Record<string, number | null>;
+    relative_vs_nifty: Record<string, number | null>;
+  } | null;
   relative_vs_nifty: Record<string, number | null>;
   monthly_returns: Record<string, Record<string, number>>;
   underwater: { date: string; drawdown: number }[];
@@ -518,6 +522,56 @@ export default function TearSheetPage() {
               </div>
             </div>
           </div>
+
+          {/* Full-history instrument risk (DSP-10): the current book measured
+              over full exchange history. Holding-window metrics above stay
+              holding-truthed and gate to N/A on young books. */}
+          {data.full_history?.metrics && (
+            <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-bold text-white">
+                  Instrument Risk — Full Exchange History
+                  {typeof data.full_history.metrics.days === 'number' && (
+                    <span className="ml-2 text-xs font-medium text-emerald-300/80">
+                      ({data.full_history.metrics.days} trading days)
+                    </span>
+                  )}
+                </h3>
+                <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono">
+                  ASSET CHARACTERISTICS
+                </span>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                {[
+                  { label: 'CAGR', key: 'cagr', pct: true },
+                  { label: 'Sharpe', key: 'sharpe', pct: false },
+                  { label: 'Sortino', key: 'sortino', pct: false },
+                  { label: 'Calmar', key: 'calmar', pct: false },
+                  { label: 'Volatility', key: 'volatility', pct: true },
+                  { label: 'Total Return', key: 'total_return', pct: true },
+                ].map(({ label, key, pct }) => {
+                  const v = data.full_history!.metrics[key];
+                  return (
+                    <div key={key} className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                      <span className="text-xs font-semibold text-slate-400">{label}</span>
+                      <p className="text-lg font-bold font-mono text-emerald-300">
+                        {v == null || Number.isNaN(v) ? 'N/A' : pct ? `${(v * 100).toFixed(2)}%` : v.toFixed(2)}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+              {(data.full_history.relative_vs_nifty?.beta_vs_nifty != null ||
+                data.full_history.relative_vs_nifty?.alpha_annualized != null) && (
+                <div className="mt-3 text-xs text-emerald-200/80 font-mono">
+                  β vs NIFTY {fmtRatio(data.full_history.relative_vs_nifty.beta_vs_nifty)}
+                  {'  ·  '}α (ann.) {fmt(data.full_history.relative_vs_nifty.alpha_annualized, 2, '%')}
+                  {typeof data.full_history.relative_vs_nifty.overlap_days === 'number' &&
+                    `  ·  ${data.full_history.relative_vs_nifty.overlap_days}d overlap`}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Relative vs NIFTY 50 */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">

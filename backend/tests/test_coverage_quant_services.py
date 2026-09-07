@@ -133,6 +133,18 @@ class TestCointegrationService:
         assert res.is_cointegrated is True
         assert res.current_spread_zscore is not None
 
+    def test_non_cointegrated_pair_signal_gated(self):
+        # Independent random walks: high EG p-value -> no trade signal.
+        rng = np.random.default_rng(7)
+        dates = pd.date_range("2024-01-01", periods=250, freq="B")
+        p1 = pd.Series(100.0 + np.cumsum(rng.normal(0, 1, 250)), index=dates)
+        p2 = pd.Series(50.0 + np.cumsum(rng.normal(0, 1, 250)), index=dates)
+        res = analyze_pair_cointegration("STOCK_A", "STOCK_C", p1, p2)
+        assert res is not None
+        assert res.engle_granger_pvalue >= 0.05
+        assert res.is_cointegrated is False
+        assert res.signal == "NOT_COINTEGRATED"
+
     @pytest.mark.asyncio
     async def test_scan_portfolio_pairs(self, test_db: AsyncSession):
         service = CointegrationService(test_db)

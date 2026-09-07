@@ -245,7 +245,7 @@ class TestDataServiceBatchAndTimeout:
         service = DataService(test_db)
         df_a = _sample_df("STOCKA.NS", 5)
         
-        async def mock_fetch(ticker, start, end, force_refresh=False):
+        async def mock_fetch(ticker, start, end, force_refresh=False, **kwargs):
             if "FAIL" in ticker:
                 return None
             if "ERROR" in ticker:

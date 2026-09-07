@@ -182,11 +182,15 @@ def analyze_pair_cointegration(
     if spread_std > 1e-8:
         current_zscore = round(float((spread[-1] - spread_mean) / spread_std), 4)
 
-    # 7. Trading Signal
+    # 7. Trading Signal — gated on cointegration: a z-score extreme on a
+    # non-cointegrated pair (p >= threshold) is spurious mean-reversion, not
+    # a trade. Such pairs render "Not cointegrated" downstream.
     last_p_a = float(p_a[-1])
     last_p_b = float(p_b[-1])
 
-    if current_zscore is not None:
+    if not is_coint:
+        signal = "NOT_COINTEGRATED"
+    elif current_zscore is not None:
         if current_zscore >= 1.5:
             signal = f"SHORT_SPREAD (Short {ticker_a}, Long {ticker_b})"
         elif current_zscore <= -1.5:

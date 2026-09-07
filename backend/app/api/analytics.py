@@ -3,8 +3,9 @@ Analytics API endpoints for risk calculations and portfolio analytics
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -30,6 +31,7 @@ from app.utils.holdings import (
     MIN_ANNUALIZE_DAYS,
     apply_annualization_gate,
     coerce_holding_date,
+    effective_starts,
     holding_coverage,
     holding_window,
 )
@@ -265,6 +267,63 @@ async def get_realized_risk(
         covered_days = int(len(price_data))
         history_coverage = holding_coverage(effectives, start, end, covered_days)
 
+        # --- Instrument risk on FULL exchange history (DSP-10) --------------
+        # Risk characteristics belong to the assets, not the ownership
+        # tenure: the covariance/vol/Sharpe of NTPC.NS does not change with
+        # when the user bought it. Realized P&L above stays holding-truthed;
+        # this block measures the current book on the full fetched window
+        # (~1Y), so a young portfolio no longer renders N/A risk metrics.
+        full_df = pd.DataFrame({
+            t: s for t, s in price_data_dict.items()
+            if isinstance(s, pd.Series) and len(s) > 1
+        })
+        instrument_risk: Dict[str, Any] = {}
+        full_days = int(len(full_df)) if not full_df.empty else 0
+        if full_days >= 2:
+            full_metrics = await analytics_engine.calculate_portfolio_metrics(full_df, weights)
+            full_portfolio = {
+                "annual_return": full_metrics.get("annual_return"),
+                "annual_volatility": full_metrics.get("annual_volatility"),
+                "sharpe_ratio": full_metrics.get("sharpe_ratio"),
+                "sortino_ratio": full_metrics.get("sortino_ratio"),
+                "max_drawdown": full_metrics.get("max_drawdown"),
+                "var_95": full_metrics.get("var_95"),
+                "days": full_days,
+            }
+            apply_annualization_gate(
+                full_portfolio,
+                ["annual_return", "annual_volatility", "sharpe_ratio", "sortino_ratio"],
+                full_days,
+            )
+            full_positions: Dict[str, Any] = {}
+            for tkr, pm in (full_metrics.get("positions") or {}).items():
+                own_series = price_data_dict.get(tkr)
+                own_days = int(len(own_series)) if own_series is not None else 0
+                total_ret = None
+                if own_series is not None and len(own_series) > 1:
+                    s0 = float(pd.Series(own_series).iloc[0])
+                    s1 = float(pd.Series(own_series).iloc[-1])
+                    total_ret = round((s1 / s0) - 1.0, 6) if s0 else None
+                row = {
+                    "annual_volatility": pm.get("annual_volatility"),
+                    "sharpe_ratio": pm.get("sharpe_ratio"),
+                    "max_drawdown": pm.get("max_drawdown"),
+                    "total_return": total_ret,
+                    "data_points": own_days,
+                }
+                apply_annualization_gate(row, ["annual_volatility", "sharpe_ratio"], own_days)
+                full_positions[tkr] = row
+            instrument_risk = {"portfolio": full_portfolio, "positions": full_positions}
+
+        history_coverage["full_history_days"] = full_days
+        if full_days:
+            try:
+                history_coverage["full_history_start"] = str(full_df.index.min().date())
+            except Exception:
+                history_coverage["full_history_start"] = None
+        else:
+            history_coverage["full_history_start"] = None
+
         # Calculate portfolio metrics using analytics engine
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         
@@ -291,9 +350,10 @@ async def get_realized_risk(
             if is_limited:
                 if history_coverage.get("truncated"):
                     notice = (
-                        f"{ticker} has only {data_pts} trading days in the current holding period "
-                        f"(held since {history_coverage.get('effective_start')}); full exchange history exists "
-                        "but predates ownership. Historical risk ratios are constrained."
+                        f"{ticker} realized P&L covers only {data_pts} trading days "
+                        f"(held since {history_coverage.get('effective_start')}); instrument risk "
+                        f"metrics use the full {history_coverage.get('full_history_days')} trading days "
+                        "of exchange history."
                     )
                 else:
                     notice = (
@@ -348,6 +408,7 @@ async def get_realized_risk(
         return {
             "portfolio": portfolio_metrics,
             "positions": positions,
+            "instrument_risk": instrument_risk,
             "warnings": warnings_list,
             "data_range": {"start": start, "end": end},
             "history_coverage": history_coverage,
@@ -355,7 +416,7 @@ async def get_realized_risk(
         }
         
     except Exception as e:
-        logger.error(f"Error in get_realized_risk: {e}")
+        logger.exception(f"Error in get_realized_risk: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -548,9 +609,15 @@ async def get_factor_exposure(
                 "error": "No price data available for factor analysis"
             }
         
-        # Combine price data, restricted to actual holding history.
+        # Factor exposure is an instrument-characteristic question: beta and
+        # R² describe how the ASSETS co-move with the market, independent of
+        # when the user bought them (DSP-10). Regressing on the holding-window
+        # mask left ~6 observations, which collapsed into the engine's
+        # degenerate fallback (beta exactly 1.0, R² 0.0) rendered as
+        # "Market-Like" for every position. Compute on full history; the
+        # holding window stays disclosed via history_coverage.
         holdings = await resolve_holdings(db, ticker_list)
-        price_data_dict, effectives = holding_window(price_data_dict, holdings)
+        _, effectives = holding_window(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
         history_coverage = holding_coverage(
             effectives, start, end, int(len(price_data))
@@ -1260,6 +1327,42 @@ async def get_tear_sheet(
             metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(port_ret)
         )
 
+        # --- Full-history instrument risk (DSP-10) ---------------------------
+        # CAGR/Sharpe/Sortino/Calmar and benchmark beta/alpha are asset-
+        # characteristic questions: the current book measured over the full
+        # fetched window. Realized P&L above stays holding-truthed. The second
+        # build is cache-served (same frames as the masked call).
+        full_returns_df, full_port_ret, _ = await _build_wide_returns(
+            ticker_list, weights, start, end, data_service,
+        )
+        full_metrics = {
+            "total_return": _q(qs.stats.comp, full_port_ret),
+            "cagr": _q(qs.stats.cagr, full_port_ret),
+            "sharpe": _q(qs.stats.sharpe, full_port_ret, rf=0.02),
+            "sortino": _q(qs.stats.sortino, full_port_ret, rf=0.02),
+            "calmar": _q(qs.stats.calmar, full_port_ret),
+            "volatility": _q(qs.stats.volatility, full_port_ret),
+            "max_drawdown": _q(qs.stats.max_drawdown, full_port_ret),
+            "days": int(len(full_port_ret)),
+        }
+        apply_annualization_gate(
+            full_metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(full_port_ret)
+        )
+
+        full_relative: Dict[str, Any] = {}
+        if bench_ret is not None and len(bench_ret) > 20:
+            common_full = full_port_ret.index.intersection(bench_ret.index)
+            if len(common_full) >= MIN_ANNUALIZE_DAYS:
+                p, b = full_port_ret.loc[common_full], bench_ret.loc[common_full]
+                var_b = float(b.var())
+                beta = float(p.cov(b) / var_b) if var_b > 0 else None
+                alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
+                full_relative = {
+                    "beta_vs_nifty": round(beta, 4) if beta is not None else None,
+                    "alpha_annualized": round(alpha_ann, 4) if beta is not None else None,
+                    "overlap_days": int(len(common_full)),
+                }
+
         relative: Dict[str, Any] = {}
         if bench_ret is not None and len(bench_ret) > 20:
             # Benchmark standalone stats describe the index over the FULL
@@ -1309,6 +1412,10 @@ async def get_tear_sheet(
             "window": {"start": start, "end": end},
             "holdings": weights,
             "metrics": metrics,
+            "full_history": {
+                "metrics": full_metrics,
+                "relative_vs_nifty": full_relative,
+            },
             "relative_vs_nifty": relative,
             "monthly_returns": monthly,
             "underwater": underwater,
@@ -1347,10 +1454,15 @@ async def get_risk_contribution(
             raise HTTPException(status_code=404, detail=str(e))
 
         holdings = await resolve_holdings(db, ticker_list)
-        returns_df, port_ret, history_coverage = await _build_wide_returns(
+        # Euler risk contribution is an asset-risk question: the covariance of
+        # the CURRENT book comes from full exchange history (DSP-10). Masking
+        # to the ~6-day holding window degenerated contributions and N/A'd the
+        # portfolio vol. Holding-period truncation stays disclosed.
+        returns_df, port_ret, _ = await _build_wide_returns(
             ticker_list, weights, start, end, data_service,
-            holdings=holdings,
         )
+        effectives = effective_starts(holdings, None)
+        history_coverage = holding_coverage(effectives, start, end, len(port_ret))
         assets = list(returns_df.columns)
         w = np.array([weights.get(a, 0.0) for a in assets])
 
@@ -1928,6 +2040,13 @@ async def get_volatility_cone(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+# /tails response memoization — the pairwise copula fit is O(n²) (~12s for 14
+# assets) and Risk Studio fires it on every load. Date-keyed: `end` rolls over
+# daily, so staleness is bounded by the calendar day.
+_TAILS_CACHE_TTL_SECONDS = 900
+_TAILS_RESPONSE_CACHE: Dict[Tuple, Tuple[float, Dict[str, Any]]] = {}
+
+
 @router.get("/tail-dependence")
 @router.get("/tails")
 async def get_tail_risk_and_copula(
@@ -1950,6 +2069,10 @@ async def get_tail_risk_and_copula(
 
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        cache_key = (tuple(sorted(ticker_list)), start, end, confidence_level, threshold_quantile)
+        cached = _TAILS_RESPONSE_CACHE.get(cache_key)
+        if cached is not None and (time.monotonic() - cached[0]) < _TAILS_CACHE_TTL_SECONDS:
+            return cached[1]
         wide_ret, port_ret, _ = await _build_wide_returns(ticker_list, weights, start, end, data_service)
 
         if len(port_ret) < 30:
@@ -1961,12 +2084,14 @@ async def get_tail_risk_and_copula(
         )
         tail_copula_matrix = TailRiskService.calculate_tail_dependence_matrix(wide_ret)
 
-        return {
+        response = {
             **evt_stats,
             "tail_dependence_matrix": tail_copula_matrix,
             "tickers": ticker_list,
             "observations": len(port_ret),
         }
+        _TAILS_RESPONSE_CACHE[cache_key] = (time.monotonic(), response)
+        return response
     except HTTPException:
         raise
     except ValueError as e:

@@ -97,8 +97,15 @@ export default function RealizedRiskPage() {
   // Generate position risk data for table
   useEffect(() => {
     if (realizedRisk?.positions) {
-      const positionsList = Object.entries(realizedRisk.positions).map(([ticker, data]: [string, any]) => ({
+      // DSP-10: per-position risk rows come from the FULL-history
+      // instrument_risk block; holding-period data stays in realizedRisk.positions.
+      const instrumentPositions = realizedRisk.instrument_risk?.positions || {};
+      const source = Object.keys(instrumentPositions).length ? instrumentPositions : realizedRisk.positions;
+      const positionsList = Object.entries(source).map(([ticker, data]: [string, any]) => ({
         ticker,
+        weight: realizedRisk.positions?.[ticker]?.weight,
+        is_limited_history: (data?.data_points ?? 0) < 30,
+        history_warning: `Only ${data?.data_points ?? 0} trading days of exchange history available`,
         ...data,
       }));
       setPositionData(positionsList);
@@ -178,14 +185,18 @@ export default function RealizedRiskPage() {
       },
     },
     {
-      header: 'Annual Return',
-      accessorKey: 'annual_return',
+      header: 'Total Return (Full History)',
+      accessorKey: 'total_return',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const isPositive = data.annual_return >= 0;
+        const ret = data.total_return ?? data.annual_return;
+        if (ret == null) {
+          return <div className="font-mono text-gray-400">N/A</div>;
+        }
+        const isPositive = ret >= 0;
         return (
           <div className={`font-mono ${isPositive ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-            {isPositive ? '+' : ''}{formatPercentage(data.annual_return)}
+            {isPositive ? '+' : ''}{formatPercentage(ret)}
           </div>
         );
       },
@@ -207,7 +218,7 @@ export default function RealizedRiskPage() {
       accessorKey: 'sharpe_ratio',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        if (data.is_limited_history) {
+        if (data.is_limited_history || data.annualized === false) {
           return (
             <div className="font-mono text-xs text-amber-600 dark:text-amber-400" title="Insufficient data (<30d) for annualized Sharpe ratio">
               -- <span className="text-[10px] text-gray-400">(Limited)</span>
@@ -251,6 +262,8 @@ export default function RealizedRiskPage() {
   ];
 
   const hasData = Boolean(realizedRisk?.portfolio);
+  // DSP-10: full-exchange-history portfolio risk (instrument characteristics)
+  const fullHistory = realizedRisk?.instrument_risk?.portfolio;
 
   return (
     <div className="space-y-6">
@@ -312,36 +325,57 @@ export default function RealizedRiskPage() {
         </div>
       )}
 
-      {/* Row 1: Return & Risk-Adjusted Ratios */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <MetricCard
-          title="Annual Return"
-          value={hasData && realizedRisk?.portfolio?.annual_return != null ? formatPercentage(realizedRisk.portfolio.annual_return) : 'N/A'}
-          icon={TrendingUp}
-          loading={analyticsLoading}
-        />
-        <MetricCard
-          title="Annual Volatility"
-          value={hasData && realizedRisk?.portfolio?.annual_volatility != null ? formatPercentage(realizedRisk.portfolio.annual_volatility) : 'N/A'}
-          icon={Activity}
-          loading={analyticsLoading}
-        />
-        <MetricCard
-          title="Sharpe Ratio"
-          value={hasData && realizedRisk?.portfolio?.sharpe_ratio != null ? formatRatio(realizedRisk.portfolio.sharpe_ratio) : 'N/A'}
-          icon={Target}
-          loading={analyticsLoading}
-        />
-        <MetricCard
-          title="Sortino Ratio"
-          value={hasData && realizedRisk?.portfolio?.sortino_ratio != null ? formatRatio(realizedRisk.portfolio.sortino_ratio) : 'N/A'}
-          icon={BarChart3}
-          loading={analyticsLoading}
-        />
+      {/* Row 1: Instrument Risk — full exchange history (DSP-10) */}
+      <div>
+        <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3 flex items-center space-x-2">
+          <Activity className="w-4 h-4 text-blue-500" />
+          <span>
+            Instrument Risk — Full Exchange History
+            {realizedRisk?.history_coverage?.full_history_days
+              ? ` (${realizedRisk.history_coverage.full_history_days} trading days${realizedRisk.history_coverage.full_history_start ? `, since ${realizedRisk.history_coverage.full_history_start}` : ''})`
+              : ''}
+          </span>
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          <MetricCard
+            title="Annual Return"
+            value={fullHistory?.annual_return != null ? formatPercentage(fullHistory.annual_return) : 'N/A'}
+            icon={TrendingUp}
+            loading={analyticsLoading}
+          />
+          <MetricCard
+            title="Annual Volatility"
+            value={fullHistory?.annual_volatility != null ? formatPercentage(fullHistory.annual_volatility) : 'N/A'}
+            icon={Activity}
+            loading={analyticsLoading}
+          />
+          <MetricCard
+            title="Sharpe Ratio"
+            value={fullHistory?.sharpe_ratio != null ? formatRatio(fullHistory.sharpe_ratio) : 'N/A'}
+            icon={Target}
+            loading={analyticsLoading}
+          />
+          <MetricCard
+            title="Sortino Ratio"
+            value={fullHistory?.sortino_ratio != null ? formatRatio(fullHistory.sortino_ratio) : 'N/A'}
+            icon={BarChart3}
+            loading={analyticsLoading}
+          />
+        </div>
       </div>
 
-      {/* Row 2: Tail Risk & Downside Distribution */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      {/* Row 2: Tail Risk & Downside Distribution — holding-period realized P&L */}
+      <div>
+        <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3 flex items-center space-x-2">
+          <TrendingDown className="w-4 h-4 text-red-500" />
+          <span>
+            Holding-Period Realized P&amp;L
+            {realizedRisk?.history_coverage?.effective_start
+              ? ` (since ${realizedRisk.history_coverage.effective_start})`
+              : ''}
+          </span>
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Max Drawdown"
           value={hasData && realizedRisk?.portfolio?.max_drawdown !== undefined ? formatPercentage(realizedRisk.portfolio.max_drawdown) : 'N/A'}
@@ -366,6 +400,7 @@ export default function RealizedRiskPage() {
           icon={Activity}
           loading={analyticsLoading}
         />
+        </div>
       </div>
 
       {/* Charts Section */}

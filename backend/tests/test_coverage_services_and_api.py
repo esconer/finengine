@@ -280,7 +280,7 @@ class TestDataAPIRoutesComprehensive:
         # Config endpoints
         res_cfg = await async_client.get("/api/v1/data/config")
         assert res_cfg.status_code == 200
-        assert res_cfg.json()["primary_source"] == "yfinance"
+        assert res_cfg.json()["primary_source"] == "bfinance"  # legacy Tier-1 default
 
         res_cfg_put = await async_client.put("/api/v1/data/config?cache_ttl_minutes=120&enable_cache=true")
         assert res_cfg_put.status_code == 200

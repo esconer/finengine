@@ -262,18 +262,36 @@ export const dataApi = {
     return response.data;
   },
 
-  // Get API config
-  async getConfig(): Promise<{ cache_ttl_minutes: number; enable_cache: boolean }> {
+  // Get API config (includes user-selected primary data source)
+  async getConfig(): Promise<{
+    primary_source: 'bfinance' | 'yfinance';
+    cache_ttl_minutes: number;
+    enable_cache: boolean;
+  }> {
     const response = await apiClient.get('/data/config');
     return response.data;
   },
 
-  // Update API config
+  // Update API config (primary_source swaps the vendor cascade order)
   async updateConfig(data: {
+    primary_source?: 'bfinance' | 'yfinance';
     cache_ttl_minutes?: number;
     enable_cache?: boolean;
-  }): Promise<{ cache_ttl_minutes: number; enable_cache: boolean }> {
+  }): Promise<{ primary_source: 'bfinance' | 'yfinance'; cache_ttl_minutes: number; enable_cache: boolean }> {
     const response = await apiClient.put('/data/config', null, { params: data });
+    return response.data;
+  },
+
+  // Purge cached market data (timeseries, analytics, NSE microstructure,
+  // fetch logs + in-process memo caches). Portfolio holdings are preserved
+  // server-side and never touched.
+  async clearCache(): Promise<{
+    cleared: Record<string, number>;
+    total_rows_cleared: number;
+    portfolio_preserved: boolean;
+    message?: string;
+  }> {
+    const response = await apiClient.post('/data/cache/clear');
     return response.data;
   },
 };
