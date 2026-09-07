@@ -254,14 +254,14 @@ function HelpBtn({
 
 interface FactorData {
   portfolio: {
-    alpha?: number;
-    annualized_alpha?: number;
-    market?: number;
+    alpha?: number | null;
+    annualized_alpha?: number | null;
+    market?: number | null;
   };
   positions: Record<string, any>;
   warnings?: Array<{ ticker: string; data_points: number; message: string }>;
-  r_squared: number;
-  adjusted_r_squared: number;
+  r_squared?: number | null;
+  adjusted_r_squared?: number | null;
   data_range?: {
     start: string;
     end: string;
@@ -361,11 +361,11 @@ export default function FactorExposurePage() {
     const headers = 'Ticker,Market Beta (β),Daily Alpha (α),Annualized Alpha (α p.a.),Sensitivity\n';
     const rows = positionData
       .map((p) => {
-        const beta = p.market ?? 1.0;
+        const beta = p.market ?? null;
         const alphaDaily = p.alpha ?? 0.0;
         const alphaAnn = p.annualized_alpha ?? alphaDaily * 252;
-        const sens = beta > 1.2 ? 'High Beta' : beta < 0.8 ? 'Defensive' : 'Market-Like';
-        return `${p.ticker},${beta.toFixed(4)},${(alphaDaily * 100).toFixed(4)}%,${(alphaAnn * 100).toFixed(2)}%,${sens}`;
+        const sens = beta == null ? 'N/A' : beta > 1.2 ? 'High Beta' : beta < 0.8 ? 'Defensive' : 'Market-Like';
+        return `${p.ticker},${beta == null ? 'N/A' : beta.toFixed(4)},${(alphaDaily * 100).toFixed(4)}%,${(alphaAnn * 100).toFixed(2)}%,${sens}`;
       })
       .join('\n');
     const blob = new Blob([headers + rows], { type: 'text/csv' });
@@ -407,7 +407,10 @@ export default function FactorExposurePage() {
         accessorKey: 'market',
         cell: ({ row }: any) => {
           const data = row.original || row;
-          const beta = data.market ?? 1.0;
+          const beta = data.market ?? null;
+          if (beta == null) {
+            return <div className="font-mono text-gray-400">N/A</div>;
+          }
           return (
             <div className={`font-mono ${getRiskColor(beta)}`}>
               {formatFactor(beta, 3)}
@@ -458,7 +461,14 @@ export default function FactorExposurePage() {
         accessorKey: 'sensitivity',
         cell: ({ row }: any) => {
           const data = row.original || row;
-          const beta = data.market ?? 1.0;
+          const beta = data.market ?? null;
+          if (beta == null) {
+            return (
+              <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full text-gray-500 bg-gray-100 dark:bg-gray-800 dark:text-gray-400 border border-gray-200 dark:border-gray-700">
+                N/A
+              </span>
+            );
+          }
           const sens =
             beta > 1.2 ? 'High Beta' : beta < 0.8 ? 'Defensive' : 'Market-Like';
           const badgeClass =
@@ -479,14 +489,14 @@ export default function FactorExposurePage() {
     []
   );
 
-  const rSquared = factorData?.r_squared ?? 0.679;
-  const systematicShare = Number((rSquared * 100).toFixed(1));
-  const idiosyncraticShare = Number(((1 - rSquared) * 100).toFixed(1));
-  const benchmarkCorr = Number((Math.sqrt(Math.max(0, rSquared)) * 100).toFixed(1));
+  const rSquared = factorData?.r_squared ?? null;
+  const systematicShare = rSquared == null ? null : Number((rSquared * 100).toFixed(1));
+  const idiosyncraticShare = rSquared == null ? null : Number(((1 - rSquared) * 100).toFixed(1));
+  const benchmarkCorr = rSquared == null ? null : Number((Math.sqrt(Math.max(0, rSquared)) * 100).toFixed(1));
 
-  const portBeta = factorData?.portfolio?.market ?? 1.083;
-  const portAlphaDaily = factorData?.portfolio?.alpha ?? 0.0016;
-  const portAlphaAnn = factorData?.portfolio?.annualized_alpha ?? portAlphaDaily * 252;
+  const portBeta = factorData?.portfolio?.market ?? null;
+  const portAlphaDaily = factorData?.portfolio?.alpha ?? null;
+  const portAlphaAnn = factorData?.portfolio?.annualized_alpha ?? (portAlphaDaily != null ? portAlphaDaily * 252 : null);
 
   const limitedHistoryCount = positionData.filter((p) => p.is_limited_history).length;
 
@@ -520,7 +530,7 @@ export default function FactorExposurePage() {
                 </div>
               )}
               <div className="px-2.5 py-1 rounded-md bg-teal-900/60 border border-teal-600/40 text-teal-200 text-xs font-medium">
-                R²: {factorData?.r_squared !== undefined ? factorData.r_squared.toFixed(3) : '0.679'}
+                R²: {factorData?.r_squared != null ? factorData.r_squared.toFixed(3) : 'N/A'}
               </div>
             </div>
           </div>
@@ -561,7 +571,7 @@ export default function FactorExposurePage() {
         <div className="relative">
           <MetricCard
             title="Market Beta (β)"
-            value={formatFactor(portBeta, 3)}
+            value={portBeta != null ? formatFactor(portBeta, 3) : 'N/A'}
             icon={Target}
             loading={loading}
           />
@@ -573,7 +583,7 @@ export default function FactorExposurePage() {
         <div className="relative">
           <MetricCard
             title="Jensen's Alpha (α)"
-            value={`+${(portAlphaAnn * 100).toFixed(2)}%`}
+            value={portAlphaAnn != null ? `+${(portAlphaAnn * 100).toFixed(2)}%` : 'N/A'}
             icon={TrendingUp}
             loading={loading}
           />
@@ -585,7 +595,7 @@ export default function FactorExposurePage() {
         <div className="relative">
           <MetricCard
             title="R-Squared (R²)"
-            value={factorData?.r_squared !== undefined ? factorData.r_squared.toFixed(3) : '0.679'}
+            value={factorData?.r_squared != null ? factorData.r_squared.toFixed(3) : 'N/A'}
             icon={BarChart3}
             loading={loading}
           />
@@ -598,7 +608,9 @@ export default function FactorExposurePage() {
           <MetricCard
             title="Model Fit Quality"
             value={
-              rSquared >= 0.70
+              rSquared == null
+                ? 'N/A'
+                : rSquared >= 0.70
                 ? 'Strong'
                 : rSquared >= 0.40
                 ? 'Moderate'
@@ -634,19 +646,19 @@ export default function FactorExposurePage() {
                   Market Beta (β)
                   <HelpBtn itemKey="market_beta" onOpen={setActiveExplainer} />
                 </span>
-                <span className={`font-mono font-semibold ${getRiskColor(portBeta)}`}>
-                  {formatFactor(portBeta, 3)}
+                <span className={`font-mono font-semibold ${portBeta != null ? getRiskColor(portBeta) : 'text-gray-400'}`}>
+                  {portBeta != null ? formatFactor(portBeta, 3) : 'N/A'}
                 </span>
               </div>
               <div className="flex items-center space-x-2">
                 <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
                   <div
-                    className={`h-2.5 rounded-full ${getBarColor(portBeta)}`}
-                    style={{ width: `${Math.min(Math.abs(portBeta) * 50, 100)}%` }}
+                    className={`h-2.5 rounded-full ${portBeta != null ? getBarColor(portBeta) : 'bg-gray-400'}`}
+                    style={{ width: `${portBeta != null ? Math.min(Math.abs(portBeta) * 50, 100) : 0}%` }}
                   />
                 </div>
                 <span className="text-xs font-medium text-gray-500 dark:text-gray-400 w-24 text-right">
-                  {getFactorInterpretation('beta', portBeta)}
+                  {portBeta != null ? getFactorInterpretation('beta', portBeta) : 'N/A'}
                 </span>
               </div>
             </div>
@@ -659,18 +671,20 @@ export default function FactorExposurePage() {
                   <HelpBtn itemKey="jensens_alpha" onOpen={setActiveExplainer} />
                 </span>
                 <span className="font-mono font-semibold text-green-600 dark:text-green-400">
-                  +{portAlphaDaily.toFixed(4)} (+{(portAlphaAnn * 100).toFixed(1)}% p.a.)
+                  {portAlphaDaily != null && portAlphaAnn != null
+                    ? `+${portAlphaDaily.toFixed(4)} (+${(portAlphaAnn * 100).toFixed(1)}% p.a.)`
+                    : 'N/A'}
                 </span>
               </div>
               <div className="flex items-center space-x-2">
                 <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
                   <div
                     className="h-2.5 rounded-full bg-green-500"
-                    style={{ width: `${Math.min(Math.max(portAlphaDaily * 20000, 10), 100)}%` }}
+                    style={{ width: `${portAlphaDaily != null ? Math.min(Math.max(portAlphaDaily * 20000, 10), 100) : 0}%` }}
                   />
                 </div>
                 <span className="text-xs font-medium text-green-600 dark:text-green-400 w-24 text-right">
-                  Positive Alpha
+                  {portAlphaDaily != null ? 'Positive Alpha' : 'N/A'}
                 </span>
               </div>
             </div>
@@ -695,28 +709,28 @@ export default function FactorExposurePage() {
             <div>
               <div className="flex justify-between text-xs font-medium mb-1">
                 <span className="text-gray-600 dark:text-gray-400">Market Correlation (ρ)</span>
-                <span className="font-mono font-semibold text-teal-600 dark:text-teal-400">{benchmarkCorr}%</span>
+                <span className="font-mono font-semibold text-teal-600 dark:text-teal-400">{benchmarkCorr != null ? `${benchmarkCorr}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-teal-500 h-2 rounded-full" style={{ width: `${benchmarkCorr}%` }} />
+                <div className="bg-teal-500 h-2 rounded-full" style={{ width: `${benchmarkCorr ?? 0}%` }} />
               </div>
             </div>
             <div>
               <div className="flex justify-between text-xs font-medium mb-1">
                 <span className="text-gray-600 dark:text-gray-400">Systematic (Market) Risk (R²)</span>
-                <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">{systematicShare}%</span>
+                <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">{systematicShare != null ? `${systematicShare}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${systematicShare}%` }} />
+                <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${systematicShare ?? 0}%` }} />
               </div>
             </div>
             <div>
               <div className="flex justify-between text-xs font-medium mb-1">
                 <span className="text-gray-600 dark:text-gray-400">Specific (Idiosyncratic) Risk (1 - R²)</span>
-                <span className="font-mono font-semibold text-purple-600 dark:text-purple-400">{idiosyncraticShare}%</span>
+                <span className="font-mono font-semibold text-purple-600 dark:text-purple-400">{idiosyncraticShare != null ? `${idiosyncraticShare}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-purple-500 h-2 rounded-full" style={{ width: `${idiosyncraticShare}%` }} />
+                <div className="bg-purple-500 h-2 rounded-full" style={{ width: `${idiosyncraticShare ?? 0}%` }} />
               </div>
             </div>
           </div>
@@ -771,9 +785,13 @@ export default function FactorExposurePage() {
           <div className="flex items-start space-x-3 p-3.5 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-gray-200 dark:border-gray-800">
             <Target className="w-5 h-5 text-teal-600 mt-0.5 shrink-0" />
             <div>
-              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Market Sensitivity (Beta: {formatFactor(portBeta, 3)})</h4>
+              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Market Sensitivity (Beta: {portBeta != null ? formatFactor(portBeta, 3) : 'N/A'})</h4>
               <p className="text-xs text-gray-600 dark:text-gray-400 mt-1 leading-relaxed">
-                Portfolio beta of {formatFactor(portBeta, 3)} indicates {portBeta > 1.2 ? 'an aggressive high-beta stance' : portBeta < 0.8 ? 'a defensive capital-preservation tilt' : 'a balanced market-like exposure'}. For every 1.0% change in the NIFTY 50, your portfolio is expected to move by ~{Math.abs(portBeta).toFixed(2)}%.
+                {portBeta != null ? (
+                  <>Portfolio beta of {formatFactor(portBeta, 3)} indicates {portBeta > 1.2 ? 'an aggressive high-beta stance' : portBeta < 0.8 ? 'a defensive capital-preservation tilt' : 'a balanced market-like exposure'}. For every 1.0% change in the NIFTY 50, your portfolio is expected to move by ~{Math.abs(portBeta).toFixed(2)}%.</>
+                ) : (
+                  <>Beta unavailable (N/A) — insufficient history for regression.</>
+                )}
               </p>
             </div>
           </div>
@@ -781,9 +799,13 @@ export default function FactorExposurePage() {
           <div className="flex items-start space-x-3 p-3.5 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-gray-200 dark:border-gray-800">
             <TrendingUp className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
             <div>
-              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Active Stock Selection (Alpha: +{(portAlphaAnn * 100).toFixed(2)}% p.a.)</h4>
+              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Active Stock Selection (Alpha: {portAlphaAnn != null ? `+${(portAlphaAnn * 100).toFixed(2)}% p.a.` : 'N/A'})</h4>
               <p className="text-xs text-gray-600 dark:text-gray-400 mt-1 leading-relaxed">
-                The portfolio demonstrates strong active outperformance (+{(portAlphaDaily * 100).toFixed(3)}% daily or +{(portAlphaAnn * 100).toFixed(2)}% annualized) over its risk-adjusted CAPM baseline, confirming positive value contribution from individual asset picks.
+                {portAlphaDaily != null && portAlphaAnn != null ? (
+                  <>The portfolio demonstrates strong active outperformance (+{(portAlphaDaily * 100).toFixed(3)}% daily or +{(portAlphaAnn * 100).toFixed(2)}% annualized) over its risk-adjusted CAPM baseline, confirming positive value contribution from individual asset picks.</>
+                ) : (
+                  <>Alpha unavailable (N/A) — insufficient history for regression.</>
+                )}
               </p>
             </div>
           </div>
@@ -791,9 +813,13 @@ export default function FactorExposurePage() {
           <div className="flex items-start space-x-3 p-3.5 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-gray-200 dark:border-gray-800">
             <BarChart3 className="w-5 h-5 text-blue-600 mt-0.5 shrink-0" />
             <div>
-              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Variance Decomposition ({systematicShare}% Systematic)</h4>
+              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Variance Decomposition ({systematicShare != null ? `${systematicShare}%` : 'N/A'} Systematic)</h4>
               <p className="text-xs text-gray-600 dark:text-gray-400 mt-1 leading-relaxed">
-                {systematicShare}% of return swings are dictated by benchmark macro momentum, while {idiosyncraticShare}% is driven by individual company financials, sector earnings, and company-specific news.
+                {systematicShare != null && idiosyncraticShare != null ? (
+                  <>{systematicShare}% of return swings are dictated by benchmark macro momentum, while {idiosyncraticShare}% is driven by individual company financials, sector earnings, and company-specific news.</>
+                ) : (
+                  <>Variance decomposition unavailable (N/A) — R² not computed.</>
+                )}
               </p>
             </div>
           </div>

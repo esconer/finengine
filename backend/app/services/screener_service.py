@@ -7,10 +7,12 @@ High Dividend Yield, and Undervalued Growth.
 import asyncio
 import hashlib
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 import bfinance as bf
+from app.services.cache_service import CacheService
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -19,6 +21,19 @@ logger = setup_logger(__name__)
 # finengine-side post-filter because the upstream bfinance
 # debt_free_compounders definition does not check debt (logged for bfinance).
 DEBT_FREE_MAX_DE_RATIO = 0.2
+
+# L2 DB persistence (cointegration precedent: `_db_cache_keys` /
+# `COINT_DB_TICKER` via `CacheService`/`AnalyticsCache`). AnalyticsCache.ticker
+# is String(10) so the namespace is a short tag, not the strategy; the screen
+# identity (strategy + universe hash + date) lives in metric_name (String(50)).
+# TTL ~24h is governed by the injected CacheService's ttl_minutes.
+SCREENER_DB_TICKER = "SCREENER"
+SCREENER_DB_TTL_MINUTES = 24 * 60
+
+
+def _db_cache_keys(strategy: str, universe_token: str, asof_date: str) -> Tuple[str, str]:
+    """Collision-free (ticker, metric_name) for a strategy-universe-day."""
+    return SCREENER_DB_TICKER, f"screen_{strategy}_{universe_token}_{asof_date}"
 
 
 def _screen_ticker(sym: str) -> str:
@@ -46,6 +61,14 @@ class ScreenerService:
 
     _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
     CACHE_TTL_SECONDS = 300  # 5 minutes cache
+
+    def __init__(
+        self,
+        db_session=None,
+        cache_service: Optional[CacheService] = None,
+    ):
+        self.db = db_session
+        self.cache_service = cache_service
 
     STRATEGIES = {
         "coffee_can": {
@@ -86,6 +109,70 @@ class ScreenerService:
             for key, val in self.STRATEGIES.items()
         ]
 
+    async def _get_cached_screen(
+        self,
+        strategy: str,
+        universe_token: str,
+        asof_day: str,
+        max_stocks: int,
+    ) -> Optional[Dict[str, Any]]:
+        """L2 DB lookup on L1 miss. Never fabricates: identity-checked, None on doubt."""
+        if self.cache_service is None:
+            return None
+        try:
+            db_ticker, metric_name = _db_cache_keys(strategy, universe_token, asof_day)
+            cached = await self.cache_service.get_cached_analytics(
+                ticker=db_ticker,
+                metric_name=metric_name,
+            )
+            if not cached or not cached.get("model_params"):
+                return None
+            payload = cached["model_params"]
+            if payload.get("strategy") != strategy or payload.get("universe_token") != universe_token:
+                return None
+            stored = payload.get("response")
+            if not stored:
+                return None
+            # Stored payload was capped at its own max_stocks: slicing down to
+            # a smaller request is exact; a larger request must recompute.
+            stored_cap = payload.get("max_stocks") or 50
+            want = max_stocks or 50
+            if stored_cap < want:
+                return None
+            stocks = stored.get("stocks", [])[:want]
+            return {**stored, "stocks": stocks, "count": len(stocks)}
+        except Exception as e:
+            logger.debug(f"Screener L2 cache read error: {e}")
+            return None
+
+    async def _set_cached_screen(
+        self,
+        strategy: str,
+        universe_token: str,
+        asof_day: str,
+        max_stocks: int,
+        response_data: Dict[str, Any],
+    ) -> None:
+        """Write-through L2 store (best-effort; compute result never depends on it)."""
+        if self.cache_service is None:
+            return
+        try:
+            db_ticker, metric_name = _db_cache_keys(strategy, universe_token, asof_day)
+            await self.cache_service.set_cached_analytics(
+                ticker=db_ticker,
+                metric_name=metric_name,
+                metric_value=float(response_data.get("count", 0)),
+                calculation_date=datetime.utcnow(),
+                model_params={
+                    "strategy": strategy,
+                    "universe_token": universe_token,
+                    "max_stocks": max_stocks or 50,
+                    "response": response_data,
+                },
+            )
+        except Exception as e:
+            logger.debug(f"Screener L2 cache write error: {e}")
+
     async def run_screen(
         self,
         strategy: str,
@@ -103,12 +190,20 @@ class ScreenerService:
 
         # Check in-memory cache (universe is part of the key: a custom
         # universe must never be served default-universe results).
-        cache_key = f"{strat_key}_{max_stocks}_{_universe_cache_token(universe)}"
+        universe_token = _universe_cache_token(universe)
+        cache_key = f"{strat_key}_{max_stocks}_{universe_token}"
         now_ts = time.time()
         if cache_key in self._cache:
             ts, cached_res = self._cache[cache_key]
             if now_ts - ts < self.CACHE_TTL_SECONDS:
                 return cached_res
+
+        # L2 DB cache on L1 miss (survives restarts; ~24h TTL).
+        asof_day = datetime.utcnow().strftime("%Y-%m-%d")
+        l2_hit = await self._get_cached_screen(strat_key, universe_token, asof_day, max_stocks)
+        if l2_hit is not None:
+            self._cache[cache_key] = (now_ts, l2_hit)
+            return l2_hit
 
         def _execute():
             screen = strategy_meta["screen_getter"]()
@@ -150,6 +245,7 @@ class ScreenerService:
                 "stocks": results,
             }
             self._cache[cache_key] = (now_ts, response_data)
+            await self._set_cached_screen(strat_key, universe_token, asof_day, max_stocks, response_data)
             return response_data
         except Exception as e:
             logger.error(f"Error running screener {strategy}: {e}")
@@ -253,8 +349,11 @@ class ScreenerService:
 _screener_service: Optional[ScreenerService] = None
 
 
-def get_screener_service() -> ScreenerService:
+def get_screener_service(
+    db_session=None,
+    cache_service: Optional[CacheService] = None,
+) -> ScreenerService:
     global _screener_service
     if _screener_service is None:
-        _screener_service = ScreenerService()
+        _screener_service = ScreenerService(db_session=db_session, cache_service=cache_service)
     return _screener_service

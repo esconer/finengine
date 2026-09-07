@@ -193,7 +193,7 @@ export default function MonteCarloPage() {
         </button>
         <p className="text-xs text-gray-500 dark:text-gray-400 mt-3">
           Starting value defaults to your current portfolio market value. Returns calibrated on
-          two years of cached closes.
+          up to two years of cached closes (limited by cache depth; min 60 daily observations).
         </p>
       </div>
 

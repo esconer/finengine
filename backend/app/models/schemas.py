@@ -2,7 +2,7 @@
 Pydantic schemas for Daisy Risk Engine
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, validator
 
@@ -16,6 +16,7 @@ class PortfolioPositionBase(BaseModel):
     buy_price: float = Field(..., gt=0, description="Price per share at time of purchase - must be > 0")
     region: str = Field(default="US", description="Region code")
     custom_name: Optional[str] = Field(default=None, max_length=100, description="Custom position name")
+    added_on: Optional[date] = Field(default=None, description="Purchase date (YYYY-MM-DD); defaults to today. Must not be in the future.")
     
     @validator('ticker')
     def ticker_must_be_uppercase(cls, v):
@@ -41,6 +42,12 @@ class PortfolioPositionBase(BaseModel):
             raise ValueError('Buy price must be greater than 0')
         return v
 
+    @validator('added_on')
+    def added_on_not_in_future(cls, v):
+        if v is not None and v > date.today():
+            raise ValueError('added_on cannot be in the future')
+        return v
+
 
 class PortfolioPositionCreate(PortfolioPositionBase):
     """Schema for creating portfolio position"""
@@ -53,6 +60,13 @@ class PortfolioPositionUpdate(BaseModel):
     quantity: Optional[float] = Field(None, gt=0)
     buy_price: Optional[float] = Field(None, gt=0)
     custom_name: Optional[str] = Field(None, max_length=100)
+    added_on: Optional[date] = Field(None, description="Purchase date (YYYY-MM-DD). Must not be in the future.")
+
+    @validator('added_on')
+    def added_on_not_in_future(cls, v):
+        if v is not None and v > date.today():
+            raise ValueError('added_on cannot be in the future')
+        return v
 
 
 class PortfolioPositionResponse(BaseModel):

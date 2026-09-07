@@ -19,13 +19,15 @@ interface AddPositionModalProps {
 }
 
 export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: AddPositionModalProps) {
+  const todayISO = () => new Date().toISOString().split('T')[0];
   const [formData, setFormData] = useState<PortfolioCreateRequest>({
     ticker: '',
     weight: 0,
     quantity: 0,
     buy_price: 0,
     region: 'US',
-    custom_name: ''
+    custom_name: '',
+    added_on: todayISO()
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -61,7 +63,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         quantity: 0,
         buy_price: 0,
         region: currency === 'INR' ? 'IN' : 'US',
-        custom_name: ''
+        custom_name: '',
+        added_on: new Date().toISOString().split('T')[0]
       });
       setErrors({});
     }
@@ -103,6 +106,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
     // Validate weight is properly set
     if (formData.weight <= 0 || formData.weight > 1) {
       newErrors.weight = 'Weight must be between 0 and 1';
+    }
+
+    if (formData.added_on) {
+      const today = new Date().toISOString().split('T')[0];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(formData.added_on) || formData.added_on > today) {
+        newErrors.added_on = 'Purchase date cannot be in the future';
+      }
     }
 
     setErrors(newErrors);
@@ -270,7 +280,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             </p>
           </div>
 
-          {/* Custom Name */}
+          {/* Custom Name + Purchase Date */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
               Custom Name (Optional)
@@ -282,6 +293,25 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
               placeholder="Apple Inc."
               className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors text-gray-900 dark:text-white bg-white dark:bg-gray-800"
             />
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+              Purchase Date
+            </label>
+            <input
+              type="date"
+              value={formData.added_on || ''}
+              max={new Date().toISOString().split('T')[0]}
+              onChange={(e) => handleInputChange('added_on', e.target.value)}
+              className={cn(
+                "w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors text-gray-900 dark:text-white bg-white dark:bg-gray-800",
+                errors.added_on ? "border-red-300 dark:border-red-600" : "border-gray-300 dark:border-gray-600"
+              )}
+            />
+            {errors.added_on && (
+              <p className="mt-2 text-sm text-red-600 dark:text-red-400">{errors.added_on}</p>
+            )}
+          </div>
           </div>
 
           {/* Error Message */}

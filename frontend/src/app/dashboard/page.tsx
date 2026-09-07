@@ -38,10 +38,28 @@ const REGIME_CHIP: Record<string, string> = {
 
 import { PortfolioPosition } from '@/types';
 
+// Relative-time formatter matching Header.tsx so every page reads the same.
+function formatLastUpdated(timestamp: string | null) {
+  if (!timestamp) return 'Never';
+
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+
+  return date.toLocaleDateString();
+}
+
 export default function DashboardSummary() {
   const router = useRouter();
   const { positions, fetchPortfolio, isLoading, error, totalValue } = usePortfolioStore();
-  const { updateLastUpdated } = useUIStore();
+  const { lastUpdated, updateLastUpdated } = useUIStore();
   const [showAddModal, setShowAddModal] = useState(false);
   const { data: analyticsData, loading: analyticsLoading, refresh: refreshAnalytics } = usePortfolioAnalytics();
   const { performanceData, loading: performanceLoading } = usePerformanceData(90);
@@ -74,6 +92,14 @@ export default function DashboardSummary() {
       updateLastUpdated();
     }
   }, [isLoading, error, positions.length, updateLastUpdated]);
+
+  // Stamp the shared store clock when fresh analytics arrive, like the
+  // realized-risk / forecast-risk pages do — the header reads this clock.
+  useEffect(() => {
+    if (analyticsData.summary) {
+      updateLastUpdated();
+    }
+  }, [analyticsData.summary, updateLastUpdated]);
 
   // Quantitative Diversification Score based on Herfindahl Concentration & Sector Breadth
   const diversificationScore = useMemo(() => {
@@ -271,9 +297,9 @@ export default function DashboardSummary() {
                 <div className="w-2 h-2 bg-green-400 rounded-full mr-2"></div>
                 <span className="text-sm">Live Data Active</span>
               </div>
-              {analyticsData.summary?.last_updated && (
+              {lastUpdated && (
                 <div className="text-blue-200 text-sm">
-                  Last updated: {new Date(analyticsData.summary.last_updated).toLocaleTimeString()}
+                  Last updated: {formatLastUpdated(lastUpdated)}
                 </div>
               )}
             </div>
@@ -308,12 +334,19 @@ export default function DashboardSummary() {
           icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
           loading={isOverallLoading}
         />
-        <MetricCard
-          title="Annual Volatility"
-          value={portfolioMetrics.volatility === null ? 'N/A' : `${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
-          icon={Activity}
-          loading={analyticsLoading}
-        />
+        <div>
+          <MetricCard
+            title="Annual Volatility"
+            value={portfolioMetrics.volatility === null ? 'N/A' : `${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
+            icon={Activity}
+            loading={analyticsLoading}
+          />
+          {!analyticsLoading && portfolioMetrics.volatility === null && (
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Holding-window realized vol (√252 annualized) — needs ≥ 30 trading days
+            </p>
+          )}
+        </div>
         <MetricCard
           title="Diversification Score"
           value={`${portfolioMetrics.diversificationScore}%`}

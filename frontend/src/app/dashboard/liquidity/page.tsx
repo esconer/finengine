@@ -8,6 +8,7 @@ import React, { useState, useEffect } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
+import { MetricCardLoading, DataTableLoading } from '@/components/ui/LoadingState';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import {
@@ -248,7 +249,7 @@ interface PositionLiquidity {
 
 export default function LiquidityPage() {
   const [liquidityData, setLiquidityData] = useState<LiquidityData | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [positionData, setPositionData] = useState<PositionLiquidity[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
@@ -399,7 +400,7 @@ export default function LiquidityPage() {
     document.body.removeChild(link);
   };
 
-  const overallScore = liquidityData?.overall_score || 0;
+  const overallScore: number | null = liquidityData?.overall_score ?? null;
   const highVolumeCount = positionData.filter(p => p.score >= 8).length;
   const mediumVolumeCount = positionData.filter(p => p.score >= 6 && p.score < 8).length;
   const lowVolumeCount = positionData.filter(p => p.score < 6).length;
@@ -556,7 +557,12 @@ export default function LiquidityPage() {
             </p>
             <div className="flex flex-wrap items-center mt-4 gap-3">
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
-                Overall Score: <span className="font-bold text-white ml-1">{formatScore(overallScore)}</span>
+                Overall Score:{' '}
+                {loading && liquidityData === null ? (
+                  <span className="inline-block w-12 h-4 ml-1 align-middle bg-white/20 rounded animate-pulse" aria-label="Loading overall score" />
+                ) : (
+                  <span className="font-bold text-white ml-1">{formatScore(overallScore)}</span>
+                )}
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
                 Risk Level: <span className="font-bold text-white ml-1">{liquidityData?.risk_level || (positions.length > 0 ? 'Low' : 'N/A')}</span>
@@ -596,6 +602,14 @@ export default function LiquidityPage() {
           >
             Try Again
           </button>
+        </div>
+      )}
+
+      {/* Loading skeleton (first load) */}
+      {loading && liquidityData === null && (
+        <div className="space-y-6">
+          <MetricCardLoading count={4} />
+          <DataTableLoading rows={6} columns={7} />
         </div>
       )}
 
@@ -811,7 +825,7 @@ export default function LiquidityPage() {
               <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-800/40">
                 <div className="flex items-center justify-between mb-1.5">
                   <h4 className="font-semibold text-emerald-300 text-sm">
-                    {overallScore >= 8 ? 'Robust Market Depth' : overallScore >= 6 ? 'Adequate Liquidity Buffer' : 'Limited Liquidity'}
+                    {((overallScore ?? 0) >= 8 ? 'Robust Market Depth' : (overallScore ?? 0) >= 6 ? 'Adequate Liquidity Buffer' : 'Limited Liquidity')}
                   </h4>
                   <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300">
                     LOW RISK

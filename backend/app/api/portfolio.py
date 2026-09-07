@@ -218,6 +218,7 @@ async def add_portfolio_position(
             quantity=position.quantity,
             buy_price=position.buy_price,
             region=position.region,
+            added_on=datetime.combine(position.added_on, datetime.min.time()) if position.added_on else None,
             primary_source="yfinance",
             last_validated_source="yfinance",
             last_price=quote_data["current_price"],
@@ -381,6 +382,7 @@ async def bulk_add_positions(
                     quantity=pos_data.quantity,
                     buy_price=pos_data.buy_price,
                     region=pos_data.region,
+                    added_on=datetime.combine(pos_data.added_on, datetime.min.time()) if pos_data.added_on else None,
                     primary_source="yfinance",
                     last_validated_source="yfinance",
                     last_price=quote_data["current_price"],
@@ -651,6 +653,9 @@ async def update_portfolio_position(
         
         if updates.custom_name is not None:
             position.custom_name = updates.custom_name
+
+        if updates.added_on is not None:
+            position.added_on = datetime.combine(updates.added_on, datetime.min.time())
         
         # Recalculate market value and metrics
         position.market_value = position.quantity * position.last_price

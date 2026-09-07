@@ -346,10 +346,16 @@ export default function ForecastRiskPage() {
   const { updateLastUpdated } = useUIStore();
 
   // Generate multi-day projection curve from portfolio forecast & term structure
-  const { volForecastCurve, varConfidenceCurve } = useMemo(() => {
-    const baseVol = (forecastData?.portfolio?.volatility_forecast || 0.20) * 100;
-    const baseVar = (forecastData?.portfolio?.var_forecast || -0.035) * 100;
-    const baseCvar = (forecastData?.portfolio?.cvar_forecast || -0.045) * 100;
+  const { volForecastCurve, varConfidenceCurve, hasCurveBase } = useMemo(() => {
+    const baseVolRaw = forecastData?.portfolio?.volatility_forecast ?? null;
+    const baseVarRaw = forecastData?.portfolio?.var_forecast ?? null;
+    const baseCvarRaw = forecastData?.portfolio?.cvar_forecast ?? null;
+    if (baseVolRaw == null || baseVarRaw == null || baseCvarRaw == null) {
+      return { volForecastCurve: [], varConfidenceCurve: [], hasCurveBase: false as const };
+    }
+    const baseVol = baseVolRaw * 100;
+    const baseVar = baseVarRaw * 100;
+    const baseCvar = baseCvarRaw * 100;
 
     const termStructure = forecastData?.portfolio?.term_structure || [];
     const maxDays = Math.max(forecastHorizon, 10);
@@ -392,7 +398,7 @@ export default function ForecastRiskPage() {
       });
     }
 
-    return { volForecastCurve: volCurve, varConfidenceCurve: varCurve };
+    return { volForecastCurve: volCurve, varConfidenceCurve: varCurve, hasCurveBase: true as const };
   }, [forecastData, forecastHorizon]);
 
   const fetchForecastData = async () => {
@@ -410,13 +416,14 @@ export default function ForecastRiskPage() {
       // Convert positions data for table with calibrated risk level
       const positionsList = Object.entries(data.positions || {}).map(
         ([ticker, posData]: [string, any]) => {
-          const volValue = posData?.volatility_forecast ?? 0.20;
+          const volValue = posData?.volatility_forecast ?? null;
           // Calibrate risk level by annualized forward volatility:
           // > 35% = High (Smallcap / High Beta)
           // 20% - 35% = Medium (Midcap / Typical Equity)
           // < 20% = Low (Large-cap / Utility / Index ETF)
+          // null = N/A (never assume 20%)
           const riskLevel =
-            volValue > 0.35 ? 'High' : volValue > 0.20 ? 'Medium' : 'Low';
+            volValue == null ? 'N/A' : volValue > 0.35 ? 'High' : volValue > 0.20 ? 'Medium' : 'Low';
 
           return {
             ticker,
@@ -537,6 +544,13 @@ export default function ForecastRiskPage() {
       cell: ({ row }: any) => {
         const data = row.original || row;
         const riskLevel = data.risk_level;
+        if (riskLevel == null || riskLevel === 'N/A') {
+          return (
+            <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full text-gray-500 bg-gray-100 dark:bg-gray-800 dark:text-gray-400 border border-gray-200 dark:border-gray-700">
+              N/A
+            </span>
+          );
+        }
         const colorClass =
           riskLevel === 'High'
             ? 'text-red-700 bg-red-100 dark:bg-red-900/40 dark:text-red-300 border border-red-200 dark:border-red-800'
@@ -649,6 +663,21 @@ export default function ForecastRiskPage() {
                 💡 <em>Tip:</em> For continuous multi-year historical risk models on Nifty 50, consider adding continuous benchmark ETF instruments like <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">NIFTYBEES.NS</code> or <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">SETFNIF50.NS</code>.
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Forecast Error Banner (backend reports uncomputable forecast honestly) */}
+      {forecastData?.error && (
+        <div data-testid="forecast-error-banner" className="bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-xl p-4 flex items-start space-x-3 shadow-sm">
+          <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+          <div className="text-sm">
+            <h4 className="font-semibold text-amber-900 dark:text-amber-200">
+              Forecast Unavailable
+            </h4>
+            <p className="text-amber-800 dark:text-amber-300 mt-1">
+              {forecastData.error}
+            </p>
           </div>
         </div>
       )}
@@ -826,7 +855,8 @@ export default function ForecastRiskPage() {
         </div>
       </div>
 
-      {/* Forecast Charts */}
+      {/* Forecast Charts (guarded: no synthetic curve when base forecasts are null) */}
+      {hasCurveBase ? (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Term Structure Chart */}
         <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-md p-6 border border-gray-200 dark:border-gray-700">
@@ -941,6 +971,13 @@ export default function ForecastRiskPage() {
           </div>
         </div>
       </div>
+      ) : (
+        <div data-testid="forecast-curve-empty" className="bg-white dark:bg-gray-800 rounded-2xl shadow-md p-6 border border-gray-200 dark:border-gray-700 text-center">
+          <p className="text-sm font-semibold text-gray-500 dark:text-gray-400">
+            Projection curves unavailable (N/A) — volatility / VaR forecast returned no data.
+          </p>
+        </div>
+      )}
 
       {/* Position-Level Forecasts Table */}
       {positionData.length > 0 && (

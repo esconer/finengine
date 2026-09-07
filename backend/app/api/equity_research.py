@@ -5,11 +5,18 @@ Provides REST routes for full company profile, 12Q/11Y institutional shareholdin
 """
 
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.database import get_db_session
+from app.services.cache_service import CacheService
 from app.services.equity_research_service import get_equity_research_service
-from app.services.screener_service import get_screener_service
+from app.services.screener_service import (
+    get_screener_service,
+    ScreenerService,
+    SCREENER_DB_TTL_MINUTES,
+)
 from app.services.ai_dossier_service import get_ai_dossier_service
 from app.models.schemas import (
     EquityResearchProfileResponse,
@@ -176,6 +183,7 @@ async def list_screener_strategies():
 async def run_screener_strategy(
     strategy: str,
     max_stocks: int = Query(default=50, ge=5, le=100, description="Max stocks to scan"),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     Run an institutional screening strategy:
@@ -184,9 +192,15 @@ async def run_screener_strategy(
     - debt_free: Debt-Free Compounders (ROCE >= 20%, Mcap >= 10k Cr)
     - high_dividend: High Dividend Champions (Yield >= 2.5%, ROCE >= 12%)
     - undervalued_growth: Undervalued Growth (P/E <= 22, ROE >= 15%)
+
+    Per-request service: CacheService holds the request-scoped session, so it
+    must not live in the module-global singleton (stale-session reuse).
     """
     try:
-        service = get_screener_service()
+        service = ScreenerService(
+            db_session=db,
+            cache_service=CacheService(db, ttl_minutes=SCREENER_DB_TTL_MINUTES),
+        )
         return await service.run_screen(strategy, max_stocks=max_stocks)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

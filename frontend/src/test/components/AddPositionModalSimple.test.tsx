@@ -48,4 +48,58 @@ describe('AddPositionModalSimple Component', () => {
     fireEvent.click(screen.getByText('Cancel'));
     expect(onClose).toHaveBeenCalled();
   });
+
+  it('renders purchase date input defaulting to today', () => {
+    const { container } = render(
+      <AddPositionModalSimple
+        isOpen={true}
+        onClose={vi.fn()}
+        onAdd={vi.fn()}
+        currency="INR"
+      />
+    );
+    const dateInput = container.querySelector('input[type="date"]') as HTMLInputElement;
+    expect(dateInput).toBeDefined();
+    expect(dateInput.value).toBe(new Date().toISOString().split('T')[0]);
+  });
+
+  it('rejects a future purchase date', async () => {
+    const onAdd = vi.fn();
+    const { container } = render(
+      <AddPositionModalSimple
+        isOpen={true}
+        onClose={vi.fn()}
+        onAdd={onAdd}
+        currency="INR"
+      />
+    );
+    fireEvent.change(screen.getByPlaceholderText(/MOTHERSON\.NS/i), { target: { value: 'INFY.NS' } });
+    fireEvent.change(screen.getByPlaceholderText('100'), { target: { value: '10' } });
+    fireEvent.change(screen.getByPlaceholderText('100.00'), { target: { value: '1500' } });
+    const dateInput = container.querySelector('input[type="date"]') as HTMLInputElement;
+    fireEvent.change(dateInput, { target: { value: '2999-01-01' } });
+    fireEvent.submit(container.querySelector('form')!);
+    expect(await screen.findByText('Purchase date cannot be in the future')).toBeDefined();
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it('passes added_on through on submit', async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
+      <AddPositionModalSimple
+        isOpen={true}
+        onClose={vi.fn()}
+        onAdd={onAdd}
+        currency="INR"
+      />
+    );
+    fireEvent.change(screen.getByPlaceholderText(/MOTHERSON\.NS/i), { target: { value: 'INFY.NS' } });
+    fireEvent.change(screen.getByPlaceholderText('100'), { target: { value: '10' } });
+    fireEvent.change(screen.getByPlaceholderText('100.00'), { target: { value: '1500' } });
+    const dateInput = container.querySelector('input[type="date"]') as HTMLInputElement;
+    fireEvent.change(dateInput, { target: { value: '2024-06-15' } });
+    fireEvent.click(screen.getByText('Add Position'));
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(onAdd.mock.calls[0][0].added_on).toBe('2024-06-15');
+  });
 });

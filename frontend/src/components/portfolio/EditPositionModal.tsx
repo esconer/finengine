@@ -23,7 +23,8 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
     weight: 0,
     quantity: 0,
     buy_price: 0,
-    custom_name: ''
+    custom_name: '',
+    added_on: ''
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -35,7 +36,8 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
         weight: position.weight,
         quantity: position.quantity,
         buy_price: position.buy_price,
-        custom_name: position.custom_name || ''
+        custom_name: position.custom_name || '',
+        added_on: position.added_on ? position.added_on.slice(0, 10) : ''
       });
       setErrors({});
     }
@@ -55,6 +57,13 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
 
     if (formData.buy_price !== undefined && formData.buy_price <= 0) {
       newErrors.buy_price = 'Buy price must be greater than 0';
+    }
+
+    if (formData.added_on) {
+      const today = new Date().toISOString().split('T')[0];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(formData.added_on) || formData.added_on > today) {
+        newErrors.added_on = 'Purchase date cannot be in the future';
+      }
     }
 
     setErrors(newErrors);
@@ -82,6 +91,10 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
       }
       if (formData.custom_name !== undefined && formData.custom_name !== position.custom_name) {
         updates.custom_name = formData.custom_name;
+      }
+      const positionDate = position.added_on ? position.added_on.slice(0, 10) : '';
+      if (formData.added_on && formData.added_on !== positionDate) {
+        updates.added_on = formData.added_on;
       }
 
       await onUpdate(position.id, updates);
@@ -266,6 +279,29 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
               />
               <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                 Current: {position.custom_name || 'None'}
+              </p>
+            </div>
+
+            {/* Purchase Date */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Purchase Date
+              </label>
+              <input
+                type="date"
+                value={formData.added_on || ''}
+                max={new Date().toISOString().split('T')[0]}
+                onChange={(e) => handleInputChange('added_on', e.target.value)}
+                className={cn(
+                  "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white",
+                  errors.added_on ? "border-red-300" : "border-gray-300 dark:border-gray-600"
+                )}
+              />
+              {errors.added_on && (
+                <p className="mt-1 text-sm text-red-600">{errors.added_on}</p>
+              )}
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                Current: {position.added_on ? position.added_on.slice(0, 10) : 'Unknown'}
               </p>
             </div>
 

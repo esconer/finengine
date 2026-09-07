@@ -236,7 +236,7 @@ def classify(
     stability = round(float((1.0 - flips) * 100), 1)
 
     current_probs = {
-        label_map[int(s)]: round(float(posteriors[-1, s]) * 100, 1)
+        label_map[int(s)]: round(float(posteriors[-1, s]) * 100, 4)
         for s in range(n_components)
     }
 

@@ -442,10 +442,10 @@ async def get_forecast_risk(
                 "model": model,
                 "horizon": horizon,
                 "portfolio": {
-                    "volatility_forecast": 0.22,
-                    "var_forecast": -0.028,
-                    "cvar_forecast": -0.041,
-                    "confidence_interval": [0.18, 0.26]
+                    "volatility_forecast": None,
+                    "var_forecast": None,
+                    "cvar_forecast": None,
+                    "confidence_interval": None
                 },
                 "positions": {},
                 "model_params": {"p": 1, "q": 1, "type": model},
@@ -464,10 +464,10 @@ async def get_forecast_risk(
                 "model": model,
                 "horizon": horizon,
                 "portfolio": {
-                    "volatility_forecast": 0.22,
-                    "var_forecast": -0.028,
-                    "cvar_forecast": -0.041,
-                    "confidence_interval": [0.18, 0.26]
+                    "volatility_forecast": None,
+                    "var_forecast": None,
+                    "cvar_forecast": None,
+                    "confidence_interval": None
                 },
                 "positions": {},
                 "model_params": {"p": 1, "q": 1, "type": model},
@@ -533,10 +533,10 @@ async def get_forecast_risk(
             except Exception as e:
                 logger.error(f"Error forecasting {ticker}: {e}")
                 positions[ticker] = {
-                    "volatility_forecast": 0.25,
-                    "var_forecast": -0.032,
-                    "is_limited_history": False,
-                    "history_warning": None,
+                    "volatility_forecast": None,
+                    "var_forecast": None,
+                    "is_limited_history": True,
+                    "history_warning": f"Forecast unavailable for {ticker}: {e}",
                     "data_points": 0
                 }
         
@@ -544,10 +544,10 @@ async def get_forecast_risk(
             "model": model,
             "horizon": horizon,
             "portfolio": {
-                "volatility_forecast": forecast_result.get("volatility_forecast", 0.22),
-                "var_forecast": forecast_result.get("var_forecast", -0.028),
-                "cvar_forecast": forecast_result.get("cvar_forecast", -0.041),
-                "confidence_interval": forecast_result.get("confidence_interval", [0.18, 0.26]),
+                "volatility_forecast": forecast_result.get("volatility_forecast"),
+                "var_forecast": forecast_result.get("var_forecast"),
+                "cvar_forecast": forecast_result.get("cvar_forecast"),
+                "confidence_interval": forecast_result.get("confidence_interval"),
                 "term_structure": forecast_result.get("term_structure", [])
             },
             "positions": positions,
@@ -1062,14 +1062,14 @@ async def get_analytics_summary(
             return {
                 "portfolio_value": round(portfolio_value, 2),
                 "total_positions": len(weights),
-                "realized_volatility": 0.20,
-                "forecast_volatility": 0.22,
-                "sharpe_ratio": 0.0,
-                "max_drawdown": 0.0,
-                "risk_score": 25.0,
-                "risk_level": "MEDIUM",
-                "liquidity_score": 5.0,
-                "concentration_score": 15.0,
+                "realized_volatility": None,
+                "forecast_volatility": None,
+                "sharpe_ratio": None,
+                "max_drawdown": None,
+                "risk_score": None,
+                "risk_level": None,
+                "liquidity_score": None,
+                "concentration_score": None,
                 "last_updated": datetime.utcnow().isoformat(),
                 "error": "No price data available for summary"
             }
@@ -1090,13 +1090,13 @@ async def get_analytics_summary(
         summary = {
             "portfolio_value": round(portfolio_value, 2),
             "total_positions": len(weights),
-            "realized_volatility": metrics.get("annual_volatility", 0.20),
-            "forecast_volatility": 0.22,
+            "realized_volatility": metrics.get("annual_volatility"),
+            "forecast_volatility": None,
             "sharpe_ratio": metrics.get("sharpe_ratio", 0),
             "max_drawdown": metrics.get("max_drawdown", 0),
             "risk_score": risk_result.get("overall_score", 25.0),
             "risk_level": risk_result.get("risk_level", "MEDIUM"),
-            "liquidity_score": 7.8,
+            "liquidity_score": None,
             "concentration_score": concentration_result.get("herfindahl_index", 0.25) * 100,
             "last_updated": datetime.utcnow().isoformat(),
             "history_coverage": history_coverage,

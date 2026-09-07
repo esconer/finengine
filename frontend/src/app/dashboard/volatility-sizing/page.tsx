@@ -236,7 +236,7 @@ interface PositionSizing {
   current_weight: number;
   target_weight: number;
   recommended_weight: number;
-  volatility: number;
+  volatility: number | null;
   weight_change: number;
   shares_delta: number;
   amount_delta: number;
@@ -280,7 +280,7 @@ export default function VolatilitySizingPage() {
         const weightChange = recommendedWeight - currentWeight;
         const sharesDelta = data.trades?.[ticker]?.shares_delta || 0;
         const amountDelta = data.trades?.[ticker]?.amount || 0;
-        const rawVol = data.volatilities?.[ticker] ?? 0.20;
+        const rawVol = data.volatilities?.[ticker] ?? null;
         
         return {
           ticker,
@@ -367,7 +367,7 @@ export default function VolatilitySizingPage() {
   // Format metrics for display
   const formatPercentage = (value: number | undefined | null, decimals = 1) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '0.0%';
+      return 'N/A';
     }
     const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
     return `${scaled.toFixed(decimals)}%`;
@@ -389,7 +389,8 @@ export default function VolatilitySizingPage() {
     return 'text-slate-400 font-medium';
   };
 
-  const getVolRiskLabel = (vol: number) => {
+  const getVolRiskLabel = (vol: number | null) => {
+    if (vol == null) return { label: 'N/A', color: 'text-slate-400 bg-slate-700/40 border-slate-600/40' };
     if (vol < 0.20) return { label: 'Low Risk', color: 'text-emerald-400 bg-emerald-500/20 border-emerald-500/40' };
     if (vol <= 0.35) return { label: 'Moderate', color: 'text-amber-400 bg-amber-500/20 border-amber-500/40' };
     return { label: 'Elevated', color: 'text-rose-400 bg-rose-500/20 border-rose-500/40' };
@@ -405,7 +406,7 @@ export default function VolatilitySizingPage() {
         p.ticker,
         (p.current_weight * 100).toFixed(2) + '%',
         (p.recommended_weight * 100).toFixed(2) + '%',
-        (p.volatility * 100).toFixed(2) + '%',
+        p.volatility == null ? 'N/A' : (p.volatility * 100).toFixed(2) + '%',
         (p.weight_change * 100).toFixed(2) + '%',
         p.shares_delta,
         p.amount_delta.toFixed(2),

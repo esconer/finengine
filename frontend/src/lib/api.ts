@@ -165,6 +165,7 @@ export const portfolioApi = {
     quantity?: number;
     buy_price?: number;
     custom_name?: string;
+    added_on?: string;
   }): Promise<PortfolioPosition> {
     const response = await apiClient.put(`/portfolio/${ticker}`, data);
     return response.data;

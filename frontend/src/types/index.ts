@@ -160,6 +160,7 @@ export interface PortfolioCreateRequest {
   buy_price: number;
   region: string;
   custom_name?: string;
+  added_on?: string;
 }
 
 export interface PortfolioUpdateRequest {
@@ -167,6 +168,7 @@ export interface PortfolioUpdateRequest {
   quantity?: number;
   buy_price?: number;
   custom_name?: string;
+  added_on?: string;
 }
 
 export interface PortfolioBulkAddRequest {

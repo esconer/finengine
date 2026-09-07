@@ -95,6 +95,26 @@ Still open (out of zcode scope): Regime saturated posterior, header
 "Last updated" unification, liquidity first-render skeleton, dashboard
 vol N/A gate, monte-carlo copy drift.
 
+## Remediation record (2026-09-07, `.scratch/remediation-2026-09/`)
+
+All five items above closed, plus a code-scan honesty batch and the
+`added_on` contract. Backend 383/383 pytest, ruff clean; frontend tsc
+clean, 81/81 vitest.
+
+- `added_on` purchase date: was output-only on both sides (backend ignored
+  it, frontend couldn't send it). Now accepted on add/bulk/update
+  (validated ≤ today), date pickers in both modals, CSV date-column import,
+  4 pytest + 3 vitest.
+- Fabricated constants: forecast/summary error branches + `liquidity_score
+  7.8` + per-ticker `0.25` → nulls; frontend `1.083/0.679/18.08/0.382/0.158/
+  0.139/1.0-beta/0.20-vol` fallbacks → N/A-aware + forecast error banner.
+  Residuals (engine-internal 0.22/vol-clamps, liquidity/stress/risk-score
+  error-branch constants) documented in issue 08.
+- Screener L2 DB cache (24h) + per-request prod wiring (singleton can't hold
+  request sessions); regime posteriors at 4dp precision.
+- B8 dead `PortfolioCharts.tsx` deleted; liquidity skeleton; dashboard store
+  timestamp; monte-carlo honest copy.
+
 ## Recommended follow-ups (not yet implemented)
 
 | Pri | Item |

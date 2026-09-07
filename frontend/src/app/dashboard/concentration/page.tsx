@@ -857,7 +857,7 @@ export default function ConcentrationPage() {
           Concentration Analysis Insights
         </h3>
         <div className="space-y-4">
-          {concentrationData?.largest_position && concentrationData.largest_position > 0.15 ? (
+          {concentrationData?.largest_position != null && concentrationData.largest_position > 0.15 ? (
             <div className="flex items-start space-x-3 bg-red-50/50 dark:bg-red-950/20 p-3.5 rounded-xl border border-red-200/50 dark:border-red-900/30">
               <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
               <div>
@@ -867,13 +867,23 @@ export default function ConcentrationPage() {
                 </p>
               </div>
             </div>
-          ) : (
+          ) : concentrationData?.largest_position != null ? (
             <div className="flex items-start space-x-3 bg-emerald-50/50 dark:bg-emerald-950/20 p-3.5 rounded-xl border border-emerald-200/50 dark:border-emerald-900/30">
               <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
               <div>
                 <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Controlled Single Position Allocation</h4>
                 <p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
-                  Largest holding is {formatPercentage(concentrationData?.largest_position || 0.139)}, safely below the 15% institutional risk ceiling.
+                  Largest holding is {formatPercentage(concentrationData.largest_position)}, safely below the 15% institutional risk ceiling.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div data-testid="largest-holding-na" className="flex items-start space-x-3 bg-gray-50 dark:bg-gray-900/40 p-3.5 rounded-xl border border-gray-200 dark:border-gray-800">
+              <Info className="w-5 h-5 text-gray-400 shrink-0 mt-0.5" />
+              <div>
+                <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Largest Holding Unavailable</h4>
+                <p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+                  Largest holding is N/A — concentration metrics returned no data.
                 </p>
               </div>
             </div>

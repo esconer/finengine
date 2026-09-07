@@ -162,7 +162,9 @@ class TestAnalyticsEmptyPortfolioRoutes:
         # 2. Forecast risk
         res = await async_client.get("/api/v1/analytics/forecast-risk")
         assert res.status_code in [200, 404]
-        assert res.json()["portfolio"]["volatility_forecast"] == 0.22
+        # Empty book: honest nulls + error key, never fabricated 0.22 vol.
+        assert res.json()["portfolio"]["volatility_forecast"] is None
+        assert "error" in res.json()
 
         # 3. Factor exposure
         res = await async_client.get("/api/v1/analytics/factor-exposure")

@@ -244,6 +244,10 @@ export default function RiskStudioPage() {
     return `${scaled.toFixed(2)}%`;
   };
 
+  // Null-aware correlation regime values (never substitute plausible constants)
+  const corrAvg = correlation?.current_avg_correlation ?? null;
+  const corrThreshold = correlation?.historical_threshold_90th ?? correlation?.percentile_90_threshold ?? null;
+
   // Prepare Euler Chart Data
   const eulerPositions = riskContribution?.positions?.volatility
     ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
@@ -288,7 +292,7 @@ export default function RiskStudioPage() {
           p50: +(q.p50 * 100 || 0).toFixed(1),
           p75: +(q.p75 * 100 || 0).toFixed(1),
           p90: +(q.p90 * 100 || 0).toFixed(1),
-          realized: +(q.realized * 100 || 18.08).toFixed(1),
+          realized: q.realized != null ? +(q.realized * 100).toFixed(1) : undefined,
           garch: volCone?.garch_forecast_vol ? +(volCone.garch_forecast_vol * 100).toFixed(1) : undefined
         };
       });
@@ -588,8 +592,8 @@ export default function RiskStudioPage() {
                       const d = payload[0].payload;
                       return (
                         <div className="bg-slate-950 border border-slate-700 p-2.5 rounded-lg text-xs text-slate-200 shadow-xl">
-                          <p className="font-semibold text-white mb-1">{d.window} Lookback Window</p>
-                          <p className="text-amber-300 font-bold">Realized: {d.realized || d.p50}%</p>
+                           <p className="font-semibold text-white mb-1">{d.window} Lookback Window</p>
+                           <p className="text-amber-300 font-bold">Realized: {d.realized != null ? `${d.realized}%` : 'N/A'}</p>
                           <p className="text-slate-400">P90 (Max): {d.p90}%</p>
                           <p className="text-slate-400">P50 (Median): {d.p50}%</p>
                           <p className="text-slate-400">P10 (Min): {d.p10}%</p>
@@ -628,30 +632,30 @@ export default function RiskStudioPage() {
               </span>
             </div>
             <p className="text-xs text-slate-400 mb-4">
-              Rolling pairwise correlation vs 90th percentile threshold ({(correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.382).toFixed(2)}).
+              Rolling pairwise correlation vs 90th percentile threshold ({corrThreshold != null ? corrThreshold.toFixed(2) : 'N/A'}).
             </p>
             <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-lg space-y-3">
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-400">Current 60-Day Average:</span>
                 <span className="font-mono text-sm font-bold text-white">
-                  {(correlation?.current_avg_correlation || 0.158).toFixed(3)}
+                  {corrAvg != null ? corrAvg.toFixed(3) : 'N/A'}
                 </span>
               </div>
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-400">Historical 90th Percentile:</span>
                 <span className="font-mono text-xs font-semibold text-amber-400">
-                  {(correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.382).toFixed(3)}
+                  {corrThreshold != null ? corrThreshold.toFixed(3) : 'N/A'}
                 </span>
               </div>
               <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden border border-slate-700/50">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${
-                    (correlation?.current_avg_correlation || 0.158) > (correlation?.historical_threshold_90th || correlation?.percentile_90_threshold || 0.382)
-                      ? 'bg-rose-500'
-                      : 'bg-emerald-500'
+                    corrAvg != null && corrThreshold != null
+                      ? (corrAvg > corrThreshold ? 'bg-rose-500' : 'bg-emerald-500')
+                      : 'bg-slate-600'
                   }`}
                   style={{
-                    width: `${Math.min(100, Math.max(0, (((correlation?.current_avg_correlation || 0.158) / (correlation?.historical_threshold_90th || 0.382)) * 50)))}%`
+                    width: `${corrAvg != null && corrThreshold != null ? Math.min(100, Math.max(0, (((corrAvg) / (corrThreshold)) * 50))) : 0}%`
                   }}
                 />
               </div>

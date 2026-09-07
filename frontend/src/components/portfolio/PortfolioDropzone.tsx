@@ -10,7 +10,29 @@ interface ParsedRow {
     buy_price: number;
     custom_name?: string;
     sector?: string;
+    added_on?: string;
 }
+
+const parseDateCell = (raw: string | undefined): string | undefined => {
+    if (!raw) return undefined;
+    const s = raw.trim().replace(/^["']|["']$/g, '');
+    if (!s) return undefined;
+    let iso: string | undefined;
+    const m1 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m1) {
+        iso = `${m1[1]}-${m1[2]}-${m1[3]}`;
+    } else {
+        const m2 = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})/);
+        if (m2) iso = `${m2[3]}-${m2[2].padStart(2, '0')}-${m2[1].padStart(2, '0')}`;
+    }
+    if (!iso) return undefined;
+    const today = new Date().toISOString().split('T')[0];
+    if (iso > today) return undefined;
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return undefined;
+    return iso;
+};
 
 interface PortfolioDropzoneProps {
     isOpen: boolean;
@@ -60,6 +82,9 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
         let priceIdx = headers.findIndex(h => 
             h === 'buy_price' || h === 'avg. cost' || h === 'avg cost' || h === 'average price' || h === 'avg price' || h === 'buy price' || h === 'price'
         );
+        let dateIdx = headers.findIndex(h =>
+            h === 'date' || h === 'purchase date' || h === 'purchase_date' || h === 'added_on' || h === 'buy date' || h === 'trade date'
+        );
 
         // Default positional fallback if no matching headers found
         if (tickerIdx === -1) tickerIdx = 0;
@@ -80,7 +105,8 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                     ticker: normalizeTicker(rawTicker),
                     quantity: rawQty,
                     buy_price: rawPrice,
-                    custom_name: rawTicker.replace('.NS', '').replace('.BO', '')
+                    custom_name: rawTicker.replace('.NS', '').replace('.BO', ''),
+                    added_on: dateIdx !== -1 ? parseDateCell(cols[dateIdx]) : undefined
                 });
             }
         }
@@ -128,7 +154,8 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                     buy_price: r.buy_price,
                     weight: 1.0 / parsedRows.length,
                     custom_name: r.custom_name,
-                    region: 'IN'
+                    region: 'IN',
+                    ...(r.added_on ? { added_on: r.added_on } : {})
                 }))
             };
 
@@ -166,7 +193,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                 <div className="p-6 space-y-4 overflow-y-auto flex-1">
                     {/* Supported brokers notice */}
                     <div className="p-3 bg-blue-950/40 border border-blue-800/60 rounded-lg text-xs text-blue-300">
-                        <span className="font-semibold text-blue-200">Supported Formats:</span> Direct exports from <strong>Zerodha Kite</strong> (Holdings CSV), <strong>Groww</strong>, <strong>AngelOne</strong>, <strong>Upstox</strong>, or generic 3-column CSV (<code className="bg-blue-900/50 px-1 py-0.5 rounded">ticker,quantity,buy_price</code>).
+                        <span className="font-semibold text-blue-200">Supported Formats:</span> Direct exports from <strong>Zerodha Kite</strong> (Holdings CSV), <strong>Groww</strong>, <strong>AngelOne</strong>, <strong>Upstox</strong>, or generic CSV (<code className="bg-blue-900/50 px-1 py-0.5 rounded">ticker,quantity,buy_price</code> + optional <code className="bg-blue-900/50 px-1 py-0.5 rounded">purchase_date</code>).
                     </div>
 
                     {/* Dropzone Area */}
@@ -228,6 +255,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                                             <th className="py-2 px-3">Ticker</th>
                                             <th className="py-2 px-3 text-right">Quantity</th>
                                             <th className="py-2 px-3 text-right">Buy Price</th>
+                                            <th className="py-2 px-3 text-right">Buy Date</th>
                                             <th className="py-2 px-3 text-right">Total Invested</th>
                                         </tr>
                                     </thead>
@@ -237,6 +265,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                                                 <td className="py-2 px-3 font-mono font-medium text-blue-300">{r.ticker}</td>
                                                 <td className="py-2 px-3 text-right">{r.quantity}</td>
                                                 <td className="py-2 px-3 text-right">₹{r.buy_price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+                                                <td className="py-2 px-3 text-right font-mono">{r.added_on || '—'}</td>
                                                 <td className="py-2 px-3 text-right text-slate-300">₹{(r.quantity * r.buy_price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
                                             </tr>
                                         ))}

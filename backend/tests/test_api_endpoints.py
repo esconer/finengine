@@ -171,6 +171,70 @@ class TestPortfolioAPI:
         await test_db.commit()
 
     @pytest.mark.asyncio
+    async def test_add_position_with_added_on(self, async_client, test_db: AsyncSession):
+        """Backdated purchase date persists via API (was output-only)."""
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/add", json={
+                "ticker": "TEST", "weight": 0.5, "quantity": 10,
+                "buy_price": 100, "added_on": "2024-06-15",
+            })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["added_on"].startswith("2024-06-15")
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_add_position_future_added_on_422(self, async_client, test_db: AsyncSession):
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/add", json={
+                "ticker": "TEST", "weight": 0.5, "quantity": 10,
+                "buy_price": 100, "added_on": "2999-01-01",
+            })
+        assert resp.status_code == 422, resp.text
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_update_position_added_on(self, async_client, seeded_positions):
+        with self._patch_market_data():
+            resp = await async_client.put("/api/v1/portfolio/AAPL", json={
+                "added_on": "2023-03-10",
+            })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["added_on"].startswith("2023-03-10")
+
+    @pytest.mark.asyncio
+    async def test_bulk_add_with_added_on(self, async_client, test_db: AsyncSession):
+        from app.models.database import PortfolioPosition
+        from sqlalchemy import delete
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+        with self._patch_market_data():
+            resp = await async_client.post("/api/v1/portfolio/bulk_add", json={
+                "positions": [
+                    {"ticker": "CCC", "weight": 1.0, "quantity": 5,
+                     "buy_price": 100, "added_on": "2022-11-01"},
+                ],
+                "auto_normalize": False,
+            })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["added"] == 1, resp.json()
+        with self._patch_market_data():
+            got = await async_client.get("/api/v1/portfolio/CCC")
+        assert got.status_code == 200, got.text
+        assert got.json()["added_on"].startswith("2022-11-01")
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
     async def test_add_duplicate_conflict(self, async_client, seeded_positions):
         with self._patch_market_data():
             resp = await async_client.post("/api/v1/portfolio/add", json={
