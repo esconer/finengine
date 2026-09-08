@@ -44,17 +44,20 @@ pattern; DB tickers `String(10)`→`String(20)`; stress honors
 `request.tickers`; rebalance `price<=0`→400 + float qty; `PUT /config`
 persists ttl/cache in `app_settings`; FX unknown-pair raises (no `1.0`).
 
-## P1 — deferred with reason (not scheduled)
+## P1 — deferred with reason (triage labels per `docs/agents/triage-labels.md`)
 
 - HMM research chain (non-overlapping features, expanding scaler, real
   sticky priors, multi-restart, filtered probs), ADF/Johansen lags,
   copula PIT-MLE, Fisher-z/leave-one-out, Amihud methodology, Piotroski/
   Graham/EV (bfinance-upstream, see `BFINANCE_RECOMMENDATIONS.md`):
   research-grade, needs design + data work beyond snippet fixes.
+  Triage: `ready-for-human`.
 - `add` global renorm: product decision (frontend auto-calcs; 400 would
-  break single-add UX) — left as-is deliberately.
+  break single-add UX) — left as-is deliberately. Triage: `wontfix`.
 - WS auth, Alembic migration path, DB Unique/Check constraints, health env:
   infra decisions for a multi-user/auth milestone, not this batch.
+  Triage: `ready-for-human`.
 - FX stale-`83.0`, N+1 selects, `utcnow` deprecation sweep, O-table perf:
-  backlog; none fabricate user-visible numbers today.
+  backlog, fully specified; none fabricate user-visible numbers today.
+  Triage: `ready-for-agent` (unscheduled).
 - t28 cron (deferred), t29/t31 (needs-info): tracker state unchanged.
