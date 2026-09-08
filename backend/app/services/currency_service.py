@@ -192,9 +192,9 @@ class CurrencyConversionService:
             else:
                 return 1.0 / rate
         else:
-            # For other currency pairs, return 1.0 (no conversion)
-            logger.warning(f"No exchange rate configured for {from_currency} to {to_currency}")
-            return 1.0
+            # Unknown pairs have no configured rate — fail loudly instead of
+            # silently treating the currencies as 1:1.
+            raise ValueError(f"No exchange rate configured for {from_currency} to {to_currency}")
 
 
 # Global currency service instance

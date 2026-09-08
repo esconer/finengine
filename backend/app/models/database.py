@@ -13,7 +13,7 @@ class PortfolioPosition(Base):
     __tablename__ = "portfolio_positions"
     
     id = Column(Integer, primary_key=True, index=True)
-    ticker = Column(String(10), nullable=False, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
     weight = Column(Float, nullable=False)
     quantity = Column(Float, default=0.0, nullable=False)
     buy_price = Column(Float, default=0.0, nullable=False)
@@ -41,7 +41,7 @@ class StockTimeseries(Base):
     __tablename__ = "stock_timeseries"
     
     id = Column(Integer, primary_key=True, index=True)
-    ticker = Column(String(10), nullable=False, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
     date = Column(DateTime, nullable=False, index=True)
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
@@ -72,7 +72,7 @@ class AnalyticsCache(Base):
     __tablename__ = "analytics_cache"
     
     id = Column(Integer, primary_key=True, index=True)
-    ticker = Column(String(10), nullable=False, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
     metric_name = Column(String(50), nullable=False)
     metric_value = Column(Float, nullable=False)
     calculation_date = Column(DateTime, nullable=False)
@@ -94,7 +94,7 @@ class FetchLog(Base):
     __tablename__ = "fetch_logs"
     
     id = Column(Integer, primary_key=True, index=True)
-    ticker = Column(String(10), nullable=False, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     primary_attempt = Column(Boolean, default=False)
     fallback_attempt = Column(Boolean, default=False)

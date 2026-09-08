@@ -203,3 +203,43 @@ describe('fabricated fallbacks — concentration null largest holding', () => {
     expect(screen.queryByText(/13\.9/)).toBeNull();
   });
 });
+
+describe('mock-200 remainder — stress nulls render N/A, never hardcoded shocks', () => {
+  it('empty results show N/A summary, never -41.9%/-17.3%/-27.9%', async () => {
+    const { default: StressTestingPage } = await import('@/app/dashboard/stress-testing/page');
+
+    render(<StressTestingPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Stress Testing & Scenario Analysis')).toBeDefined();
+    });
+    // No scenario has run: summary cards must not show fabricated shocks.
+    expect(screen.queryByText(/-41\.9/)).toBeNull();
+    expect(screen.queryByText(/-17\.3/)).toBeNull();
+    expect(screen.queryByText(/-27\.9/)).toBeNull();
+    expect(screen.getAllByText('N/A').length).toBeGreaterThan(0);
+  });
+});
+
+describe('mock-200 remainder — null risk score renders N/A, never 0', () => {
+  it('RiskMetricsDisplay with null risk_score shows N/A and no elevated alert', async () => {
+    const { RiskMetricsDisplay } = await import('@/components/charts/RiskMetricsDisplay');
+
+    const { container } = render(
+      <RiskMetricsDisplay
+        data={{
+          risk_score: null,
+          risk_level: 'Unknown',
+          annual_volatility: null,
+          sharpe_ratio: null,
+          max_drawdown: 0,
+          var_95: 0,
+          cvar_95: 0,
+        }}
+      />
+    );
+
+    expect(container.textContent).toMatch(/N\/A/);
+    expect(screen.queryByText('Risk Alert')).toBeNull();
+  });
+});

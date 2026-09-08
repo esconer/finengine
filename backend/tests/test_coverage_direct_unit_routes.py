@@ -259,7 +259,7 @@ class TestDirectUnitRoutes:
 
         # Summary
         mock_db_result.scalar_one_or_none.return_value = pos
-        p_sum = await get_portfolio(db=mock_db, data_service=mock_ds)
+        p_sum = await get_portfolio(currency="INR", db=mock_db, data_service=mock_ds)
         assert p_sum is not None
 
         # Add position

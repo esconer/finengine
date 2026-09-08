@@ -416,7 +416,9 @@ class TestAnalyticsAPI:
         data = resp.json()
         rec = data["recommended_weights"]
         assert set(rec.keys()) == {"AAPL", "MSFT"}
-        assert abs(sum(rec.values()) - 1.0) < 1e-6
+        # Scale-to-target: weights sum to the scale factor, rest is cash
+        assert abs(sum(rec.values()) - data["scale_factor"]) < 1e-4
+        assert abs(sum(rec.values()) + data["cash_weight"] - 1.0) < 1e-4 or data["leveraged"]
 
     @pytest.mark.asyncio
     async def test_risk_score_components(self, async_client, seeded_positions, ohlcv_frame_factory):

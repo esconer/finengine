@@ -221,16 +221,16 @@ async def get_realized_risk(
         except ValueError as e:
             return {
                 "portfolio": {
-                    "annual_return": 0.0,
-                    "annual_volatility": 0.20,
-                    "sharpe_ratio": 0.0,
-                    "sortino_ratio": 0.0,
-                    "skewness": 0.0,
-                    "kurtosis": 3.0,
-                    "max_drawdown": 0.0,
-                    "var_95": -0.032,
-                    "cvar_95": -0.047,
-                    "hit_ratio": 0.5
+                    "annual_return": None,
+                    "annual_volatility": None,
+                    "sharpe_ratio": None,
+                    "sortino_ratio": None,
+                    "skewness": None,
+                    "kurtosis": None,
+                    "max_drawdown": None,
+                    "var_95": None,
+                    "cvar_95": None,
+                    "hit_ratio": None
                 },
                 "positions": {},
                 "error": str(e)
@@ -243,16 +243,16 @@ async def get_realized_risk(
             logger.warning("No price data available for tickers")
             return {
                 "portfolio": {
-                    "annual_return": 0.0,
-                    "annual_volatility": 0.20,
-                    "sharpe_ratio": 0.0,
-                    "sortino_ratio": 0.0,
-                    "skewness": 0.0,
-                    "kurtosis": 3.0,
-                    "max_drawdown": 0.0,
-                    "var_95": -0.032,
-                    "cvar_95": -0.047,
-                    "hit_ratio": 0.5
+                    "annual_return": None,
+                    "annual_volatility": None,
+                    "sharpe_ratio": None,
+                    "sortino_ratio": None,
+                    "skewness": None,
+                    "kurtosis": None,
+                    "max_drawdown": None,
+                    "var_95": None,
+                    "cvar_95": None,
+                    "hit_ratio": None
                 },
                 "positions": {},
                 "error": "No price data available"
@@ -809,7 +809,7 @@ async def get_liquidity_metrics(
         liquidity_result = await analytics_engine.liquidity_analysis(price_data_dict, market_caps=market_caps_dict)
         
         return {
-            "overall_score": liquidity_result.get("overall_score", 7.8),
+            "overall_score": liquidity_result.get("overall_score"),
             "liquidation_time_days": liquidity_result.get("liquidation_time_days", "2-5"),
             "risk_level": liquidity_result.get("risk_level", "Medium"),
             "by_position": liquidity_result.get("by_position", {}),
@@ -834,14 +834,25 @@ async def run_stress_test(
     """
     try:
         # Actual DB positions (request-level tickers override)
-        weights = await _load_portfolio_allocation(db)
+        requested_csv = ",".join(request.tickers) if request.tickers else None
+        try:
+            ticker_list, weights = await resolve_allocation(requested_csv, db)
+        except ValueError as e:
+            return {
+                "scenario": request.scenario,
+                "max_drawdown": None,
+                "portfolio_impact": None,
+                "position_impacts": {},
+                "recovery_time": None,
+                "error": str(e)
+            }
         if not weights:
             return {
                 "scenario": request.scenario,
-                "max_drawdown": -0.20,
-                "portfolio_impact": -0.17,
+                "max_drawdown": None,
+                "portfolio_impact": None,
                 "position_impacts": {},
-                "recovery_time": 30,
+                "recovery_time": None,
                 "error": "No portfolio positions found for stress testing"
             }
         
@@ -849,15 +860,15 @@ async def run_stress_test(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=756)).strftime('%Y-%m-%d')  # 3 years for stress testing
         
-        price_data_dict = await _fetch_price_series_dict(data_service, list(weights.keys()), start, end)
+        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
         
         if not price_data_dict:
             return {
                 "scenario": request.scenario,
-                "max_drawdown": -0.20,
-                "portfolio_impact": -0.17,
-                "position_impacts": {ticker: -0.20 for ticker in weights.keys()},
-                "recovery_time": 30,
+                "max_drawdown": None,
+                "portfolio_impact": None,
+                "position_impacts": {},
+                "recovery_time": None,
                 "error": "No price data available for stress testing"
             }
         
@@ -959,7 +970,8 @@ async def get_volatility_sizing(
 async def get_risk_score(
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
-    analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
+    analytics_engine: AnalyticsEngine = Depends(get_analytics_engine),
+    benchmark_service: BenchmarkService = Depends(get_benchmark_service)
 ) -> Dict:
     """
     Get overall portfolio risk score
@@ -969,10 +981,10 @@ async def get_risk_score(
         weights = await _load_portfolio_allocation(db)
         if not weights:
             return {
-                "overall_score": 25.0,
-                "risk_level": "MEDIUM",
+                "overall_score": None,
+                "risk_level": None,
                 "change": 0,
-                "components": {"concentration": 15.0, "volatility": 15.0, "correlation": 10.0, "factor_risk": 20.0, "market_risk": 10.0},
+                "components": {},
                 "alerts": ["No portfolio positions found for risk scoring"],
                 "error": "No portfolio positions found"
             }
@@ -989,10 +1001,10 @@ async def get_risk_score(
         
         if not price_data_dict:
             return {
-                "overall_score": 25.0,
-                "risk_level": "MEDIUM",
+                "overall_score": None,
+                "risk_level": None,
                 "change": 0,
-                "components": {"concentration": 15.0, "volatility": 15.0, "correlation": 10.0, "factor_risk": 20.0, "market_risk": 10.0},
+                "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
                 "error": "No price data available for risk scoring"
             }
@@ -1005,8 +1017,16 @@ async def get_risk_score(
             effectives, start, end, int(len(price_data))
         )
 
+        # Benchmark returns for the factor leg (best-effort: without them the
+        # engine excludes + renormalizes instead of scoring a silent R²=0).
+        benchmark_returns = None
+        try:
+            benchmark_returns = await benchmark_service.get_returns(start=start, end=end)
+        except Exception as be:
+            logger.warning(f"Could not load benchmark returns for risk scoring: {be}")
+
         # Calculate risk score using analytics engine
-        risk_result = await analytics_engine.risk_scoring(price_data, weights)
+        risk_result = await analytics_engine.risk_scoring(price_data, weights, benchmark_data=benchmark_returns)
         risk_result["history_coverage"] = history_coverage
 
         return risk_result
@@ -1032,14 +1052,14 @@ async def get_analytics_summary(
             return {
                 "portfolio_value": 0.0,
                 "total_positions": 0,
-                "realized_volatility": 0.20,
-                "forecast_volatility": 0.22,
-                "sharpe_ratio": 0.0,
-                "max_drawdown": 0.0,
-                "risk_score": 25.0,
-                "risk_level": "MEDIUM",
-                "liquidity_score": 5.0,
-                "concentration_score": 15.0,
+                "realized_volatility": None,
+                "forecast_volatility": None,
+                "sharpe_ratio": None,
+                "max_drawdown": None,
+                "risk_score": None,
+                "risk_level": None,
+                "liquidity_score": None,
+                "concentration_score": None,
                 "last_updated": datetime.utcnow().isoformat(),
                 "error": "No portfolio positions found for summary"
             }

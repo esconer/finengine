@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 
 interface RiskMetricsData {
-  risk_score: number;
+  risk_score: number | null;
   risk_level: string;
   annual_volatility: number | null;
   sharpe_ratio: number | null;
@@ -41,7 +41,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
 }) => {
   // Default data when none provided
   const defaultData: RiskMetricsData = {
-    risk_score: 0,
+    risk_score: null,
     risk_level: 'Unknown',
     annual_volatility: 0,
     sharpe_ratio: 0,
@@ -65,7 +65,8 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
     }
   };
 
-  const getRiskScoreChangeType = (score: number): 'positive' | 'negative' | 'neutral' => {
+  const getRiskScoreChangeType = (score: number | null): 'positive' | 'negative' | 'neutral' => {
+    if (score == null) return 'neutral';
     if (score <= 25) return 'positive'; // Low risk is good
     if (score <= 50) return 'neutral';
     return 'negative'; // High risk is bad
@@ -125,7 +126,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Risk Score"
-          value={metrics.risk_score.toFixed(1)}
+          value={metrics.risk_score == null ? 'N/A' : metrics.risk_score.toFixed(1)}
           icon={Shield}
           loading={loading}
         />
@@ -195,7 +196,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
       </div>
 
       {/* Risk Alerts */}
-      {metrics.risk_score > 50 && (
+      {metrics.risk_score != null && metrics.risk_score > 50 && (
         <div className="mt-6 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
           <div className="flex items-center">
             <AlertTriangle className="w-5 h-5 text-yellow-600 dark:text-yellow-400 mr-2" />

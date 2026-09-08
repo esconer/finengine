@@ -627,15 +627,30 @@ class AnalyticsEngine:
             sum_inv_vol = sum(inv_vols.values())
             
             if sum_inv_vol > 0:
-                recommended_weights = {k: round(v / sum_inv_vol, 4) for k, v in inv_vols.items()}
+                recommended_weights = {k: v / sum_inv_vol for k, v in inv_vols.items()}
             else:
                 recommended_weights = weights.copy()
-            
+
+            # Scale-to-target: size the inverse-volatility basket so its
+            # ex-ante volatility equals target_volatility; the remainder is
+            # cash (unlevered long-only). scale > 1 implies leverage required.
+            rec_vec = np.array([recommended_weights.get(ticker, 0.0) for ticker in returns.columns])
+            if len(correlation_matrix) > 0 and rec_vec.sum() > 0:
+                rec_cov = correlation_matrix.values * np.outer(current_vol_arr, current_vol_arr)
+                rec_vol_ann = float(np.sqrt(max(0.0, rec_vec @ rec_cov @ rec_vec)) * np.sqrt(252))
+            else:
+                rec_vol_ann = 0.0
+            scale = float(target_volatility / rec_vol_ann) if rec_vol_ann > 0 else 1.0
+            scaled_weights = {k: round(v * scale, 6) for k, v in recommended_weights.items()}
+            cash_weight = round(max(0.0, 1.0 - scale), 6)
+            leveraged = bool(scale > 1.0)
+            achieved_vol = float(rec_vol_ann * scale) if rec_vol_ann > 0 else rec_vol_ann
+
             # Calculate trade recommendations
             trades = {}
             for ticker in returns.columns:
                 current_weight = weights.get(ticker, 0)
-                recommended_weight = recommended_weights.get(ticker, 0)
+                recommended_weight = scaled_weights.get(ticker, 0)
                 weight_delta = recommended_weight - current_weight
                 
                 current_price = float(price_data[ticker].iloc[-1]) if ticker in price_data.columns else 100.0
@@ -651,14 +666,25 @@ class AnalyticsEngine:
                     "amount": weight_value_delta
                 }
             
+            methodology = (
+                f"{model} inverse-volatility risk parity scaled to target volatility "
+                f"{target_volatility} (scale={round(scale, 4)}, cash={cash_weight}, "
+                f"achieved_vol={round(achieved_vol, 4)}"
+                + (", leverage required" if leveraged else ", unlevered long-only + cash")
+                + "; not full ERC: no Euler RC_i decomposition)"
+            )
             return {
                 "current_weights": weights,
-                "recommended_weights": recommended_weights,
+                "recommended_weights": scaled_weights,
                 "trades": trades,
                 "target_volatility": target_volatility,
                 "current_volatility": portfolio_volatility,
                 "volatilities": annualized_vols,
-                "methodology": f"{model} inverse-volatility risk parity with target volatility scaling"
+                "scale_factor": round(scale, 6),
+                "cash_weight": cash_weight,
+                "leveraged": leveraged,
+                "achieved_volatility": round(achieved_vol, 6),
+                "methodology": methodology
             }
             
         except Exception as e:
@@ -668,15 +694,19 @@ class AnalyticsEngine:
     async def risk_scoring(
         self, 
         price_data: pd.DataFrame, 
-        weights: Dict[str, float]
+        weights: Dict[str, float],
+        benchmark_data: Optional[pd.Series] = None
     ) -> Dict[str, Any]:
         """
         Calculate comprehensive risk score
-        
+
         Args:
             price_data: Historical price data
             weights: Portfolio weights
-            
+            benchmark_data: Optional benchmark returns (or prices) for the
+                factor leg. Without it the factor leg is excluded and the
+                remaining legs renormalized (never a silent R²=0 → max score).
+
         Returns:
             Dictionary with risk score and components
         """
@@ -713,10 +743,18 @@ class AnalyticsEngine:
                 correlation_score = 0
             scores['correlation'] = correlation_score
             
-            # Factor risk (25% weight) - simplified
-            factor_result = await self.factor_exposure_analysis(price_data)
-            r_squared = factor_result.get('r_squared', 0)
-            factor_score = min(30, (1 - r_squared) * 100)
+            # Factor risk (25% weight) — only with a real benchmark. Calling
+            # factor_exposure_analysis without one yields R²=0 always, which
+            # would pin this leg at max risk, so exclude + renormalize instead.
+            excluded: list[str] = []
+            if benchmark_data is not None and not benchmark_data.empty:
+                factor_result = await self.factor_exposure_analysis(price_data, benchmark_data=benchmark_data)
+                r_squared = factor_result.get('r_squared', 0)
+                factor_score: Optional[float] = min(30, (1 - r_squared) * 100)
+            else:
+                r_squared = None
+                factor_score = None
+                excluded.append('factor_risk')
             scores['factor_risk'] = factor_score
             
             # Market risk (10% weight) - based on recent volatility
@@ -725,7 +763,8 @@ class AnalyticsEngine:
             market_score = min(30, recent_vol * 100)
             scores['market_risk'] = market_score
             
-            # Calculate overall score (weighted average)
+            # Calculate overall score (weighted average; excluded legs are
+            # dropped and the remaining weights renormalized to sum to 1)
             weights_scores = {
                 'concentration': 0.20,
                 'volatility': 0.25,
@@ -733,23 +772,22 @@ class AnalyticsEngine:
                 'factor_risk': 0.25,
                 'market_risk': 0.10
             }
+            active_weights = {k: w for k, w in weights_scores.items() if k not in excluded}
+            w_total = sum(active_weights.values()) or 1.0
+            active_weights = {k: w / w_total for k, w in active_weights.items()}
+
+            overall_score = sum(scores[component] * active_weights[component]
+                              for component in active_weights)
             
-            overall_score = sum(scores[component] * weights_scores[component] 
-                              for component in scores)
-            
-            # Determine risk level
+            # Determine risk level (stateless: no cross-request score memory,
+            # so no singleton bleed or async race; change is always 0)
             if overall_score < 15:
                 risk_level = "LOW"
-                change = -1 if hasattr(self, '_previous_risk_score') else 0
             elif overall_score < 25:
                 risk_level = "MEDIUM"
-                change = -1 if hasattr(self, '_previous_risk_score') and self._previous_risk_score > 25 else 0
             else:
                 risk_level = "HIGH"
-                change = 1 if hasattr(self, '_previous_risk_score') and self._previous_risk_score < 25 else 0
-            
-            # Store previous score for change calculation
-            self._previous_risk_score = overall_score
+            change = 0
             
             # Generate alerts
             alerts = []
@@ -759,16 +797,20 @@ class AnalyticsEngine:
                 alerts.append(f"High volatility risk ({portfolio_vol:.1%} annualized)")
             if correlation_score > 15:
                 alerts.append(f"High correlation risk (avg correlation: {avg_correlation:.2f})")
-            if factor_score > 15:
+            if factor_score is not None and factor_score > 15:
                 alerts.append(f"High unexplained risk (low R-squared: {r_squared:.2f})")
+            if excluded:
+                alerts.append("Factor leg excluded: no benchmark supplied (remaining legs renormalized)")
             
             return {
                 "overall_score": round(overall_score, 1),
                 "risk_level": risk_level,
                 "change": change,
-                "components": {k: round(v, 1) for k, v in scores.items()},
+                "components": {k: (round(v, 1) if v is not None else None) for k, v in scores.items()},
                 "alerts": alerts,
-                "methodology": "Multi-factor risk scoring with weighted components"
+                "excluded_components": excluded,
+                "factor_r_squared": r_squared,
+                "methodology": "Multi-factor risk scoring with weighted components (stateless; factor leg requires a benchmark, else excluded + renormalized)"
             }
             
         except Exception as e:
@@ -813,9 +855,12 @@ class AnalyticsEngine:
                 # Sharpe ratio
                 sharpe_ratio = float((annual_return - self.risk_free_rate) / annual_volatility) if annual_volatility > 0 else 0.0
                 
-                # Sortino ratio
-                downside_returns = returns[returns < 0]
-                downside_deviation = float(downside_returns.std() * np.sqrt(252)) if not downside_returns.empty else 0.0
+                # Sortino ratio (Sortino & Price 1994): downside deviation of the
+                # full return series below a target, not std of negative subsample.
+                # Target matches the numerator (annual rf -> daily equivalent).
+                target = self.risk_free_rate / 252
+                downside = np.minimum(0.0, returns.to_numpy(dtype=float) - target)
+                downside_deviation = float(np.sqrt(np.mean(downside ** 2)) * np.sqrt(252)) if len(returns) else 0.0
                 sortino_ratio = float((annual_return - self.risk_free_rate) / downside_deviation) if downside_deviation > 0 else 0.0
             
             # Hit ratio
@@ -1003,27 +1048,22 @@ class AnalyticsEngine:
             return self._empty_forecast(h)
     
     def _ewma_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
-        """EWMA volatility forecast"""
+        """EWMA volatility forecast (RiskMetrics 1996 single-pass recursion)."""
         try:
             h = max(1, horizon)
             clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
             clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             lambda_val = 0.94  # Standard RiskMetrics decay factor
-            
-            # Calculate historical volatilities
-            daily_vols = clean_returns.rolling(window=min(30, len(clean_returns))).std().fillna(clean_returns.std())
-            ewma_variance = daily_vols.ewm(alpha=1-lambda_val).mean() ** 2
-            
-            # Forecast (assume mean reversion to long-term average)
-            long_term_var = float(clean_returns.var())
-            last_var = float(ewma_variance.iloc[-1]) if not ewma_variance.empty else long_term_var
-            
-            term_structure = []
-            for step in range(1, h + 1):
-                step_var = last_var * (lambda_val ** step) + long_term_var * (1 - lambda_val ** step)
-                term_structure.append(float(np.clip(np.sqrt(step_var * 252), 0.05, 1.20)))
-                
-            forecast_volatility = term_structure[-1] if term_structure else float(np.clip(np.sqrt(last_var * 252), 0.05, 1.20))
+
+            # Single-pass recursion: sigma^2_t = lambda*sigma^2_{t-1} + (1-lambda)*r^2_{t-1}
+            r = clean_returns.to_numpy(dtype=float)
+            var = float(np.var(r)) if len(r) else 0.0
+            for x in r[-min(len(r), 60):]:
+                var = lambda_val * var + (1.0 - lambda_val) * x * x
+
+            forecast_volatility = float(np.clip(np.sqrt(var * 252), 0.05, 1.20))
+            # RiskMetrics has no mean reversion: flat h-step term structure
+            term_structure = [forecast_volatility] * h
             h_factor = np.sqrt(h / 252.0)
             
             return {
@@ -1069,10 +1109,16 @@ class AnalyticsEngine:
                             is_limited = data_pts < 30
 
                             if data_pts >= 10:
-                                valid_idx = s.index
-                                X = sm.add_constant(aligned_benchmark.loc[valid_idx])
-                                y = s.loc[valid_idx]
-                                model = sm.OLS(y, X).fit()
+                                # Active-history filter: regress only on days the asset
+                                # actually traded (zero-filled pre-listing rows would
+                                # attenuate beta toward 0). HAC SEs, statsmodels-local.
+                                active = s[s != 0.0].index.intersection(aligned_benchmark.index)
+                                X = sm.add_constant(aligned_benchmark.loc[active])
+                                y = s.loc[active]
+                                try:
+                                    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
+                                except Exception:
+                                    model = sm.OLS(y, X).fit()
                                 alpha = float(model.params.iloc[0]) if len(model.params) > 0 else 0.0
                                 beta = float(model.params.iloc[1]) if len(model.params) > 1 else 1.0
                             else:
@@ -1100,8 +1146,14 @@ class AnalyticsEngine:
                     port_returns = self._calculate_portfolio_returns(aligned_returns, weights)
                     if not port_returns.empty:
                         try:
-                            X_port = sm.add_constant(aligned_benchmark)
-                            port_model = sm.OLS(port_returns, X_port).fit()
+                            port_active = port_returns[port_returns != 0.0].index.intersection(aligned_benchmark.index)
+                            if len(port_active) < 10:
+                                raise ValueError("insufficient active portfolio history")
+                            X_port = sm.add_constant(aligned_benchmark.loc[port_active])
+                            try:
+                                port_model = sm.OLS(port_returns.loc[port_active], X_port).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
+                            except Exception:
+                                port_model = sm.OLS(port_returns.loc[port_active], X_port).fit()
                             port_alpha = float(port_model.params.iloc[0]) if len(port_model.params) > 0 else 0.0
                             port_beta = float(port_model.params.iloc[1]) if len(port_model.params) > 1 else 1.0
                             return {

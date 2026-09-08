@@ -239,9 +239,11 @@ class TestAnalyticsEngine:
         # Check that trades are generated
         assert len(result["trades"]) > 0
         
-        # Check that weights sum to approximately 1
-        total_recommended = sum(result["recommended_weights"].values())
-        assert abs(total_recommended - 1.0) < 0.01
+        # Scale-to-target: recommended weights sum to the scale factor,
+        # with the remainder held as cash (fully-invested sum only if levered)
+        assert abs(sum(result["recommended_weights"].values()) - result["scale_factor"]) < 1e-4
+        assert result["cash_weight"] == pytest.approx(max(0.0, 1.0 - result["scale_factor"]))
+        assert "cash" in result["methodology"]
     
     @pytest.mark.asyncio
     async def test_risk_scoring(self, mock_price_dataframe, sample_portfolio_weights):
@@ -260,33 +262,35 @@ class TestAnalyticsEngine:
         # Check risk level
         assert result["risk_level"] in ["LOW", "MEDIUM", "HIGH"]
         
-        # Check components
+        # Check components (factor leg excluded without a benchmark)
         components = result["components"]
         assert "concentration" in components
         assert "volatility" in components
         assert "correlation" in components
         assert "factor_risk" in components
         assert "market_risk" in components
+        assert components["factor_risk"] is None
+        assert result["excluded_components"] == ["factor_risk"]
         
-        # Check that all component scores are reasonable
+        # Check that active component scores are reasonable
         for score in components.values():
-            assert 0 <= score <= 30
+            if score is not None:
+                assert 0 <= score <= 30
     
     @pytest.mark.asyncio
     async def test_risk_scoring_with_previous_score(self, mock_price_dataframe, sample_portfolio_weights):
-        """Test risk scoring change calculation"""
+        """Test risk scoring is stateless (no singleton score bleed)"""
         engine = AnalyticsEngine()
         
         result1 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
-
-        # Force a level-boundary crossing relative to the fresh baseline:
-        prev_on_other_side_of_25 = 100.0 if result1["overall_score"] < 25 else 0.0
-        engine._previous_risk_score = prev_on_other_side_of_25
-
         result2 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
 
-        # Crossing the LOW/MEDIUM/HIGH boundary must register a change
-        assert result2["change"] != 0
+        # Stateless: identical inputs give identical scores, change stays 0,
+        # and no cross-request memory is stored on the shared engine
+        assert result1["overall_score"] == result2["overall_score"]
+        assert result1["change"] == 0
+        assert result2["change"] == 0
+        assert not hasattr(engine, "_previous_risk_score")
     
     def test_calculate_portfolio_returns(self, mock_price_dataframe, sample_portfolio_weights):
         """Test portfolio return calculation"""

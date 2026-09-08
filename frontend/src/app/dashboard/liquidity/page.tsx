@@ -214,9 +214,10 @@ function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
 }
 
 interface LiquidityData {
-  overall_score: number;
+  overall_score: number | null;
   liquidation_time_days: string;
   risk_level: string;
+  error?: string;
   by_position: Record<string, {
     score: number;
     category: string;
@@ -565,10 +566,10 @@ export default function LiquidityPage() {
                 )}
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
-                Risk Level: <span className="font-bold text-white ml-1">{liquidityData?.risk_level || (positions.length > 0 ? 'Low' : 'N/A')}</span>
+                Risk Level: <span className="font-bold text-white ml-1">{liquidityData?.risk_level || 'N/A'}</span>
               </div>
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-cyan-100 text-xs font-medium border border-white/10">
-                Est. Liquidation: <span className="font-bold text-white ml-1">{liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : (positions.length > 0 ? '< 1 day' : 'N/A')}</span>
+                Est. Liquidation: <span className="font-bold text-white ml-1">{liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : 'N/A'}</span>
               </div>
             </div>
           </div>
@@ -589,13 +590,13 @@ export default function LiquidityPage() {
       </div>
 
       {/* Error State */}
-      {error && (
+      {(error || liquidityData?.error) && (
         <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4">
           <div className="flex items-center">
             <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 mr-2" />
             <h3 className="text-red-800 dark:text-red-300 font-medium">Error Loading Liquidity Data</h3>
           </div>
-          <p className="text-red-700 dark:text-red-400 text-sm mt-1">{error}</p>
+          <p className="text-red-700 dark:text-red-400 text-sm mt-1">{error || liquidityData?.error}</p>
           <button
             onClick={handleRefresh}
             className="mt-2 px-3 py-1 bg-red-100 dark:bg-red-800 text-red-700 dark:text-red-300 rounded text-sm hover:bg-red-200 dark:hover:bg-red-700 transition-colors"
@@ -631,7 +632,7 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="Avg. Days to Liquidate"
-              value={liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : (positions.length > 0 ? '< 1 day' : 'N/A')}
+              value={liquidityData?.liquidation_time_days ? `${liquidityData.liquidation_time_days} days` : 'N/A'}
               icon={Clock}
               loading={loading}
             />
@@ -643,7 +644,7 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="Liquidity Risk"
-              value={liquidityData?.risk_level || (positions.length > 0 ? 'Low' : 'N/A')}
+              value={liquidityData?.risk_level || 'N/A'}
               icon={AlertTriangle}
               loading={loading}
             />

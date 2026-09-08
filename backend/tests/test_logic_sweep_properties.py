@@ -88,8 +88,8 @@ class TestRealizedMetricConventionsAndProperties:
         expected_sharpe = (annual_return - engine.risk_free_rate) / annual_vol
         assert pytest.approx(basic["sharpe_ratio"], rel=1e-4) == expected_sharpe
 
-        downside = r[r < 0]
-        downside_vol = downside.std() * np.sqrt(252)
+        downside = np.minimum(0.0, r.to_numpy() - engine.risk_free_rate / 252)
+        downside_vol = np.sqrt(np.mean(downside ** 2)) * np.sqrt(252)
         expected_sortino = (annual_return - engine.risk_free_rate) / downside_vol
         assert pytest.approx(basic["sortino_ratio"], rel=1e-4) == expected_sortino
         assert 0.0 <= basic["hit_ratio"] <= 1.0

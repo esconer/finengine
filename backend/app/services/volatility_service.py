@@ -223,7 +223,6 @@ class VolatilityService:
             returns = pd.Series(returns)
 
         clean_returns = returns.dropna()
-        n_obs = len(clean_returns)
 
         if as_of is None:
             if isinstance(clean_returns.index, pd.DatetimeIndex) and len(clean_returns.index) > 0:
@@ -233,11 +232,6 @@ class VolatilityService:
 
         window_results: List[Dict[str, Any]] = []
         realized_vols_by_window: Dict[int, pd.Series] = {}
-
-        # Fallback baseline vol if series is very short or constant
-        baseline_vol = float(clean_returns.std(ddof=1) * np.sqrt(252.0)) if n_obs > 1 else 0.20
-        if np.isnan(baseline_vol) or baseline_vol <= 0:
-            baseline_vol = 0.20
 
         for w in sorted(windows):
             rolling_vol = cls.calculate_rolling_realized_volatility(clean_returns, window=w)
@@ -253,36 +247,36 @@ class VolatilityService:
                 curr_v = float(vol_values[-1])
                 # Quantile ranking of current realized vol (0 to 100)
                 rank = float(np.sum(vol_values <= curr_v) / len(vol_values) * 100.0)
+                insufficient = False
             elif len(rolling_vol) == 1:
+                # Single observation: quantile bounds would be fabricated
+                # multiples — report nulls + flag, keep the observed value only.
                 curr_v = float(rolling_vol.iloc[-1])
-                min_v = curr_v * 0.8
-                p25_v = curr_v * 0.9
-                med_v = curr_v
-                p75_v = curr_v * 1.1
-                max_v = curr_v * 1.2
-                rank = 50.0
+                min_v = p25_v = med_v = p75_v = max_v = None
+                rank = None
+                insufficient = True
             else:
-                # Window exceeds observations: synthesize tight bounds around baseline
-                curr_v = baseline_vol
-                min_v = baseline_vol * 0.85
-                p25_v = baseline_vol * 0.95
-                med_v = baseline_vol
-                p75_v = baseline_vol * 1.05
-                max_v = baseline_vol * 1.15
-                rank = 50.0
+                # Window exceeds observations: no realized vol at all — nulls +
+                # flag, never synthetic multiples of an arbitrary baseline.
+                curr_v = None
+                min_v = p25_v = med_v = p75_v = max_v = None
+                rank = None
+                insufficient = True
 
             # Ensure strict mathematical monotonicity: min <= p25 <= median <= p75 <= max
-            min_v, p25_v, med_v, p75_v, max_v = sorted([min_v, p25_v, med_v, p75_v, max_v])
+            if not insufficient:
+                min_v, p25_v, med_v, p75_v, max_v = sorted([min_v, p25_v, med_v, p75_v, max_v])
 
             window_results.append({
                 "window_days": int(w),
-                "min": round(min_v, 4),
-                "p25": round(p25_v, 4),
-                "median": round(med_v, 4),
-                "p75": round(p75_v, 4),
-                "max": round(max_v, 4),
-                "current_realized": round(curr_v, 4),
-                "percentile_rank": round(rank, 1),
+                "min": round(min_v, 4) if min_v is not None else None,
+                "p25": round(p25_v, 4) if p25_v is not None else None,
+                "median": round(med_v, 4) if med_v is not None else None,
+                "p75": round(p75_v, 4) if p75_v is not None else None,
+                "max": round(max_v, 4) if max_v is not None else None,
+                "current_realized": round(curr_v, 4) if curr_v is not None else None,
+                "percentile_rank": round(rank, 1) if rank is not None else None,
+                "insufficient_data": insufficient,
             })
 
         # Calculate forecast overlay
@@ -303,11 +297,14 @@ class VolatilityService:
         p75_bench = matching_window_stat["p75"]
 
         if len(benchmark_vol_series) >= 2:
-            forecast_rank = float(np.sum(benchmark_vol_series.values <= ann_vol_forecast) / len(benchmark_vol_series) * 100.0)
+            forecast_rank: float | None = float(np.sum(benchmark_vol_series.values <= ann_vol_forecast) / len(benchmark_vol_series) * 100.0)
         else:
-            forecast_rank = 50.0
+            forecast_rank = None
 
-        if ann_vol_forecast <= p25_bench:
+        if p25_bench is None or p75_bench is None:
+            # Benchmark window has no realized distribution — no honest valuation
+            valuation = "unknown"
+        elif ann_vol_forecast <= p25_bench:
             valuation = "cheap"
         elif ann_vol_forecast > p75_bench:
             valuation = "rich"
@@ -318,7 +315,7 @@ class VolatilityService:
             "model": model_label,
             "annualized_vol": round(ann_vol_forecast, 4),
             "horizon_days": int(forecast_horizon),
-            "percentile_rank": round(forecast_rank, 1),
+            "percentile_rank": round(forecast_rank, 1) if forecast_rank is not None else None,
             "valuation": valuation,
         }
 

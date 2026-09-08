@@ -160,6 +160,8 @@ def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
     if y.value is None:
         raise ValueError("max_sharpe optimization failed to converge")
     raw = np.asarray(y.value).flatten()
+    if raw.sum() <= 0 or not np.all(np.isfinite(raw)):
+        raise ValueError("max_sharpe undefined: tangency weights sum to non-positive")
     return raw / raw.sum()
 
 
@@ -168,7 +170,7 @@ def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
     scenarios = returns.values          # (T, N)
     t_len, n = scenarios.shape
     w = cp.Variable(n)
-    alpha = cp.Variable(neg=True)       # alpha <= 0 conventionally; free var works too
+    alpha = cp.Variable()  # VaR of loss is free (can be > 0); neg=True cuts off positive-loss VaR
     z = cp.Variable(t_len, nonneg=True)
     loss = -(scenarios @ w)             # daily portfolio losses (positive = loss)
     prob = cp.Problem(
@@ -272,6 +274,7 @@ def optimize(
     risk_free_rate: float = 0.02,
     views: Optional[Dict[str, float]] = None,
     relative_views: Optional[list[dict[str, Any]]] = None,
+    beta: float = 0.95,
 ) -> Dict[str, Any]:
     """Run one strategy over a wide returns frame.
 
@@ -294,7 +297,7 @@ def optimize(
         elif strategy == "black_litterman":
             w_vec = _black_litterman(returns, views=views, relative_views=relative_views, risk_free_rate=risk_free_rate)
         else:
-            w_vec = _min_cvar(returns)
+            w_vec = _min_cvar(returns, beta=beta)
 
     w_vec = np.clip(w_vec, 0.0, None)
     w_vec = w_vec / w_vec.sum()

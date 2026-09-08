@@ -162,7 +162,12 @@ class BatchStockDataResponse(BaseModel):
 
 class ValidateTickerRequest(BaseModel):
     """Schema for ticker validation request"""
-    ticker: str = Field(..., min_length=1, max_length=10)
+    ticker: str = Field(..., min_length=1, max_length=20, pattern=r"^[A-Z0-9\-\&\.]{1,20}$")
+
+    @validator('ticker', pre=True)
+    def ticker_uppercase(cls, v):
+        # Mirror portfolio._TICKER_PATTERN semantics: match against uppercased input
+        return v.upper().strip() if isinstance(v, str) else v
 
 
 class ValidateTickerResponse(BaseModel):

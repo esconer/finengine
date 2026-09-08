@@ -138,7 +138,7 @@ export default function DashboardSummary() {
     totalWeight: positions.reduce((sum, pos) => sum + pos.weight, 0),
     averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
     topSector: sectorData.length > 0 ? sectorData[0]?.name || 'N/A' : 'N/A',
-    riskScore: analyticsData.riskScore?.overall_score || 0,
+    riskScore: analyticsData.riskScore?.overall_score ?? null,
     volatility: analyticsData.summary?.realized_volatility ?? null,
     sharpeRatio: analyticsData.summary?.sharpe_ratio ?? null,
     maxDrawdown: analyticsData.summary?.max_drawdown || 0,

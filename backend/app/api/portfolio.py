@@ -889,12 +889,17 @@ async def rebalance_portfolio(
                 curr_w = float(pos.weight or 0.0)
                 new_w = round(float(normalized_weights[pos.ticker]), 4)
                 w_delta = new_w - curr_w
-                price = float(pos.last_price or 100.0)
+                price = float(pos.last_price or 0.0)
+                if price <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Missing price for {pos.ticker}; rebalancing requires live position values"
+                    )
                 target_mv = new_w * total_pv
                 # A zero target weight must fully exit the position (qty 0), not hold 1 share
-                target_qty = round(target_mv / price, 4) if price > 0 else 0.0
+                target_qty = round(target_mv / price, 4)
                 curr_qty = float(pos.quantity or 0.0)
-                shares_delta = int(round(target_qty - curr_qty))
+                shares_delta = round(target_qty - curr_qty, 4)
                 cash_delta = round(w_delta * total_pv, 2)
                 
                 if cash_delta > 0:

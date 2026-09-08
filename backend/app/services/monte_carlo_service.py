@@ -36,6 +36,11 @@ MIN_HIST_OBS = 60
 METHODS = ("gbm", "student_t", "bootstrap")
 
 
+def _steps(horizon_years: float) -> int:
+    """Trading-day step count; int(round()) so float horizons don't TypeError."""
+    return int(round(float(horizon_years) * TRADING_DAYS))
+
+
 def _calibrate(portfolio_returns: pd.Series) -> tuple[float, float, np.ndarray]:
     """Annualized mu, sigma plus the raw daily returns array (dropna)."""
     r = pd.Series(portfolio_returns).dropna()
@@ -52,12 +57,12 @@ def _simulate_gbm(
     mu_annual: float,
     sigma_annual: float,
     initial_value: float,
-    horizon_years: int,
+    horizon_years: float,
     num_paths: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
     """(num_paths, horizon_years*252 + 1) value paths, column 0 = initial."""
-    steps = horizon_years * TRADING_DAYS
+    steps = _steps(horizon_years)
     dt = 1.0 / TRADING_DAYS
     drift = (mu_annual - 0.5 * sigma_annual**2) * dt
     diffusion = sigma_annual * np.sqrt(dt)
@@ -73,7 +78,7 @@ def _simulate_student_t(
     sigma_annual: float,
     daily_returns: np.ndarray,
     initial_value: float,
-    horizon_years: int,
+    horizon_years: float,
     num_paths: int,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, float]:
@@ -84,7 +89,7 @@ def _simulate_student_t(
     winsorized at +/-8 z and simple returns floored at -95% so log1p stays
     finite even when the fit lands near the Cauchy boundary.
     """
-    steps = horizon_years * TRADING_DAYS
+    steps = _steps(horizon_years)
     df_, loc_, scale_ = student_t.fit(daily_returns)
     df_fit = float(max(df_, 2.1))  # variance undefined at df <= 2
     innov = student_t.rvs(df_fit, loc=loc_, scale=scale_,
@@ -101,15 +106,17 @@ def _simulate_student_t(
 def _simulate_bootstrap(
     daily_returns: np.ndarray,
     initial_value: float,
-    horizon_years: int,
+    horizon_years: float,
     num_paths: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
     """Stationary bootstrap (arch.bootstrap); chains resamples for long horizons."""
-    steps = horizon_years * TRADING_DAYS
+    steps = _steps(horizon_years)
     data = np.asarray(daily_returns, dtype=float)
     draws_per_path = int(np.ceil(steps / data.size))
-    bs = StationaryBootstrap(BLOCK_LENGTH, data, seed=rng)
+    # arch StationaryBootstrap takes an int seed on older versions — derive one
+    # from the Generator instead of passing the Generator itself.
+    bs = StationaryBootstrap(BLOCK_LENGTH, data, seed=int(rng.integers(0, 2**32 - 1)))
     gen = bs.bootstrap(num_paths * draws_per_path)
     paths = np.empty((num_paths, steps + 1))
     paths[:, 0] = initial_value
@@ -153,7 +160,7 @@ def simulate_goal(
     portfolio_returns: pd.Series,
     initial_value: float,
     target_value: float,
-    horizon_years: int,
+    horizon_years: float,
     method: str = "gbm",
     num_paths: int = DEFAULT_PATHS,
     seed: Optional[int] = None,

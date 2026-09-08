@@ -64,9 +64,9 @@ class TestCurrencyServiceComprehensive:
         rate_inv = await service.get_exchange_rate("INR", "USD")
         assert round(rate_inv, 4) == round(1.0 / 85.0, 4)
 
-        # Unsupported pair
-        rate_unsupported = await service.get_exchange_rate("EUR", "GBP")
-        assert rate_unsupported == 1.0
+        # Unsupported pair raises instead of silently returning 1.0
+        with pytest.raises(ValueError, match="No exchange rate configured"):
+            await service.get_exchange_rate("EUR", "GBP")
 
     async def test_currency_service_history_and_fallback(self):
         service = CurrencyConversionService()

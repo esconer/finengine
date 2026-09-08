@@ -6,11 +6,13 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.db.database import get_db_session
+from app.models.database import AppSetting
 from app.services.data_service import GlobalDataService, DataService
 from app.services.cache_service import GlobalCacheService, CacheService, clear_market_data_cache
-from app.services.source_preference_service import get_primary_source, set_primary_source, source_order_for
+from app.services.source_preference_service import get_primary_source, set_primary_source, source_order_for, get_setting
 from app.services.indicators_service import IndicatorsService, SUPPORTED_INDICATORS, StaleMarketDataError
 from app.services.company_data_service import get_company_data_service
 from app.models.schemas import (
@@ -170,11 +172,19 @@ async def get_api_config(
         # Get cache stats
         cache_stats = await cache_service.get_cache_stats()
         primary_source = await get_primary_source(db)
+        # Persisted overrides win over live cache-service defaults.
+        ttl_raw = await get_setting(db, "cache_ttl_minutes")
+        enable_raw = await get_setting(db, "enable_cache")
+        try:
+            cache_ttl = int(ttl_raw) if ttl_raw is not None else int(cache_stats.get("ttl_minutes", 60))
+        except (TypeError, ValueError):
+            cache_ttl = 60
+        enable_cache = (enable_raw.lower() == "true") if enable_raw is not None else True
 
         return APIConfigResponse(
             primary_source=primary_source,
-            cache_ttl_minutes=cache_stats.get("ttl_minutes", 60),
-            enable_cache=True
+            cache_ttl_minutes=cache_ttl,
+            enable_cache=enable_cache
         )
 
     except HTTPException:
@@ -214,10 +224,25 @@ async def update_api_config(
         updated_settings["primary_source"] = saved
 
     if cache_ttl_minutes is not None:
+        stmt = sqlite_insert(AppSetting.__table__).values(key="cache_ttl_minutes", value=str(cache_ttl_minutes))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value": stmt.excluded.value},
+        )
+        await db.execute(stmt)
         updated_settings["cache_ttl_minutes"] = cache_ttl_minutes
 
     if enable_cache is not None:
-        updated_settings["enable_cache"] = enable_cache
+        stmt = sqlite_insert(AppSetting.__table__).values(key="enable_cache", value=str(bool(enable_cache)))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value": stmt.excluded.value},
+        )
+        await db.execute(stmt)
+        updated_settings["enable_cache"] = bool(enable_cache)
+
+    if "cache_ttl_minutes" in updated_settings or "enable_cache" in updated_settings:
+        await db.commit()
 
     return {
         "updated": True,

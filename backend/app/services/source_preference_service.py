@@ -10,7 +10,7 @@ Fallback chains:
     primary = yfinance :  yfinance -> bfinance -> Alpha Vantage
 """
 
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -42,16 +42,23 @@ def validate_source(source: str) -> str:
 
 async def get_primary_source(db: AsyncSession) -> str:
     """Read the persisted primary source, defaulting to bfinance (Tier-1 legacy behavior)."""
+    value = await get_setting(db, PREFERENCE_KEY)
+    if value and value.lower() in SELECTABLE_SOURCES:
+        return value.lower()
+    return DEFAULT_PRIMARY_SOURCE
+
+
+async def get_setting(db: AsyncSession, key: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a raw app_settings value (None when unset or unreadable)."""
     try:
         result = await db.execute(
-            select(AppSetting.value).where(AppSetting.key == PREFERENCE_KEY)
+            select(AppSetting.value).where(AppSetting.key == key)
         )
         value = result.scalar_one_or_none()
-        if value and value.lower() in SELECTABLE_SOURCES:
-            return value.lower()
+        return value if value is not None else default
     except Exception as e:
-        logger.error(f"Error reading primary source preference: {e}")
-    return DEFAULT_PRIMARY_SOURCE
+        logger.error(f"Error reading app setting '{key}': {e}")
+        return default
 
 
 async def set_primary_source(db: AsyncSession, source: str) -> str:

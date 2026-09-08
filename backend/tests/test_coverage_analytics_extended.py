@@ -157,7 +157,9 @@ class TestAnalyticsEmptyPortfolioRoutes:
         # 1. Realized risk
         res = await async_client.get("/api/v1/analytics/realized-risk")
         assert res.status_code in [200, 404]
-        assert res.json()["portfolio"]["annual_return"] == 0.0
+        # Empty book: honest nulls + error key, never fabricated constants.
+        assert res.json()["portfolio"]["annual_return"] is None
+        assert "error" in res.json()
 
         # 2. Forecast risk
         res = await async_client.get("/api/v1/analytics/forecast-risk")

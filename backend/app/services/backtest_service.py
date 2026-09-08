@@ -75,7 +75,9 @@ def run_walk_forward_backtest(
                 logger.warning(f"Optimization failed on day {t_start} for {strategy}: {e}. Retaining previous weights.")
                 new_weights = current_weights.copy()
 
-        turnover = float(np.sum(np.abs(new_weights - current_weights)))
+        # One-way turnover: sum|Δw| double-counts (10% A→B reads 0.2 turnover),
+        # so halve it before applying the cost rate.
+        turnover = float(0.5 * np.sum(np.abs(new_weights - current_weights)))
         total_turnover += turnover
         cost_penalty = turnover * cost_factor
 
@@ -95,7 +97,8 @@ def run_walk_forward_backtest(
             day_bench_ret = float(np.sum(bench_weights * ret_vals))
             
             if idx == 0:
-                day_strat_ret -= cost_penalty
+                # Multiplicative day-0 friction: pay cost on capital first, then earn
+                day_strat_ret = (1.0 - cost_penalty) * (1.0 + day_strat_ret) - 1.0
 
             date_str = str(row.name)[:10] if hasattr(row.name, "strftime") else str(row.name)
             daily_strategy_returns.append((date_str, day_strat_ret))
@@ -123,11 +126,18 @@ def run_walk_forward_backtest(
     strat_cagr = float((strat_cum[-1]) ** (1.0 / years) - 1.0) if years > 0 else 0.0
     bench_cagr = float((bench_cum[-1]) ** (1.0 / years) - 1.0) if years > 0 else 0.0
 
-    strat_vol = float(np.std(strat_rets) * np.sqrt(TRADING_DAYS))
-    bench_vol = float(np.std(bench_rets) * np.sqrt(TRADING_DAYS))
+    # Sharpe (1966) / Lo (2002): mean-based excess return over ddof=1 sample
+    # volatility — not geometric CAGR over population std.
+    strat_mu_d = float(np.mean(strat_rets))
+    strat_sd_d = float(np.std(strat_rets, ddof=1)) if n_days > 1 else 0.0
+    bench_mu_d = float(np.mean(bench_rets))
+    bench_sd_d = float(np.std(bench_rets, ddof=1)) if n_days > 1 else 0.0
 
-    strat_sharpe = float((strat_cagr - risk_free_rate) / strat_vol) if strat_vol > 0 else None
-    bench_sharpe = float((bench_cagr - risk_free_rate) / bench_vol) if bench_vol > 0 else None
+    strat_vol = float(strat_sd_d * np.sqrt(TRADING_DAYS))
+    bench_vol = float(bench_sd_d * np.sqrt(TRADING_DAYS))
+
+    strat_sharpe = float((strat_mu_d * TRADING_DAYS - risk_free_rate) / strat_vol) if strat_vol > 0 else None
+    bench_sharpe = float((bench_mu_d * TRADING_DAYS - risk_free_rate) / bench_vol) if bench_vol > 0 else None
 
     strat_mdd = float(np.min(strat_dds))
     bench_mdd = float(np.min(bench_dds))

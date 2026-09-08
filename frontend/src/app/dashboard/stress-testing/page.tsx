@@ -34,12 +34,13 @@ import {
 interface StressTestResult {
   scenario: string;
   scenario_description?: string;
-  max_drawdown: number;
-  portfolio_impact: number;
+  max_drawdown: number | null;
+  portfolio_impact: number | null;
   position_impacts: Record<string, number>;
-  recovery_time: number;
+  recovery_time: number | null;
   confidence_level?: number;
   methodology?: string;
+  error?: string;
 }
 
 interface Scenario {
@@ -402,6 +403,7 @@ export default function StressTestingPage() {
     type: 'Hypothetical' as 'Historical' | 'Hypothetical'
   });
   const [showCustomForm, setShowCustomForm] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [runningAll, setRunningAll] = useState(false);
 
@@ -409,6 +411,7 @@ export default function StressTestingPage() {
 
   const runStressTest = async (scenarioName: string) => {
     setLoading(true);
+    setRunError(null);
     try {
       const data = await analyticsApi.runStressTest({
         scenario: scenarioName
@@ -457,18 +460,24 @@ export default function StressTestingPage() {
     }
 
     setLoading(true);
+    setRunError(null);
     try {
       const data = await analyticsApi.runStressTest({
         scenario: `Custom: ${customScenario.name}`,
         tickers: positions.map(p => p.ticker)
       });
+
+      if (data.error || data.portfolio_impact == null) {
+        setRunError(typeof data.error === 'string' ? data.error : 'Stress test returned no computable impact for this shock.');
+        return;
+      }
       
       const newScenario: Scenario = {
         name: customScenario.name,
         type: customScenario.type,
         description: `${customScenario.market_shock}% shock over ${customScenario.duration || '30'} days`,
-        impact: data.portfolio_impact || -10,
-        recovery_time: `${data.recovery_time || '12'} months`,
+        impact: data.portfolio_impact,
+        recovery_time: data.recovery_time != null ? `${data.recovery_time} months` : 'N/A',
         icon: TestTube,
         color_class: 'text-emerald-500'
       };
@@ -507,7 +516,8 @@ export default function StressTestingPage() {
     return `${pct >= 0 ? '+' : ''}${pct.toFixed(decimals)}%`;
   };
 
-  const getImpactColor = (impact: number): string => {
+  const getImpactColor = (impact: number | null | undefined): string => {
+    if (impact == null) return 'text-gray-400 dark:text-gray-500';
     const pct = Math.abs(impact) <= 1.0 && impact !== 0 ? impact * 100 : impact;
     if (pct < -25) return 'text-red-600 dark:text-red-400';
     if (pct < -15) return 'text-orange-600 dark:text-orange-400';
@@ -515,12 +525,24 @@ export default function StressTestingPage() {
     return 'text-green-600 dark:text-green-400';
   };
 
-  const getImpactBgColor = (impact: number): string => {
+  const getImpactBgColor = (impact: number | null | undefined): string => {
+    if (impact == null) return 'bg-gray-50 dark:bg-gray-800/40 border-gray-200 dark:border-gray-700';
     const pct = Math.abs(impact) <= 1.0 && impact !== 0 ? impact * 100 : impact;
     if (pct < -25) return 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800';
     if (pct < -15) return 'bg-orange-50 dark:bg-orange-950/20 border-orange-200 dark:border-orange-800';
     if (pct < -5) return 'bg-yellow-50 dark:bg-yellow-950/20 border-yellow-200 dark:border-yellow-800';
     return 'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800';
+  };
+
+  const severityFor = (rawImpact: number | null | undefined): { label: string; className: string } | null => {
+    if (rawImpact == null) return null;
+    const impactVal = Math.abs(rawImpact) <= 1.0 && rawImpact !== 0 ? rawImpact * 100 : rawImpact;
+    const severity = impactVal < -25 ? 'Critical' : impactVal < -15 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
+    const colorClass = severity === 'Critical' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300 border-red-200 dark:border-red-800' :
+                      severity === 'High' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300 border-orange-200 dark:border-orange-800' :
+                      severity === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300 border-yellow-200 dark:border-yellow-800' :
+                      'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800';
+    return { label: severity, className: colorClass };
   };
 
   // Derive active position table data based on activeScenarioName
@@ -576,16 +598,17 @@ export default function StressTestingPage() {
       accessorKey: 'severity_level',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const rawImpact = data.impact ?? 0;
-        const impactVal = Math.abs(rawImpact) <= 1.0 && rawImpact !== 0 ? rawImpact * 100 : rawImpact;
-        const severity = impactVal < -25 ? 'Critical' : impactVal < -15 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
-        const colorClass = severity === 'Critical' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300 border-red-200 dark:border-red-800' :
-                          severity === 'High' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300 border-orange-200 dark:border-orange-800' :
-                          severity === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300 border-yellow-200 dark:border-yellow-800' :
-                          'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800';
+        const sev = severityFor(data.impact);
+        if (!sev) {
+          return (
+            <span className="px-2.5 py-1 text-xs rounded-full font-semibold border bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400 border-gray-200 dark:border-gray-600">
+              N/A
+            </span>
+          );
+        }
         return (
-          <span className={`px-2.5 py-1 text-xs rounded-full font-semibold border ${colorClass}`}>
-            {severity}
+          <span className={`px-2.5 py-1 text-xs rounded-full font-semibold border ${sev.className}`}>
+            {sev.label}
           </span>
         );
       },
@@ -597,10 +620,8 @@ export default function StressTestingPage() {
     const headers = 'Ticker,Scenario,Impact,Severity\n';
     const rows = positionData
       .map(p => {
-        const rawImpact = p.impact ?? 0;
-        const impactVal = Math.abs(rawImpact) <= 1.0 && rawImpact !== 0 ? rawImpact * 100 : rawImpact;
-        const sev = impactVal < -25 ? 'Critical' : impactVal < -15 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
-        return `${p.ticker},${activeScenarioName},${(p.impact * 100).toFixed(2)}%,${sev}`;
+        const sev = severityFor(p.impact);
+        return `${p.ticker},${activeScenarioName},${formatPercentage(p.impact, 2)},${sev ? sev.label : 'N/A'}`;
       })
       .join('\n');
     const blob = new Blob([headers + rows], { type: 'text/csv' });
@@ -612,11 +633,12 @@ export default function StressTestingPage() {
     URL.revokeObjectURL(url);
   };
 
-  // Calculate summary metrics
+  // Calculate summary metrics (null until at least one scenario returns a value)
   const stressTestResults = Object.values(stressResults);
-  const worstCase = stressTestResults.length > 0 ? Math.min(...stressTestResults.map(r => r.portfolio_impact)) : -0.419;
-  const bestCase = stressTestResults.length > 0 ? Math.max(...stressTestResults.map(r => r.portfolio_impact)) : -0.173;
-  const avgImpact = stressTestResults.length > 0 ? (stressTestResults.reduce((sum: number, r: StressTestResult) => sum + r.portfolio_impact, 0) / stressTestResults.length) : -0.279;
+  const impacts = stressTestResults.map(r => r.portfolio_impact).filter((v): v is number => v != null);
+  const worstCase = impacts.length > 0 ? Math.min(...impacts) : null;
+  const bestCase = impacts.length > 0 ? Math.max(...impacts) : null;
+  const avgImpact = impacts.length > 0 ? (impacts.reduce((sum: number, v) => sum + v, 0) / impacts.length) : null;
 
   return (
     <div className="space-y-6">
@@ -858,7 +880,7 @@ export default function StressTestingPage() {
                     <div className="flex justify-between items-center text-gray-600 dark:text-gray-400">
                       <span>Recovery Time</span>
                       <span className="font-semibold text-gray-900 dark:text-white">
-                        {result.recovery_time} months
+                        {result.recovery_time != null ? `${result.recovery_time} months` : 'N/A'}
                       </span>
                     </div>
                     <div className="flex justify-between items-center text-gray-600 dark:text-gray-400">
@@ -901,6 +923,11 @@ export default function StressTestingPage() {
       </div>
 
       {/* Position Impact Analysis Section */}
+      {(runError || activeResult?.error) && (
+        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4 text-sm text-amber-800 dark:text-amber-200">
+          {runError || activeResult?.error}
+        </div>
+      )}
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md border border-gray-200 dark:border-gray-700 overflow-hidden">
         <DataTable
           title={`Position-Level Impact Analysis (${activeScenarioName})`}

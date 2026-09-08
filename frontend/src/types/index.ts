@@ -382,12 +382,13 @@ export interface RiskContributionResponse {
 
 export interface StressTestResponse {
   scenario: string;
-  max_drawdown: number;
-  portfolio_impact: number;
+  max_drawdown: number | null;
+  portfolio_impact: number | null;
   position_impacts: Record<string, number>;
-  recovery_time: number;
+  recovery_time: number | null;
   confidence_level: number;
   methodology?: string;
+  error?: string;
 }
 
 export interface VolatilitySizingResponse {

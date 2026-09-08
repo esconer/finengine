@@ -89,9 +89,11 @@ def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional
             return round(theta, 6), round(half_life, 2)
         return None, None
     elif -2.0 < gamma <= -1.0:
-        # Strongly oscillatory / immediate mean reversion
-        theta = float(-np.log(max(1e-6, 1.0 + gamma + 1.0)))  # numerical guard
-        return round(abs(float(gamma)), 6), 1.0
+        # Oscillatory overshoot: the discrete AR(1) flips sign each step, so no
+        # continuous-time half-life exists. Return (None, None) as the
+        # oscillatory flag — never fabricate half_life=1.0.
+        logger.debug(f"OU oscillatory regime (gamma={gamma:.4f}); no half-life defined")
+        return None, None
     else:
         return None, None
 
