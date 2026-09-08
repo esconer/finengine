@@ -69,11 +69,13 @@ export default function PortfolioManagePage() {
         buy_price: number;
         weight: number;
         custom_name: string;
+        added_on: string;
     }>({
         quantity: 0,
         buy_price: 0,
         weight: 0,
-        custom_name: ''
+        custom_name: '',
+        added_on: ''
     });
 
     // Filter states
@@ -239,7 +241,8 @@ export default function PortfolioManagePage() {
             quantity: position.quantity,
             buy_price: position.buy_price,
             weight: position.weight,
-            custom_name: position.custom_name || ''
+            custom_name: position.custom_name || '',
+            added_on: position.added_on ? position.added_on.slice(0, 10) : new Date().toISOString().split('T')[0]
         });
     };
 
@@ -249,7 +252,8 @@ export default function PortfolioManagePage() {
             quantity: 0,
             buy_price: 0,
             weight: 0,
-            custom_name: ''
+            custom_name: '',
+            added_on: ''
         });
     };
 
@@ -260,12 +264,18 @@ export default function PortfolioManagePage() {
             const position = positions.find(p => p.ticker === editingTicker);
             if (!position) return;
 
+            const today = new Date().toISOString().split('T')[0];
+            const positionDate = position.added_on ? position.added_on.slice(0, 10) : '';
             const updates: PortfolioUpdateRequest = {
                 quantity: editingValues.quantity,
                 buy_price: editingValues.buy_price,
                 weight: editingValues.weight,
                 custom_name: editingValues.custom_name
             };
+            if (editingValues.added_on && editingValues.added_on !== positionDate &&
+                /^\d{4}-\d{2}-\d{2}$/.test(editingValues.added_on) && editingValues.added_on <= today) {
+                updates.added_on = editingValues.added_on;
+            }
 
             await handleUpdatePosition(position.id, updates);
             setEditingTicker(null);
@@ -545,6 +555,12 @@ export default function PortfolioManagePage() {
                                         </th>
                                         <th
                                             className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
+                                            onClick={() => handleSort('added_on')}
+                                        >
+                                            Buy Date {sortBy === 'added_on' && (sortDirection === 'asc' ? '↑' : '↓')}
+                                        </th>
+                                        <th
+                                            className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
                                             onClick={() => handleSort('current_value')}
                                         >
                                             Current Value {sortBy === 'current_value' && (sortDirection === 'asc' ? '↑' : '↓')}
@@ -626,6 +642,19 @@ export default function PortfolioManagePage() {
                                                     />
                                                 ) : (
                                                     formatCurrency(position.buy_price)
+                                                )}
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
+                                                {editingTicker === position.ticker ? (
+                                                    <input
+                                                        type="date"
+                                                        value={editingValues.added_on}
+                                                        max={new Date().toISOString().split('T')[0]}
+                                                        onChange={(e) => setEditingValues(prev => ({ ...prev, added_on: e.target.value }))}
+                                                        className="w-32 px-2 py-1 border border-gray-300 rounded text-sm"
+                                                    />
+                                                ) : (
+                                                    position.added_on ? position.added_on.slice(0, 10) : '—'
                                                 )}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
