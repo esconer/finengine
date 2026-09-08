@@ -40,6 +40,7 @@ export default function RealizedRiskPage() {
   });
   const [loading, setLoading] = useState(false);
   const [positionData, setPositionData] = useState<any[]>([]);
+  const [showCoverageDetail, setShowCoverageDetail] = useState(false);
 
   const { data: analyticsData, loading: analyticsLoading, refresh } = usePortfolioAnalytics();
   const { performanceData } = usePerformanceData(252);
@@ -265,6 +266,23 @@ export default function RealizedRiskPage() {
   // DSP-10: full-exchange-history portfolio risk (instrument characteristics)
   const fullHistory = realizedRisk?.instrument_risk?.portfolio;
 
+  // Phase 2 disclosure: one summary banner for the holding-intersection window.
+  const coverage = realizedRisk?.history_coverage;
+  const coverageWarnings = realizedRisk?.warnings || [];
+  const intersection = coverage?.intersection_start || coverage?.effective_start;
+  const coveredDays = coverage?.covered_days ?? coverageWarnings[0]?.data_points;
+  const fullDays = coverage?.full_history_days;
+  const coverageTickers = coverage?.tickers || {};
+  const coverageNames = Object.keys(coverageTickers);
+  const coverageTotal = coverageNames.length || positions.length || coverageWarnings.length;
+  const heldLonger = coverageNames.length
+    ? coverageNames.filter(
+        (t: string) =>
+          coverageTickers[t]?.effective_start && intersection &&
+          coverageTickers[t].effective_start < intersection
+      ).length
+    : null;
+
   return (
     <div className="space-y-6">
       {/* Hero Section */}
@@ -303,24 +321,45 @@ export default function RealizedRiskPage() {
         </div>
       </div>
 
-      {/* Insufficient History Warning Banner */}
-      {realizedRisk?.warnings && realizedRisk.warnings.length > 0 && (
-        <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-xl p-4 flex items-start space-x-3 shadow-sm">
+      {/* Holding-intersection coverage banner (Phase 2 disclosure) */}
+      {coverageWarnings.length > 0 && (
+        <div data-testid="coverage-banner" className="bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-xl p-4 flex items-start space-x-3 shadow-sm">
           <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
-          <div className="text-sm">
+          <div className="text-sm flex-1">
             <h4 className="font-semibold text-amber-900 dark:text-amber-200">
-              Data Quality Notice: Limited Historical Depth Detected ({realizedRisk.warnings.length} Instrument{realizedRisk.warnings.length > 1 ? 's' : ''})
+              Realized P&amp;L covers {coveredDays ?? '?'} trading days
+              {intersection ? ` since ${intersection}` : ''}
+              {heldLonger !== null
+                ? ` — ${heldLonger} of ${coverageTotal} positions held longer`
+                : ''}
+              {fullDays ? `; instrument risk uses full ${fullDays}d` : ''}
             </h4>
-            <div className="text-amber-800 dark:text-amber-300 mt-1 space-y-1">
-              {realizedRisk.warnings.map((w: any, idx: number) => (
-                <p key={idx}>
-                  • <strong className="font-mono">{w.ticker}</strong>: {w.message}
-                </p>
-              ))}
-              <p className="text-xs text-amber-700 dark:text-amber-400 mt-2">
-                💡 <em>Tip:</em> For continuous multi-year historical risk metrics and backtesting on Nifty 50, use continuous ETF benchmarks like <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">NIFTYBEES.NS</code> or <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">SETFNIF50.NS</code> in your portfolio.
+            {intersection && fullDays ? (
+              <p data-testid="coverage-caption" className="text-xs font-mono text-amber-700 dark:text-amber-400 mt-1">
+                {`{${intersection} · ${fullDays}d raw}`}
               </p>
-            </div>
+            ) : null}
+            <button
+              type="button"
+              data-testid="coverage-details-toggle"
+              aria-expanded={showCoverageDetail}
+              onClick={() => setShowCoverageDetail((v) => !v)}
+              className="mt-2 text-xs font-medium text-amber-800 dark:text-amber-300 underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-200"
+            >
+              {showCoverageDetail ? 'Hide' : 'Show'} per-ticker detail ({coverageWarnings.length})
+            </button>
+            {showCoverageDetail && (
+              <div data-testid="coverage-details" className="text-amber-800 dark:text-amber-300 mt-2 space-y-1">
+                {coverageWarnings.map((w: any, idx: number) => (
+                  <p key={idx}>
+                    • <strong className="font-mono">{w.ticker}</strong>: {w.message}
+                  </p>
+                ))}
+                <p className="text-xs text-amber-700 dark:text-amber-400 mt-2">
+                  💡 <em>Tip:</em> For continuous multi-year historical risk metrics and backtesting on Nifty 50, use continuous ETF benchmarks like <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">NIFTYBEES.NS</code> or <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">SETFNIF50.NS</code> in your portfolio.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       )}

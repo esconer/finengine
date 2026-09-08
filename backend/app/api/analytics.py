@@ -265,7 +265,14 @@ async def get_realized_risk(
         wiped = sorted(set(price_data_dict) - set(masked_dict))
         price_data = pd.DataFrame(masked_dict)
         covered_days = int(len(price_data))
-        history_coverage = holding_coverage(effectives, start, end, covered_days)
+        per_ticker = {
+            t: {
+                "raw_days": int(len(s)) if s is not None else 0,
+                "masked_days": int(len(masked_dict[t])) if t in masked_dict and masked_dict[t] is not None else 0,
+            }
+            for t, s in price_data_dict.items()
+        }
+        history_coverage = holding_coverage(effectives, start, end, covered_days, per_ticker)
 
         # --- Instrument risk on FULL exchange history (DSP-10) --------------
         # Risk characteristics belong to the assets, not the ownership
@@ -344,11 +351,29 @@ async def get_realized_risk(
         # Position-level metrics & data quality warnings
         positions = {}
         warnings_list = []
+        intersection = history_coverage.get("intersection_start") or history_coverage.get("effective_start")
         for ticker, pos_metrics in metrics.get("positions", {}).items():
             is_limited = pos_metrics.get("is_limited_history", False)
             data_pts = pos_metrics.get("data_points", 0)
             if is_limited:
-                if history_coverage.get("truncated"):
+                own_start = effectives.get(ticker)
+                raw_s = price_data_dict.get(ticker)
+                raw_len = int(len(raw_s)) if raw_s is not None else 0
+                masked_s = masked_dict.get(ticker)
+                masked_len = int(len(masked_s)) if masked_s is not None else 0
+                if raw_len and raw_len < MIN_ANNUALIZE_DAYS:
+                    notice = (
+                        f"{ticker} has only {data_pts} trading days of data available on exchange feeds. "
+                        "Historical risk ratios are constrained."
+                    )
+                elif masked_len < raw_len and intersection and own_start and intersection > own_start:
+                    notice = (
+                        f"{ticker} realized P&L covers {covered_days} trading days "
+                        f"since {intersection}; {ticker} held since {own_start}; instrument risk "
+                        f"uses full {history_coverage.get('full_history_days')} trading days "
+                        "of exchange history."
+                    )
+                elif history_coverage.get("truncated"):
                     notice = (
                         f"{ticker} realized P&L covers only {data_pts} trading days "
                         f"(held since {history_coverage.get('effective_start')}); instrument risk "
@@ -1094,8 +1119,10 @@ async def get_analytics_summary(
                 "error": "No price data available for summary"
             }
         
-        # Combine price data, restricted to actual holding history.
+        # Combine price data, restricted to actual holding history. The
+        # unmasked dict is kept for instrument (asset) volatility below.
         holdings = await resolve_holdings(db, list(weights.keys()))
+        unmasked_dict = price_data_dict
         price_data_dict, effectives = holding_window(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
         covered_days = int(len(price_data))
@@ -1105,12 +1132,28 @@ async def get_analytics_summary(
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         concentration_result = await analytics_engine.concentration_analysis(weights)
         risk_result = await analytics_engine.risk_scoring(price_data, weights)
-        
+
+        # Instrument volatility on the UNMASKED window (same asset-risk logic
+        # as realized-risk): never N/A-gated by intersection length.
+        full_iv_df = pd.DataFrame({
+            t: s for t, s in unmasked_dict.items()
+            if isinstance(s, pd.Series) and len(s) > 1
+        })
+        instrument_volatility = None
+        instrument_volatility_days = int(len(full_iv_df)) if not full_iv_df.empty else 0
+        if instrument_volatility_days >= 2:
+            iv_metrics = await analytics_engine.calculate_portfolio_metrics(full_iv_df, weights)
+            iv_payload = {"instrument_volatility": iv_metrics.get("annual_volatility")}
+            apply_annualization_gate(iv_payload, ["instrument_volatility"], instrument_volatility_days)
+            instrument_volatility = iv_payload["instrument_volatility"]
+
         # Generate summary (annualized ratios suppressed on short history).
         summary = {
             "portfolio_value": round(portfolio_value, 2),
             "total_positions": len(weights),
             "realized_volatility": metrics.get("annual_volatility"),
+            "instrument_volatility": instrument_volatility,
+            "instrument_volatility_days": instrument_volatility_days,
             "forecast_volatility": None,
             "sharpe_ratio": metrics.get("sharpe_ratio", 0),
             "max_drawdown": metrics.get("max_drawdown", 0),
@@ -1328,7 +1371,31 @@ async def get_tear_sheet(
             holdings=holdings,
         )
 
-        bench_ret = await benchmark.get_returns(start=start, end=end, days=756)
+        # Full-history spans entire cache depth (Phase 1 get_coverage), not
+        # the 365d request window — ends the 251-vs-175 confusion. The
+        # holding-truthed leg above stays on the requested window.
+        full_start = start
+        try:
+            get_cov = getattr(data_service, "get_coverage", None)
+            if callable(get_cov):
+                cached_starts = []
+                for t in ticker_list:
+                    cov = await get_cov(t)
+                    cs = cov.get("cached_start") if isinstance(cov, dict) else None
+                    if isinstance(cs, str) and cs:
+                        cached_starts.append(cs)
+                if cached_starts:
+                    earliest = min(cached_starts)
+                    if earliest < full_start:
+                        full_start = earliest
+        except Exception:
+            full_start = start
+
+        try:
+            bench_days = max(756, (pd.to_datetime(end) - pd.to_datetime(full_start)).days + 30)
+        except Exception:
+            bench_days = 756
+        bench_ret = await benchmark.get_returns(start=full_start, end=end, days=bench_days)
 
         metrics = {
             "total_return": _q(qs.stats.comp, port_ret),
@@ -1350,10 +1417,11 @@ async def get_tear_sheet(
         # --- Full-history instrument risk (DSP-10) ---------------------------
         # CAGR/Sharpe/Sortino/Calmar and benchmark beta/alpha are asset-
         # characteristic questions: the current book measured over the full
-        # fetched window. Realized P&L above stays holding-truthed. The second
-        # build is cache-served (same frames as the masked call).
+        # cache depth (see full_start above). Realized P&L above stays
+        # holding-truthed. The second build is cache-served (same frames as
+        # the masked call).
         full_returns_df, full_port_ret, _ = await _build_wide_returns(
-            ticker_list, weights, start, end, data_service,
+            ticker_list, weights, full_start, end, data_service,
         )
         full_metrics = {
             "total_return": _q(qs.stats.comp, full_port_ret),
@@ -1368,6 +1436,10 @@ async def get_tear_sheet(
         apply_annualization_gate(
             full_metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(full_port_ret)
         )
+        try:
+            full_history_start = str(full_port_ret.index.min().date())
+        except Exception:
+            full_history_start = full_start
 
         full_relative: Dict[str, Any] = {}
         if bench_ret is not None and len(bench_ret) > 20:
@@ -1385,15 +1457,22 @@ async def get_tear_sheet(
 
         relative: Dict[str, Any] = {}
         if bench_ret is not None and len(bench_ret) > 20:
-            # Benchmark standalone stats describe the index over the FULL
-            # requested window (no holding concept applies to NIFTY itself).
+            # Holding leg stays on the requested window: slice the (possibly
+            # deeper) benchmark back down. Benchmark standalone stats describe
+            # the index over the requested window (no holding concept applies
+            # to NIFTY itself).
+            bench_window = bench_ret
+            try:
+                bench_window = bench_ret[bench_ret.index >= start]
+            except Exception:
+                bench_window = bench_ret
             relative = {
                 "beta_vs_nifty": None,
                 "alpha_annualized": None,
-                "benchmark_sharpe": _q(qs.stats.sharpe, bench_ret, rf=0.02),
-                "benchmark_volatility": _q(qs.stats.volatility, bench_ret),
-                "benchmark_max_drawdown": _q(qs.stats.max_drawdown, bench_ret),
-                "benchmark_total_return": _q(qs.stats.comp, bench_ret),
+                "benchmark_sharpe": _q(qs.stats.sharpe, bench_window, rf=0.02),
+                "benchmark_volatility": _q(qs.stats.volatility, bench_window),
+                "benchmark_max_drawdown": _q(qs.stats.max_drawdown, bench_window),
+                "benchmark_total_return": _q(qs.stats.comp, bench_window),
             }
             # Beta/alpha genuinely need joint history: gate on the common
             # window so a handful of overlapping days never annualizes noise.
@@ -1435,6 +1514,7 @@ async def get_tear_sheet(
             "full_history": {
                 "metrics": full_metrics,
                 "relative_vs_nifty": full_relative,
+                "start": full_history_start,
             },
             "relative_vs_nifty": relative,
             "monthly_returns": monthly,

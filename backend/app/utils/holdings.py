@@ -147,24 +147,45 @@ def holding_coverage(
     start: str,
     end: str,
     covered_days: int,
+    per_ticker: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Disclosure payload: how much of the window is true holding history.
 
     start/end may be non-strings when route functions are invoked directly
     in unit tests (FastAPI Query defaults); only ISO strings participate
     in the truncation comparison, everything else degrades to flags.
+
+    `truncated` compares the INTERSECTION start (newest holding — the date
+    the current composition first existed) against the requested start, not
+    the oldest holding: a book held for years but rebalanced yesterday only
+    has days of realized history for its current composition. `per_ticker`
+    optionally carries {"raw_days", "masked_days"} counts per ticker (the
+    caller owns the raw/masked frames); without it the per-ticker entries
+    still report effective starts with None counts.
     """
     start_s = start if isinstance(start, str) else None
     known = {t: d for t, d in (active_from or {}).items() if d}
     oldest = min(known.values()) if known else None
-    eff = effective_start(active_from) or start_s
+    intersection = effective_start(active_from)
+    eff = intersection or start_s
+    counts = per_ticker or {}
+    tickers: Dict[str, Any] = {}
+    for t in sorted(set((active_from or {}).keys()) | set(counts.keys())):
+        c = counts.get(t) or {}
+        tickers[t] = {
+            "effective_start": (active_from or {}).get(t),
+            "raw_days": c.get("raw_days"),
+            "masked_days": c.get("masked_days"),
+        }
     return {
         "requested_start": start_s,
         "effective_start": eff,
+        "intersection_start": intersection,
         "oldest_holding": oldest,
         "covered_days": int(covered_days),
-        "truncated": bool(oldest and start_s and oldest > start_s),
+        "truncated": bool(intersection and start_s and intersection > start_s),
         "annualized": int(covered_days) >= MIN_ANNUALIZE_DAYS,
+        "tickers": tickers,
     }
 
 

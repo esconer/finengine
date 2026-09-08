@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import yfinance as yf
 from zoneinfo import ZoneInfo
@@ -116,6 +116,194 @@ class DataService:
 
     _in_memory_df_cache: Dict[str, Any] = {}
 
+    # Deep-cache horizon: vendor-max backfills download up to 10y back from
+    # `end`, regardless of the requested window. L1 keeps a 5-min TTL.
+    DEEP_CACHE_YEARS = 10
+    _L1_TTL_SECONDS = 300
+
+    @classmethod
+    def _deep_start(cls, start: str, end: str) -> str:
+        """Backfill floor for a vendor fetch: 10y back from `end`, extended
+        further back when the caller explicitly asked for more (never shrink)."""
+        try:
+            floor = (pd.to_datetime(end) - pd.DateOffset(years=cls.DEEP_CACHE_YEARS)).strftime("%Y-%m-%d")
+        except Exception:
+            return start
+        return min(start, floor)
+
+    @staticmethod
+    def _as_column_frame(df: pd.DataFrame) -> pd.DataFrame:
+        """Canonical serve/L1 shape: normalized frame with a 'date' column.
+
+        Fresh vendor frames already carry one; SQLite slices are date-indexed.
+        """
+        if df is None or "date" in getattr(df, "columns", []):
+            return df
+        try:
+            return df.reset_index()
+        except Exception:
+            return df
+
+    @staticmethod
+    def _frame_bounds(df: pd.DataFrame):
+        """(min, max) Timestamp of a frame's dates, None when undeterminable."""
+        try:
+            if "date" in getattr(df, "columns", []):
+                d = pd.to_datetime(df["date"])
+            elif isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+                d = pd.to_datetime(df.index)
+            else:
+                return None
+            if d.empty:
+                return None
+            return (d.min(), d.max())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _slice_window(df: pd.DataFrame, req_start, req_end) -> pd.DataFrame:
+        """Return the [start, end] slice of a column-shape frame."""
+        d = pd.to_datetime(df["date"])
+        return df[(d >= req_start) & (d <= req_end)].copy()
+
+    def _l1_slice(
+        self, ticker: str, start: str, end: str, now_ts: float
+    ) -> Optional[pd.DataFrame]:
+        """Slice [start, end] out of the ticker-keyed L1 full-depth frame.
+
+        Misses (None) when the entry is absent/expired, doesn't cover the
+        window, or its tail is stale for a near-real-time `end` — mirroring
+        the SQLite stale-tail rule so refresh still flows through DB/vendor.
+        """
+        try:
+            entry = self._in_memory_df_cache.get(ticker)
+        except Exception:
+            return None
+        if not entry:
+            return None
+        cached_ts, full_df = entry
+        if full_df is None or now_ts - cached_ts >= self._L1_TTL_SECONDS:
+            return None
+        try:
+            req_start = pd.to_datetime(start)
+            req_end = pd.to_datetime(end)
+        except Exception:
+            return None
+        bounds = self._frame_bounds(full_df)
+        if bounds is None:
+            return None
+        lo, hi = bounds
+        if req_start < lo or req_end > hi:
+            return None
+        if (req_end - hi).days >= 3 and (datetime.utcnow() - req_end).days <= 2:
+            return None
+        try:
+            return self._slice_window(self._as_column_frame(full_df), req_start, req_end)
+        except Exception:
+            return None
+
+    async def get_coverage(self, ticker: str) -> Dict[str, Any]:
+        """Cheap per-ticker cache census for Phase-2 consumers.
+
+        Single aggregate query (no rows fetched). Dates are ISO strings;
+        None/0 when the ticker has no cached rows. No new route.
+        """
+        normalized = self._normalize_indian_ticker(ticker)
+        try:
+            query = select(
+                func.min(StockTimeseries.date),
+                func.max(StockTimeseries.date),
+                func.count(StockTimeseries.id),
+            ).where(StockTimeseries.ticker == normalized.upper())
+            lo, hi, n = (await self.db.execute(query)).one()
+
+            def _iso(v):
+                if v is None:
+                    return None
+                try:
+                    return pd.to_datetime(v).strftime("%Y-%m-%d")
+                except Exception:
+                    return str(v)[:10]
+
+            return {
+                "ticker": normalized.upper(),
+                "cached_start": _iso(lo),
+                "cached_end": _iso(hi),
+                "trading_days": int(n or 0),
+            }
+        except Exception as e:
+            logger.error(f"Error getting coverage for {ticker}: {e}")
+            return {
+                "ticker": normalized.upper(),
+                "cached_start": None,
+                "cached_end": None,
+                "trading_days": 0,
+            }
+
+    async def _get_full_cached_frame(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Full-depth column-shape frame for one ticker (no window filter, no
+        staleness heuristics — freshness is enforced by the window query that
+        gates every call site, plus the L1 TTL). Populates ticker-keyed L1."""
+        try:
+            query = select(StockTimeseries).where(
+                StockTimeseries.ticker == ticker.upper()
+            ).order_by(StockTimeseries.date)
+
+            result = await self.db.execute(query)
+            records = result.scalars().all()
+
+            if not records:
+                return None
+
+            data = []
+            for record in records:
+                data.append({
+                    'date': record.date,
+                    'open': record.open,
+                    'high': record.high,
+                    'low': record.low,
+                    'close': record.close,
+                    'adj_close': record.adj_close,
+                    'volume': record.volume,
+                    'ticker': record.ticker
+                })
+
+            df = pd.DataFrame(data)
+            df['date'] = pd.to_datetime(df['date'])
+            return df
+
+        except Exception as e:
+            logger.error(f"Error getting full cached frame for {ticker}: {e}")
+            return None
+
+    async def _serve_backfilled_slice(
+        self,
+        ticker: str,
+        start: str,
+        end: str,
+        fallback_df: pd.DataFrame,
+        now_ts: float,
+    ) -> pd.DataFrame:
+        """Serve [start, end] from SQLite after a vendor-max backfill (re-query,
+        never the max frame); refresh ticker-keyed L1 with the full-depth frame."""
+        async with self._db_lock:
+            served = await self._get_cached_data(ticker, start, end)
+            full = await self._get_full_cached_frame(ticker)
+        if served is not None:
+            out = self._as_column_frame(served)
+        else:
+            try:
+                out = self._slice_window(
+                    self._as_column_frame(fallback_df),
+                    pd.to_datetime(start),
+                    pd.to_datetime(end),
+                )
+            except Exception:
+                out = fallback_df
+        base = full if full is not None else self._as_column_frame(fallback_df)
+        self._in_memory_df_cache[ticker] = (now_ts, base)
+        return out
+
     async def fetch_historical_data(
         self,
         ticker: str,
@@ -141,14 +329,14 @@ class DataService:
         try:
             # Normalize ticker for Indian market
             normalized_ticker = self._normalize_indian_ticker(ticker)
-            cache_key = f"{normalized_ticker}:{start}:{end}"
             now_ts = time.time()
 
-            # Check fast in-memory cache first
-            if not force_refresh and cache_key in self._in_memory_df_cache:
-                cached_ts, cached_df = self._in_memory_df_cache[cache_key]
-                if now_ts - cached_ts < 300 and cached_df is not None:  # 5 min in-memory TTL
-                    return cached_df.copy()
+            # L1: ticker-keyed full-depth frame; each request slices its own
+            # [start, end] window so unrelated windows share one entry.
+            if not force_refresh:
+                l1_hit = self._l1_slice(normalized_ticker, start, end, now_ts)
+                if l1_hit is not None:
+                    return l1_hit
 
             logger.info(f"Fetching historical data for {ticker} -> {normalized_ticker} from {start} to {end}")
 
@@ -156,19 +344,27 @@ class DataService:
             if not force_refresh:
                 async with self._db_lock:
                     cached_data = await self._get_cached_data(normalized_ticker, start, end)
+                    full_frame = await self._get_full_cached_frame(normalized_ticker) if cached_data is not None else None
                 if cached_data is not None:
-                    self._in_memory_df_cache[cache_key] = (now_ts, cached_data)
-                    return cached_data
+                    served = self._as_column_frame(cached_data)
+                    self._in_memory_df_cache[normalized_ticker] = (
+                        now_ts, full_frame if full_frame is not None else served)
+                    return served
 
             # Vendor cascade per user preference: [primary, secondary], Alpha Vantage last
             if source_order is None:
                 source_order = await self._resolve_source_order()
 
+            # Deep-cache backfill: on miss/stale tail, download vendor-max
+            # history (capped 10y back from `end`) regardless of the requested
+            # window; the union accumulates in SQLite via upsert.
+            dl_start = self._deep_start(start, end)
+
             # Download data with retry logic (Tier 1/2 per preference inside _download_with_timeout)
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    df = await self._download_with_timeout(normalized_ticker, start, end, source_order)
+                    df = await self._download_with_timeout(normalized_ticker, dl_start, end, source_order)
 
                     if df is not None and not df.empty:
                         # Read vendor marker before normalization (reset_index
@@ -177,6 +373,9 @@ class DataService:
 
                         # Handle multi-index columns
                         df = self._normalize_yfinance_data(df, normalized_ticker)
+
+                        if df.empty:
+                            return df
 
                         # Store in database cache + log the attempt; both touch
                         # the shared session, so keep them inside the DB gate
@@ -189,8 +388,9 @@ class DataService:
                             )
 
                         logger.info(f"Successfully fetched {len(df)} records for {normalized_ticker} via {actual_source}")
-                        self._in_memory_df_cache[cache_key] = (now_ts, df)
-                        return df
+                        # Serve the requested slice from SQLite, not the max frame
+                        return await self._serve_backfilled_slice(
+                            normalized_ticker, start, end, df, now_ts)
 
                 except Exception as e:
                     logger.warning(f"Attempt {attempt + 1} failed for {normalized_ticker}: {e}")
@@ -206,10 +406,12 @@ class DataService:
                     else:
                         await asyncio.sleep(1)  # Brief pause before retry
 
-            # Tier 3: Alpha Vantage fallback
-            fallback_df = await self._fetch_from_alpha_vantage(normalized_ticker, ticker, start, end)
+            # Tier 3: Alpha Vantage fallback (same deep-window backfill contract)
+            fallback_df = await self._fetch_from_alpha_vantage(normalized_ticker, ticker, dl_start, end)
             if fallback_df is not None and not fallback_df.empty:
-                return fallback_df
+                return await self._serve_backfilled_slice(
+                    normalized_ticker, start, end,
+                    self._as_column_frame(fallback_df), now_ts)
 
             return None
             

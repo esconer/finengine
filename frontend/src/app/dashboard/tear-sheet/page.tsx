@@ -245,6 +245,7 @@ interface TearSheetData {
   full_history?: {
     metrics: Record<string, number | null>;
     relative_vs_nifty: Record<string, number | null>;
+    start?: string | null;
   } | null;
   relative_vs_nifty: Record<string, number | null>;
   monthly_returns: Record<string, Record<string, number>>;
@@ -252,7 +253,8 @@ interface TearSheetData {
   methodology: string;
   history_coverage?: {
     effective_start: string | null;
-    oldest_holding: string | null;
+    intersection_start?: string | null;
+    oldest_holding?: string | null;
     covered_days: number;
     truncated: boolean;
     annualized: boolean;
@@ -302,6 +304,15 @@ export default function TearSheetPage() {
     return `rgba(239, 68, 68, ${0.20 + (-capped / 0.08) * 0.75})`;
   };
 
+  // Phase 3 hierarchy: headlines read full-history asset characteristics;
+  // the holding-truthed book lives in its own labeled section below.
+  const hl = data?.full_history?.metrics ?? data?.metrics ?? {};
+  const hlRel = data?.full_history?.relative_vs_nifty ?? data?.relative_vs_nifty ?? {};
+  const hlDays = typeof hl.days === 'number' ? hl.days : null;
+  const bookStart = data?.history_coverage?.intersection_start
+    ?? data?.history_coverage?.effective_start
+    ?? null;
+
   const years = data ? Object.keys(data.monthly_returns).sort() : [];
 
   const drawdownPoints = data?.underwater ?? [];
@@ -328,25 +339,25 @@ export default function TearSheetPage() {
     rows.push('Daisy Risk Engine - Performance Tear-Sheet Report');
     rows.push(`Analysis Window,${data.window.start} to ${data.window.end}`);
     rows.push('');
-    rows.push('Headline QuantStats Metrics');
-    rows.push(`Total Return,${fmt(data.metrics.total_return, 2, '%')}`);
-    rows.push(`CAGR,${fmt(data.metrics.cagr, 2, '%')}`);
-    rows.push(`Sharpe Ratio,${fmtRatio(data.metrics.sharpe)}`);
-    rows.push(`Sortino Ratio,${fmtRatio(data.metrics.sortino)}`);
-    rows.push(`Calmar Ratio,${fmtRatio(data.metrics.calmar)}`);
+    rows.push('Headline QuantStats Metrics (full-history asset characteristics)');
+    rows.push(`Total Return,${fmt(hl.total_return, 2, '%')}`);
+    rows.push(`CAGR,${fmt(hl.cagr, 2, '%')}`);
+    rows.push(`Sharpe Ratio,${fmtRatio(hl.sharpe)}`);
+    rows.push(`Sortino Ratio,${fmtRatio(hl.sortino)}`);
+    rows.push(`Calmar Ratio,${fmtRatio(hl.calmar)}`);
     rows.push(`Omega Ratio,${fmtRatio(data.metrics.omega)}`);
     rows.push(`Tail Ratio,${fmtRatio(data.metrics.tail_ratio)}`);
-    rows.push(`Annualized Volatility,${fmt(data.metrics.volatility, 2, '%')}`);
-    rows.push(`Max Drawdown,${fmt(data.metrics.max_drawdown, 2, '%')}`);
+    rows.push(`Annualized Volatility,${fmt(hl.volatility, 2, '%')}`);
+    rows.push(`Max Drawdown,${fmt(hl.max_drawdown, 2, '%')}`);
     rows.push(`Skewness,${fmtRatio(data.metrics.skew)}`);
     rows.push(`Kurtosis,${fmtRatio(data.metrics.kurtosis)}`);
     rows.push('');
     rows.push('Against NIFTY 50 Benchmark');
-    rows.push(`Beta vs Nifty,${fmtRatio(data.relative_vs_nifty.beta_vs_nifty)}`);
-    rows.push(`Alpha (Annualized),${fmt(data.relative_vs_nifty.alpha_annualized, 2, '%')}`);
-    rows.push(`Portfolio Sharpe,${fmtRatio(data.metrics.sharpe)}`);
+    rows.push(`Beta vs Nifty,${fmtRatio(hlRel.beta_vs_nifty)}`);
+    rows.push(`Alpha (Annualized),${fmt(hlRel.alpha_annualized, 2, '%')}`);
+    rows.push(`Portfolio Sharpe,${fmtRatio(hl.sharpe)}`);
     rows.push(`Benchmark Sharpe,${fmtRatio(data.relative_vs_nifty.benchmark_sharpe)}`);
-    rows.push(`Portfolio Volatility,${fmt(data.metrics.volatility, 2, '%')}`);
+    rows.push(`Portfolio Volatility,${fmt(hl.volatility, 2, '%')}`);
     rows.push(`Benchmark Volatility,${fmt(data.relative_vs_nifty.benchmark_volatility, 2, '%')}`);
     rows.push('');
     rows.push('Monthly Returns (Year, Jan, Feb, Mar, Apr, May, Jun, Jul, Aug, Sep, Oct, Nov, Dec, Full Year)');
@@ -472,12 +483,17 @@ export default function TearSheetPage() {
       {/* Main Content */}
       {!loading && !error && data && (
         <>
-          {/* Headline 4 Core Metrics */}
+          {/* Headline metrics: full-history asset characteristics */}
+          {data.full_history?.metrics && hlDays !== null && (
+            <p data-testid="headline-caption" className="text-xs text-emerald-300/80 font-mono -mt-2">
+              Full-history · {hlDays} trading days
+            </p>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="relative group">
               <MetricCard
                 title="Total Return"
-                value={fmt(data.metrics.total_return, 2, '%')}
+                value={fmt(hl.total_return, 2, '%')}
                 icon={TrendingUp}
                 loading={loading}
               />
@@ -489,7 +505,7 @@ export default function TearSheetPage() {
             <div className="relative group">
               <MetricCard
                 title="CAGR"
-                value={fmt(data.metrics.cagr, 2, '%')}
+                value={fmt(hl.cagr, 2, '%')}
                 icon={Activity}
                 loading={loading}
               />
@@ -501,7 +517,7 @@ export default function TearSheetPage() {
             <div className="relative group">
               <MetricCard
                 title="Sharpe Ratio"
-                value={fmtRatio(data.metrics.sharpe)}
+                value={fmtRatio(hl.sharpe)}
                 icon={Scale}
                 loading={loading}
               />
@@ -513,7 +529,7 @@ export default function TearSheetPage() {
             <div className="relative group">
               <MetricCard
                 title="Max Drawdown"
-                value={fmt(data.metrics.max_drawdown, 2, '%')}
+                value={fmt(hl.max_drawdown, 2, '%')}
                 icon={AlertTriangle}
                 loading={loading}
               />
@@ -522,6 +538,34 @@ export default function TearSheetPage() {
               </div>
             </div>
           </div>
+
+          {/* Current book: holding-truthed realized P&L since the intersection */}
+          {bookStart && (
+            <div data-testid="holding-section" className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-bold text-white">
+                  Current book since {bookStart}
+                </h3>
+                <span className="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono">
+                  BOOK-TRUE
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                  <span className="text-xs font-semibold text-slate-400">Holding Total Return</span>
+                  <p className="text-lg font-bold font-mono text-white">
+                    {fmt(data.metrics.total_return, 2, '%')}
+                  </p>
+                </div>
+                <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                  <span className="text-xs font-semibold text-slate-400">Holding Max Drawdown</span>
+                  <p className="text-lg font-bold font-mono text-white">
+                    {fmt(data.metrics.max_drawdown, 2, '%')}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Full-history instrument risk (DSP-10): the current book measured
               over full exchange history. Holding-window metrics above stay
@@ -595,7 +639,7 @@ export default function TearSheetPage() {
                     <HelpBtn onClick={() => setActiveExplainer('beta_vs_nifty')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-white">
-                    {fmtRatio(data.relative_vs_nifty.beta_vs_nifty)}
+                    {fmtRatio(hlRel.beta_vs_nifty)}
                   </p>
                   <span className="text-[10px] text-slate-400 mt-0.5 block">Market Sensitivity</span>
                 </div>
@@ -606,9 +650,9 @@ export default function TearSheetPage() {
                     <HelpBtn onClick={() => setActiveExplainer('alpha_annualized')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-emerald-300">
-                    {data.relative_vs_nifty.alpha_annualized == null
+                    {hlRel.alpha_annualized == null
                       ? 'N/A'
-                      : `${data.relative_vs_nifty.alpha_annualized > 0 ? '+' : ''}${fmt(data.relative_vs_nifty.alpha_annualized, 2, '%')}`}
+                      : `${hlRel.alpha_annualized > 0 ? '+' : ''}${fmt(hlRel.alpha_annualized, 2, '%')}`}
                   </p>
                   <span className="text-[10px] text-emerald-400/80 mt-0.5 block">Active Outperformance</span>
                 </div>
@@ -619,7 +663,7 @@ export default function TearSheetPage() {
                     <HelpBtn onClick={() => setActiveExplainer('sharpe_ratio')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-teal-300">
-                    {fmtRatio(data.metrics.sharpe)}
+                    {fmtRatio(hl.sharpe)}
                   </p>
                   <span className="text-[10px] text-slate-400 mt-0.5 block">Risk Efficiency</span>
                 </div>
@@ -641,7 +685,7 @@ export default function TearSheetPage() {
                     <HelpBtn onClick={() => setActiveExplainer('portfolio_volatility')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-amber-300">
-                    {fmt(data.metrics.volatility, 2, '%')}
+                    {fmt(hl.volatility, 2, '%')}
                   </p>
                   <span className="text-[10px] text-slate-400 mt-0.5 block">1-Yr Realized Risk</span>
                 </div>
@@ -737,7 +781,14 @@ export default function TearSheetPage() {
                   <h3 className="text-lg font-bold text-white">Monthly Returns Heatmap (%)</h3>
                   <HelpBtn onClick={() => setActiveExplainer('monthly_returns')} />
                 </div>
-                <CalendarDays className="w-5 h-5 text-slate-400" />
+                <div className="flex items-center space-x-2">
+                  {bookStart && (
+                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono">
+                      Book-true · since {bookStart}
+                    </span>
+                  )}
+                  <CalendarDays className="w-5 h-5 text-slate-400" />
+                </div>
               </div>
 
               <table className="min-w-full tabular-nums border-collapse">
@@ -806,9 +857,16 @@ export default function TearSheetPage() {
                     <h3 className="text-lg font-bold text-white">Underwater Drawdown Curve</h3>
                     <HelpBtn onClick={() => setActiveExplainer('underwater_curve')} />
                   </div>
-                  <span className="text-xs px-2.5 py-1 rounded-full bg-rose-950/40 text-rose-300 border border-rose-800/50 font-mono font-bold">
-                    Peak Drop: {fmt(worstDrawdown, 2, '%')}
-                  </span>
+                  <div className="flex items-center">
+                    {bookStart && (
+                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono mr-2">
+                        Book-true · since {bookStart}
+                      </span>
+                    )}
+                    <span className="text-xs px-2.5 py-1 rounded-full bg-rose-950/40 text-rose-300 border border-rose-800/50 font-mono font-bold">
+                      Peak Drop: {fmt(worstDrawdown, 2, '%')}
+                    </span>
+                  </div>
                 </div>
                 
                 <div className="p-3 bg-slate-800/30 rounded-lg border border-slate-700/40 mb-3 flex items-center justify-between text-xs text-slate-400">

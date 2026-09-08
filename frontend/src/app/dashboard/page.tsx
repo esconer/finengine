@@ -115,7 +115,7 @@ export default function DashboardSummary() {
     // Score scaled from 0% (1 stock) to 100% (10+ effective stocks across 4+ sectors)
     const positionScore = Math.min(100, Math.max(0, ((effectiveN - 1) / 9) * 100));
     const sectorMultiplier = Math.min(1, Math.max(0.25, (sectorData.length / 4)));
-    return Math.round(positionScore * sectorMultiplier);
+    return Math.round(positionScore * sectorMultiplier * 10) / 10;
   }, [positions, totalValue, sectorData]);
 
   const totalCost = useMemo(() => {
@@ -144,6 +144,14 @@ export default function DashboardSummary() {
     maxDrawdown: analyticsData.summary?.max_drawdown || 0,
     diversificationScore,
   };
+
+  // Phase 4: the Ann Vol card reads full-history asset vol (unmasked), so it
+  // never N/A-gates on intersection length. Falls back to holding-window
+  // realized vol for older summary payloads without the field.
+  const summaryAny = analyticsData.summary as any;
+  const instrumentVol: number | null = summaryAny?.instrument_volatility ?? null;
+  const instrumentVolDays: number | null = summaryAny?.instrument_volatility_days ?? null;
+  const volCardValue = instrumentVol ?? portfolioMetrics.volatility;
 
   // DataTable columns with enhanced functionality
   const positionColumns = [
@@ -337,11 +345,16 @@ export default function DashboardSummary() {
         <div>
           <MetricCard
             title="Annual Volatility"
-            value={portfolioMetrics.volatility === null ? 'N/A' : `${(portfolioMetrics.volatility * 100).toFixed(2)}%`}
+            value={volCardValue === null ? 'N/A' : `${(volCardValue * 100).toFixed(2)}%`}
             icon={Activity}
             loading={analyticsLoading}
           />
-          {!analyticsLoading && portfolioMetrics.volatility === null && (
+          {!analyticsLoading && volCardValue !== null && instrumentVol !== null && (
+            <p data-testid="vol-caption" className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              full-history asset vol{instrumentVolDays !== null ? ` · ${instrumentVolDays}d` : ''}
+            </p>
+          )}
+          {!analyticsLoading && volCardValue === null && (
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
               Holding-window realized vol (√252 annualized) — needs ≥ 30 trading days
             </p>
@@ -349,7 +362,7 @@ export default function DashboardSummary() {
         </div>
         <MetricCard
           title="Diversification Score"
-          value={`${portfolioMetrics.diversificationScore}%`}
+          value={`${portfolioMetrics.diversificationScore.toFixed(1)}%`}
           icon={Shield}
           loading={analyticsLoading}
         />
@@ -561,7 +574,7 @@ export default function DashboardSummary() {
                   ? 'text-amber-500 dark:text-amber-400'
                   : 'text-green-600 dark:text-green-400'
               }`}>
-                {diversificationScore}%
+                {diversificationScore.toFixed(1)}%
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 Diversification Score
