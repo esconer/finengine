@@ -4,7 +4,7 @@ and REST endpoints in equity_research.py.
 """
 
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from httpx import AsyncClient, ASGITransport
 import pandas as pd
 import bfinance as bf
@@ -321,3 +321,36 @@ class TestEquityResearchAPIRoutes:
             assert resp.status_code == 200
             data = resp.json()
             assert len(data) >= 5
+
+    async def test_ai_routes_map_value_error_to_404(self):
+        transport = ASGITransport(app=app)
+        mock_svc = Mock()
+        mock_svc.get_investment_memo_prompt = AsyncMock(side_effect=ValueError("Unknown ticker"))
+        mock_svc.get_forensic_audit_prompt = AsyncMock(side_effect=ValueError("Unknown ticker"))
+        mock_svc.get_ai_dossier = AsyncMock(side_effect=ValueError("Unknown ticker"))
+        with patch(
+            "app.api.equity_research.get_ai_dossier_service", return_value=mock_svc
+        ):
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                for path in (
+                    "/api/v1/company/NOPE/ai-memo-prompt",
+                    "/api/v1/company/NOPE/ai-forensic-prompt",
+                    "/api/v1/company/NOPE/ai-dossier",
+                ):
+                    resp = await ac.get(path)
+                    assert resp.status_code == 404, path
+                    assert "Unknown ticker" in resp.json()["detail"]
+
+    async def test_export_excel_filename_sanitized(self):
+        transport = ASGITransport(app=app)
+        mock_svc = Mock()
+        mock_svc.export_excel_model = AsyncMock(return_value=b"xlsx-bytes")
+        with patch(
+            "app.api.equity_research.get_equity_research_service", return_value=mock_svc
+        ):
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                # Path param with a double-quote must not break Content-Disposition
+                resp = await ac.get("/api/v1/company/AB%22C.NS/export-excel")
+                assert resp.status_code == 200
+                cd = resp.headers["content-disposition"]
+                assert 'filename="AB_C_financial_model.xlsx"' in cd

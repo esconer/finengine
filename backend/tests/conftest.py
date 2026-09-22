@@ -231,8 +231,30 @@ async def async_client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, Non
 
 
 @pytest.fixture
-def client() -> Generator[TestClient, None, None]:
-    """Create test client"""
+def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
+    """Test client whose lifespan runs against a TEMP db, never daisy.db.
+
+    TestClient(app) enters the FastAPI lifespan -> init_db(), whose self-heal
+    (analytics_cache dedupe + CREATE UNIQUE INDEX) would otherwise mutate the
+    production backend/data/daisy.db on every full-suite run. Mirrors the
+    monkeypatch pattern of test_bugfix_cache_index_selfheal; also rebinds
+    SessionLocal (get_db_session) and the WS background sender's alias so no
+    code reachable from this fixture can touch the real engine. monkeypatch
+    and tmp_path undo/clean up automatically.
+    """
+    import app.api.websocket as ws_mod
+    import app.db.database as db_mod
+
+    url = f"sqlite+aiosqlite:///{(tmp_path / 'client.db').as_posix()}"
+    tmp_engine = create_async_engine(url, echo=False)
+    monkeypatch.setattr(db_mod, "engine", tmp_engine)
+    monkeypatch.setattr(
+        db_mod,
+        "SessionLocal",
+        async_sessionmaker(tmp_engine, class_=AsyncSession, expire_on_commit=False),
+    )
+    monkeypatch.setattr(ws_mod, "SessionLocal", db_mod.SessionLocal)
+    monkeypatch.setattr(db_mod.settings, "database_url", url)
     with TestClient(app) as client:
         yield client
 

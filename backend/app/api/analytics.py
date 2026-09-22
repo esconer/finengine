@@ -3,8 +3,9 @@ Analytics API endpoints for risk calculations and portfolio analytics
 """
 
 import asyncio
+import math
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,12 +69,20 @@ async def resolve_allocation(
     tickers_param: Optional[str],
     db: AsyncSession,
 ) -> tuple[List[str], Dict[str, float]]:
-    """Shared allocation resolution: DB positions with real market-value weights, or custom tickers."""
+    """Shared allocation resolution: DB positions with real market-value weights, or custom tickers.
+
+    `tickers_param="portfolio"` is the documented sentinel for "use the full
+    book" (same as omitting the param).
+    """
     db_weights = await _load_portfolio_allocation(db)
     if tickers_param:
         ticker_list = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
         if not ticker_list:
             raise ValueError("No tickers specified")
+        if ticker_list == ["PORTFOLIO"]:
+            if not db_weights:
+                raise ValueError("No portfolio positions found")
+            return list(db_weights.keys()), db_weights
         if db_weights:
             subset = {t: db_weights.get(t, 0.0) for t in ticker_list if t in db_weights}
             if subset and sum(subset.values()) > 0:
@@ -94,7 +103,10 @@ def _q(metric_fn, *args, **kwargs):
         val = metric_fn(*args, **kwargs)
         if hasattr(val, "item"):
             val = val.item()
-        return round(float(val), 6)
+        val = float(val)
+        if not math.isfinite(val):
+            return None
+        return round(val, 6)
     except Exception as e:  # noqa: BLE001
         logger.debug(f"quantstats metric unavailable ({metric_fn.__name__}): {e}")
         return None
@@ -202,7 +214,6 @@ async def get_realized_risk(
     end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
-    cache_service: CacheService = Depends(get_cache_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
     """
@@ -334,18 +345,18 @@ async def get_realized_risk(
         # Calculate portfolio metrics using analytics engine
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         
-        # Format response
+        # Format response — absent engine keys are None, never fabricated constants.
         portfolio_metrics = {
-            "annual_return": metrics.get("annual_return", 0),
-            "annual_volatility": metrics.get("annual_volatility", 0.20),
-            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
-            "sortino_ratio": metrics.get("sortino_ratio", 0),
-            "skewness": metrics.get("skewness", 0),
-            "kurtosis": metrics.get("kurtosis", 3),
-            "max_drawdown": metrics.get("max_drawdown", 0),
-            "var_95": metrics.get("var_95", -0.032),
-            "cvar_95": metrics.get("cvar_95", -0.047),
-            "hit_ratio": metrics.get("hit_ratio", 0.5)
+            "annual_return": metrics.get("annual_return"),
+            "annual_volatility": metrics.get("annual_volatility"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "sortino_ratio": metrics.get("sortino_ratio"),
+            "skewness": metrics.get("skewness"),
+            "kurtosis": metrics.get("kurtosis"),
+            "max_drawdown": metrics.get("max_drawdown"),
+            "var_95": metrics.get("var_95"),
+            "cvar_95": metrics.get("cvar_95"),
+            "hit_ratio": metrics.get("hit_ratio")
         }
         
         # Position-level metrics & data quality warnings
@@ -391,11 +402,11 @@ async def get_realized_risk(
                     "message": notice,
                 })
             positions[ticker] = {
-                "annual_return": pos_metrics.get("annual_return", 0),
-                "annual_volatility": pos_metrics.get("annual_volatility", 0.20),
-                "sharpe_ratio": pos_metrics.get("sharpe_ratio", 0),
-                "max_drawdown": pos_metrics.get("max_drawdown", 0),
-                "var_95": pos_metrics.get("var_95", -0.032),
+                "annual_return": pos_metrics.get("annual_return"),
+                "annual_volatility": pos_metrics.get("annual_volatility"),
+                "sharpe_ratio": pos_metrics.get("sharpe_ratio"),
+                "max_drawdown": pos_metrics.get("max_drawdown"),
+                "var_95": pos_metrics.get("var_95"),
                 "weight": pos_metrics.get("weight", 0),
                 "data_points": data_pts,
                 "is_limited_history": is_limited,
@@ -413,22 +424,15 @@ async def get_realized_risk(
                 pos_payload, ["annual_return", "annual_volatility", "sharpe_ratio"], covered_days
             )
         for ticker in wiped:
-            if ticker in price_data_dict:
-                warnings_list.append({
-                    "ticker": ticker,
-                    "data_points": 0,
-                    "message": (
-                        f"{ticker} has no price data within the current holding period "
-                        f"(held since {effectives.get(ticker) or history_coverage.get('effective_start')}); "
-                        "excluded from realized metrics."
-                    ),
-                })
-            else:
-                warnings_list.append({
-                    "ticker": ticker,
-                    "data_points": 0,
-                    "message": f"No price data available for {ticker}; excluded from realized metrics.",
-                })
+            warnings_list.append({
+                "ticker": ticker,
+                "data_points": 0,
+                "message": (
+                    f"{ticker} has no price data within the current holding period "
+                    f"(held since {effectives.get(ticker) or history_coverage.get('effective_start')}); "
+                    "excluded from realized metrics."
+                ),
+            })
 
         return {
             "portfolio": portfolio_metrics,
@@ -442,7 +446,7 @@ async def get_realized_risk(
         
     except Exception as e:
         logger.exception(f"Error in get_realized_risk: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/forecast-risk")
@@ -450,9 +454,10 @@ async def get_forecast_risk(
     model: str = Query(default="GARCH", description="Risk model: EWMA, GARCH, or EGARCH"),
     horizon: int = Query(default=1, ge=1, le=30, description="Forecast horizon in days"),
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
+    start: Optional[str] = Query(default=None, description="Start date (YYYY-MM-DD)"),
+    end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
-    cache_service: CacheService = Depends(get_cache_service),
     analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
 ) -> Dict:
     """
@@ -477,9 +482,11 @@ async def get_forecast_risk(
                 "error": str(e)
             }
         
-        # Default date range for sufficient historical data
-        end = datetime.now().strftime('%Y-%m-%d')
-        start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
+        # Date range: honor explicit start/end, else 252d default
+        if not end:
+            end = datetime.now().strftime('%Y-%m-%d')
+        if not start:
+            start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
         
         # Fetch price data for all tickers concurrently
         price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
@@ -584,7 +591,7 @@ async def get_forecast_risk(
         
     except Exception as e:
         logger.error(f"Error in get_forecast_risk: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/factor-exposure")
@@ -606,8 +613,8 @@ async def get_factor_exposure(
         except ValueError as e:
             return {
                 "portfolio": {
-                    "alpha": 0.0,
-                    "market": 1.0
+                    "alpha": None,
+                    "market": None
                 },
                 "positions": {},
                 "r_squared": 0.0,
@@ -625,8 +632,8 @@ async def get_factor_exposure(
         if not price_data_dict:
             return {
                 "portfolio": {
-                    "alpha": 0.0,
-                    "market": 1.0
+                    "alpha": None,
+                    "market": None
                 },
                 "positions": {},
                 "r_squared": 0.0,
@@ -687,7 +694,7 @@ async def get_factor_exposure(
         
     except Exception as e:
         logger.error(f"Error in get_factor_exposure: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/concentration")
@@ -721,16 +728,17 @@ async def get_concentration_metrics(
         # Calculate concentration metrics using analytics engine
         concentration_result = await analytics_engine.concentration_analysis(weights)
         
-        # Sector allocation from actual position metadata
+        # Sector allocation from actual position metadata, weighted by the SAME
+        # market-value weights the metrics above use (stored `weight` can be stale).
         sector_result = await db.execute(select(PortfolioPosition))
         positions = sector_result.scalars().all()
-        total_position_weight = sum(pos.weight or 0.0 for pos in positions) or 1.0
         by_sector = {}
         for pos in positions:
+            w = weights.get(pos.ticker, 0.0)
+            if w <= 0:
+                continue
             sector = pos.sector or "Unknown"
-            by_sector[sector] = round(
-                by_sector.get(sector, 0.0) + (pos.weight or 0.0) / total_position_weight, 4
-            )
+            by_sector[sector] = round(by_sector.get(sector, 0.0) + w, 4)
         
         return {
             "largest_position": concentration_result.get("largest_position", 0.0),
@@ -749,7 +757,7 @@ async def get_concentration_metrics(
         
     except Exception as e:
         logger.error(f"Error in get_concentration_metrics: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/liquidity")
@@ -783,24 +791,9 @@ async def get_liquidity_metrics(
         async def fetch_liq(ticker: str):
             async with sem:
                 try:
-                    res = data_service.fetch_historical_data(ticker, start, end)
-                    if asyncio.iscoroutine(res):
-                        df = await res
-                    else:
-                        df = res
-
-                    mc = None
-                    if hasattr(data_service, 'fetch_quote'):
-                        q_res = data_service.fetch_quote(ticker)
-                        if asyncio.iscoroutine(q_res):
-                            quote = await q_res
-                        elif isinstance(q_res, dict):
-                            quote = q_res
-                        else:
-                            quote = None
-                        if quote and isinstance(quote, dict):
-                            mc = quote.get('market_cap')
-                    
+                    df = await data_service.fetch_historical_data(ticker, start, end)
+                    quote = await data_service.fetch_quote(ticker)
+                    mc = quote.get('market_cap') if isinstance(quote, dict) else None
                     return ticker, df, mc
                 except Exception as e:
                     logger.error(f"Error in liquidity fetch for {ticker}: {e}")
@@ -813,7 +806,10 @@ async def get_liquidity_metrics(
             if mc:
                 market_caps_dict[ticker] = mc
             if df is not None and not df.empty:
-                price_col = 'adj_close' if 'adj_close' in df.columns else 'close'
+                price_col = next(
+                    (c for c in ("adj_close", "close", "Adj Close", "Close") if c in df.columns),
+                    None,
+                )
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
                 if vol_col and price_col in df.columns:
                     price_data_dict[ticker] = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
@@ -844,7 +840,7 @@ async def get_liquidity_metrics(
         
     except Exception as e:
         logger.error(f"Error in get_liquidity_metrics: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/stress-test")
@@ -912,7 +908,7 @@ async def run_stress_test(
         
     except Exception as e:
         logger.error(f"Error in run_stress_test: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/volatility-sizing")
@@ -988,7 +984,7 @@ async def get_volatility_sizing(
         
     except Exception as e:
         logger.error(f"Error in get_volatility_sizing: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/risk-score")
@@ -1058,7 +1054,7 @@ async def get_risk_score(
         
     except Exception as e:
         logger.error(f"Error in get_risk_score: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/summary")
@@ -1085,7 +1081,7 @@ async def get_analytics_summary(
                 "risk_level": None,
                 "liquidity_score": None,
                 "concentration_score": None,
-                "last_updated": datetime.utcnow().isoformat(),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
                 "error": "No portfolio positions found for summary"
             }
         
@@ -1115,7 +1111,7 @@ async def get_analytics_summary(
                 "risk_level": None,
                 "liquidity_score": None,
                 "concentration_score": None,
-                "last_updated": datetime.utcnow().isoformat(),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
                 "error": "No price data available for summary"
             }
         
@@ -1131,7 +1127,13 @@ async def get_analytics_summary(
         # Calculate portfolio metrics for summary
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
         concentration_result = await analytics_engine.concentration_analysis(weights)
-        risk_result = await analytics_engine.risk_scoring(price_data, weights)
+        # Same best-effort benchmark leg as /risk-score so scores agree.
+        benchmark_returns = None
+        try:
+            benchmark_returns = await get_benchmark_service(db).get_returns(start=start, end=end)
+        except Exception as be:
+            logger.warning(f"Could not load benchmark returns for summary risk score: {be}")
+        risk_result = await analytics_engine.risk_scoring(price_data, weights, benchmark_data=benchmark_returns)
 
         # Instrument volatility on the UNMASKED window (same asset-risk logic
         # as realized-risk): never N/A-gated by intersection length.
@@ -1155,13 +1157,16 @@ async def get_analytics_summary(
             "instrument_volatility": instrument_volatility,
             "instrument_volatility_days": instrument_volatility_days,
             "forecast_volatility": None,
-            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
-            "max_drawdown": metrics.get("max_drawdown", 0),
-            "risk_score": risk_result.get("overall_score", 25.0),
-            "risk_level": risk_result.get("risk_level", "MEDIUM"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "max_drawdown": metrics.get("max_drawdown"),
+            "risk_score": risk_result.get("overall_score"),
+            "risk_level": risk_result.get("risk_level"),
             "liquidity_score": None,
-            "concentration_score": concentration_result.get("herfindahl_index", 0.25) * 100,
-            "last_updated": datetime.utcnow().isoformat(),
+            "concentration_score": (
+                concentration_result.get("herfindahl_index") * 100
+                if concentration_result.get("herfindahl_index") is not None else None
+            ),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
             "history_coverage": history_coverage,
             "methodology": "Real-time portfolio analytics summary with multi-factor risk assessment"
         }
@@ -1171,7 +1176,7 @@ async def get_analytics_summary(
         
     except Exception as e:
         logger.error(f"Error in get_analytics_summary: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/performance-history")
@@ -1205,15 +1210,23 @@ async def get_performance_history(
                 q = p.quantity if (p.quantity and p.quantity > 0) else 0.0
                 if q == 0.0 and p.market_value and p.last_price and p.last_price > 0:
                     q = p.market_value / p.last_price
-                quantities[t] = q if q > 0 else 1.0
+                if q <= 0:
+                    # Degenerate row: no qty and nothing to derive it from.
+                    # Never fabricate a share (price x 1.0 = phantom value).
+                    logger.warning(f"performance-history: excluding {t} (no usable quantity)")
+                    continue
+                quantities[t] = q
             else:
                 quantities[t] = 1.0
+
+        if not quantities:
+            return []
 
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
         # Fetch price data concurrently
-        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
+        price_data_dict = await _fetch_price_series_dict(data_service, list(quantities), start, end)
 
         if not price_data_dict:
             return []
@@ -1222,7 +1235,7 @@ async def get_performance_history(
         # Drop pre-holding dates: quantity x past-price before import is phantom
         # value. db_positions is already loaded above, so no extra query.
         perf_holdings: Dict[str, Dict[str, Any]] = {}
-        for t in ticker_list:
+        for t in quantities:
             pos = db_positions.get(t)
             if pos is None:
                 continue
@@ -1231,11 +1244,11 @@ async def get_performance_history(
             except (TypeError, ValueError):
                 buy = None
             perf_holdings[t] = {
-                "added_on": coerce_holding_date(getattr(pos, "added_on", None)),
+                "added_on": coerce_holding_date(pos.added_on),
                 "buy_price": buy,
             }
         price_df_dict, _perf_effectives = holding_window(
-            {t: price_df[t] for t in price_df.columns}, perf_holdings
+            {t: price_df[t] for t in price_df.columns if t in quantities}, perf_holdings
         )
         price_df = pd.DataFrame(price_df_dict).ffill().bfill().dropna(how="all")
         if price_df.empty:
@@ -1256,7 +1269,12 @@ async def get_performance_history(
                 common_dates = portfolio_series.index.intersection(bench_ret.index)
                 if not common_dates.empty:
                     initial_val = float(portfolio_series.loc[common_dates[0]])
+                    # Rebase so the first common date equals the portfolio value
+                    # there (cumprod alone seeds initial_val * (1+r_d0)).
                     cum_bench = (1.0 + bench_ret.loc[common_dates]).cumprod()
+                    first = float(cum_bench.iloc[0])
+                    if first != 0:
+                        cum_bench = cum_bench / first
                     bench_val_series = initial_val * cum_bench
         except Exception as be:
             logger.debug(f"Benchmark returns unavailable for performance history: {be}")
@@ -1279,7 +1297,7 @@ async def get_performance_history(
 
     except Exception as e:
         logger.error(f"Error in get_performance_history: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ---------------------------------------------------------------------------
@@ -1335,7 +1353,7 @@ async def resolve_holdings(
             buy = float(p.buy_price) if p.buy_price else None
         except (TypeError, ValueError):
             buy = None
-        out[p.ticker] = {"added_on": coerce_holding_date(getattr(p, "added_on", None)), "buy_price": buy}
+        out[p.ticker] = {"added_on": coerce_holding_date(p.added_on), "buy_price": buy}
     return out
 
 
@@ -1395,7 +1413,11 @@ async def get_tear_sheet(
             bench_days = max(756, (pd.to_datetime(end) - pd.to_datetime(full_start)).days + 30)
         except Exception:
             bench_days = 756
-        bench_ret = await benchmark.get_returns(start=full_start, end=end, days=bench_days)
+        try:
+            bench_ret = await benchmark.get_returns(start=full_start, end=end, days=bench_days)
+        except Exception as be:
+            logger.warning(f"Benchmark returns unavailable for tear sheet: {be}")
+            bench_ret = None
 
         metrics = {
             "total_return": _q(qs.stats.comp, port_ret),
@@ -1528,7 +1550,7 @@ async def get_tear_sheet(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error building tear-sheet: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/risk-contribution")
@@ -1617,7 +1639,7 @@ async def get_risk_contribution(
         raise
     except Exception as e:
         logger.error(f"Error in risk-contribution: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/optimize/run")
@@ -1649,12 +1671,23 @@ async def run_optimization(
 
         if len(ticker_list) == 1:
             single_t = ticker_list[0]
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+            prices = (await _fetch_price_series_dict(data_service, [single_t], start, end)).get(single_t)
+            ann_ret = ann_vol = sharpe = None
+            if prices is not None and len(prices) > 1:
+                rets = prices.pct_change().dropna()
+                if len(rets) > 0:
+                    ann_ret = float(rets.mean() * 252)
+                    ann_vol = float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) > 1 else None
+                    if ann_vol and ann_vol > 0:
+                        sharpe = float((ann_ret - rf) / ann_vol)
             return {
                 "strategy": strategy,
                 "weights": {single_t: 1.0},
-                "expected_annual_return": 0.12,
-                "expected_annual_volatility": 0.22,
-                "expected_sharpe": 0.45,
+                "expected_annual_return": ann_ret,
+                "expected_annual_volatility": ann_vol,
+                "expected_sharpe": sharpe,
                 "solver": "single-holding",
                 "universe": ticker_list,
                 "current_weights": {single_t: 1.0},
@@ -1699,7 +1732,7 @@ async def run_optimization(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in optimize/run: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/backtest")
@@ -1752,7 +1785,7 @@ async def run_backtest(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in backtest: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/regime")
@@ -1795,7 +1828,7 @@ async def get_regime(
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         logger.error(f"Error detecting regime: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/monte-carlo")
@@ -1869,7 +1902,7 @@ async def run_monte_carlo(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in monte-carlo: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/correlation-stability", response_model=CorrelationStabilityResponse)
@@ -1929,7 +1962,7 @@ async def get_correlation_stability(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in correlation-stability: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/coint", response_model=CointScannerResponse)
@@ -1992,7 +2025,8 @@ async def get_cointegration_pairs(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in coint scanner: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @router.get("/india-flows")
 async def get_india_institutional_flows(
     lookback_days: int = Query(default=30, ge=5, le=365, description="Lookback window for FII/DII flows"),
@@ -2012,7 +2046,7 @@ async def get_india_institutional_flows(
         }
     except Exception as e:
         logger.error(f"Error getting institutional flows: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/delivery-anomalies")
@@ -2050,7 +2084,7 @@ async def get_delivery_anomalies(
         }
     except Exception as e:
         logger.error(f"Error getting delivery anomalies: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/liquidity-limits")
@@ -2070,9 +2104,11 @@ async def get_liquidity_limits(
                 PortfolioPosition(ticker=t, weight=1.0 / len(ticker_list), quantity=100.0, buy_price=100.0, last_price=100.0, market_value=10000.0)
                 for t in ticker_list
             ]
+            ad_hoc = True
         else:
             result = await db.execute(select(PortfolioPosition))
             positions = result.scalars().all()
+            ad_hoc = False
 
         if not positions:
             return {
@@ -2084,8 +2120,8 @@ async def get_liquidity_limits(
                 "message": "No positions found"
             }
 
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        end = datetime.now().strftime('%Y-%m-%d')
+        start = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
 
         price_dfs = {}
         for p in positions:
@@ -2095,13 +2131,19 @@ async def get_liquidity_limits(
 
         from app.services.india_data_service import IndiaDataService
         india_svc = IndiaDataService(db=db)
-        return await india_svc.calculate_portfolio_liquidity_limits(
+        result_payload = await india_svc.calculate_portfolio_liquidity_limits(
             positions=positions,
             price_history=price_dfs
         )
+        if ad_hoc:
+            # Synthetic per-ticker placeholders must not masquerade as a real
+            # portfolio valuation.
+            result_payload["mode"] = "ad_hoc"
+            result_payload["portfolio_value"] = None
+        return result_payload
     except Exception as e:
         logger.error(f"Error getting liquidity limits: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/vol-cone")
@@ -2137,7 +2179,7 @@ async def get_volatility_cone(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in vol-cone: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # /tails response memoization — the pairwise copula fit is O(n²) (~12s for 14
@@ -2145,6 +2187,14 @@ async def get_volatility_cone(
 # daily, so staleness is bounded by the calendar day.
 _TAILS_CACHE_TTL_SECONDS = 900
 _TAILS_RESPONSE_CACHE: Dict[Tuple, Tuple[float, Dict[str, Any]]] = {}
+
+# Max live entries: different lookback/confidence keys would otherwise grow unbounded.
+_TAILS_CACHE_MAX_ENTRIES = 32
+
+
+def clear_tails_cache() -> None:
+    """Drop every memoized /tails response (called by the market-data cache purge)."""
+    _TAILS_RESPONSE_CACHE.clear()
 
 
 @router.get("/tail-dependence")
@@ -2191,6 +2241,9 @@ async def get_tail_risk_and_copula(
             "observations": len(port_ret),
         }
         _TAILS_RESPONSE_CACHE[cache_key] = (time.monotonic(), response)
+        # Evict oldest entries beyond the cap (insertion order == age order).
+        while len(_TAILS_RESPONSE_CACHE) > _TAILS_CACHE_MAX_ENTRIES:
+            _TAILS_RESPONSE_CACHE.pop(next(iter(_TAILS_RESPONSE_CACHE)))
         return response
     except HTTPException:
         raise
@@ -2198,5 +2251,5 @@ async def get_tail_risk_and_copula(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in tail-dependence: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 

@@ -106,7 +106,9 @@ class TestIndicatorsServiceWindow:
         svc = next(gen)
         out = await svc.verified_snapshot("TEST.NS", end_date="2026-08-20", look_back_days=10)
         assert out["snapshot_date"] <= "2026-08-20"
-        assert len(out["recent_closes"]) <= 10
+        # look_back_days is honored exactly when history exists (the old
+        # hardcoded 5-day window made the parameter dead and truncated this)
+        assert len(out["recent_closes"]) == 10
         assert "close" in out["latest_row"]
 
 

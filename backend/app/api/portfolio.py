@@ -4,10 +4,11 @@ Portfolio API endpoints for portfolio management operations
 
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import csv
@@ -63,6 +64,9 @@ async def get_portfolio(
         if sector and isinstance(sector, str):
             query = query.where(PortfolioPosition.sector == sector)
         
+        if currency not in ("INR", "USD", "EUR", "GBP", "JPY", "AED"):
+            raise HTTPException(status_code=400, detail=f"Unsupported currency: {currency}")
+
         # Execute query
         result = await db.execute(query)
         positions = result.scalars().all()
@@ -142,9 +146,13 @@ async def get_portfolio(
             sectors=normalized_sectors
         )
         
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in get_portfolio: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/add", response_model=PortfolioPositionResponse)
@@ -162,7 +170,6 @@ async def add_portfolio_position(
         logger.info("=== ADD POSITION REQUEST RECEIVED ===")
         logger.info(f"Raw request data: {position}")
         logger.info(f"Request type: {type(position)}")
-        logger.info(f"Position dict: {position.dict() if hasattr(position, 'dict') else 'N/A'}")
         logger.info(f"Currency: {currency}")
         logger.info("=== END REQUEST DATA ===")
         
@@ -264,7 +271,7 @@ async def add_portfolio_position(
     except Exception as e:
         logger.error(f"Error adding position {position.ticker}: {e}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/bulk_add", response_model=BulkAddResponse)
@@ -285,24 +292,13 @@ async def bulk_add_positions(
         # STEP 1: Pre-Commit Business Rule Validation
         logger.info("Starting bulk add operation with pre-commit validation")
         
-        # Validate all positions against business rules before any database operations
+        # Validate ticker format only — quantity/buy_price/weight bounds are
+        # enforced by PortfolioPositionBase pydantic constraints (422 first).
         validation_errors = []
         validated_positions = []
         
         for i, pos_data in enumerate(request.positions):
             position_errors = []
-            
-            # Business rule: quantity must be > 0
-            if not hasattr(pos_data, 'quantity') or pos_data.quantity <= 0:
-                position_errors.append(f"Position {i+1}: quantity must be greater than 0")
-            
-            # Business rule: buy_price must be > 0
-            if not hasattr(pos_data, 'buy_price') or pos_data.buy_price <= 0:
-                position_errors.append(f"Position {i+1}: buy_price must be greater than 0")
-            
-            # Business rule: weight must be between 0 and 1
-            if not (0 < pos_data.weight <= 1):
-                position_errors.append(f"Position {i+1}: weight must be between 0 and 1")
             
             # Business rule: ticker must be valid format (NSE/BSE scrip codes incl.
             # hyphens, digits and exchange suffixes, e.g. BAJAJ-AUTO.NS, 500112.BO)
@@ -333,23 +329,29 @@ async def bulk_add_positions(
                 detail=f"Invalid tickers (do not exist): {', '.join(invalid_tickers)}"
             )
         
-        # STEP 3: Check for duplicates in existing portfolio (canonical forms on
-        # both sides, so RELIANCE / RELIANCE.NS / legacy bare rows all collide)
+        # STEP 3: Check for duplicates against existing portfolio AND within the
+        # payload itself (canonical forms on both sides, so RELIANCE /
+        # RELIANCE.NS / legacy bare rows all collide; no unique constraint on
+        # portfolio_positions.ticker, so API-layer dedupe is load-bearing).
         existing_tickers = await db.execute(
             select(PortfolioPosition.ticker)
         )
         existing_set = {canonical_ticker(t) for t in existing_tickers.scalars().all()}
 
         duplicate_tickers = []
+        seen_in_payload = set()
+        unique_positions = []
         for pos_data in validated_positions:
-            if canonical_ticker(pos_data.ticker) in existing_set:
-                duplicate_tickers.append(canonical_ticker(pos_data.ticker))
+            canon = canonical_ticker(pos_data.ticker)
+            if canon in existing_set or canon in seen_in_payload:
+                duplicate_tickers.append(canon)
+                continue
+            seen_in_payload.add(canon)
+            unique_positions.append(pos_data)
 
         if duplicate_tickers:
             logger.warning(f"Duplicate tickers found: {duplicate_tickers}")
-            # Filter out duplicates but continue with valid positions
-            validated_positions = [pos for pos in validated_positions
-                                 if canonical_ticker(pos.ticker) not in duplicate_tickers]
+        validated_positions = unique_positions
         
         # STEP 4: Create position objects and fetch quotes concurrently (IN MEMORY ONLY)
         sem = asyncio.Semaphore(5)
@@ -410,12 +412,19 @@ async def bulk_add_positions(
         # STEP 5: Auto-normalize weights if requested
         normalized = False
         if request.auto_normalize and added_positions:
-            total_weight = sum(pos.weight for pos in added_positions)
+            # Global normalize: pre-existing holdings + new ones must sum to 1.0
+            # (added-only normalization left the global sum free to exceed 1.0).
+            existing_rows = (await db.execute(select(PortfolioPosition))).scalars().all()
+            total_weight = sum(p.weight or 0.0 for p in existing_rows) + sum(
+                pos.weight or 0.0 for pos in added_positions
+            )
             if total_weight > 0 and abs(total_weight - 1.0) > 1e-9:
                 normalized = True
                 for position in added_positions:
-                    position.weight = position.weight / total_weight
+                    position.weight = (position.weight or 0.0) / total_weight
                     position.market_value = position.quantity * position.last_price
+                for p in existing_rows:
+                    p.weight = (p.weight or 0.0) / total_weight
         
         # STEP 6: Response Schema Validation (PRE-COMMIT)
         logger.info(f"Validating response schema for {len(added_positions)} positions")
@@ -504,7 +513,7 @@ async def bulk_add_positions(
     except Exception as e:
         logger.error(f"Critical error in bulk_add_positions: {e}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 def _validate_portfolio_position(position: PortfolioPosition) -> bool:
     """Validate portfolio position data integrity.
@@ -550,9 +559,11 @@ async def get_portfolio_position(
     """
     try:
         result = await db.execute(
-            select(PortfolioPosition).where(PortfolioPosition.ticker == ticker.upper())
+            select(PortfolioPosition).where(
+                PortfolioPosition.ticker.in_([ticker.upper(), canonical_ticker(ticker)])
+            )
         )
-        position = result.scalar_one_or_none()
+        position = result.scalars().first()
         
         if not position:
             raise HTTPException(
@@ -565,7 +576,7 @@ async def get_portfolio_position(
         if quote_data:
             position.last_price = quote_data["current_price"]
             position.market_value = (position.quantity or 0) * position.last_price
-            position.updated_on = datetime.utcnow()
+            position.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
             await db.commit()
 
         # Reload eagerly: on-update server columns (updated_on) are otherwise
@@ -600,14 +611,13 @@ async def get_portfolio_position(
         raise
     except Exception as e:
         logger.error(f"Error getting position {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.put("/{ticker}", response_model=PortfolioPositionResponse)
 async def update_portfolio_position(
     ticker: str,
     updates: PortfolioPositionUpdate,
-    currency: str = Query(default="INR", description="Target currency (USD or INR)"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service)
 ) -> PortfolioPositionResponse:
@@ -616,9 +626,11 @@ async def update_portfolio_position(
     """
     try:
         result = await db.execute(
-            select(PortfolioPosition).where(PortfolioPosition.ticker == ticker.upper())
+            select(PortfolioPosition).where(
+                PortfolioPosition.ticker.in_([ticker.upper(), canonical_ticker(ticker)])
+            )
         )
-        position = result.scalar_one_or_none()
+        position = result.scalars().first()
         
         if not position:
             raise HTTPException(
@@ -627,39 +639,22 @@ async def update_portfolio_position(
             )
         
         # Apply updates
-        if updates.weight is not None:
-            if updates.weight <= 0 or updates.weight > 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Weight must be between 0 and 1"
-                )
-            position.weight = updates.weight
-        
-        if updates.quantity is not None:
-            if updates.quantity <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Quantity must be greater than 0"
-                )
-            position.quantity = updates.quantity
-        
-        if updates.buy_price is not None:
-            if updates.buy_price <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Buy price must be greater than 0"
-                )
-            position.buy_price = updates.buy_price
-        
         if updates.custom_name is not None:
             position.custom_name = updates.custom_name
 
         if updates.added_on is not None:
             position.added_on = datetime.combine(updates.added_on, datetime.min.time())
         
+        if updates.weight is not None:
+            position.weight = updates.weight
+        if updates.quantity is not None:
+            position.quantity = updates.quantity
+        if updates.buy_price is not None:
+            position.buy_price = updates.buy_price
+        
         # Recalculate market value and metrics
         position.market_value = position.quantity * position.last_price
-        position.updated_on = datetime.utcnow()
+        position.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
         
         await db.commit()
         await db.refresh(position)
@@ -694,7 +689,7 @@ async def update_portfolio_position(
     except Exception as e:
         logger.error(f"Error updating position {ticker}: {e}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{ticker}")
@@ -707,9 +702,11 @@ async def delete_portfolio_position(
     """
     try:
         result = await db.execute(
-            select(PortfolioPosition).where(PortfolioPosition.ticker == ticker.upper())
+            select(PortfolioPosition).where(
+                PortfolioPosition.ticker.in_([ticker.upper(), canonical_ticker(ticker)])
+            )
         )
-        position = result.scalar_one_or_none()
+        position = result.scalars().first()
         
         if not position:
             raise HTTPException(
@@ -746,13 +743,13 @@ async def delete_portfolio_position(
     except Exception as e:
         logger.error(f"Error deleting position {ticker}: {e}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/export/csv")
 async def export_portfolio_csv(
     db: AsyncSession = Depends(get_db_session)
-) -> str:
+) -> Response:
     """
     Export portfolio as CSV
     """
@@ -793,24 +790,30 @@ async def export_portfolio_csv(
         csv_content = output.getvalue()
         output.close()
         
-        return csv_content
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=portfolio.csv"},
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error exporting portfolio CSV: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/normalize")
 async def normalize_portfolio_weights(
-    method: str = Query(default="proportional", description="Normalization method"),
+    method: str = Query(default="proportional", description="Normalization method (only 'proportional' supported)"),
     db: AsyncSession = Depends(get_db_session)
 ) -> SuccessResponse:
     """
     Normalize portfolio weights to sum to 1.0
     """
     try:
+        if method != "proportional":
+            raise HTTPException(status_code=400, detail=f"Unsupported normalization method: {method}")
         result = await db.execute(select(PortfolioPosition))
         positions = result.scalars().all()
         
@@ -826,7 +829,7 @@ async def normalize_portfolio_weights(
         # owned by the price-refresh path, not by weight bookkeeping.
         for position in positions:
             position.weight = position.weight / total_weight
-            position.updated_on = datetime.utcnow()
+            position.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
         
         await db.commit()
         
@@ -840,7 +843,7 @@ async def normalize_portfolio_weights(
     except Exception as e:
         logger.error(f"Error normalizing portfolio: {e}")
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 class RebalancePayload(BaseModel):
@@ -874,6 +877,20 @@ async def rebalance_portfolio(
             raise HTTPException(
                 status_code=400,
                 detail="Portfolio market value is unavailable (zero or missing prices); rebalancing requires live position values"
+            )
+        
+        known = {p.ticker for p in positions}
+        negatives = [k for k, v in payload.new_weights.items() if v < 0]
+        if negatives:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Negative weights not allowed: {', '.join(negatives)}"
+            )
+        unknown = [k for k in payload.new_weights if k not in known]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown tickers: {', '.join(unknown)}"
             )
             
         sum_weights = sum(payload.new_weights.values())
@@ -926,7 +943,7 @@ async def rebalance_portfolio(
                     if pos.last_price and pos.last_price > 0:
                         pos.quantity = target_qty
                         pos.market_value = round(pos.quantity * pos.last_price, 2)
-                    pos.updated_on = datetime.utcnow()
+                    pos.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
         
         if not payload.dry_run:
             await db.commit()
@@ -956,7 +973,7 @@ async def rebalance_portfolio(
     except Exception as e:
         await db.rollback()
         logger.error(f"Error rebalancing portfolio: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 def _generate_ticker_suggestions(invalid_ticker: str) -> List[str]:
@@ -1070,7 +1087,7 @@ async def _update_portfolio_prices(
     force: bool = False
 ) -> None:
     """Update portfolio position prices concurrently if stale or forced"""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     stale_cutoff = now - timedelta(minutes=15)
 
     positions_to_update = [
@@ -1094,7 +1111,7 @@ async def _update_portfolio_prices(
                         position.sector = quote_data["sector"]
                     if quote_data.get("industry") and not position.industry:
                         position.industry = quote_data["industry"]
-                    position.updated_on = datetime.utcnow()
+                    position.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
             except Exception as e:
                 logger.error(f"Error updating price for {position.ticker}: {e}")
 

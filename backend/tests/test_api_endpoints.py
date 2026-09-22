@@ -28,6 +28,8 @@ class TestDataAPI:
         service = Mock()
         for name, value in returns.items():
             setattr(service.get_service.return_value, name, AsyncMock(return_value=value))
+        # Route reads the real vendor off the frame via this static seam
+        service.get_service.return_value._source_of_df = Mock(return_value="yfinance")
         self._last_service = service.get_service.return_value
         return patch("app.api.data.GlobalDataService", return_value=service)
 

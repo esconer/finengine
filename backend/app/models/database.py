@@ -78,10 +78,11 @@ class AnalyticsCache(Base):
     calculation_date = Column(DateTime, nullable=False)
     calculated_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
-    model_params = Column(JSON, default={})
+    model_params = Column(JSON, default=dict)
     
-    # Composite index for efficient lookups
+    # Composite unique key + index for efficient lookups and atomic upserts
     __table_args__ = (
+        UniqueConstraint("ticker", "metric_name", name="uq_analytics_cache_ticker_metric"),
         Index("ix_ticker_metric", "ticker", "metric_name"),
     )
     
@@ -132,10 +133,14 @@ class NSEBhavcopy(Base):
     deliv_qty = Column(Integer, nullable=True)
     deliv_per = Column(Float, nullable=True)
     
+    # Natural key (symbol, date): the ingest path is select-then-insert, so
+    # uniqueness must live in the schema or concurrent ingests create dupes
+    # (later scalar_one_or_none -> MultipleResultsFound). SQLite renders a
+    # UniqueConstraint as an index, so it replaces the old non-unique Index.
     __table_args__ = (
-        Index("ix_bhav_symbol_date", "symbol", "date"),
+        UniqueConstraint("symbol", "date", name="uq_bhav_symbol_date"),
     )
-    
+
     def __repr__(self):
         return f"<NSEBhavcopy(symbol='{self.symbol}', date='{self.date}', close={self.close}, deliv_per={self.deliv_per})>"
 
@@ -151,10 +156,13 @@ class NSEInstitutionalFlow(Base):
     sell_value_crores = Column(Float, nullable=False)
     net_value_crores = Column(Float, nullable=False)
     
+    # Natural key (date, category): one FII/DII row per day per category —
+    # the flow writer's scalar_one_or_none() would raise MultipleResultsFound
+    # on a race without this.
     __table_args__ = (
-        Index("ix_flow_date_cat", "date", "category"),
+        UniqueConstraint("date", "category", name="uq_flow_date_cat"),
     )
-    
+
     def __repr__(self):
         return f"<NSEInstitutionalFlow(date='{self.date}', category='{self.category}', net={self.net_value_crores})>"
 
@@ -173,6 +181,9 @@ class NSEBulkBlockDeal(Base):
     trade_price = Column(Float, nullable=False)
     remarks = Column(String(200), nullable=True)
     
+    # NOTE deliberately NOT unique on (symbol, date): NSE bulk/block deal
+    # pages list multiple client trades per symbol per day — that composite
+    # is a query index, not a natural key (audit B10 partial refute).
     __table_args__ = (
         Index("ix_deal_symbol_date", "symbol", "date"),
     )
@@ -195,8 +206,9 @@ class NSEShareholdingPattern(Base):
     public_pct = Column(Float, default=0.0)
     updated_on = Column(DateTime(timezone=True), server_default=func.now())
     
+    # One shareholding row per symbol per period report
     __table_args__ = (
-        Index("ix_shp_symbol_period", "symbol", "period_ended"),
+        UniqueConstraint("symbol", "period_ended", name="uq_shp_symbol_period"),
     )
     
     def __repr__(self):

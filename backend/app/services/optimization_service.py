@@ -43,6 +43,15 @@ def _as_matrices(returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndar
     return mu, cov, list(returns.columns)
 
 
+def _solve(prob: cp.Problem) -> None:
+    """Solve in place; map cvxpy SolverError to ValueError so API routes
+    map solver failures to 400, not 500 (SolverError is not a ValueError)."""
+    try:
+        prob.solve(solver=cp.CLARABEL)
+    except cp.error.SolverError as e:
+        raise ValueError(f"Optimization solver failed: {e}") from e
+
+
 def _cluster_var(cov_ord: np.ndarray, items: list[int]) -> float:
     """Inverse-variance-weighted cluster variance for HRP bisection.
 
@@ -139,7 +148,7 @@ def _min_vol(cov: np.ndarray) -> np.ndarray:
         cp.Minimize(cp.quad_form(w, cp.psd_wrap(cov))),
         [cp.sum(w) == 1, w >= 0],
     )
-    prob.solve(solver=cp.CLARABEL)
+    _solve(prob)
     if w.value is None:
         raise ValueError("min_vol optimization failed to converge")
     return np.asarray(w.value).flatten()
@@ -156,7 +165,7 @@ def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
         cp.Minimize(cp.quad_form(y, cp.psd_wrap(cov))),
         [excess @ y == 1, y >= 0],
     )
-    prob.solve(solver=cp.CLARABEL)
+    _solve(prob)
     if y.value is None:
         raise ValueError("max_sharpe optimization failed to converge")
     raw = np.asarray(y.value).flatten()
@@ -177,7 +186,7 @@ def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
         cp.Minimize(alpha + (1.0 / ((1 - beta) * t_len)) * cp.sum(z)),
         [z >= loss - alpha, cp.sum(w) == 1, w >= 0],
     )
-    prob.solve(solver=cp.CLARABEL)
+    _solve(prob)
     if w.value is None:
         raise ValueError("min_cvar optimization failed to converge")
     return np.asarray(w.value).flatten()
@@ -194,7 +203,11 @@ def _black_litterman(
     """Black-Litterman Bayesian Portfolio Optimization.
 
     - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt
-    - Incorporates absolute views (e.g. {'INFY.NS': 0.15}) and relative views
+    - Incorporates views on the EXCESS-return convention (the prior Pi and
+      the final tangency both work in excess space: mu_bl - rf). Express
+      absolute-return views as view minus risk-free rate, e.g. an expected
+      15% return with rf=6% is passed as 0.09. Relative (long-short) view
+      diffs are rf-invariant and need no adjustment.
     - View uncertainty Omega = diag(P * (tau * Sigma) * P^T) (He-Litterman method)
     - Blended posterior parameters mu_bl and cov_bl
     - Long-only tangency solution
@@ -284,12 +297,12 @@ def optimize(
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy '{strategy}'. Choose from {list(STRATEGIES)}")
 
+    mu, cov, assets = _as_matrices(returns)
     if strategy == "hrp":
         weights_series = _hrp_weights(returns)
         assets = list(weights_series.index)
         w_vec = weights_series.values
     else:
-        mu, cov, assets = _as_matrices(returns)
         if strategy == "min_vol":
             w_vec = _min_vol(cov)
         elif strategy == "max_sharpe":
@@ -302,7 +315,6 @@ def optimize(
     w_vec = np.clip(w_vec, 0.0, None)
     w_vec = w_vec / w_vec.sum()
 
-    mu, cov, _ = _as_matrices(returns)
     exp_ret = float(mu @ w_vec)
     exp_vol = float(np.sqrt(max(0.0, w_vec @ cov @ w_vec)))
 

@@ -1,53 +1,74 @@
 """
 Configuration settings for Daisy Risk Engine backend
+
+Env binding: pydantic-settings matches environment variables to field names
+uppercased (DATABASE_URL -> database_url, DEBUG -> debug, ...). Do not add
+`env=` kwargs to Field — on pydantic v2 they are silently ignored (they land
+in json_schema_extra, they do NOT bind), which made renames silently drop
+their env override.
 """
 
-from typing import Optional
-from pydantic_settings import BaseSettings
-from pydantic import Field
+import json
+from typing import Annotated, Optional
+from pydantic_settings import BaseSettings, NoDecode
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
     """Application settings"""
     
     # Database
-    database_url: str = Field(default="sqlite+aiosqlite:///./data/daisy.db", env="DATABASE_URL")
+    database_url: str = Field(default="sqlite+aiosqlite:///./data/daisy.db")
     
     # API Settings
-    api_host: str = Field(default="0.0.0.0", env="API_HOST")
-    api_port: int = Field(default=8000, env="API_PORT")
+    api_host: str = Field(default="127.0.0.1")
+    api_port: int = Field(default=8000)
     
     # Data Fetching
-    yfinance_timeout: int = Field(default=30, env="YFINANCE_TIMEOUT")
-    cache_ttl_minutes: int = Field(default=60, env="CACHE_TTL_MINUTES")
+    yfinance_timeout: int = Field(default=30)
+    cache_ttl_minutes: int = Field(default=60)
+
+    # Analytics
+    risk_free_rate: float = Field(default=0.02)  # 2% annual risk-free rate
 
     # Alpha Vantage fallback (free tier per key: 25 req/day, 5 req/min).
     # Provide ONE key via ALPHA_VANTAGE_API_KEY or several via
     # ALPHA_VANTAGE_API_KEYS="key1,key2,key3" (comma/semicolon/space separated);
     # they are rotated automatically when one hits a rate limit.
-    alpha_vantage_api_key: Optional[str] = Field(default=None, env="ALPHA_VANTAGE_API_KEY")
-    alpha_vantage_api_keys: str = Field(default="", env="ALPHA_VANTAGE_API_KEYS")
-    alpha_vantage_daily_limit: int = Field(default=25, env="ALPHA_VANTAGE_DAILY_LIMIT")
-    alpha_vantage_minute_limit: int = Field(default=5, env="ALPHA_VANTAGE_MINUTE_LIMIT")
-    alpha_vantage_timeout: int = Field(default=30, env="ALPHA_VANTAGE_TIMEOUT")
+    alpha_vantage_api_key: Optional[str] = Field(default=None)
+    alpha_vantage_api_keys: str = Field(default="")
+    alpha_vantage_daily_limit: int = Field(default=25)
+    alpha_vantage_minute_limit: int = Field(default=5)
+    alpha_vantage_timeout: int = Field(default=30)
     
-    # Application
-    debug: bool = Field(default=True, env="DEBUG")
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    # Application (SQL echo additionally requires environment == "development",
+    # see app/db/database.py — debug alone must not spam stdout with queries)
+    debug: bool = Field(default=False)
+    log_level: str = Field(default="INFO")
     
-    # CORS
-    allowed_origins: list[str] = Field(
+    # CORS: NoDecode skips pydantic-settings' strict JSON decoding of env vars,
+    # so the value may be a JSON array OR the natural comma-separated string.
+    allowed_origins: Annotated[list[str], NoDecode] = Field(
         default=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
             "http://localhost:3001",
             "http://127.0.0.1:3001",
         ],
-        env="ALLOWED_ORIGINS"
     )
+
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def parse_allowed_origins(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
+            return [part.strip() for part in v.split(",") if part.strip()]
+        return v
     
     # Environment
-    environment: str = Field(default="development", env="ENVIRONMENT")
+    environment: str = Field(default="development")
     
     class Config:
         env_file = ".env"

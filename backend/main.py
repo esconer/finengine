@@ -12,13 +12,12 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import os
 import time
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Callable, Any
 
 from app.config import settings
-from app.db.database import init_db
+from app.db.database import init_db, close_db_connections
 from app.api import portfolio, data, analytics, websocket, equity_research
 from app.utils.logger import setup_logger
 
@@ -63,6 +62,9 @@ async def lifespan(app: FastAPI):
     
     # Cleanup on shutdown
     logger.info("Shutting down Daisy Risk Engine Backend")
+    if websocket.update_task and not websocket.update_task.done():
+        websocket.update_task.cancel()
+    await close_db_connections()
 
 
 # Create FastAPI application
@@ -76,7 +78,7 @@ app = FastAPI(
 )
 
 # Add production middleware
-if os.getenv("ENVIRONMENT", "development") == "production":
+if settings.environment == "production":
     # Security middleware for production
     app.add_middleware(HTTPSRedirectMiddleware)
     app.add_middleware(
@@ -154,7 +156,7 @@ async def health_check():
         "status": "healthy",
         "service": "Daisy Risk Engine",
         "version": "0.1.0",
-        "environment": "development"
+        "environment": settings.environment
     }
 
 # Root endpoint
@@ -172,7 +174,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
         reload=True,
         log_level="info"

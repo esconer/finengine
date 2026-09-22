@@ -2,7 +2,7 @@
 Pydantic schemas for Daisy Risk Engine
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, validator
 
@@ -10,17 +10,21 @@ from pydantic import BaseModel, Field, validator
 # Portfolio Schemas
 class PortfolioPositionBase(BaseModel):
     """Base portfolio position schema with comprehensive validation"""
-    ticker: str = Field(..., min_length=1, max_length=20, description="Stock ticker symbol")
+    ticker: str = Field(..., min_length=1, max_length=20, pattern=r"^[A-Z0-9\-\&\.]{1,20}$", description="Stock ticker symbol")
     weight: float = Field(..., gt=0, le=1, description="Portfolio weight (0-1)")
     quantity: float = Field(..., gt=0, description="Number of shares/units held - must be > 0")
     buy_price: float = Field(..., gt=0, description="Price per share at time of purchase - must be > 0")
     region: str = Field(default="US", description="Region code")
     custom_name: Optional[str] = Field(default=None, max_length=100, description="Custom position name")
     added_on: Optional[date] = Field(default=None, description="Purchase date (YYYY-MM-DD); defaults to today. Must not be in the future.")
-    
-    @validator('ticker')
+
+    # pre=True so uppercasing happens BEFORE the pattern check (lowercase
+    # input like "infy.ns" stays legal; "BAD TICKER!" is rejected at schema level)
+    @validator('ticker', pre=True)
     def ticker_must_be_uppercase(cls, v):
-        if not v or not v.strip():
+        if not isinstance(v, str):
+            return v
+        if not v.strip():
             raise ValueError('Ticker cannot be empty')
         return v.upper().strip()
     
@@ -148,7 +152,7 @@ class StockQuoteResponse(BaseModel):
 
 class BatchStockDataRequest(BaseModel):
     """Schema for batch stock data request"""
-    tickers: List[str] = Field(..., min_items=1)
+    tickers: List[str] = Field(..., min_length=1)
     start: Optional[str] = None
     end: Optional[str] = None
     force_refresh: bool = False
@@ -286,7 +290,7 @@ class SuccessResponse(BaseModel):
     success: bool
     message: str
     data: Optional[Any] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # Bulk Operations
@@ -365,13 +369,17 @@ class CointScannerResponse(BaseModel):
 
 # Volatility Term Structure & Cone Schemas
 class VolConeWindow(BaseModel):
-    """Realized volatility quantiles for a single rolling window"""
+    """Realized volatility quantiles for a single rolling window.
+
+    Quantiles are Optional: the service honestly returns None on
+    insufficient history (volatility_service short-window path).
+    """
     window_days: int
-    min: float
-    p25: float
-    median: float
-    p75: float
-    max: float
+    min: Optional[float] = None
+    p25: Optional[float] = None
+    median: Optional[float] = None
+    p75: Optional[float] = None
+    max: Optional[float] = None
     current_realized: float
     percentile_rank: Optional[float] = None
 
@@ -402,8 +410,9 @@ class EVTPOTVarMetrics(BaseModel):
     historical_var_99: float
     historical_es_99: float
     threshold_u: float
-    gpd_shape_xi: float
-    gpd_scale_beta: float
+    gpd_shape_xi: Optional[float] = None
+    gpd_scale_beta: Optional[float] = None
+    model_fitted: bool = True
     exceedances_count: int
     total_observations: int
     is_fat_tailed: bool
@@ -557,12 +566,16 @@ class ScreenerResponse(BaseModel):
 
 
 class CustomScreenRequest(BaseModel):
-    """Request schema for custom screener filters"""
-    min_roce: Optional[float] = None
-    min_roe: Optional[float] = None
-    max_pe: Optional[float] = None
-    min_mcap_cr: Optional[float] = None
-    min_div_yield: Optional[float] = None
-    max_stocks: Optional[int] = 50
+    """Request schema for custom screener filters.
+
+    Bounds mirror the prebuilt route's Query(ge=5, le=100) on max_stocks;
+    ratios are percentages (0-100), P/E and market cap are non-negative.
+    """
+    min_roce: Optional[float] = Field(default=None, ge=0, le=100)
+    min_roe: Optional[float] = Field(default=None, ge=0, le=100)
+    max_pe: Optional[float] = Field(default=None, ge=0, le=1000)
+    min_mcap_cr: Optional[float] = Field(default=None, ge=0)
+    min_div_yield: Optional[float] = Field(default=None, ge=0, le=100)
+    max_stocks: Optional[int] = Field(default=50, ge=5, le=100)
 
 

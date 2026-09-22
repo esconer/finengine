@@ -83,7 +83,14 @@ async def test_bulk_add_rejects_malformed_ticker(async_client: AsyncClient, test
         ]
     })
     assert resp.status_code in [400, 422]
-    assert "invalid ticker format" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    if resp.status_code == 400:
+        # route-level _TICKER_PATTERN check
+        assert "invalid ticker format" in detail
+    else:
+        # schema-level pattern (PortfolioPositionBase now owns the NSE/BSE
+        # regex, audit 06 B14) — FastAPI returns a pydantic error list
+        assert "pattern" in str(detail).lower()
 
 
 # ---------------------------------------------------------------------------

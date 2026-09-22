@@ -3,12 +3,13 @@ India Market Microstructure, NSE Ingestion, and ADV Liquidity Service
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 import numpy as np
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, desc
+from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
     NSEBhavcopy,
@@ -81,15 +82,17 @@ class IndiaDataService:
                 symbol=symbol,
                 date=date_dt,
                 series=rec.get("series", "EQ"),
-                open=float(rec.get("open", 0.0)),
-                high=float(rec.get("high", 0.0)),
-                low=float(rec.get("low", 0.0)),
-                close=float(rec.get("close", 0.0)),
-                prev_close=float(rec.get("prev_close", 0.0)),
-                avg_price=float(rec.get("avg_price", rec.get("close", 0.0))),
-                ttl_trd_qnty=int(rec.get("ttl_trd_qnty", 0)),
-                turnover_lacs=float(rec.get("turnover_lacs", 0.0)),
-                no_of_trades=int(rec.get("no_of_trades", 0)),
+                # None-safe (`or` pattern): an explicit null OHLC/trade field
+                # must not TypeError (B-15).
+                open=float(rec.get("open") or 0.0),
+                high=float(rec.get("high") or 0.0),
+                low=float(rec.get("low") or 0.0),
+                close=float(rec.get("close") or 0.0),
+                prev_close=float(rec.get("prev_close") or 0.0),
+                avg_price=float(rec.get("avg_price") or rec.get("close") or 0.0),
+                ttl_trd_qnty=int(rec.get("ttl_trd_qnty") or 0),
+                turnover_lacs=float(rec.get("turnover_lacs") or 0.0),
+                no_of_trades=int(rec.get("no_of_trades") or 0),
                 deliv_qty=int(rec.get("deliv_qty", 0)) if rec.get("deliv_qty") is not None else None,
                 deliv_per=float(rec.get("deliv_per", 0.0)) if rec.get("deliv_per") is not None else None,
             )
@@ -97,7 +100,16 @@ class IndiaDataService:
 
         if new_entities:
             self.db.add_all(new_entities)
-            await self.db.commit()
+            try:
+                await self.db.commit()
+            except IntegrityError:
+                # HANDOFF #1 (06-foundation): a concurrent same-(symbol,date)
+                # ingest won the race against uq_bhav_symbol_date. Dedupe
+                # intent is one row per key — treat as already ingested
+                # instead of letting the unique violation 500 the request.
+                await self.db.rollback()
+                logger.info(f"Bhavcopy for {date_dt.date()} already ingested concurrently")
+                return 0
 
         return len(new_entities)
 
@@ -133,14 +145,36 @@ class IndiaDataService:
             )
             self.db.add(flow_record)
 
-        await self.db.commit()
+        try:
+            await self.db.commit()
+        except IntegrityError:
+            # HANDOFF #1 (06-foundation): a concurrent same-(date,category)
+            # insert won the race against uq_flow_date_cat. Adopt the
+            # winner's row and update it instead of 500ing.
+            await self.db.rollback()
+            winner = await self.db.execute(
+                select(NSEInstitutionalFlow).where(
+                    and_(
+                        NSEInstitutionalFlow.date == date_dt,
+                        NSEInstitutionalFlow.category == category,
+                    )
+                )
+            )
+            rec = winner.scalar_one_or_none()
+            if rec is None:
+                logger.error(f"Institutional flow {category} {date_dt.date()} conflict but winner row missing")
+                return False
+            rec.buy_value_crores = buy_crores
+            rec.sell_value_crores = sell_crores
+            rec.net_value_crores = net_crores
+            await self.db.commit()
         return True
 
     async def get_institutional_flows(self, lookback_days: int = 30) -> List[Dict[str, Any]]:
         """
         Retrieve daily FII / DII net cash flows for the last N trading sessions.
         """
-        cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=lookback_days)
         result = await self.db.execute(
             select(NSEInstitutionalFlow)
             .where(NSEInstitutionalFlow.date >= cutoff)
@@ -171,7 +205,7 @@ class IndiaDataService:
         across specified holdings/watchlists.
         """
         anomalies = []
-        cutoff = datetime.utcnow() - timedelta(days=lookback_days * 2)
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=lookback_days * 2)
 
         for sym in symbols:
             clean_sym = sym.replace(".NS", "").replace(".BO", "").upper().strip()
@@ -216,7 +250,6 @@ class IndiaDataService:
         self,
         positions: List[PortfolioPosition],
         price_history: Dict[str, pd.DataFrame],
-        participation_rates: List[float] = [0.10, 0.20],
     ) -> Dict[str, Any]:
         """
         Compute participation-based liquidation limits, days-to-liquidate @ 10% & 20% ADV,
@@ -242,10 +275,14 @@ class IndiaDataService:
             if df is None or df.empty:
                 df = price_history.get(p.ticker.replace(".NS", ""))
 
-            if df is not None and not df.empty and "volume" in [c.lower() for c in df.columns]:
-                vol_col = next(c for c in df.columns if c.lower() == "volume")
-                close_col = next(c for c in df.columns if c.lower() in ["close", "adj_close"])
+            # Guarded next(): a volume-only frame (no close/adj_close) must
+            # fall back to defaults instead of raising StopIteration (B-14).
+            vol_col = close_col = None
+            if df is not None and not df.empty:
+                vol_col = next((c for c in df.columns if c.lower() == "volume"), None)
+                close_col = next((c for c in df.columns if c.lower() in ("close", "adj_close")), None)
 
+            if vol_col and close_col:
                 close_s = pd.to_numeric(df[close_col], errors="coerce").ffill()
                 vol_s = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
                 rupee_vol = close_s * vol_s

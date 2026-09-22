@@ -110,8 +110,10 @@ class _FakeBfTicker:
 def _clear_in_memory_caches():
     """Class-level memo caches must not leak across tests."""
     DataService._in_memory_df_cache.clear()
+    DataService._quote_memo.clear()
     yield
     DataService._in_memory_df_cache.clear()
+    DataService._quote_memo.clear()
 
 
 # ---------------------------------------------------------------------------

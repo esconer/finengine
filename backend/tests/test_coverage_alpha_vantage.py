@@ -3,12 +3,12 @@ Comprehensive test suite for AlphaVantageService, KeyPool, and CompanyDataServic
 """
 
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
-from datetime import date
 import pandas as pd
 import pytest
 import time
 from yfinance.exceptions import YFRateLimitError
 
+import app.services.alpha_vantage_service as avmod
 from app.services.alpha_vantage_service import (
     AlphaVantageService,
     KeyPool,
@@ -31,7 +31,7 @@ from app.services.company_data_service import (
 class TestAlphaVantageServiceComprehensive:
     def test_to_av_symbol_conversions(self):
         assert to_av_symbol("RELIANCE.NS") == "RELIANCE.BSE"
-        assert to_av_symbol("TCS.BO") == "TCS.BO"
+        assert to_av_symbol("TCS.BO") == "TCS.BSE"
         assert to_av_symbol("AAPL") == "AAPL"
         assert to_av_symbol("  msft  ") == "MSFT"
 
@@ -39,7 +39,7 @@ class TestAlphaVantageServiceComprehensive:
         assert _classify_notice("Thank you for using Alpha Vantage! Our standard API call frequency is 5 calls per minute") == "frequency"
         assert _classify_notice("Thank you for using Alpha Vantage! Our standard API rate limit is 25 requests per day") == "daily"
         assert _classify_notice("Invalid API key") == "invalid_key"
-        assert _classify_notice("Please upgrade to premium") == "daily"
+        assert _classify_notice("Please upgrade to premium") == "other"
         assert _classify_notice("Some other informational text") == "other"
 
     def test_key_budget_logic(self):
@@ -61,7 +61,7 @@ class TestAlphaVantageServiceComprehensive:
 
         # Retired on today
         budget3 = _KeyBudget(key="demo_key_3", daily_limit=100, minute_limit=10)
-        budget3.retired_on = date.today()
+        budget3.retired_on = avmod._quota_day()
         assert budget3.available() is False
 
         # Cooldown active
@@ -219,9 +219,8 @@ class TestCompanyDataServiceComprehensive:
 
     @pytest.mark.asyncio
     async def test_get_fundamentals(self):
+        # Success (fresh instance so the 24h yf-fundamentals cache is empty)
         service = CompanyDataService()
-
-        # Success
         mock_stock = MagicMock()
         mock_stock.info = {
             "longName": "Infosys Limited",
@@ -235,25 +234,28 @@ class TestCompanyDataServiceComprehensive:
             assert res["name"] == "Infosys Limited"
             assert res["sector"] == "Technology"
             assert res["pe_ratio_ttm"] == 26.0
+            # O-01: second call served from the 24h cache without re-fetch
+            res2 = await service.get_fundamentals("INFY.NS")
+            assert res2 == res
 
         # Upstream 401 / crumb error
         with patch("yfinance.Ticker", side_effect=Exception("Invalid Crumb 401")):
             with pytest.raises(RuntimeError, match="Fundamentals upstream unavailable"):
-                await service.get_fundamentals("INFY.NS")
+                await CompanyDataService().get_fundamentals("INFY.NS")
 
         # Empty info
         mock_stock_empty = MagicMock()
         mock_stock_empty.info = {}
         with patch("yfinance.Ticker", return_value=mock_stock_empty):
             with pytest.raises(ValueError, match="No fundamentals returned"):
-                await service.get_fundamentals("INFY.NS")
+                await CompanyDataService().get_fundamentals("INFY.NS")
 
         # Stub info
         mock_stock_stub = MagicMock()
         mock_stock_stub.info = {"randomKey": "val"}
         with patch("yfinance.Ticker", return_value=mock_stock_stub):
             with pytest.raises(ValueError, match="No fundamental fields returned"):
-                await service.get_fundamentals("INFY.NS")
+                await CompanyDataService().get_fundamentals("INFY.NS")
 
     @pytest.mark.asyncio
     async def test_get_financial_statements(self):

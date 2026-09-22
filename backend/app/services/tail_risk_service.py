@@ -59,6 +59,14 @@ class TailRiskService:
                 f"Insufficient observations for EVT-POT (need >= 20, got {n_total})"
             )
 
+        if threshold_quantile >= confidence_level:
+            # Fitting GPD above the reported confidence level would make the
+            # threshold clamp systematically overstate VaR/ES for that level.
+            raise ValueError(
+                f"threshold_quantile ({threshold_quantile}) must be < "
+                f"confidence_level ({confidence_level})"
+            )
+
         # Daily loss series: positive values are losses
         losses = -r
         alpha = 1.0 - confidence_level  # 0.01 for 99%
@@ -74,11 +82,15 @@ class TailRiskService:
         n_u = len(exceedances)
 
         if n_u < 5:
-            # Not enough exceedances to fit GPD reliably -> fallback to historical / standard EVT
-            xi = 0.15
-            beta = float(np.std(losses) * 0.5)
-            var_evt_loss = hist_var_loss * 1.15
-            es_evt_loss = hist_es_loss * 1.20
+            # Not enough exceedances to fit GPD reliably: report honest
+            # historical-only VaR/ES with model_fitted=False and no GPD
+            # parameters — never invent xi/beta or scale history by
+            # arbitrary factors (fabrication class as the fixed P0-6).
+            xi = None
+            beta = None
+            model_fitted = False
+            var_evt_loss = hist_var_loss
+            es_evt_loss = hist_es_loss
         else:
             try:
                 # Fit GPD with location fixed at 0: y ~ GPD(xi, beta)
@@ -86,6 +98,7 @@ class TailRiskService:
                 c_est, loc_est, scale_est = stats.genpareto.fit(exceedances, floc=0.0)
                 xi = float(c_est)
                 beta = float(max(scale_est, 1e-6))
+                model_fitted = True
 
                 # Numerical stability constraint: clip xi in [-0.5, 0.95]
                 # If xi >= 1.0, theoretical mean (ES) does not exist
@@ -101,20 +114,30 @@ class TailRiskService:
                 # Analytical EVT Expected Shortfall formula: ES = (VaR + beta - xi * u) / (1 - xi)
                 es_evt_loss = (var_evt_loss + beta - xi * threshold_u) / (1.0 - xi)
 
-                # Monotonicity & conservative sanity check: ES >= VaR >= threshold_u
+                # Monotonicity & conservative sanity check: ES >= VaR >= threshold_u.
+                # No cosmetic VaR->ES gap: a thin tail with ES ~ VaR stays honest.
                 var_evt_loss = max(var_evt_loss, threshold_u, hist_var_loss * 0.9)
-                es_evt_loss = max(es_evt_loss, var_evt_loss * 1.05)
+                es_evt_loss = max(es_evt_loss, var_evt_loss)
 
             except Exception as e:
-                logger.warning(f"GPD fit failed ({e}), falling back to adjusted historical tail")
-                xi = 0.15
-                beta = float(np.std(exceedances)) if len(exceedances) > 1 else 0.01
-                var_evt_loss = max(hist_var_loss * 1.15, threshold_u)
-                es_evt_loss = max(hist_es_loss * 1.25, var_evt_loss * 1.1)
+                logger.warning(
+                    f"GPD fit failed ({e}); reporting historical-only tail metrics "
+                    f"(model_fitted=False)"
+                )
+                xi = None
+                beta = None
+                model_fitted = False
+                var_evt_loss = hist_var_loss
+                es_evt_loss = hist_es_loss
 
         # Check kurtosis for fat tails
         excess_kurt = float(stats.kurtosis(r)) if n_total > 4 else 0.0
-        is_fat_tailed = bool(xi > 0.05 or excess_kurt > 0.5 or (var_evt_loss > hist_var_loss))
+        if model_fitted:
+            is_fat_tailed = bool(xi > 0.05 or excess_kurt > 0.5 or (var_evt_loss > hist_var_loss))
+        else:
+            # No GPD fit: fatness comes from the empirical tail only —
+            # never forced True by a fabricated inflation factor.
+            is_fat_tailed = bool(excess_kurt > 0.5)
 
         return {
             "confidence_level": round(confidence_level, 2),
@@ -123,8 +146,9 @@ class TailRiskService:
             "historical_var_99": round(-float(hist_var_loss), 6),
             "historical_es_99": round(-float(hist_es_loss), 6),
             "threshold_u": round(float(threshold_u), 6),
-            "gpd_shape_xi": round(float(xi), 4),
-            "gpd_scale_beta": round(float(beta), 6),
+            "gpd_shape_xi": round(float(xi), 4) if xi is not None else None,
+            "gpd_scale_beta": round(float(beta), 6) if beta is not None else None,
+            "model_fitted": model_fitted,
             "exceedances_count": int(n_u),
             "total_observations": int(n_total),
             "is_fat_tailed": is_fat_tailed,
@@ -134,6 +158,8 @@ class TailRiskService:
     def calculate_bivariate_tail_dependence(
         returns_a: Union[pd.Series, np.ndarray],
         returns_b: Union[pd.Series, np.ndarray],
+        marginal_df_a: Optional[float] = None,
+        marginal_df_b: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         """
         Calculate Bivariate Student-t Copula Lower Tail Dependence Coefficient (lambda_L).
@@ -147,15 +173,30 @@ class TailRiskService:
             Returns series of asset A.
         returns_b : pd.Series or np.ndarray
             Returns series of asset B.
+        marginal_df_a, marginal_df_b : Optional[float]
+            Pre-fitted marginal Student-t degrees of freedom for A and B
+            (fit once per ticker by the matrix caller). When omitted, each
+            series is fitted here (two fits per call).
 
         Returns
         -------
         Tuple[float, float, float]
             (lambda_L, linear_correlation, degrees_of_freedom)
+
+        Notes
+        -----
+        nu is a univariate Student-t MLE on each raw return series (the t
+        scale absorbs location/scale, so no standardization is needed), then
+        averaged across the pair and used as the copula dependence df — an
+        approximation, not a joint copula fit. rho is Pearson correlation of
+        the raw pair, used directly in the copula formula.
         """
         df_paired = pd.DataFrame({"a": returns_a, "b": returns_b}).dropna()
         if len(df_paired) < 10:
-            return 0.0, 0.0, 4.0
+            raise ValueError(
+                "Insufficient overlapping observations for tail dependence "
+                f"(need >= 10, got {len(df_paired)})"
+            )
 
         r_a = df_paired["a"].values
         r_b = df_paired["b"].values
@@ -167,13 +208,16 @@ class TailRiskService:
             rho = 0.0
         rho = float(np.clip(rho, -0.9999, 0.9999))
 
-        # Estimate degrees of freedom nu via Student-t MLE fit on standardized marginals
-        try:
-            df_a, _, _ = stats.t.fit(r_a)
-            df_b, _, _ = stats.t.fit(r_b)
-            nu = float(np.clip((df_a + df_b) / 2.0, 2.1, 30.0))
-        except Exception:
-            nu = 4.0
+        # Degrees of freedom: caller-cached marginal fits, else fit here.
+        if marginal_df_a is not None and marginal_df_b is not None:
+            nu = float(np.clip((marginal_df_a + marginal_df_b) / 2.0, 2.1, 30.0))
+        else:
+            try:
+                df_a, _, _ = stats.t.fit(r_a)
+                df_b, _, _ = stats.t.fit(r_b)
+                nu = float(np.clip((df_a + df_b) / 2.0, 2.1, 30.0))
+            except Exception:
+                nu = 4.0
 
         # Copula lower-tail dependence formula
         if rho <= -0.999:
@@ -225,11 +269,32 @@ class TailRiskService:
         matrix = np.eye(n, dtype=float)
         pairs_list = []
 
+        # Fit marginal t df once per ticker (O(n) fits instead of O(n²) —
+        # each scipy t-fit is tens of hundreds of ms, previously the source
+        # of the multi-second first /tails call). On NaN-free frames this is
+        # bit-identical to the old per-pair fit.
+        marginal_dfs: Dict[str, Optional[float]] = {}
+        for t in tickers:
+            col = returns_df[t].dropna().to_numpy(dtype=float)
+            col = col[np.isfinite(col)]
+            if col.size >= 10:
+                try:
+                    marginal_dfs[t] = float(stats.t.fit(col)[0])
+                except Exception:
+                    marginal_dfs[t] = None
+            else:
+                marginal_dfs[t] = None
+
         for i in range(n):
             for j in range(i + 1, n):
                 t_i = tickers[i]
                 t_j = tickers[j]
-                lambda_l, rho, nu = cls.calculate_bivariate_tail_dependence(returns_df[t_i], returns_df[t_j])
+                lambda_l, rho, nu = cls.calculate_bivariate_tail_dependence(
+                    returns_df[t_i],
+                    returns_df[t_j],
+                    marginal_df_a=marginal_dfs[t_i],
+                    marginal_df_b=marginal_dfs[t_j],
+                )
 
                 matrix[i, j] = lambda_l
                 matrix[j, i] = lambda_l
@@ -255,10 +320,9 @@ class TailRiskService:
         # Sort pairs by lower_tail_lambda descending
         pairs_list.sort(key=lambda p: p["lower_tail_lambda"], reverse=True)
 
-        # High tail risk pairs: lambda >= 0.20 or top 5 if none meet threshold
+        # High tail risk pairs: lambda >= 0.20 only. Never backfill with
+        # lower-risk pairs — an empty list honestly means "none found".
         high_risk_pairs = [p for p in pairs_list if p["lower_tail_lambda"] >= 0.20]
-        if not high_risk_pairs and pairs_list:
-            high_risk_pairs = pairs_list[:min(5, len(pairs_list))]
 
         # Convert matrix to rounded list of lists
         matrix_list = [[round(float(matrix[r, c]), 4) for c in range(n)] for r in range(n)]

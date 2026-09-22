@@ -5,18 +5,29 @@ Database cleanup migration script to remove duplicate records and add constraint
 import sqlite3
 import logging
 from datetime import datetime
+from pathlib import Path
 import os
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Anchored to this file, not the CWD: sqlite3.connect CREATES an empty file
+# when pointed at a missing path in the wrong directory (audit B13).
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "daisy.db"
+
 class DatabaseCleanupManager:
     """Manager for database cleanup and schema updates"""
-    
-    def __init__(self, db_path: str = "data/daisy.db"):
-        self.db_path = db_path
-        self.backup_dir = "data/backups"
+
+    def __init__(self, db_path: str | Path = _DEFAULT_DB_PATH):
+        db_path = Path(db_path)
+        if not db_path.exists():
+            # Refuse instead of letting sqlite3.connect fabricate an empty DB
+            raise FileNotFoundError(
+                f"Database not found at {db_path} — refusing to create an empty one"
+            )
+        self.db_path = str(db_path)
+        self.backup_dir = str(db_path.parent / "backups")
         os.makedirs(self.backup_dir, exist_ok=True)
     
     def create_backup(self) -> str:

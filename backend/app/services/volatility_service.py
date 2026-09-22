@@ -92,7 +92,9 @@ class VolatilityService:
 
         n = len(r)
         if n == 0:
-            return 0.20
+            # No fabrication: an EWMA forecast cannot be computed from
+            # nothing (route/garch callers guard non-empty inputs).
+            raise ValueError("Cannot compute EWMA volatility on empty returns")
         if n == 1:
             return float(abs(r[0]) * annualization_factor)
 
@@ -216,7 +218,9 @@ class VolatilityService:
         Dict[str, Any]
             Structure compliant with VolConeResponse schema.
         """
-        if windows is None:
+        if not windows:
+            # None or [] both mean "use defaults" — windows[0] / window_results[0]
+            # below would IndexError on an empty list.
             windows = DEFAULT_CONE_WINDOWS
 
         if not isinstance(returns, pd.Series):
@@ -263,9 +267,8 @@ class VolatilityService:
                 rank = None
                 insufficient = True
 
-            # Ensure strict mathematical monotonicity: min <= p25 <= median <= p75 <= max
-            if not insufficient:
-                min_v, p25_v, med_v, p75_v, max_v = sorted([min_v, p25_v, med_v, p75_v, max_v])
+            # min <= p25 <= median <= p75 <= max holds by construction
+            # (percentiles of the same array); no re-sorting needed.
 
             window_results.append({
                 "window_days": int(w),

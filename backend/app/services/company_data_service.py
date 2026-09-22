@@ -18,11 +18,12 @@ Licensed under the Apache License, Version 2.0.
 """
 
 import asyncio
+import time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from app.services.data_service import canonical_ticker
+from app.services.data_service import canonical_ticker, DataService
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -52,11 +53,21 @@ def _yf_retry(func, max_retries: int = 3, base_delay: float = 2.0):
 
 
 async def _to_thread(func, *args):
-    return await asyncio.to_thread(func)
+    return await asyncio.to_thread(func, *args)
+
+
+# Mirror bfinance's 24h SQLite cache (bfinance/ticker.py) for the yfinance
+# fundamentals tier so fallback requests don't re-hit Yahoo every call (O-01).
+YF_FUNDAMENTALS_TTL_SECONDS = 24 * 60 * 60
 
 
 class CompanyDataService:
     """Fundamentals / statements / insider feed on top of yfinance."""
+
+    def __init__(self):
+        # norm_ticker -> (fetched_at_epoch, payload); local to the instance
+        # (process-wide singleton in prod, fresh per test).
+        self._yf_fundamentals_cache: Dict[str, tuple] = {}
 
     # ---------------------------------------------------------- fundamentals
 
@@ -108,13 +119,21 @@ class CompanyDataService:
                 (503 semantics - retry later).
         """
         norm_ticker = _normalize(ticker)
-        import unittest.mock
+        import bfinance
         import yfinance as yf
 
         order = source_order or ["bfinance", "yfinance"]
+        # Fail fast on typos/unknown tiers instead of silently serving
+        # yfinance for anything that isn't exactly "bfinance" (I-02).
+        unknown = [v for v in order if v not in ("bfinance", "yfinance")]
+        if unknown:
+            raise ValueError(f"Unknown data source(s) in source_order: {unknown}")
 
-        # If yfinance.Ticker is explicitly mocked in a unit test, prioritize mock without network
-        is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+        # Identity check against module-load originals (data_service pattern):
+        # a replaced Ticker means mocked mode; bfinance stays usable when the
+        # test patched it too.
+        is_yf_mocked = yf.Ticker is not DataService._YF_TICKER_REAL
+        is_bf_mocked = bfinance.Ticker is not DataService._BF_TICKER_REAL
 
         def _fetch_bf() -> Optional[Dict[str, Any]]:
             try:
@@ -135,7 +154,10 @@ class CompanyDataService:
                     "sub_industry": profile.sub_industry,
                     "indices": profile.indices or [],
                     "about": profile.about,
-                    "market_cap": r.market_cap or info.get("marketCap"),
+                    # bfinance Ratios.market_cap is ₹ Cr; the house contract
+                    # for `market_cap` is absolute ₹ (yfinance marketCap,
+                    # bfinance info["marketCap"] = r.market_cap * 1e7) (B-01).
+                    "market_cap": (r.market_cap * 1e7) if r.market_cap else info.get("marketCap"),
                     "pe_ratio_ttm": r.stock_pe or info.get("trailingPE"),
                     "forward_pe": info.get("forwardPE"),
                     "peg_ratio": r.peg_ratio or info.get("pegRatio"),
@@ -165,6 +187,10 @@ class CompanyDataService:
                 return None
 
         async def _fetch_yf() -> Dict[str, Any]:
+            cached = self._yf_fundamentals_cache.get(norm_ticker)
+            if cached and time.time() - cached[0] < YF_FUNDAMENTALS_TTL_SECONDS:
+                return cached[1]
+
             def _fetch() -> Dict[str, Any]:
                 t = yf.Ticker(norm_ticker)
                 return _yf_retry(lambda: t.info)
@@ -196,10 +222,15 @@ class CompanyDataService:
                         if val is not None:
                             break
                 if val is not None:
+                    if our_key == "return_on_equity":
+                        # yfinance emits a fraction (0.145); house contract is
+                        # percent to match the bfinance tier's Ratios.roe (B-03).
+                        val = val * 100
                     out[our_key] = val
 
             if len(out) <= 1:  # only ticker -> stub info dict
                 raise ValueError(f"No fundamental fields returned for {ticker}")
+            self._yf_fundamentals_cache[norm_ticker] = (time.time(), out)
             return out
 
         # Cascade per the user's preferred vendor order. Vendor failures fall
@@ -208,7 +239,7 @@ class CompanyDataService:
         last_error: Optional[Exception] = None
         for vendor in order:
             if vendor == "bfinance":
-                if is_yf_mocked:
+                if is_yf_mocked and not is_bf_mocked:
                     continue  # mocked-yf tests must not hit real network vendors
                 bf_res = await _to_thread(_fetch_bf)
                 if bf_res is not None:
@@ -252,13 +283,14 @@ class CompanyDataService:
 
         av_symbol = _normalize(ticker)
         normalized_freq = "quarterly" if freq == "quarterly" else "yearly"
-        import unittest.mock
+        import bfinance
         import yfinance as yf
 
-        is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+        is_yf_mocked = yf.Ticker is not DataService._YF_TICKER_REAL
+        is_bf_mocked = bfinance.Ticker is not DataService._BF_TICKER_REAL
         raw = None
 
-        if not is_yf_mocked:
+        if not is_yf_mocked or is_bf_mocked:
             # Tier 1: Try bfinance statements
             def _fetch_bf():
                 try:

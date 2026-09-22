@@ -7,7 +7,9 @@ MultipleResultsFound, caught -> perpetual miss). Isolated in-memory DB.
 
 from datetime import datetime
 
+import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.database import AnalyticsCache
 from app.services.cache_service import CacheService
@@ -32,28 +34,25 @@ async def test_repeated_set_keeps_single_row_and_latest_value(test_db):
     assert got["model_params"] == {"v": 3}
 
 
-async def test_preexisting_duplicates_heal_on_next_set(test_db):
-    test_db.add_all(
-        [
-            AnalyticsCache(
-                ticker="INFY", metric_name="sharpe", metric_value=1.0,
-                calculation_date=datetime(2026, 1, 1),
-                expires_at=datetime(2030, 1, 1), model_params={},
-            ),
-            AnalyticsCache(
-                ticker="INFY", metric_name="sharpe", metric_value=9.0,
-                calculation_date=datetime(2026, 1, 1),
-                expires_at=datetime(2030, 1, 1), model_params={},
-            ),
-        ]
+async def test_preexisting_duplicate_insert_raises(test_db):
+    test_db.add(
+        AnalyticsCache(
+            ticker="INFY", metric_name="sharpe", metric_value=1.0,
+            calculation_date=datetime(2026, 1, 1),
+            expires_at=datetime(2030, 1, 1), model_params={},
+        )
     )
     await test_db.commit()
-    svc = CacheService(test_db)
-    assert await svc.get_cached_analytics("INFY", "sharpe") is None  # dup -> miss (old symptom)
-    await svc.set_cached_analytics("INFY", "sharpe", 2.0, datetime(2026, 1, 2), {})
-    assert await _count(test_db, "INFY", "sharpe") == 1
-    got = await svc.get_cached_analytics("INFY", "sharpe")
-    assert got is not None and got["value"] == 2.0
+    test_db.add(
+        AnalyticsCache(
+            ticker="INFY", metric_name="sharpe", metric_value=9.0,
+            calculation_date=datetime(2026, 1, 1),
+            expires_at=datetime(2030, 1, 1), model_params={},
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await test_db.commit()
+    await test_db.rollback()
 
 
 async def test_distinct_keys_coexist(test_db):

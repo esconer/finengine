@@ -116,9 +116,11 @@ class EquityResearchService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error getting full profile for {ticker}: {e}")
-            raise ValueError(f"Failed to load research profile for {ticker}: {e}")
+            raise RuntimeError(f"Failed to load research profile for {ticker}: {e}") from e
 
     async def get_shareholding(self, ticker: str) -> Dict[str, Any]:
         """
@@ -181,9 +183,11 @@ class EquityResearchService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error fetching shareholding for {ticker}: {e}")
-            raise ValueError(f"Failed to load shareholding for {ticker}: {e}")
+            raise RuntimeError(f"Failed to load shareholding for {ticker}: {e}") from e
 
     async def get_concalls(self, ticker: str) -> List[Dict[str, Any]]:
         """
@@ -201,8 +205,9 @@ class EquityResearchService:
         try:
             return await _to_thread(_fetch)
         except Exception as e:
+            # Upstream outage must not masquerade as "no concalls" (B-11).
             logger.error(f"Error fetching concalls for {ticker}: {e}")
-            return []
+            raise RuntimeError(f"Failed to load concalls for {ticker}: {e}") from e
 
     async def get_custom_ratios(self, ticker: str) -> Dict[str, Any]:
         """
@@ -244,9 +249,11 @@ class EquityResearchService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error fetching custom ratios for {ticker}: {e}")
-            raise ValueError(f"Failed to compute custom ratios for {ticker}: {e}")
+            raise RuntimeError(f"Failed to compute custom ratios for {ticker}: {e}") from e
 
     async def export_excel_model(self, ticker: str) -> bytes:
         """
@@ -278,9 +285,11 @@ class EquityResearchService:
 
         try:
             return await _to_thread(_generate)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error generating Excel model for {ticker}: {e}")
-            raise ValueError(f"Failed to export Excel model: {e}")
+            raise RuntimeError(f"Failed to export Excel model: {e}") from e
 
 
 _equity_research_service: Optional[EquityResearchService] = None

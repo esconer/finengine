@@ -114,14 +114,14 @@ class TestDirectUnitRoutes:
         # 1. Realized risk
         res_rr = await get_realized_risk(
             tickers="TCS.NS,INFY.NS", db=mock_db,
-            data_service=mock_ds, cache_service=mock_cache, analytics_engine=mock_engine
+            data_service=mock_ds, analytics_engine=mock_engine
         )
         assert res_rr is not None
 
         # 2. Forecast risk
         res_fr = await get_forecast_risk(
             model="GARCH", horizon=10, tickers="TCS.NS", db=mock_db,
-            data_service=mock_ds, cache_service=mock_cache, analytics_engine=mock_engine
+            data_service=mock_ds, analytics_engine=mock_engine
         )
         assert res_fr is not None
 
@@ -287,13 +287,16 @@ class TestDirectUnitRoutes:
         )
         assert res_upd is not None
 
-        # Bulk add
+        # Bulk add — auto_normalize=False: STEP 5 re-selects full ORM rows,
+        # which this flat mock cannot distinguish from the ticker-column
+        # duplicate check; global auto_normalize is covered end-to-end in
+        # test_coverage_portfolio_api.
         bulk_req = BulkAddRequest(
             positions=[
                 PortfolioPositionCreate(ticker="INFY.NS", weight=0.5, quantity=10.0, buy_price=1400.0),
                 PortfolioPositionCreate(ticker="TCS.NS", weight=0.5, quantity=5.0, buy_price=3000.0)
             ],
-            auto_normalize=True
+            auto_normalize=False
         )
         mock_db_result.scalar_one_or_none.return_value = None
         # bulk_add's duplicate check also selects the ticker column (strings)

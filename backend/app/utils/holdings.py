@@ -12,10 +12,14 @@ monte-carlo, stress-test, scenario, universe scans): those model "what if we
 held X", where full-history simulation is the documented assumption.
 """
 
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 #: Below this many covered trading days, annualized ratios (CAGR, Sharpe,
 #: Sortino, Calmar, annualized vol) are not reported (None) — annualizing a
@@ -138,7 +142,13 @@ def holding_window(
             if len(s):
                 masked[ticker] = s
         except Exception:
-            masked[ticker] = series
+            # Never pass an unmaskable series through: that silently
+            # re-attributes pre-purchase action (the failure this module
+            # exists to prevent). Warn and leave a visible gap instead.
+            logger.warning(
+                "holding_window: failed to mask %s to holding window; dropping series",
+                ticker, exc_info=True,
+            )
     return masked, effectives
 
 
@@ -230,7 +240,11 @@ def portfolio_regime_summary(sub: pd.Series) -> Dict[str, Any]:
 
 
 def coerce_holding_date(value: Any) -> Optional[str]:
-    """ORM added_on (datetime/str/None) -> ISO date string or None."""
+    """ORM added_on (datetime/str/None) -> ISO date string or None.
+
+    Anything that is not a real ISO date (``"abc"``, ``"None"``) is None —
+    a truncated junk string must never masquerade as a holding start.
+    """
     if value is None:
         return None
     if hasattr(value, "date"):
@@ -239,6 +253,8 @@ def coerce_holding_date(value: Any) -> Optional[str]:
         except Exception:
             return None
     try:
-        return str(value)[:10] or None
-    except Exception:
+        iso = str(value)[:10]
+        date.fromisoformat(iso)
+        return iso
+    except (TypeError, ValueError):
         return None

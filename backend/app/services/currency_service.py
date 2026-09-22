@@ -5,57 +5,66 @@ Configured with INR as the default currency for Indian market focus
 """
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
 
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+# Served (never cached) when the live FX vendor is unreachable.
+FALLBACK_USD_INR = 83.0
+
 
 class CurrencyConversionService:
     """Service for handling currency conversions between USD and INR"""
-    
+
     def __init__(self):
         self._exchange_rates: Dict[str, float] = {}
         self._last_updated: Optional[datetime] = None
         self._cache_duration = timedelta(minutes=30)  # Cache for 30 minutes
         self._refresh_lock = asyncio.Lock()
-        
+
     async def get_exchange_rate(self, from_currency: str, to_currency: str) -> float:
         """
         Get exchange rate between two currencies
-        
+
         Args:
             from_currency: Source currency code (e.g., 'USD')
             to_currency: Target currency code (e.g., 'INR')
-            
+
         Returns:
             Exchange rate from source to target currency
         """
         if from_currency == to_currency:
             return 1.0
-            
+
         cache_key = f"{from_currency}_{to_currency}"
-        
+
         # Check cache first (fast path)
         if self._is_cache_valid() and cache_key in self._exchange_rates:
             return self._exchange_rates[cache_key]
-        
+
         # Lock to prevent cache stampede under concurrent requests
         async with self._refresh_lock:
             # Double check after acquiring lock
             if self._is_cache_valid() and cache_key in self._exchange_rates:
                 return self._exchange_rates[cache_key]
-                
+
             # Fetch fresh exchange rate
-            rate = await self._fetch_exchange_rate(from_currency, to_currency)
-            
-            # Update cache
-            self._exchange_rates[cache_key] = rate
-            self._exchange_rates[f"{to_currency}_{from_currency}"] = 1.0 / rate if rate > 0 else 1.0
-            self._last_updated = datetime.utcnow()
-            
+            rate, is_fallback = await self._fetch_exchange_rate(from_currency, to_currency)
+
+            # B-07: never cache the hardcoded fallback — only live rates enter
+            # the cache / _last_updated, so info can't report 83.0 as fetched.
+            if not is_fallback:
+                self._exchange_rates[cache_key] = rate
+                self._exchange_rates[f"{to_currency}_{from_currency}"] = 1.0 / rate if rate > 0 else 1.0
+                self._last_updated = datetime.now(timezone.utc)
+            else:
+                logger.warning(
+                    f"FX fallback served for {cache_key} (not cached): live vendor unavailable"
+                )
+
             return rate
     
     async def convert_amount(self, amount: float, from_currency: str, to_currency: str) -> float:
@@ -102,33 +111,19 @@ class CurrencyConversionService:
     
     def format_currency_indian(self, amount: float, currency: str = 'INR') -> str:
         """
-        Format currency using Indian numbering system
-        
-        Args:
-            amount: Amount to format
-            currency: Currency code
-            
-        Returns:
-            Formatted currency string with Indian abbreviations
+        Format currency using Indian numbering system with a K tier.
+
+        Thin wrapper over format_currency with an extra thousands tier.
         """
-        if currency == 'INR':
-            symbol = '₹'
-            if amount >= 10000000:  # 1 crore
-                return f"{symbol}{(amount/10000000):.2f} Cr"
-            elif amount >= 100000:  # 1 lakh
-                return f"{symbol}{(amount/100000):.2f} L"
-            elif amount >= 1000:  # 1 thousand
-                return f"{symbol}{(amount/1000):.2f} K"
-            else:
-                return f"{symbol}{amount:,.2f}"
-        else:
-            return self.format_currency(amount, currency)
+        if currency == 'INR' and 1000 <= amount < 100000:
+            return f"₹{amount/1000:.2f} K"
+        return self.format_currency(amount, currency)
     
     def get_currency_symbol(self, currency: str) -> str:
         """Get currency symbol"""
         return '₹' if currency == 'INR' else '$'
     
-    def get_exchange_rate_info(self) -> Dict[str, any]:
+    def get_exchange_rate_info(self) -> Dict[str, Any]:
         """
         Get information about cached exchange rates
         
@@ -147,19 +142,16 @@ class CurrencyConversionService:
         if not self._last_updated:
             return False
         
-        age = datetime.utcnow() - self._last_updated
+        age = datetime.now(timezone.utc) - self._last_updated
         return age < self._cache_duration
     
-    async def _fetch_exchange_rate(self, from_currency: str, to_currency: str) -> float:
+    async def _fetch_exchange_rate(self, from_currency: str, to_currency: str) -> tuple:
         """
-        Fetch exchange rate from yfinance (USDINR=X) or return fallback rate
-        
-        Args:
-            from_currency: Source currency
-            to_currency: Target currency
-            
+        Fetch exchange rate from yfinance (USDINR=X) or return the fallback.
+
         Returns:
-            Exchange rate
+            (rate, is_fallback) — is_fallback is True when the hardcoded
+            constant is served so the caller can skip caching it.
         """
         if (from_currency == 'USD' and to_currency == 'INR') or (from_currency == 'INR' and to_currency == 'USD'):
             def _get_live_rate() -> Optional[float]:
@@ -185,12 +177,17 @@ class CurrencyConversionService:
                 logger.warning(f"Error in async thread for USDINR rate: {e}")
                 live_usd_inr = None
 
-            rate = live_usd_inr if live_usd_inr and live_usd_inr > 0 else 83.0
+            if live_usd_inr and live_usd_inr > 0:
+                rate = live_usd_inr
+                is_fallback = False
+            else:
+                rate = FALLBACK_USD_INR
+                is_fallback = True
 
             if from_currency == 'USD' and to_currency == 'INR':
-                return rate
+                return rate, is_fallback
             else:
-                return 1.0 / rate
+                return 1.0 / rate, is_fallback
         else:
             # Unknown pairs have no configured rate — fail loudly instead of
             # silently treating the currencies as 1:1.
@@ -209,74 +206,55 @@ def get_currency_service() -> CurrencyConversionService:
     return _currency_service
 
 
-# Async context manager for currency service
-class CurrencyServiceContext:
-    """Context manager for currency service with cleanup"""
-    
-    def __init__(self):
-        self.service = get_currency_service()
-    
-    async def __aenter__(self) -> CurrencyConversionService:
-        return self.service
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Cleanup if needed
-        pass
-
-
 # Convenience functions - NOW DEFAULT TO INR FOR INDIAN MARKET
 async def convert_portfolio_value(amount: float, target_currency: str = 'INR') -> float:
     """
     Convert portfolio value to target currency
-    
+
     Args:
         amount: Amount to convert
         target_currency: Target currency ('USD' or 'INR')
-        
+
     Returns:
         Converted amount
     """
-    async with CurrencyServiceContext() as service:
-        # Default to INR - assume amounts are in INR by default for Indian market
-        return await service.convert_amount(amount, 'INR', target_currency)
+    # Default to INR - assume amounts are in INR by default for Indian market
+    return await get_currency_service().convert_amount(amount, 'INR', target_currency)
 
 
 async def format_portfolio_value(amount: float, currency: str = 'INR') -> str:
     """
     Format portfolio value with currency symbol
-    
+
     Args:
         amount: Amount to format
         currency: Currency code
-        
+
     Returns:
         Formatted currency string
     """
-    async with CurrencyServiceContext() as service:
-        return service.format_currency(amount, currency)
+    return get_currency_service().format_currency(amount, currency)
 
 
 async def format_portfolio_value_indian(amount: float, currency: str = 'INR') -> str:
     """
     Format portfolio value with Indian numbering system
-    
+
     Args:
         amount: Amount to format
         currency: Currency code
-        
+
     Returns:
         Formatted currency string with Indian formatting
     """
-    async with CurrencyServiceContext() as service:
-        return service.format_currency_indian(amount, currency)
+    return get_currency_service().format_currency_indian(amount, currency)
 
 
 async def get_exchange_rate_usd_inr() -> float:
     """
     Get current USD to INR exchange rate
-    
+
     Returns:
         Exchange rate
     """
-    async with CurrencyServiceContext() as service:
-        return await service.get_exchange_rate('USD', 'INR')
+    return await get_currency_service().get_exchange_rate('USD', 'INR')

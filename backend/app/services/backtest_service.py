@@ -7,7 +7,7 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 
-from app.services.optimization_service import optimize
+from app.services.optimization_service import STRATEGIES, optimize
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -25,7 +25,21 @@ def run_walk_forward_backtest(
 ) -> Dict[str, Any]:
     """
     Run out-of-sample walk-forward backtest over wide returns dataframe.
+
+    Raises ValueError for invalid input (unknown strategy, bad windows);
+    per-window optimizer failures fall back to retaining previous weights.
     """
+    # Fail fast on invalid input: a bogus strategy must not be silently
+    # swallowed by the per-window solver-failure fallback below.
+    if strategy not in STRATEGIES and strategy != "equal_weight":
+        raise ValueError(
+            f"Unknown strategy '{strategy}'. Choose from {list(STRATEGIES)} or 'equal_weight'"
+        )
+    if lookback_days < 20:
+        raise ValueError(f"lookback_days must be >= 20, got {lookback_days}")
+    if rebalance_freq_days < 1:
+        raise ValueError(f"rebalance_freq_days must be >= 1, got {rebalance_freq_days}")
+
     if len(returns) < 30:
         raise ValueError(
             f"Insufficient data for backtest: have {len(returns)} days, "
@@ -39,17 +53,18 @@ def run_walk_forward_backtest(
     assets = list(returns.columns)
     cost_factor = transaction_cost_bps / 10000.0
 
-    # Rebalance schedule indices
+    # Rebalance schedule indices. The final boundary must be len(returns)
+    # (exclusive slice end) so the LAST day of the frame is simulated —
+    # appending len-1 would silently drop it from every backtest.
     rebalance_indices = list(range(lookback_days, len(returns), rebalance_freq_days))
-    if not rebalance_indices or rebalance_indices[-1] < len(returns) - 1:
-        rebalance_indices.append(len(returns) - 1)
+    rebalance_indices.append(len(returns))
 
     daily_strategy_returns = []
     daily_benchmark_returns = []
     rebalance_events = []
-    
+
     current_weights = np.ones(len(assets)) / len(assets)
-    bench_weights = np.ones(len(assets)) / len(assets)
+    bench_bh_weights = np.ones(len(assets)) / len(assets)
     total_turnover = 0.0
 
     for i in range(len(rebalance_indices) - 1):
@@ -91,16 +106,23 @@ def run_walk_forward_backtest(
         })
 
         test_chunk = returns.iloc[t_start:t_end]
-        for idx, (_, row) in enumerate(test_chunk.iterrows()):
-            ret_vals = row.values
-            day_strat_ret = float(np.sum(current_weights * ret_vals))
-            day_bench_ret = float(np.sum(bench_weights * ret_vals))
-            
+        # Vectorized P&L: one matmul per chunk instead of row-at-a-time
+        # iterrows; day-0 multiplicative friction branch unchanged.
+        chunk_vals = test_chunk.to_numpy(dtype=float)
+        chunk_index = test_chunk.index
+        day_strat_rets = chunk_vals @ current_weights
+        day_bench_rets = chunk_vals @ bench_bh_weights
+
+        for idx in range(len(chunk_vals)):
+            day_strat_ret = float(day_strat_rets[idx])
+            day_bench_ret = float(day_bench_rets[idx])
+
             if idx == 0:
                 # Multiplicative day-0 friction: pay cost on capital first, then earn
                 day_strat_ret = (1.0 - cost_penalty) * (1.0 + day_strat_ret) - 1.0
 
-            date_str = str(row.name)[:10] if hasattr(row.name, "strftime") else str(row.name)
+            row_name = chunk_index[idx]
+            date_str = str(row_name)[:10] if hasattr(row_name, "strftime") else str(row_name)
             daily_strategy_returns.append((date_str, day_strat_ret))
             daily_benchmark_returns.append((date_str, day_bench_ret))
 

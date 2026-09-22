@@ -5,19 +5,20 @@ Data API endpoints for market data fetching and management
 from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.db.database import get_db_session
-from app.models.database import AppSetting
-from app.services.data_service import GlobalDataService, DataService
+from app.models.database import AppSetting, StockTimeseries
+from app.services.data_service import GlobalDataService, DataService, canonical_ticker
 from app.services.cache_service import GlobalCacheService, CacheService, clear_market_data_cache
 from app.services.source_preference_service import get_primary_source, set_primary_source, source_order_for, get_setting
 from app.services.indicators_service import IndicatorsService, SUPPORTED_INDICATORS, StaleMarketDataError
 from app.services.company_data_service import get_company_data_service
 from app.models.schemas import (
     StockDataResponse, StockQuoteResponse, BatchStockDataRequest, BatchStockDataResponse,
-    ValidateTickerRequest, ValidateTickerResponse, APIConfigResponse
+    ValidateTickerRequest, ValidateTickerResponse, APIConfigResponse, StockTimeseriesResponse
 )
 from app.utils.logger import setup_logger
 
@@ -42,10 +43,6 @@ def get_indicators_service(db: AsyncSession = Depends(get_db_session)) -> Indica
     """Get technical indicators service instance"""
     return IndicatorsService(db)
 
-
-from app.models.schemas import (
-    StockTimeseriesResponse
-)
 
 @router.get("/indicators/{ticker}")
 async def get_technical_indicators(
@@ -74,7 +71,7 @@ async def get_technical_indicators(
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         logger.error(f"Error computing indicators for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/verified-snapshot/{ticker}")
@@ -99,7 +96,7 @@ async def get_verified_snapshot(
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         logger.error(f"Error building verified snapshot for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/fundamentals/{ticker}")
@@ -122,7 +119,7 @@ async def get_fundamentals(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching fundamentals for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/financials/{ticker}")
@@ -143,7 +140,7 @@ async def get_financial_statements(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching financials for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/insider/{ticker}")
@@ -154,7 +151,7 @@ async def get_insider_transactions(ticker: str):
         return {"ticker": ticker.upper(), "count": len(records), "transactions": records}
     except Exception as e:
         logger.error(f"Error fetching insider transactions for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/config", response_model=APIConfigResponse)
@@ -191,12 +188,7 @@ async def get_api_config(
         raise
     except Exception as e:
         logger.error(f"Error getting API config: {e}")
-        # Return default config on error
-        return APIConfigResponse(
-            primary_source="bfinance",
-            cache_ttl_minutes=60,
-            enable_cache=True
-        )
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.put("/config")
@@ -215,6 +207,9 @@ async def update_api_config(
         yfinance primary -> yfinance, bfinance, Alpha Vantage (always last)
     """
     updated_settings = {}
+
+    if primary_source is None and cache_ttl_minutes is None and enable_cache is None:
+        raise HTTPException(status_code=400, detail="No configuration parameters provided")
 
     if primary_source is not None:
         try:
@@ -264,11 +259,13 @@ async def clear_cache(
     user-owned truth and are never touched.
     """
     try:
+        from app.api.analytics import clear_tails_cache
         result = await clear_market_data_cache(db)
+        clear_tails_cache()
         return result
     except Exception as e:
         logger.error(f"Error clearing market data cache: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
 
 
 @router.get("/{ticker}", response_model=StockTimeseriesResponse)
@@ -278,7 +275,8 @@ async def get_stock_data(
     end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
     force_refresh: bool = Query(default=False, description="Force refresh from yfinance"),
     data_service: DataService = Depends(get_data_service),
-    cache_service: CacheService = Depends(get_cache_service)
+    cache_service: CacheService = Depends(get_cache_service),
+    db: AsyncSession = Depends(get_db_session)
 ) -> StockTimeseriesResponse:
     """
     Get historical OHLCV data for a ticker
@@ -295,6 +293,12 @@ async def get_stock_data(
         if not start:
             start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
+        # Probe cache BEFORE fetch: fetch_historical_data stores fresh rows on a
+        # vendor miss, so a post-fetch probe would mislabel vendor data as cached.
+        cached_before = (
+            None if force_refresh else await data_service._get_cached_data(ticker, start, end)
+        )
+        
         # Fetch data
         df = await data_service.fetch_historical_data(ticker, start, end, force_refresh)
         
@@ -304,8 +308,25 @@ async def get_stock_data(
                 detail=f"No data found for ticker {ticker}"
             )
         
-        # Determine if data is from cache
-        from_cache = not force_refresh and await data_service._get_cached_data(ticker, start, end) is not None
+        from_cache = cached_before is not None and not cached_before.empty
+        
+        # Source of truth: the vendor recorded on the just-stored timeseries row
+        canon = canonical_ticker(ticker)
+        source = None
+        try:
+            row = await db.execute(
+                select(StockTimeseries.source_used)
+                .where(StockTimeseries.ticker == canon)
+                .order_by(StockTimeseries.date.desc())
+                .limit(1)
+            )
+            source = row.scalar_one_or_none()
+        except Exception as se:
+            logger.debug(f"source_used lookup failed for {canon}: {se}")
+        if not source:
+            source = data_service._source_of_df(df)
+        if not isinstance(source, str) or not source:
+            source = "yfinance"
         
         # Get ticker metadata for response (skip None values - yfinance often
         # lacks sector/industry, and the schema forbids nulls here)
@@ -334,7 +355,7 @@ async def get_stock_data(
         return StockTimeseriesResponse(
             ticker=ticker.upper(),
             data=stock_data,
-            source="yfinance",
+            source=source,
             from_cache=from_cache,
             metadata=metadata
         )
@@ -343,7 +364,7 @@ async def get_stock_data(
         raise
     except Exception as e:
         logger.error(f"Error in get_stock_data for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/quote/{ticker}", response_model=StockQuoteResponse)
@@ -369,7 +390,7 @@ async def get_stock_quote(
         raise
     except Exception as e:
         logger.error(f"Error in get_stock_quote for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/batch", response_model=BatchStockDataResponse)
@@ -410,9 +431,7 @@ async def get_batch_stock_data(
                         low=float(row['low']),
                         close=float(row['close']),
                         adj_close=float(row['adj_close']),
-                        volume=int(row['volume']),
-                        source_used='yfinance',
-                        fetch_status='fresh'
+                        volume=int(row['volume'])
                     ))
                 data_dict[ticker] = stock_responses
         
@@ -423,7 +442,7 @@ async def get_batch_stock_data(
         
     except Exception as e:
         logger.error(f"Error in get_batch_stock_data: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/validate", response_model=ValidateTickerResponse)
@@ -444,7 +463,7 @@ async def validate_ticker(
         
     except Exception as e:
         logger.error(f"Error validating ticker {request.ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/refresh")
@@ -482,6 +501,6 @@ async def refresh_ticker_data(
         
     except Exception as e:
         logger.error(f"Error in refresh_ticker_data: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 

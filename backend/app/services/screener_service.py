@@ -7,7 +7,7 @@ High Dividend Yield, and Undervalued Growth.
 import asyncio
 import hashlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
@@ -162,7 +162,7 @@ class ScreenerService:
                 ticker=db_ticker,
                 metric_name=metric_name,
                 metric_value=float(response_data.get("count", 0)),
-                calculation_date=datetime.utcnow(),
+                calculation_date=datetime.now(timezone.utc).replace(tzinfo=None),
                 model_params={
                     "strategy": strategy,
                     "universe_token": universe_token,
@@ -199,7 +199,7 @@ class ScreenerService:
                 return cached_res
 
         # L2 DB cache on L1 miss (survives restarts; ~24h TTL).
-        asof_day = datetime.utcnow().strftime("%Y-%m-%d")
+        asof_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         l2_hit = await self._get_cached_screen(strat_key, universe_token, asof_day, max_stocks)
         if l2_hit is not None:
             self._cache[cache_key] = (now_ts, l2_hit)
@@ -249,7 +249,9 @@ class ScreenerService:
             return response_data
         except Exception as e:
             logger.error(f"Error running screener {strategy}: {e}")
-            raise ValueError(f"Screen execution failed: {e}")
+            # Upstream/vendor failure is not the client's fault (B-06):
+            # ValueError here mapped to 400; RuntimeError maps to 5xx.
+            raise RuntimeError(f"Screen execution failed: {e}") from e
 
     async def _enforce_debt_free(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Keep only matches with D/E <= ceiling (fail-closed on unknown)."""
@@ -292,7 +294,10 @@ class ScreenerService:
             roe = (info.get("returnOnEquity") or 0.0) * 100
             pe = info.get("trailingPE") or 999.0
             mcap = info.get("marketCapInCr") or 0.0
-            div_yield = (info.get("dividendYield") or 0.0) * 100
+            # bfinance sets info["dividendYield"] = r.dividend_yield raw
+            # PERCENT (models/company.py:19 "Dividend Yield %", quotes.py:241
+            # no conversion) — *100 here admitted nearly every payer (B-13).
+            div_yield = info.get("dividendYield") or 0.0
 
             if min_roce is not None and roce < min_roce:
                 return False

@@ -4,9 +4,9 @@ WebSocket API for real-time updates
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Set
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from sqlalchemy import select
 import pandas as pd
@@ -27,11 +27,16 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.subscriptions: Dict[str, Set[str]] = {}  # WebSocket -> set of topics
 
-    async def connect(self, websocket: WebSocket, client_id: str):
+    async def connect(self, websocket: WebSocket, client_id: str) -> bool:
         await websocket.accept()
+        if client_id in self.active_connections:
+            logger.warning(f"Client {client_id} rejected: id already connected")
+            await websocket.close(code=1008)
+            return False
         self.active_connections[client_id] = websocket
         self.subscriptions[client_id] = set()
         logger.info(f"Client {client_id} connected. Total connections: {len(self.active_connections)}")
+        return True
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
@@ -49,8 +54,9 @@ class ConnectionManager:
                 self.disconnect(client_id)
 
     async def broadcast(self, message: dict, topic: str = None):
-        # Send to all connections subscribed to the topic
-        for client_id, subscriptions in self.subscriptions.items():
+        # Snapshot: send_personal_message may disconnect (mutating subscriptions)
+        # mid-iteration, which raised RuntimeError on the live dict.
+        for client_id, subscriptions in list(self.subscriptions.items()):
             if topic is None or topic in subscriptions:
                 await self.send_personal_message(message, client_id)
 
@@ -118,7 +124,7 @@ async def send_portfolio_update():
             
             update_data = {
                 "type": "portfolio_update",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": {
                     "total_value": round(float(total_value), 2),
                     "positions": pos_list
@@ -160,7 +166,7 @@ async def send_analytics_update():
                     weights = {t: 1.0 / len(tickers) for t in tickers}
 
             # Lookback limited to 1 year (~252 trading days) to prevent unbounded memory growth
-            cutoff_date = datetime.utcnow().date() - timedelta(days=365)
+            cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=365)
             t_res = await db.execute(
                 select(StockTimeseries)
                 .where(
@@ -184,15 +190,22 @@ async def send_analytics_update():
                 # of longer-established holdings (CONTEXT.md gotcha #7).
                 price_df = pd.DataFrame(data_dict).sort_index().ffill().bfill().dropna(how="all")
                 if not price_df.empty and len(price_df) > 5:
-                    engine = AnalyticsEngine()
-                    metrics = await engine.calculate_portfolio_metrics(price_df, weights)
-                    realized_vol = metrics.get("annual_volatility", 0.0)
-                    sharpe = metrics.get("sharpe_ratio", 0.0)
-                    max_dd = metrics.get("max_drawdown", 0.0)
+                    # Only weight tickers that actually have columns; a holding
+                    # without timeseries would otherwise dilute the metrics
+                    # (engine maps missing cols to 0 after full-dict renorm).
+                    covered = {t: w for t, w in weights.items() if t in price_df.columns}
+                    w_sum = sum(covered.values())
+                    if w_sum > 0:
+                        covered = {k: v / w_sum for k, v in covered.items()}
+                        engine = AnalyticsEngine()
+                        metrics = await engine.calculate_portfolio_metrics(price_df, covered)
+                        realized_vol = metrics.get("annual_volatility", 0.0)
+                        sharpe = metrics.get("sharpe_ratio", 0.0)
+                        max_dd = metrics.get("max_drawdown", 0.0)
 
             update_data = {
                 "type": "analytics_update",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": {
                     "realized_volatility": round(float(realized_vol), 4),
                     "sharpe_ratio": round(float(sharpe), 4),
@@ -215,7 +228,7 @@ async def send_market_data_update():
 
             tickers = [p.ticker for p in positions]
             # Fetch recent timeseries for all portfolio tickers in a single batched query
-            cutoff_date = datetime.utcnow().date() - timedelta(days=14)
+            cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=14)
             t_res = await db.execute(
                 select(StockTimeseries)
                 .where(
@@ -249,7 +262,7 @@ async def send_market_data_update():
 
             update_data = {
                 "type": "market_data_update",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": market_dict
             }
             await manager.broadcast(update_data, "market_data")
@@ -257,11 +270,12 @@ async def send_market_data_update():
         logger.error(f"Error sending market data update: {e}")
 
 @router.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = Query(None)):
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
     """
     WebSocket endpoint for real-time updates
     """
-    await manager.connect(websocket, client_id)
+    if not await manager.connect(websocket, client_id):
+        return
     
     global update_task
     # Start background update task if not already running
@@ -282,7 +296,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = 
                     await manager.send_personal_message({
                         "type": "subscription_confirmed",
                         "topic": topic,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat()
                     }, client_id)
             
             elif message.get("type") == "unsubscribe":
@@ -292,14 +306,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = 
                     await manager.send_personal_message({
                         "type": "unsubscription_confirmed",
                         "topic": topic,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat()
                     }, client_id)
             
             elif message.get("type") == "ping":
                 # Respond to ping with pong
                 await manager.send_personal_message({
                     "type": "pong",
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 }, client_id)
             
     except WebSocketDisconnect:
@@ -318,9 +332,9 @@ async def websocket_status():
     Get WebSocket connection status
     """
     return {
-        "status": "connected",
+        "status": "connected" if manager.active_connections else "disconnected",
         "active_connections": len(manager.active_connections),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 @router.post("/broadcast")
@@ -333,7 +347,7 @@ async def broadcast_message(
     """
     message["type"] = "broadcast"
     message["topic"] = topic
-    message["timestamp"] = datetime.utcnow().isoformat()
+    message["timestamp"] = datetime.now(timezone.utc).isoformat()
     
     await manager.broadcast(message, topic)
     

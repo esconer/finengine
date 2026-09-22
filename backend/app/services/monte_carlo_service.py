@@ -32,6 +32,10 @@ TRADING_DAYS = 252
 BLOCK_LENGTH = 21
 DEFAULT_PATHS = 2000
 MAX_PATHS = 20000
+# Hard element budget for the (num_paths, steps) path matrix: 5e7 float64
+# ≈ 400 MB per live array — without this, 20000 paths × 40y (~201.6M
+# elements) multiplies into multi-GB peaks from one legitimate API call.
+MAX_PATH_ELEMENTS = 50_000_000
 MIN_HIST_OBS = 60
 METHODS = ("gbm", "student_t", "bootstrap")
 
@@ -134,7 +138,7 @@ def _simulate_bootstrap(
 
 
 def _fan_from_paths(
-    paths: np.ndarray, horizon_years: int, checkpoints_per_year: int = 2
+    paths: np.ndarray, checkpoints_per_year: int = 2
 ) -> list[Dict[str, float]]:
     """Percentile fan at half-year checkpoints."""
     checkpoints = list(range(0, paths.shape[1], max(1, TRADING_DAYS // checkpoints_per_year)))
@@ -179,6 +183,9 @@ def simulate_goal(
     if method not in METHODS:
         raise ValueError(f"method must be one of {list(METHODS)}")
     num_paths = max(100, min(int(num_paths), MAX_PATHS))
+    # Cap num_paths × steps to the element budget (scale paths down).
+    steps = _steps(horizon_years)
+    num_paths = max(100, min(num_paths, MAX_PATH_ELEMENTS // max(steps, 1)))
 
     mu_annual, sigma_annual, daily = _calibrate(portfolio_returns)
     rng = np.random.default_rng(seed)
@@ -215,7 +222,7 @@ def simulate_goal(
             "p75": round(float(p75), 2),
             "p95": round(float(p95), 2),
         },
-        "fan": _fan_from_paths(paths, horizon_years),
+        "fan": _fan_from_paths(paths),
         "expected_shortfall_vs_target": expected_shortfall,
         "historical_mu_annual": round(mu_annual, 4),
         "historical_sigma_annual": round(sigma_annual, 4),

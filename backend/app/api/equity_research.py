@@ -5,6 +5,7 @@ Provides REST routes for full company profile, 12Q/11Y institutional shareholdin
 """
 
 from typing import Any, Dict, List, Optional
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,9 +46,11 @@ async def get_company_full_profile(ticker: str):
         return data
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching full profile for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/shareholding", response_model=ShareholdingResponse)
@@ -60,9 +63,11 @@ async def get_company_shareholding(ticker: str):
         return await service.get_shareholding(ticker)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching shareholding for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/concalls")
@@ -74,9 +79,11 @@ async def get_company_concalls(ticker: str):
         service = get_equity_research_service()
         concalls = await service.get_concalls(ticker)
         return {"ticker": ticker.upper(), "count": len(concalls), "concalls": concalls}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching concalls for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/custom-ratios", response_model=CustomRatiosResponse)
@@ -90,9 +97,11 @@ async def get_company_custom_ratios(ticker: str):
         return await service.get_custom_ratios(ticker)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error fetching custom ratios for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/export-excel")
@@ -103,7 +112,8 @@ async def export_company_excel_model(ticker: str):
     try:
         service = get_equity_research_service()
         content = await service.export_excel_model(ticker)
-        filename = f"{ticker.upper().replace('.NS', '').replace('.BO', '')}_financial_model.xlsx"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", ticker.upper().replace(".NS", "").replace(".BO", ""))
+        filename = f"{safe_name}_financial_model.xlsx"
         return Response(
             content=content,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -113,9 +123,11 @@ async def export_company_excel_model(ticker: str):
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error exporting Excel for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ------------------------------------------------------------- AI Prompts & Dossiers
@@ -131,9 +143,13 @@ async def get_ai_investment_memo_prompt(
         service = get_ai_dossier_service()
         prompt = await service.get_investment_memo_prompt(ticker, custom_instructions=custom_instructions)
         return {"ticker": ticker.upper(), "prompt": prompt}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error generating memo prompt for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/ai-forensic-prompt")
@@ -145,9 +161,13 @@ async def get_ai_forensic_prompt(ticker: str):
         service = get_ai_dossier_service()
         prompt = await service.get_forensic_audit_prompt(ticker)
         return {"ticker": ticker.upper(), "prompt": prompt}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error generating forensic prompt for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/company/{ticker}/ai-dossier")
@@ -164,9 +184,13 @@ async def get_ai_dossier(
         if format == "json":
             return {"ticker": ticker.upper(), "format": format, "data": dossier}
         return {"ticker": ticker.upper(), "format": format, "content": dossier}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error generating AI dossier for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ------------------------------------------------------------- Institutional Screeners
@@ -204,9 +228,11 @@ async def run_screener_strategy(
         return await service.run_screen(strategy, max_stocks=max_stocks)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error running screener {strategy}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/screens/custom", response_model=ScreenerResponse)
@@ -224,6 +250,8 @@ async def run_custom_screen(request: CustomScreenRequest):
             min_div_yield=request.min_div_yield,
             max_stocks=request.max_stocks or 50,
         )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error running custom screener: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")

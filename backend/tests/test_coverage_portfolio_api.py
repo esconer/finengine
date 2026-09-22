@@ -298,12 +298,95 @@ class TestPortfolioAPIEndpoints:
             assert "added" in data or "added_count" in data or "positions" in data
             assert data["failed"] == 1
             assert data["normalized"] is True
-            # Weights should sum to 1.0 for added positions
-            assert abs(sum(p["weight"] for p in data["positions"]) - 1.0) < 1e-4
+            # Global auto_normalize: DB-wide weights (existing OLD.NS + added)
+            # must sum to 1.0 — response positions are added-only.
+            all_rows = (await test_db.execute(select(PortfolioPosition))).scalars().all()
+            assert abs(sum(p.weight for p in all_rows) - 1.0) < 1e-4
 
         # Clean up
         await test_db.execute(delete(PortfolioPosition))
         await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_bulk_add_intra_payload_dedup(self, async_client, test_db: AsyncSession):
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+        mock_ds = Mock()
+        mock_ds.validate_ticker = AsyncMock(return_value=True)
+        mock_ds.fetch_quote = AsyncMock(
+            return_value={"current_price": 100.0, "sector": "Tech", "industry": "Software"}
+        )
+
+        with patch("app.api.portfolio.GlobalDataService") as mock_gds:
+            mock_gds.return_value.get_service.return_value = mock_ds
+            resp = await async_client.post("/api/v1/portfolio/bulk_add", json={
+                "positions": [
+                    {"ticker": "DUP.NS", "weight": 0.5, "quantity": 10.0, "buy_price": 100.0},
+                    {"ticker": "DUP.NS", "weight": 0.5, "quantity": 10.0, "buy_price": 100.0},
+                ],
+                "auto_normalize": False,
+            })
+        assert resp.status_code == 200
+        assert resp.json()["added"] == 1
+        rows = (await test_db.execute(select(PortfolioPosition))).scalars().all()
+        assert len(rows) == 1
+
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_currency_whitelist_returns_400(self, async_client, test_db: AsyncSession):
+        resp = await async_client.get("/api/v1/portfolio", params={"currency": "XYZ"})
+        assert resp.status_code == 400
+        assert "Unsupported currency" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_bare_ticker_crud_canonical_lookup(self, async_client, test_db: AsyncSession):
+        await test_db.execute(delete(PortfolioPosition))
+        pos = PortfolioPosition(
+            ticker="RELIANCE.NS",
+            weight=1.0,
+            quantity=10.0,
+            buy_price=2500.0,
+            last_price=2600.0,
+            market_value=26000.0,
+            region="IN",
+            sector="Energy",
+        )
+        test_db.add(pos)
+        await test_db.commit()
+
+        mock_ds = Mock()
+        mock_ds.fetch_quote = AsyncMock(return_value={"current_price": 2600.0})
+
+        with patch("app.api.portfolio.GlobalDataService") as mock_gds:
+            mock_gds.return_value.get_service.return_value = mock_ds
+            resp_get = await async_client.get("/api/v1/portfolio/RELIANCE")
+            assert resp_get.status_code == 200
+            assert resp_get.json()["ticker"] == "RELIANCE.NS"
+
+            resp_put = await async_client.put(
+                "/api/v1/portfolio/RELIANCE", json={"quantity": 20.0}
+            )
+            assert resp_put.status_code == 200
+            assert resp_put.json()["quantity"] == 20.0
+
+            resp_del = await async_client.delete("/api/v1/portfolio/RELIANCE")
+            assert resp_del.status_code == 200
+
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_normalize_rejects_unknown_method(self, async_client, test_db: AsyncSession):
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+        resp = await async_client.post(
+            "/api/v1/portfolio/normalize", params={"method": "equal"}
+        )
+        assert resp.status_code == 400
+        assert "Unsupported normalization method" in resp.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_get_update_delete_single_position(self, async_client, test_db: AsyncSession):
@@ -437,13 +520,16 @@ class TestPortfolioAPIEndpoints:
         test_db.add_all([pos1, pos2])
         await test_db.commit()
 
-        # Export CSV success
+        # Export CSV success — real CSV bytes, not a JSON-encoded string
         resp_csv = await async_client.get("/api/v1/portfolio/export/csv")
         assert resp_csv.status_code == 200
+        assert resp_csv.headers.get("content-type", "").startswith("text/csv")
+        assert "attachment" in resp_csv.headers.get("content-disposition", "")
         content = resp_csv.text
         assert "ticker,weight,region,last_price" in content
         assert "SBIN.NS" in content
         assert "LT.NS" in content
+        assert "\n" in content and "\\n" not in content
 
         # Normalize success
         resp_norm = await async_client.post("/api/v1/portfolio/normalize")
@@ -585,3 +671,68 @@ class TestPortfolioHelpers:
             json={"new_weights": {"CIPLA.NS": 0.5}}
         )
         assert resp_nopos.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_rebalance_rejects_negative_unknown_keeps_full_exit(
+        self, async_client, test_db: AsyncSession
+    ):
+        await test_db.execute(delete(PortfolioPosition))
+        test_db.add_all([
+            PortfolioPosition(
+                ticker="A.NS", weight=0.5, quantity=10.0, buy_price=100.0,
+                last_price=100.0, market_value=1000.0, region="IN", sector="Tech",
+            ),
+            PortfolioPosition(
+                ticker="B.NS", weight=0.5, quantity=10.0, buy_price=100.0,
+                last_price=100.0, market_value=1000.0, region="IN", sector="Tech",
+            ),
+        ])
+        await test_db.commit()
+
+        resp_neg = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {"A.NS": -0.5, "B.NS": 1.5}},
+        )
+        assert resp_neg.status_code == 400
+        assert "Negative weights" in resp_neg.json()["detail"]
+
+        resp_unknown = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {"A.NS": 0.5, "GHOST.NS": 0.5}},
+        )
+        assert resp_unknown.status_code == 400
+        assert "Unknown tickers" in resp_unknown.json()["detail"]
+
+        # All-zero full exit must not be treated as invalid (sum == 0 is legal)
+        resp_exit = await async_client.post(
+            "/api/v1/portfolio/rebalance",
+            json={"new_weights": {"A.NS": 0.0, "B.NS": 0.0}},
+        )
+        assert resp_exit.status_code == 200
+        assert resp_exit.json()["success"] is True
+
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()
+
+    @pytest.mark.asyncio
+    async def test_get_position_hides_exception_detail(self, async_client, test_db: AsyncSession):
+        await test_db.execute(delete(PortfolioPosition))
+        test_db.add(PortfolioPosition(
+            ticker="LEAK.NS", weight=1.0, quantity=10.0, buy_price=100.0,
+            last_price=100.0, market_value=1000.0, region="IN", sector="Tech",
+        ))
+        await test_db.commit()
+
+        mock_ds = Mock()
+        mock_ds.fetch_quote = AsyncMock(side_effect=Exception("secret-path /etc/passwd"))
+
+        with patch("app.api.portfolio.GlobalDataService") as mock_gds:
+            mock_gds.return_value.get_service.return_value = mock_ds
+            resp = await async_client.get("/api/v1/portfolio/LEAK.NS")
+
+        assert resp.status_code == 500
+        assert "secret" not in resp.text
+        assert "Internal server error" in resp.text
+
+        await test_db.execute(delete(PortfolioPosition))
+        await test_db.commit()

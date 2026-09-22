@@ -45,9 +45,11 @@ class AIDossierService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error building AI dossier for {ticker}: {e}")
-            raise ValueError(f"Failed to generate AI dossier for {ticker}: {e}")
+            raise RuntimeError(f"Failed to generate AI dossier for {ticker}: {e}") from e
 
     async def get_investment_memo_prompt(
         self,
@@ -65,9 +67,11 @@ class AIDossierService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error generating investment memo prompt for {ticker}: {e}")
-            raise ValueError(f"Failed to create investment memo prompt: {e}")
+            raise RuntimeError(f"Failed to create investment memo prompt: {e}") from e
 
     async def get_forensic_audit_prompt(self, ticker: str) -> str:
         """
@@ -81,9 +85,11 @@ class AIDossierService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error generating forensic audit prompt for {ticker}: {e}")
-            raise ValueError(f"Failed to create forensic audit prompt: {e}")
+            raise RuntimeError(f"Failed to create forensic audit prompt: {e}") from e
 
     async def get_concall_prompt(self, ticker: str) -> str:
         """
@@ -97,9 +103,11 @@ class AIDossierService:
 
         try:
             return await _to_thread(_fetch)
+        except ValueError:
+            raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
             logger.error(f"Error generating concall prompt for {ticker}: {e}")
-            raise ValueError(f"Failed to create concall prompt: {e}")
+            raise RuntimeError(f"Failed to create concall prompt: {e}") from e
 
 
 _ai_dossier_service: Optional[AIDossierService] = None

@@ -95,12 +95,14 @@ def analyze_correlation_stability(
     historical_median = float(np.median(corr_values))
 
     current_avg_corr = float(corr_values[-1])
-    is_regime_break = bool(current_avg_corr > threshold_90th)
+    # Single comparison for both the flag and the CRITICAL alert: on a flat
+    # series where current == p90 exactly, flag and alert must agree.
+    is_regime_break = bool(current_avg_corr >= threshold_90th)
 
-    if current_avg_corr >= threshold_90th:
+    if is_regime_break:
         alert_level = "CRITICAL"
         message = (
-            f"Average pairwise correlation ({current_avg_corr:.3f}) exceeds 90th percentile "
+            f"Average pairwise correlation ({current_avg_corr:.3f}) meets or exceeds 90th percentile "
             f"({threshold_90th:.3f}). Diversification breakdown detected."
         )
     elif current_avg_corr >= threshold_75th:
@@ -146,23 +148,3 @@ def analyze_correlation_stability(
         message=message,
         series=series_points,
     )
-
-
-class CorrelationService:
-    """Service wrapper for Correlation Stability calculations"""
-
-    @staticmethod
-    def compute_rolling_correlation(
-        returns_df: pd.DataFrame,
-        window_days: int = 60,
-        min_periods: Optional[int] = None,
-    ) -> pd.Series:
-        return compute_rolling_avg_correlation(returns_df, window_days, min_periods)
-
-    @staticmethod
-    def analyze_stability(
-        returns_df: pd.DataFrame,
-        window_days: int = 60,
-        min_periods: Optional[int] = None,
-    ) -> CorrelationStabilityResponse:
-        return analyze_correlation_stability(returns_df, window_days, min_periods)

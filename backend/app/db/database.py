@@ -4,8 +4,9 @@ Database configuration and initialization for Daisy Risk Engine
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import event
-import os
+from sqlalchemy import event, text
+from sqlalchemy.engine import make_url
+from pathlib import Path
 from typing import AsyncGenerator
 
 from app.config import settings
@@ -14,10 +15,11 @@ from app.config import settings
 # Base class for SQLAlchemy models
 Base = declarative_base()
 
-# Async database engine
+# Async database engine. SQL echo only in a development environment AND with
+# debug on: debug alone must not stream every statement to stdout (audit B7/O1).
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.debug,
+    echo=bool(settings.debug and settings.environment == "development"),
     pool_pre_ping=True,
 )
 
@@ -29,18 +31,44 @@ SessionLocal = async_sessionmaker(
 )
 
 
+def ensure_sqlite_dir(database_url: str) -> None:
+    """Create the parent directory of a file-based sqlite DB URL.
+
+    No-op for in-memory sqlite, non-sqlite dialects, and `file:` URIs.
+    Must run BEFORE create_all/connect: sqlite does not create missing
+    directories (`OperationalError: unable to open database file`).
+    """
+    url = make_url(database_url)
+    if url.get_backend_name() != "sqlite":
+        return
+    database = url.database
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return
+    Path(database).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
 async def init_db() -> None:
     """
     Initialize database tables
     """
+    # Register all models on Base.metadata so init_db works even when called
+    # without the routers having been imported (main.py imports routers first,
+    # but init_db must not depend on that ordering).
+    from app.models import database as _models  # noqa: F401
+
+    ensure_sqlite_dir(settings.database_url)
     async with engine.begin() as conn:
-        # Import all models to ensure they're registered
-        
         # Create all tables
         await conn.run_sync(Base.metadata.create_all)
-    
-    # Create data directory if it doesn't exist
-    os.makedirs("data", exist_ok=True)
+        if conn.dialect.name == "sqlite":
+            await conn.execute(text(
+                "DELETE FROM analytics_cache WHERE id NOT IN "
+                "(SELECT MAX(id) FROM analytics_cache GROUP BY ticker, metric_name)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_cache_ticker_metric "
+                "ON analytics_cache (ticker, metric_name)"
+            ))
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -86,6 +114,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
 # For manual database operations
 async def create_tables():
     """Create database tables"""
+    ensure_sqlite_dir(settings.database_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

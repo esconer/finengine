@@ -15,10 +15,10 @@ Modifications from the original:
   notices (TradingAgents issue #991): daily phrases retire the key until
   midnight, frequency phrases impose a 60s cooldown, invalid keys are
   dropped from the pool.
-- symbol bridge for Indian listings: yfinance's NSE suffix (.NS) maps to
-  Alpha Vantage's BSE feed (.BSE); US-style symbols pass through unchanged.
-  Caveat: a minority of companies use different ticker letters per exchange;
-  failures here simply leave yfinance as sole source.
+- symbol bridge for Indian listings: yfinance's NSE suffix (.NS) and BSE
+  suffix (.BO) both map to Alpha Vantage's .BSE feed; plain symbols pass
+  through unchanged. Caveat: a minority of companies use different ticker
+  letters per exchange; failures here simply leave yfinance as sole source.
 
 Licensed under the Apache License, Version 2.0.
 """
@@ -27,8 +27,9 @@ import asyncio
 import re
 import time
 from collections import deque
-from datetime import date as _date
+from datetime import date as _date, datetime
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -44,14 +45,22 @@ API_BASE_URL = "https://www.alphavantage.co/query"
 def to_av_symbol(ticker: str) -> str:
     """Map our tickers to Alpha Vantage convention.
 
-    .NS (NSE, yfinance style) -> .BSE (Alpha Vantage has no NSE feed; BSE
-    lists the same companies). .BO already matches AV convention. Plain
-    symbols (US etc.) pass through unchanged.
+    .NS (NSE, yfinance style) and .BO (BSE) both map to .BSE — Alpha
+    Vantage has no NSE feed and does not accept Yahoo's .BO suffix; the
+    BSE lists the same companies. Plain symbols (US etc.) pass through.
     """
     t = ticker.upper().strip()
-    if t.endswith(".NS"):
+    if t.endswith(".NS") or t.endswith(".BO"):
         return t[:-3] + ".BSE"
     return t
+
+
+def _quota_day() -> _date:
+    """Alpha Vantage free-tier quota resets at US Eastern midnight, not local."""
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return _date.today()
 
 # Cooldown applied to a key after a per-minute ("call frequency") rejection.
 FREQUENCY_COOLDOWN_SECONDS = 60
@@ -79,8 +88,6 @@ def _classify_notice(notice: str) -> Optional[str]:
         return "frequency"
     if "api key" in low or "apikey" in low:
         return "invalid_key"
-    if "premium" in low:
-        return "daily"
     return "other"
 
 
@@ -98,14 +105,14 @@ class _KeyBudget:
         self.retired_on: Optional[_date] = None  # day the key was marked daily-exhausted
 
     def _roll_day(self) -> None:
-        today = _date.today()
+        today = _quota_day()
         if self._day != today:
             self._day = today
             self.used_today = 0
 
     def available(self) -> bool:
         now = time.monotonic()
-        if self.retired_on == _date.today():
+        if self.retired_on == _quota_day():
             return False
         if now < self.cooldown_until:
             return False
@@ -149,7 +156,7 @@ class KeyPool:
         return None
 
     def mark_daily_exhausted(self, budget: _KeyBudget) -> None:
-        budget.retired_on = _date.today()
+        budget.retired_on = _quota_day()
         logger.warning(f"Alpha Vantage key ...{budget.key[-4:]} retired until midnight (daily limit)")
 
     def mark_frequency_limited(self, budget: _KeyBudget) -> None:
@@ -223,7 +230,15 @@ class AlphaVantageService:
                 return requests.get(API_BASE_URL, params=query, timeout=self.timeout)
 
             response = await asyncio.to_thread(_get)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as e:
+                self.pool.mark_frequency_limited(budget)
+                last_error = ValueError(
+                    f"Alpha Vantage HTTP {response.status_code} for {function_name}"
+                )
+                logger.warning(f"AV HTTP error on {function_name}: {e}")
+                continue
 
             try:
                 data = response.json()
@@ -260,7 +275,9 @@ class AlphaVantageService:
         Returns None when the vendor yields no rows in range.
         """
         av_symbol = to_av_symbol(ticker)
-        data = await self._make_request("TIME_SERIES_DAILY", {"symbol": av_symbol})
+        data = await self._make_request(
+            "TIME_SERIES_DAILY", {"symbol": av_symbol, "outputsize": "full"}
+        )
 
         series = data.get("Time Series (Daily)") or {}
         rows: List[Dict[str, Any]] = []
@@ -306,8 +323,9 @@ class AlphaVantageService:
         if not price_raw:
             return None
         try:
+            chg = q.get("10. change percent")
             return {
-                "ticker": av_symbol.upper(),
+                "ticker": ticker.upper().strip(),
                 "current_price": float(price_raw),
                 "volume": int(float(q.get("06. volume") or 0)),
                 "market_cap": None,
@@ -318,11 +336,11 @@ class AlphaVantageService:
                 "pe_ratio": None,
                 "dividend_yield": None,
                 "previous_close": float(q["08. previous close"]) if q.get("08. previous close") else None,
-                "change_percent": q.get("10. change percent"),
+                "change_percent": float(str(chg).rstrip("%")) if chg else None,
                 "currency": "INR" if ".BSE" in av_symbol else "USD",
                 "exchange": "BSE" if ".BSE" in av_symbol else "Other",
                 "source": "alphavantage",
-                "timestamp": pd.Timestamp.utcnow().isoformat(),
+                "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
             }
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(f"Malformed AV quote for {av_symbol}: {e}")

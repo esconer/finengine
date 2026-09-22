@@ -1,9 +1,10 @@
 """
 Market-regime detection via a 3-state Gaussian HMM over NIFTY 50 returns.
 
-States are ordered by risk (return/vol profile) and labeled crisis / calm /
-bull so downstream UI never sees raw integer state ids. Persistence
-(day-over-day stability) is reported so consumers can distrust a flapping fit.
+States are ordered by state CAGR (worst -> crisis, middle -> calm, best ->
+bull; volatility does not enter the ordering) and labeled so downstream UI
+never sees raw integer state ids. Persistence (day-over-day stability) is
+reported so consumers can distrust a flapping fit.
 """
 
 import asyncio
@@ -123,6 +124,12 @@ def classify(
     from hmmlearn.hmm import GaussianHMM
     from sklearn.preprocessing import StandardScaler
 
+    # The sticky init matrices and crisis/calm/bull labeling are defined for
+    # exactly 3 states; any other value would be rejected by hmmlearn's fit
+    # anyway (after accepting the wrong-shaped setters), so fail fast here.
+    if n_components != 3:
+        raise ValueError(f"n_components must be 3 (crisis/calm/bull), got {n_components}")
+
     if bench_data is None or len(bench_data) < MIN_OBSERVATIONS:
         return None
 
@@ -146,8 +153,11 @@ def classify(
             valid_hl = (high > 0) & (low > 0) & (high >= low)
             if valid_hl.sum() >= 10:
                 log_hl = np.log((high[valid_hl] / low[valid_hl]).clip(lower=1.00001))
-                parkinson_daily = np.sqrt((log_hl ** 2) / (4 * np.log(2))) * np.sqrt(252)
-                parkinson_vol = float(parkinson_daily.rolling(10, min_periods=3).mean().iloc[-1])
+                # Pool mean(logHL^2) over the window and take ONE sqrt
+                # (Jensen-correct); annualizing each observation first and
+                # averaging the sigmas would bias the result downward.
+                pooled_var = (log_hl ** 2).rolling(10, min_periods=3).mean() / (4 * np.log(2))
+                parkinson_vol = float((np.sqrt(pooled_var) * np.sqrt(252)).iloc[-1])
             else:
                 parkinson_vol = None
         else:

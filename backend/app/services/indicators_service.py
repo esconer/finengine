@@ -75,7 +75,10 @@ def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
     for candidate in ("date", "index", "Datetime"):
         if candidate in out.columns:
             return out.rename(columns={candidate: "Date"})
-    return out
+    # Index under any other name (e.g. "timestamp"): after reset_index the
+    # first column holds the date axis — rename it rather than KeyError on
+    # data["Date"] downstream.
+    return out.rename(columns={out.columns[0]: "Date"})
 
 
 def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
@@ -142,8 +145,11 @@ class IndicatorsService:
         self.data_service = DataService(db_session)
 
     def _resolve_dates(self, lookback_days: int, end_date: Optional[str]):
+        # Fetch warmup in CALENDAR days (floor 365 ≈ 240+ trading rows even
+        # after NSE holidays) so long-window indicators like close_200_sma
+        # have enough history even when lookback_days itself is short.
         end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
-        start = end - timedelta(days=int(lookback_days * 1.6) + 120)
+        start = end - timedelta(days=max(int(lookback_days * 1.6) + 120, 365))
         return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
     async def compute_window(
@@ -205,8 +211,16 @@ class IndicatorsService:
         Deterministic ground-truth snapshot (TradingAgents build_verified_market_snapshot):
         latest verified OHLCV row + default indicator values + recent closes. No estimates.
         """
+        # Output window must hold at least look_back_days trading rows
+        # (2 calendar days per trading day + floor); indicator warmup inside
+        # compute_window is handled by _resolve_dates' 365-day fetch floor.
         _, end = self._resolve_dates(0, end_date)
-        result = await self.compute_window(ticker, list(DEFAULT_INDICATORS), lookback_days=5, end_date=end)
+        result = await self.compute_window(
+            ticker,
+            list(DEFAULT_INDICATORS),
+            lookback_days=max(look_back_days * 2, 60),
+            end_date=end,
+        )
         records = result["records"]
         if not records:
             raise ValueError(f"No verified rows for {ticker}")

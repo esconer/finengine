@@ -134,9 +134,10 @@ class TestBacktestOneWayTurnover:
         assert res["rebalance_events"][0]["turnover"] == pytest.approx(0.3)
         assert res["total_turnover"] == pytest.approx(
             sum(e["turnover"] for e in res["rebalance_events"]))
-        # OOS rows 60..198 at fixed 80/20; only the first day pays friction,
-        # multiplicatively: (1-c)(1+r)-1 with c = 0.3 * 0.01
-        base = rets.iloc[60:199].to_numpy() @ np.array([0.8, 0.2])
+        # OOS rows 60..199 (final day of the 200-row frame included) at fixed
+        # 80/20; only the first day pays friction, multiplicatively:
+        # (1-c)(1+r)-1 with c = 0.3 * 0.01
+        base = rets.iloc[60:200].to_numpy() @ np.array([0.8, 0.2])
         exp_daily = base.copy()
         exp_daily[0] = (1.0 - 0.003) * (1.0 + base[0]) - 1.0
         exp_sharpe = (exp_daily.mean() * 252 - 0.02) / (exp_daily.std(ddof=1) * np.sqrt(252))
@@ -223,21 +224,28 @@ class TestVolConeNulls:
 
 class TestFactorActiveHistory:
     @pytest.mark.asyncio
-    async def test_zero_filled_prelisting_rows_excluded(self):
+    async def test_nan_prelisting_excluded_genuine_zero_days_kept(self):
         engine = AnalyticsEngine()
         dates = pd.bdate_range("2024-01-01", periods=120)
         rng = np.random.default_rng(6)
         bench_rets = rng.normal(0.0005, 0.01, 120)
         bench_prices = pd.Series(100 * np.cumprod(1 + bench_rets), index=dates)
         idio = rng.normal(0, 0.005, 120)
-        a_rets = np.concatenate([np.zeros(60), 1.5 * bench_rets[60:] + idio[60:]])
-        a_prices = np.concatenate([np.full(60, 50.0), 50 * np.cumprod(1 + a_rets[60:])])
-        prices = pd.DataFrame({"A": a_prices}, index=dates)
+        # Pre-listing gap as NaN prices (P2 fix: dropna separates gaps from
+        # genuine 0% days; zero-fill makes them indistinguishable)
+        active_rets = 1.5 * bench_rets[61:] + idio[61:]
+        active_rets[29] = 0.0  # genuine 0% day: benchmark moves, stock flat
+        active_prices = 50.0 * np.concatenate([[1.0], np.cumprod(1.0 + active_rets)])
+        prices = pd.DataFrame(
+            {"A": np.concatenate([np.full(60, np.nan), active_prices])},
+            index=dates,
+        )
         res = await engine.factor_exposure_analysis(prices, benchmark_data=bench_prices)
         pos = res["positions"]["A"]
-        # 60 active days (first listing-day jump + 59); zeros excluded
-        assert pos["data_points"] == 60
-        # Active-only beta ~= 1.5; zero-diluted full-sample beta would be ~0.75
+        # 59 computable post-listing returns (listing-day jump needs the NaN
+        # predecessor); the 0% day is kept, so a `!= 0.0` mask reports 58
+        assert pos["data_points"] == 59
+        # Active-only beta ~= 1.5; NaN-diluted full-sample beta would not fit
         assert abs(pos["market"] - 1.5) < 0.35
 
 

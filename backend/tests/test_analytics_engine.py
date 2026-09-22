@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from unittest.mock import patch, Mock
 
+from app.config import settings
 from app.services.analytics_engine import AnalyticsEngine, GlobalAnalyticsEngine
 
 
@@ -17,7 +18,7 @@ class TestAnalyticsEngine:
     def test_analytics_engine_initialization(self):
         """Test analytics engine initialization"""
         engine = AnalyticsEngine()
-        assert engine.risk_free_rate == 0.02
+        assert engine.risk_free_rate == settings.risk_free_rate
         # previous-score tracking initializes lazily inside risk_scoring
         assert not hasattr(engine, '_previous_risk_score')
     
@@ -31,8 +32,8 @@ class TestAnalyticsEngine:
         result = await engine.calculate_portfolio_metrics(empty_df, weights)
         
         assert result["error"] == "Insufficient data for calculations"
-        assert result["annual_return"] == 0
-        assert result["annual_volatility"] == 0.20
+        assert result["annual_return"] is None
+        assert result["annual_volatility"] is None
     
     @pytest.mark.asyncio
     async def test_calculate_portfolio_metrics_with_data(self, mock_price_dataframe, sample_portfolio_weights):
@@ -104,7 +105,7 @@ class TestAnalyticsEngine:
         result = await engine.forecast_volatility(short_returns, model="GARCH")
         
         assert result["error"] == "Insufficient data for forecast"
-        assert result["volatility_forecast"] == 0.22
+        assert result["volatility_forecast"] is None
     
     @pytest.mark.asyncio
     async def test_concentration_analysis(self, sample_portfolio_weights):
@@ -365,59 +366,6 @@ class TestAnalyticsEngine:
         # Check that values are finite
         assert abs(metrics["skewness"]) < 10
         assert abs(metrics["kurtosis"]) < 50
-    
-    def test_calculate_max_drawdown(self):
-        """Test max drawdown calculation"""
-        engine = AnalyticsEngine()
-        
-        # Create test cumulative returns
-        cumulative_returns = pd.Series([1.0, 1.1, 0.9, 1.05, 1.0, 0.95])
-        
-        max_drawdown = engine._calculate_max_drawdown(cumulative_returns)
-        
-        # Should be negative (drawdown)
-        assert max_drawdown < 0
-        assert max_drawdown >= -1.0
-    
-    def test_simulate_stress_drawdown(self, sample_portfolio_weights):
-        """Test stress drawdown simulation"""
-        engine = AnalyticsEngine()
-        
-        drawdown = engine._simulate_stress_drawdown(sample_portfolio_weights)
-        
-        # Should be negative
-        assert drawdown < 0
-        assert drawdown >= -0.5
-    
-    def test_estimate_recovery_time(self):
-        """Test recovery time estimation"""
-        engine = AnalyticsEngine()
-        
-        # Test different scenarios
-        covid_time = engine._estimate_recovery_time(0.25, "covid")
-        inflation_time = engine._estimate_recovery_time(0.20, "inflation")
-        normal_time = engine._estimate_recovery_time(0.15, "normal")
-        
-        # COVID should take longer
-        assert covid_time >= inflation_time
-        assert inflation_time >= normal_time
-        
-        # All should be reasonable
-        assert 0 < normal_time < 365
-        assert 0 < covid_time < 365
-    
-    def test_calculate_liquidation_days(self):
-        """Test liquidation time calculation"""
-        engine = AnalyticsEngine()
-        
-        # Test different scores
-        high_score = engine._calculate_liquidation_days(8.5)
-        medium_score = engine._calculate_liquidation_days(6.5)
-        low_score = engine._calculate_liquidation_days(3.0)
-        
-        assert high_score == "1-2"
-        assert medium_score == "2-5"
-        assert low_score == "5-10"
     
     def test_empty_result_methods(self):
         """Test all empty result methods return expected structure"""

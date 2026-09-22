@@ -227,6 +227,26 @@ def test_validate_ticker_rejects_bad_format():
         ValidateTickerRequest(ticker="A" * 21)
 
 
+def test_portfolio_position_ticker_pattern():
+    """PortfolioPositionBase now owns the NSE/BSE pattern (audit B14):
+    junk rejected at the schema layer, lowercase still uppercased first."""
+    from app.models.schemas import PortfolioPositionCreate
+
+    ok = PortfolioPositionCreate(ticker="infy.ns", weight=0.1, quantity=1.0, buy_price=100.0)
+    assert ok.ticker == "INFY.NS"
+    hyphen = PortfolioPositionCreate(ticker="BAJAJ-AUTO.NS", weight=0.1, quantity=1.0, buy_price=100.0)
+    assert hyphen.ticker == "BAJAJ-AUTO.NS"
+    bse = PortfolioPositionCreate(ticker="500112.BO", weight=0.1, quantity=1.0, buy_price=100.0)
+    assert bse.ticker == "500112.BO"
+
+    with pytest.raises(ValidationError):
+        PortfolioPositionCreate(ticker="BAD TICKER!", weight=0.1, quantity=1.0, buy_price=100.0)
+    with pytest.raises(ValidationError):
+        PortfolioPositionCreate(ticker="A" * 21, weight=0.1, quantity=1.0, buy_price=100.0)
+    with pytest.raises(ValidationError):
+        PortfolioPositionCreate(ticker=123, weight=0.1, quantity=1.0, buy_price=100.0)
+
+
 # --- (3) DB ticker widths -----------------------------------------------------
 
 def test_db_ticker_columns_width_20():

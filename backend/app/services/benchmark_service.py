@@ -18,15 +18,16 @@ logger = setup_logger(__name__)
 
 BENCHMARK_SYMBOL = "^NSEI"  # NIFTY 50
 
+# Close-price column candidates, in DataService (lowercase) and yfinance
+# (Title-case) spellings — single source shared by frame and series readers.
+_CLOSE_CANDIDATES = ("adj_close", "close", "Adj Close", "Close")
+
 
 def _close_series(df: pd.DataFrame) -> Optional[pd.Series]:
     """Date-indexed close-price series from any DataService frame shape."""
     if df is None or df.empty:
         return None
-    price_col = next(
-        (c for c in ("adj_close", "close", "Adj Close", "Close") if c in df.columns),
-        None,
-    )
+    price_col = next((c for c in _CLOSE_CANDIDATES if c in df.columns), None)
     if price_col is None:
         return None
     values = df[price_col]
@@ -65,7 +66,8 @@ class BenchmarkService:
             if dcol in out.columns:
                 out.index = pd.to_datetime(out[dcol], errors="coerce")
                 break
-        return out.dropna(subset=["close"] if "close" in out.columns else [])
+        close_col = next((c for c in _CLOSE_CANDIDATES if c in out.columns), None)
+        return out.dropna(subset=[close_col]) if close_col else out
 
     async def get_returns(
         self,
@@ -79,7 +81,10 @@ class BenchmarkService:
         if not start:
             start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        df = await self.ensure_history(days=days)
+        # Fetch must cover the requested window: derive the calendar span
+        # from start when it reaches further back than the days default.
+        span_days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+        df = await self.ensure_history(days=max(days, span_days))
         series = _close_series(df)
         if series is None:
             logger.warning("No benchmark data available for %s", BENCHMARK_SYMBOL)
@@ -89,20 +94,3 @@ class BenchmarkService:
         returns = series.pct_change().dropna()
         returns.name = "benchmark"
         return returns if not returns.empty else None
-
-
-_service_registry: dict = {}
-
-
-def get_benchmark_service(db_session) -> BenchmarkService:
-    """Request-scoped instance keyed by session identity (DI-friendly)."""
-    key = id(db_session)
-    svc = _service_registry.get(key)
-    if svc is None:
-        svc = BenchmarkService(db_session)
-        _service_registry[key] = svc
-        # opportunistic cleanup so the registry cannot grow unbounded
-        if len(_service_registry) > 64:
-            for k in list(_service_registry.keys())[:-32]:
-                _service_registry.pop(k, None)
-    return svc

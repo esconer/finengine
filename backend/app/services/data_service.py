@@ -1,16 +1,18 @@
 """
-Data service for fetching market data using yfinance as primary source
-Configured with Indian market focus (.NS and .BO suffixes)
+Data service for fetching market data via a user-selectable 3-tier cascade:
+bfinance/yfinance (per source preference) first, Alpha Vantage last.
+Indian market focus (.NS and .BO suffixes).
 """
 
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+import bfinance
 import yfinance as yf
 from zoneinfo import ZoneInfo
 
@@ -18,7 +20,7 @@ from app.utils.logger import setup_logger
 from app.services.cache_service import CacheService
 from app.services.alpha_vantage_service import get_alpha_vantage_service
 from app.services.source_preference_service import get_primary_source, source_order_for
-from app.models.database import StockTimeseries
+from app.models.database import StockTimeseries, AppSetting
 from app.config import settings
 
 logger = setup_logger(__name__)
@@ -116,10 +118,21 @@ class DataService:
 
     _in_memory_df_cache: Dict[str, Any] = {}
 
+    # Short-TTL quote memo (canonical ticker -> (ts, payload)); cleared by clear_market_data_cache
+    _quote_memo: Dict[str, Any] = {}
+    _quote_memo_ttl = 30.0
+
+    # Module-load identities for mock detection (tests patch these attributes)
+    _YF_TICKER_REAL = staticmethod(yf.Ticker)
+    _YF_DOWNLOAD_REAL = staticmethod(yf.download)
+    _BF_TICKER_REAL = staticmethod(bfinance.Ticker)
+    _BF_DOWNLOAD_REAL = staticmethod(bfinance.download)
+
     # Deep-cache horizon: vendor-max backfills download up to 10y back from
     # `end`, regardless of the requested window. L1 keeps a 5-min TTL.
     DEEP_CACHE_YEARS = 10
     _L1_TTL_SECONDS = 300
+    _l1_ttl = _L1_TTL_SECONDS
 
     @classmethod
     def _deep_start(cls, start: str, end: str) -> str:
@@ -195,7 +208,7 @@ class DataService:
         lo, hi = bounds
         if req_start < lo or req_end > hi:
             return None
-        if (req_end - hi).days >= 3 and (datetime.utcnow() - req_end).days <= 2:
+        if (req_end - hi).days >= 3 and (datetime.now(timezone.utc).replace(tzinfo=None) - req_end).days <= 2:
             return None
         try:
             return self._slice_window(self._as_column_frame(full_df), req_start, req_end)
@@ -344,11 +357,21 @@ class DataService:
             if not force_refresh:
                 async with self._db_lock:
                     cached_data = await self._get_cached_data(normalized_ticker, start, end)
-                    full_frame = await self._get_full_cached_frame(normalized_ticker) if cached_data is not None else None
+                    # Skip full-frame reload when L1 is already live within TTL
+                    l1_live = (
+                        normalized_ticker in self._in_memory_df_cache
+                        and now_ts - self._in_memory_df_cache[normalized_ticker][0] < self._l1_ttl
+                    )
+                    full_frame = (
+                        await self._get_full_cached_frame(normalized_ticker)
+                        if cached_data is not None and not l1_live
+                        else None
+                    )
                 if cached_data is not None:
                     served = self._as_column_frame(cached_data)
-                    self._in_memory_df_cache[normalized_ticker] = (
-                        now_ts, full_frame if full_frame is not None else served)
+                    if not l1_live:
+                        self._in_memory_df_cache[normalized_ticker] = (
+                            now_ts, full_frame if full_frame is not None else served)
                     return served
 
             # Vendor cascade per user preference: [primary, secondary], Alpha Vantage last
@@ -375,12 +398,16 @@ class DataService:
                         df = self._normalize_yfinance_data(df, normalized_ticker)
 
                         if df.empty:
-                            return df
+                            # Unnormalizable frame (e.g. missing Adj Close):
+                            # treat as a failed attempt so remaining retries
+                            # and the Alpha Vantage tier still run.
+                            continue
 
                         # Store in database cache + log the attempt; both touch
                         # the shared session, so keep them inside the DB gate
                         async with self._db_lock:
                             await self._store_timeseries_data(normalized_ticker, df, source_used=actual_source)
+                            await self._set_backfill_marker(normalized_ticker)
                             await self.cache.log_fetch_attempt(
                                 ticker=normalized_ticker,
                                 status="success",
@@ -430,10 +457,16 @@ class DataService:
             Dictionary with quote data or None if failed
         """
         try:
-            # Normalize ticker for Indian market
+            # Normalize ticker for Indian market (needed on the exception path too)
             normalized_ticker = self._normalize_indian_ticker(ticker)
             is_indian = self._is_indian_ticker(normalized_ticker)
             logger.debug(f"Fetching quote for {ticker} -> {normalized_ticker}")
+
+            # Short-TTL in-process memo (dashboard/WS/portfolio refresh hammer)
+            now_ts = time.time()
+            memo = self._quote_memo.get(normalized_ticker)
+            if memo is not None and now_ts - memo[0] < self._quote_memo_ttl:
+                return memo[1]
 
             # Vendor cascade per user preference: [primary, secondary]
             source_order = await self._resolve_source_order()
@@ -537,14 +570,23 @@ class DataService:
                 }
 
             def _sync_fetch() -> Optional[Dict[str, Any]]:
-                import unittest.mock
-                # Under mocked yfinance (unit tests), skip real network vendors
-                # and let the yfinance mock serve regardless of preference order.
-                is_yf_mocked = isinstance(yf.Ticker, (unittest.mock.Mock, unittest.mock.MagicMock))
+                # Identity check against module-load originals: tests that
+                # patch these attributes replace them, so a non-identity
+                # means mocked mode. Skip the REAL bfinance tier only when
+                # yfinance is mocked alone; a patched bfinance is intentional
+                # and must stay usable.
+                is_yf_mocked = (
+                    yf.Ticker is not DataService._YF_TICKER_REAL
+                    or yf.download is not DataService._YF_DOWNLOAD_REAL
+                )
+                is_bf_mocked = (
+                    bfinance.Ticker is not DataService._BF_TICKER_REAL
+                    or bfinance.download is not DataService._BF_DOWNLOAD_REAL
+                )
 
                 for source in source_order:
                     if source == "bfinance":
-                        if is_yf_mocked:
+                        if is_yf_mocked and not is_bf_mocked:
                             continue
                         quote = _fetch_bf_quote()
                     else:
@@ -556,13 +598,14 @@ class DataService:
             quote_data = await asyncio.to_thread(_sync_fetch)
             if quote_data:
                 logger.debug(f"Successfully fetched quote for {normalized_ticker}: {quote_data['current_price']}")
+                self._quote_memo[normalized_ticker] = (now_ts, quote_data)
                 return quote_data
 
             return await self._fallback_quote(ticker, normalized_ticker)
             
         except Exception as e:
             logger.error(f"Error fetching quote for {ticker}: {e}")
-            return await self._fallback_quote(ticker, ticker.upper().strip())
+            return await self._fallback_quote(ticker, normalized_ticker)
     
     async def fetch_ohlcv_batch(
         self, 
@@ -646,9 +689,23 @@ class DataService:
 
             source_order = await self._resolve_source_order()
 
+            # Identity check against module-load originals (see fetch_quote):
+            # skip the REAL bfinance tier only when yfinance is mocked alone;
+            # a patched bfinance is intentional and must stay usable.
+            is_yf_mocked = (
+                yf.Ticker is not DataService._YF_TICKER_REAL
+                or yf.download is not DataService._YF_DOWNLOAD_REAL
+            )
+            is_bf_mocked = (
+                bfinance.Ticker is not DataService._BF_TICKER_REAL
+                or bfinance.download is not DataService._BF_DOWNLOAD_REAL
+            )
+
             for source in source_order:
                 try:
                     if source == "bfinance":
+                        if is_yf_mocked and not is_bf_mocked:
+                            continue
                         def _bf_validate() -> bool:
                             import bfinance as bf
                             bt = bf.Ticker(normalized_ticker)
@@ -657,9 +714,11 @@ class DataService:
                             return bool(price and price > 0)
                         valid = await asyncio.to_thread(_bf_validate)
                     else:
-                        stock = yf.Ticker(normalized_ticker)
-                        hist = stock.history(period="5d")
-                        valid = not hist.empty
+                        def _yf_validate() -> bool:
+                            stock = yf.Ticker(normalized_ticker)
+                            hist = stock.history(period="5d")
+                            return not hist.empty
+                        valid = await asyncio.to_thread(_yf_validate)
 
                     if valid:
                         logger.info(f"Ticker {normalized_ticker} is valid (source: {source})")
@@ -686,9 +745,11 @@ class DataService:
             normalized_ticker = self._normalize_indian_ticker(ticker)
             stock = yf.Ticker(normalized_ticker)
             
-            # Get splits and dividends
-            splits = stock.splits
-            dividends = stock.dividends
+            def _fetch_actions():
+                return stock.splits, stock.dividends
+
+            # Get splits and dividends (sync yfinance I/O off the event loop)
+            splits, dividends = await asyncio.to_thread(_fetch_actions)
             
             return {
                 "ticker": normalized_ticker.upper(),
@@ -730,14 +791,16 @@ class DataService:
             loop = asyncio.get_event_loop()
 
             def download():
-                import unittest.mock
-                is_yf_mocked = isinstance(yf.download, (unittest.mock.Mock, unittest.mock.MagicMock))
+                # Identity check against module-load originals (see fetch_quote):
+                # skip the REAL bfinance tier only when yfinance is mocked alone.
+                is_yf_mocked = yf.download is not DataService._YF_DOWNLOAD_REAL
+                is_bf_mocked = bfinance.download is not DataService._BF_DOWNLOAD_REAL
 
                 for source in order:
                     try:
                         if source == "bfinance":
-                            if is_yf_mocked:
-                                continue  # mocked yfinance tests must not hit real vendors
+                            if is_yf_mocked and not is_bf_mocked:
+                                continue  # mocked yfinance must not hit real vendors
                             import bfinance as bf
                             df_src = bf.download(
                                 ticker,
@@ -763,7 +826,11 @@ class DataService:
                         logger.debug(f"{source} download failed for {ticker}: {src_err}")
                 return None
 
-            # Run with timeout
+            # Run with timeout. NOTE: wait_for cannot cancel the worker thread
+            # on timeout — a timed-out download keeps running while retries
+            # stack (ceiling: 3 stacked downloads/ticker × 5 batch workers).
+            # ponytail: accepted limitation; upgrade path = cancellable pool +
+            # per-ticker single-flight if timeout storms become a problem.
             df = await asyncio.wait_for(
                 loop.run_in_executor(None, download),
                 timeout=self.yfinance_timeout
@@ -807,6 +874,7 @@ class DataService:
                 source_used="alphavantage",
             )
             await self._store_timeseries_data(normalized_ticker, df, source_used="alphavantage")
+            await self._set_backfill_marker(normalized_ticker)
         logger.info(
             f"Fallback succeeded via Alpha Vantage for {normalized_ticker}: {len(df)} records"
         )
@@ -837,7 +905,7 @@ class DataService:
                 fallback_attempt=True,
                 source_used="alphavantage",
             )
-        q.setdefault("is_indian", ".BSE" in normalized_ticker.upper())
+        q.setdefault("is_indian", self._is_indian_ticker(normalized_ticker))
         return q
     
     def _normalize_yfinance_data(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -929,9 +997,28 @@ class DataService:
             # If caller requested >60 days but cached data starts more than 30 days after requested start,
             # or if cached count is too sparse for requested window, check if we fetched recently (within 1 hour)
             if req_days > 60:
-                if (earliest_cached - req_start).days > 30 or len(records) < min(30, int(req_days * 0.3)):
+                start_gap_too_big = (earliest_cached - req_start).days > 30
+                too_sparse = len(records) < min(30, int(req_days * 0.3))
+                if start_gap_too_big or too_sparse:
+                    # Deep backfill marker: after a successful 10y download the
+                    # coverage is authoritative even if the asset's real history
+                    # starts late (IPO/new ETF). Wall-clock grace alone left
+                    # partial-history tickers in a perpetual refetch loop.
+                    marker_key = f"deep_backfill:{ticker}"
+                    marker_q = await self.db.execute(
+                        select(AppSetting).where(AppSetting.key == marker_key)
+                    )
+                    marker = marker_q.scalar_one_or_none()
+                    marker_ok = False
+                    if marker and marker.value:
+                        try:
+                            marker_ok = datetime.fromisoformat(marker.value) >= earliest_cached
+                        except ValueError:
+                            marker_ok = False
                     latest_fetched = max((r.fetched_on for r in records if r.fetched_on), default=None)
-                    if latest_fetched and (datetime.utcnow() - latest_fetched).total_seconds() < 3600:
+                    if marker_ok:
+                        logger.debug(f"Deep-backfill marker covers start gap for {ticker}")
+                    elif latest_fetched and (datetime.now(timezone.utc).replace(tzinfo=None) - latest_fetched).total_seconds() < 3600:
                         logger.debug(f"Using recent partial cache for {ticker} ({len(records)} records)")
                     else:
                         logger.info(f"Cache miss for {ticker}: cached has {len(records)} records from {earliest_cached.date()}, requested from {req_start.date()}")
@@ -939,9 +1026,9 @@ class DataService:
 
             # Check if cached data is stale at the end (missing latest 3+ days when req_end is recent)
             latest_cached = pd.to_datetime(records[-1].date)
-            if (req_end - latest_cached).days >= 3 and (datetime.utcnow() - req_end).days <= 2:
+            if (req_end - latest_cached).days >= 3 and (datetime.now(timezone.utc).replace(tzinfo=None) - req_end).days <= 2:
                 latest_fetched = max((r.fetched_on for r in records if r.fetched_on), default=None)
-                if not latest_fetched or (datetime.utcnow() - latest_fetched).total_seconds() >= 3600:
+                if not latest_fetched or (datetime.now(timezone.utc).replace(tzinfo=None) - latest_fetched).total_seconds() >= 3600:
                     logger.info(f"Cache stale for {ticker}: latest cached date is {latest_cached.date()}, requested up to {req_end.date()}")
                     return None
             
@@ -981,10 +1068,10 @@ class DataService:
             if validation_errors:
                 logger.warning(f"Data validation warnings for {ticker}: {validation_errors}")
             
-            # Convert DataFrame to list of StockTimeseries objects
-            records = []
-            for _, row in df.iterrows():
-                record_data = {
+            # Convert DataFrame to list of upsert dicts (to_dict beats iterrows)
+            fetched_on = datetime.now(timezone.utc).replace(tzinfo=None)
+            records = [
+                {
                     'ticker': ticker.upper(),
                     'date': row['date'],
                     'open': float(row['open']),
@@ -995,9 +1082,10 @@ class DataService:
                     'volume': int(row['volume']),
                     'source_used': source_used,
                     'fetch_status': 'fresh',
-                    'fetched_on': datetime.utcnow()
+                    'fetched_on': fetched_on,
                 }
-                records.append(record_data)
+                for row in df.to_dict("records")
+            ]
             
             if not records:
                 return
@@ -1022,9 +1110,6 @@ class DataService:
             await self.db.commit()
             
             logger.info(f"Successfully atomic upserted {len(records)} records for {ticker}")
-            
-            # Log data integrity metrics
-            await self._log_storage_metrics(ticker, len(records), 0)
             
         except Exception as e:
             logger.error(f"Error storing timeseries data for {ticker}: {e}")
@@ -1088,26 +1173,27 @@ class DataService:
         
         return errors
     
-    async def _log_storage_metrics(self, ticker: str, stored_count: int, replaced_count: int) -> None:
-        """Log storage-metric warnings.
+    async def _set_backfill_marker(self, ticker: str) -> None:
+        """Persist that a deep-window backfill completed for this ticker.
 
-        Deliberately does NOT write a FetchLog row: the success path already
-        records one via log_fetch_attempt with the real source_used, and this
-        second hardcoded-yfinance row duplicated it (two rows per fetch, the
-        extra one mislabeled).
+        Written under the caller's DB lock. Value = ISO wall-clock timestamp
+        of completion; `_get_cached_data` compares it against the earliest
+        cached row so late-starting real history counts as authoritative.
         """
         try:
-            total_operations = stored_count + replaced_count
-            replacement_ratio = replaced_count / total_operations if total_operations > 0 else 0
-
-            # Log high replacement ratio as warning
-            if replacement_ratio > 0.5:
-                logger.warning(f"High replacement ratio for {ticker}: {replacement_ratio:.2%} "
-                             f"({replaced_count}/{total_operations} operations)")
-
+            marker_key = f"deep_backfill:{ticker}"
+            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            stmt = sqlite_insert(AppSetting).values(key=marker_key, value=now_iso)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['key'],
+                set_={'value': now_iso},
+            )
+            await self.db.execute(stmt)
+            await self.db.commit()
         except Exception as e:
-            logger.error(f"Error logging storage metrics: {e}")
-    
+            logger.debug(f"Could not write backfill marker for {ticker}: {e}")
+            await self.db.rollback()
+
     def _analyze_storage_error(self, ticker: str, df: pd.DataFrame, error: Exception) -> None:
         """Analyze storage errors to provide better debugging information"""
         try:
@@ -1134,11 +1220,9 @@ class DataService:
         except Exception as analysis_error:
             logger.error(f"Error in storage error analysis: {analysis_error}")
             
-    async def check_data_integrity(self, ticker: str = None) -> Dict[str, Any]:
+    async def check_data_integrity(self, ticker: Optional[str] = None) -> Dict[str, Any]:
         """Check data integrity for specified ticker or entire database"""
         try:
-            from sqlalchemy import func, select
-            
             if ticker:
                 # Check specific ticker
                 query = select(func.count()).select_from(StockTimeseries).where(

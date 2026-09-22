@@ -4,7 +4,8 @@ Implements Engle-Granger two-step test, Johansen rank test, OLS hedge ratio esti
 Ornstein-Uhlenbeck (OU) mean-reversion speed/half-life, spread z-scores, and caching.
 """
 
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,10 +34,42 @@ CACHE_TTL_HOURS = 24
 COINT_DB_TICKER = "COINT"
 
 
-def _db_cache_keys(ticker_a: str, ticker_b: str, last_date: str) -> Tuple[str, str]:
-    """Collision-free (ticker, metric_name) for a pair-day within column sizes."""
-    digest = sha1(f"{ticker_a}|{ticker_b}".encode("utf-8")).hexdigest()[:8]
+def _utcnow() -> datetime:
+    """Naive UTC now: datetime.utcnow() replacement (DeprecationWarning on
+    Python >= 3.12). Strips tz so stored values stay comparable with legacy
+    cached rows (aware vs naive subtraction would raise TypeError)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _db_cache_keys(
+    ticker_a: str,
+    ticker_b: str,
+    last_date: str,
+    p_value_threshold: float = 0.05,
+    include_spread_series: bool = False,
+) -> Tuple[str, str]:
+    """Collision-free (ticker, metric_name) for a pair-day-params within column sizes.
+
+    Result-affecting query params (p threshold, spread inclusion) are digested
+    into the metric name: a p=0.05 scan must not be served for p=0.10 after restarts.
+    """
+    raw = f"{ticker_a}|{ticker_b}|{p_value_threshold}|{int(include_spread_series)}"
+    digest = sha1(raw.encode("utf-8")).hexdigest()[:8]
     return COINT_DB_TICKER, f"coint_{digest}_{last_date}"
+
+
+def _mem_cache_key(
+    ticker_a: str,
+    ticker_b: str,
+    last_date: str,
+    p_value_threshold: float = 0.05,
+    include_spread_series: bool = False,
+) -> str:
+    """Single source of truth for the in-memory key; mirrors _db_cache_keys' param set."""
+    return (
+        f"coint_{ticker_a}_{ticker_b}_{last_date}"
+        f"_{p_value_threshold}_{int(include_spread_series)}"
+    )
 
 
 def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
@@ -249,15 +282,20 @@ class CointegrationService:
         self.cache_service = cache_service
 
     async def _get_cached_pair(
-        self, ticker_a: str, ticker_b: str, last_date: str
+        self,
+        ticker_a: str,
+        ticker_b: str,
+        last_date: str,
+        p_value_threshold: float = 0.05,
+        include_spread_series: bool = False,
     ) -> Optional[CointPairResult]:
         """Check in-memory cache and DB cache for computed pair result"""
-        cache_key = f"coint_{ticker_a}_{ticker_b}_{last_date}"
+        cache_key = _mem_cache_key(ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series)
 
         # 1. In-memory check
         if cache_key in _IN_MEMORY_COINT_CACHE:
             ts, data = _IN_MEMORY_COINT_CACHE[cache_key]
-            if datetime.utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS):
+            if _utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS):
                 try:
                     return CointPairResult(**data)
                 except Exception:
@@ -266,7 +304,9 @@ class CointegrationService:
         # 2. Database check
         if self.cache_service is not None:
             try:
-                db_ticker, metric_name = _db_cache_keys(ticker_a, ticker_b, last_date)
+                db_ticker, metric_name = _db_cache_keys(
+                    ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series
+                )
                 cached = await self.cache_service.get_cached_analytics(
                     ticker=db_ticker,
                     metric_name=metric_name,
@@ -275,7 +315,7 @@ class CointegrationService:
                     pair_data = cached["model_params"]
                     if pair_data.get("ticker_a") == ticker_a and pair_data.get("ticker_b") == ticker_b:
                         res = CointPairResult(**pair_data)
-                        _IN_MEMORY_COINT_CACHE[cache_key] = (datetime.utcnow(), pair_data)
+                        _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_data)
                         return res
             except Exception as e:
                 logger.debug(f"DB cache read error: {e}")
@@ -288,23 +328,34 @@ class CointegrationService:
         ticker_b: str,
         last_date: str,
         result: CointPairResult,
+        p_value_threshold: float = 0.05,
+        include_spread_series: bool = False,
     ) -> None:
         """Store pair result in memory and DB cache"""
-        cache_key = f"coint_{ticker_a}_{ticker_b}_{last_date}"
+        cache_key = _mem_cache_key(ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series)
         pair_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
 
         # 1. In-memory store
-        _IN_MEMORY_COINT_CACHE[cache_key] = (datetime.utcnow(), pair_dict)
+        _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_dict)
+        # Bounded memory: drop expired entries on every write (cache is
+        # per-key-per-day-per-params, so long-running scanners grow it otherwise)
+        now = _utcnow()
+        stale = [k for k, (ts, _) in _IN_MEMORY_COINT_CACHE.items()
+                 if now - ts >= timedelta(hours=CACHE_TTL_HOURS)]
+        for k in stale:
+            _IN_MEMORY_COINT_CACHE.pop(k, None)
 
         # 2. Database store
         if self.cache_service is not None:
             try:
-                db_ticker, metric_name = _db_cache_keys(ticker_a, ticker_b, last_date)
+                db_ticker, metric_name = _db_cache_keys(
+                    ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series
+                )
                 await self.cache_service.set_cached_analytics(
                     ticker=db_ticker,
                     metric_name=metric_name,
                     metric_value=float(result.engle_granger_pvalue),
-                    calculation_date=datetime.utcnow(),
+                    calculation_date=_utcnow(),
                     model_params=pair_dict,
                 )
             except Exception as e:
@@ -334,7 +385,7 @@ class CointegrationService:
 
         if n < 2:
             return CointScannerResponse(
-                as_of=datetime.utcnow().strftime("%Y-%m-%d"),
+                as_of=_utcnow().strftime("%Y-%m-%d"),
                 universe_size=n,
                 scanned_pairs_count=0,
                 cointegrated_pairs_count=0,
@@ -348,7 +399,7 @@ class CointegrationService:
                 all_dates.append(s.index[-1].strftime("%Y-%m-%d"))
             elif s is not None and not s.empty:
                 all_dates.append(str(s.index[-1])[:10])
-        as_of_date = max(all_dates) if all_dates else datetime.utcnow().strftime("%Y-%m-%d")
+        as_of_date = max(all_dates) if all_dates else _utcnow().strftime("%Y-%m-%d")
 
         pair_combinations = list(combinations(tickers, 2))
         scanned_count = 0
@@ -360,12 +411,17 @@ class CointegrationService:
             s2 = price_data[t2]
 
             # Check cache first
-            cached_result = await self._get_cached_pair(t1, t2, as_of_date)
+            cached_result = await self._get_cached_pair(
+                t1, t2, as_of_date, p_value_threshold, include_spread_series
+            )
             if cached_result is not None:
                 all_results.append(cached_result)
                 continue
 
-            pair_res = analyze_pair_cointegration(
+            # analyze_pair_cointegration is CPU-bound statsmodels work; run in a
+            # worker thread so the event loop stays responsive during scans.
+            pair_res = await asyncio.to_thread(
+                analyze_pair_cointegration,
                 ticker_a=t1,
                 ticker_b=t2,
                 series_a=s1,
@@ -375,7 +431,9 @@ class CointegrationService:
             )
 
             if pair_res is not None:
-                await self._set_cached_pair(t1, t2, as_of_date, pair_res)
+                await self._set_cached_pair(
+                    t1, t2, as_of_date, pair_res, p_value_threshold, include_spread_series
+                )
                 all_results.append(pair_res)
 
         # Filter and rank pairs
@@ -385,16 +443,25 @@ class CointegrationService:
 
         sorted_pairs = sorted(all_results, key=rank_key)
 
-        # If max_half_life is requested, filter cointegrated pairs or flag them
-        cointegrated_count = sum(
-            1 for p in sorted_pairs
-            if p.is_cointegrated and (max_half_life is None or (p.ou_half_life_days is not None and p.ou_half_life_days <= max_half_life))
-        )
+        # max_half_life: a cointegrated pair with missing/oversized OU half-life
+        # is filtered OUT of pairs (and the count) so the response invariant
+        # count == sum(p.is_cointegrated for p in pairs) holds. Non-cointegrated
+        # pairs remain listed (they are never counted).
+        def half_life_ok(p: CointPairResult) -> bool:
+            if max_half_life is None:
+                return True
+            return p.ou_half_life_days is not None and p.ou_half_life_days <= max_half_life
+
+        kept_pairs = [
+            p for p in sorted_pairs
+            if (not p.is_cointegrated) or half_life_ok(p)
+        ]
+        cointegrated_count = sum(1 for p in kept_pairs if p.is_cointegrated)
 
         return CointScannerResponse(
             as_of=as_of_date,
             universe_size=n,
             scanned_pairs_count=scanned_count,
             cointegrated_pairs_count=cointegrated_count,
-            pairs=sorted_pairs,
+            pairs=kept_pairs,
         )

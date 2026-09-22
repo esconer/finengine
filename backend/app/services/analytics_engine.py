@@ -3,17 +3,24 @@ Real-time Analytics Engine for Portfolio Risk Calculations
 Implements comprehensive financial analytics using quantstats, arch, and statsmodels
 """
 
+import asyncio
+import re
+
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Any
 import warnings
 
-warnings.filterwarnings('ignore')
-
 # Financial analytics libraries
 from arch import arch_model
+try:
+    from arch.utility.exceptions import ConvergenceWarning
+    warnings.filterwarnings('ignore', category=ConvergenceWarning)
+except ImportError:  # pragma: no cover - arch layout guard
+    ConvergenceWarning = None
 import statsmodels.api as sm
 
+from app.config import settings
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -25,7 +32,7 @@ class AnalyticsEngine:
     """
     
     def __init__(self):
-        self.risk_free_rate = 0.02  # 2% annual risk-free rate
+        self.risk_free_rate = settings.risk_free_rate  # Settings default: 2% annual
         
     async def calculate_portfolio_metrics(
         self, 
@@ -60,8 +67,9 @@ class AnalyticsEngine:
             else:
                 # Normalize weights to sum to 1
                 weight_sum = sum(weights.values())
-                if weight_sum > 0:
-                    weights = {k: v/weight_sum for k, v in weights.items()}
+                if weight_sum <= 0:
+                    return self._empty_metrics()
+                weights = {k: v/weight_sum for k, v in weights.items()}
             
             # Calculate portfolio returns
             portfolio_returns = self._calculate_portfolio_returns(returns, weights)
@@ -103,7 +111,7 @@ class AnalyticsEngine:
         """
         try:
             if len(returns) < 30:  # Need sufficient data
-                return self._empty_forecast()
+                return self._empty_forecast(model=model.upper())
             
             if model.upper() == "GARCH":
                 return await self._garch_forecast(returns, horizon)
@@ -116,7 +124,7 @@ class AnalyticsEngine:
                 
         except Exception as e:
             logger.error(f"Error in volatility forecast: {e}")
-            return self._empty_forecast()
+            return self._empty_forecast(model=model.upper())
     
     async def factor_exposure_analysis(
         self, 
@@ -139,8 +147,9 @@ class AnalyticsEngine:
             if price_data.empty or len(price_data.columns) == 0:
                 return self._empty_factor_exposure()
             
-            cleaned_prices = price_data.sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            # Keep raw NaN so the regression active mask can separate
+            # pre-listing gaps from genuine 0% return days.
+            returns = price_data.sort_index().pct_change(fill_method=None)
             if returns.empty or len(returns) < 2:
                 return self._empty_factor_exposure()
             returns = returns.iloc[1:]
@@ -166,16 +175,14 @@ class AnalyticsEngine:
                     benchmark_returns = benchmark_data.dropna()
             
             exposures_result = self._calculate_factor_exposures(returns, benchmark_returns, weights)
-            r2 = self._calculate_r_squared(returns, benchmark_returns, weights)
-            adj_r2 = self._calculate_adjusted_r_squared(returns, benchmark_returns, weights)
-
             results = {
-                'portfolio': exposures_result.get('portfolio', {'alpha': 0.0, 'market': 1.0}),
+                'portfolio': exposures_result.get('portfolio') or {'alpha': None, 'market': None},
                 'positions': exposures_result.get('positions', {}),
-                'r_squared': r2,
-                'adjusted_r_squared': adj_r2
+                'r_squared': exposures_result.get('r_squared'),
+                'adjusted_r_squared': exposures_result.get('adjusted_r_squared'),
             }
-            
+            if exposures_result.get('error'):
+                results['error'] = exposures_result['error']
             return results
             
         except Exception as e:
@@ -314,7 +321,7 @@ class AnalyticsEngine:
                 # Tier 4: Smallcap / Lower Turnover (< 2 Cr/day)
                 else:
                     score = max(2.5, min(5.9, 3.0 + (daily_turnover / 2e7) * 2.9))
-                    category = "Low" if score < 6.0 else "Medium"
+                    category = "Low"
                     spread = round(max(0.0025, 0.0060 - (daily_turnover / 2e7) * 0.0030), 4)
                     liquidation_days = "5-10"
                 
@@ -476,14 +483,16 @@ class AnalyticsEngine:
 
             matched_scenario = None
             for k, cfg in scenarios_config.items():
-                if k in scenario_key or scenario_key in k:
+                if scenario_key and (k in scenario_key or scenario_key in k):
                     matched_scenario = (k, cfg)
                     break
             
             if not matched_scenario:
-                # Custom shock if present in scenario string
+                # Custom shock: parse a signed percentage if present, else fixed -20%
+                shock_match = re.search(r'([+-]?\d+(?:\.\d+)?)\s*%', scenario or "")
+                custom_shock = float(shock_match.group(1)) / 100.0 if shock_match else -0.20
                 matched_scenario = ("custom_stress", {
-                    "market_shock": -0.20,
+                    "market_shock": custom_shock,
                     "recovery_months": 12,
                     "description": scenario or "Custom Scenario Shock",
                     "sectors": {}
@@ -737,9 +746,11 @@ class AnalyticsEngine:
             
             # Correlation risk (20% weight)
             if len(returns.columns) > 1:
-                avg_correlation = returns.corr().values[np.triu_indices_from(returns.corr().values, k=1)].mean()
+                corr_values = returns.corr().values
+                avg_correlation = corr_values[np.triu_indices_from(corr_values, k=1)].mean()
                 correlation_score = min(30, max(0, (avg_correlation - 0.3) * 50))  # High correlation = high risk
             else:
+                avg_correlation = 0.0
                 correlation_score = 0
             scores['correlation'] = correlation_score
             
@@ -749,8 +760,12 @@ class AnalyticsEngine:
             excluded: list[str] = []
             if benchmark_data is not None and not benchmark_data.empty:
                 factor_result = await self.factor_exposure_analysis(price_data, benchmark_data=benchmark_data)
-                r_squared = factor_result.get('r_squared', 0)
-                factor_score: Optional[float] = min(30, (1 - r_squared) * 100)
+                r_squared = factor_result.get('r_squared')
+                if r_squared is None:
+                    factor_score = None
+                    excluded.append('factor_risk')
+                else:
+                    factor_score = min(30, (1 - r_squared) * 100)
             else:
                 r_squared = None
                 factor_score = None
@@ -822,17 +837,10 @@ class AnalyticsEngine:
     def _calculate_portfolio_returns(self, returns: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
         """Calculate weighted portfolio returns"""
         try:
-            weight_vector = []
-            for col in returns.columns:
-                weight_vector.append(weights.get(col, 0))
-            
-            weight_vector = np.array(weight_vector)
-            if len(weight_vector) != len(returns.columns):
-                return pd.Series(dtype=float)
-            
+            weight_vector = np.array([weights.get(col, 0) for col in returns.columns])
             portfolio_returns = (returns * weight_vector).sum(axis=1)
             return portfolio_returns
-        except:
+        except Exception:
             return pd.Series(dtype=float)
     
     def _calculate_basic_metrics(self, returns: pd.Series) -> Dict[str, float]:
@@ -873,7 +881,7 @@ class AnalyticsEngine:
                 "sortino_ratio": sortino_ratio,
                 "hit_ratio": hit_ratio
             }
-        except:
+        except Exception:
             return {}
     
     def _calculate_risk_metrics(self, returns: pd.Series) -> Dict[str, float]:
@@ -892,7 +900,7 @@ class AnalyticsEngine:
                 "var_95": var_95,
                 "cvar_95": cvar_95
             }
-        except:
+        except Exception:
             return {}
     
     def _calculate_drawdown_metrics(self, returns: pd.Series) -> Dict[str, float]:
@@ -910,7 +918,7 @@ class AnalyticsEngine:
             return {
                 "max_drawdown": max_drawdown
             }
-        except:
+        except Exception:
             return {}
     
     def _calculate_return_distribution(self, returns: pd.Series) -> Dict[str, float]:
@@ -923,7 +931,7 @@ class AnalyticsEngine:
                 "skewness": returns.skew(),
                 "kurtosis": returns.kurtosis()
             }
-        except:
+        except Exception:
             return {}
     
     def _calculate_position_metrics(
@@ -964,7 +972,7 @@ class AnalyticsEngine:
                     }
             
             return position_metrics
-        except:
+        except Exception:
             return {}
             
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
@@ -974,12 +982,14 @@ class AnalyticsEngine:
             clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
             clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             if len(clean_returns) < 20:
-                return self._empty_forecast(h)
+                return self._empty_forecast(h, "GARCH")
 
             # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
-            fitted_model = model.fit(disp='off', show_warning=False, options={'maxiter': 100})
+            fitted_model = await asyncio.to_thread(
+                lambda: model.fit(disp='off', show_warning=False, options={'maxiter': 100})
+            )
             
             # Generate analytical forecast (fast O(1) computation instead of 1000 simulation paths)
             forecast = fitted_model.forecast(horizon=h, method='analytic')
@@ -1005,7 +1015,7 @@ class AnalyticsEngine:
             }
         except Exception as e:
             logger.error(f"GARCH forecast error: {e}")
-            return self._empty_forecast(h)
+            return self._empty_forecast(h, "GARCH")
     
     async def _egarch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EGARCH volatility forecast"""
@@ -1014,12 +1024,14 @@ class AnalyticsEngine:
             clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
             clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             if len(clean_returns) < 20:
-                return self._empty_forecast(h)
+                return self._empty_forecast(h, "EGARCH")
 
             # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
-            fitted_model = model.fit(disp='off', show_warning=False)
+            fitted_model = await asyncio.to_thread(
+                lambda: model.fit(disp='off', show_warning=False)
+            )
             
             # Generate forecast
             forecast = fitted_model.forecast(horizon=h)
@@ -1045,7 +1057,7 @@ class AnalyticsEngine:
             }
         except Exception as e:
             logger.error(f"EGARCH forecast error: {e}")
-            return self._empty_forecast(h)
+            return self._empty_forecast(h, "EGARCH")
     
     def _ewma_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EWMA volatility forecast (RiskMetrics 1996 single-pass recursion)."""
@@ -1081,7 +1093,7 @@ class AnalyticsEngine:
             }
         except Exception as e:
             logger.error(f"EWMA forecast error: {e}")
-            return self._empty_forecast(h)
+            return self._empty_forecast(h, "EWMA")
     
     def _calculate_factor_exposures(
         self, 
@@ -1090,11 +1102,20 @@ class AnalyticsEngine:
         weights: Dict[str, float]
     ) -> Dict[str, Any]:
         """Calculate factor exposures using OLS regression against market benchmark"""
+        err_portfolio = {
+            'alpha': None, 'annualized_alpha': None, 'market': None,
+            'is_limited_history': False, 'history_warning': None,
+            'data_points': 0, 'error': 'insufficient data for factor regression'
+        }
         try:
             if returns.empty:
-                return {'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0}, 'positions': {}}
+                return {
+                    'portfolio': dict(err_portfolio), 'positions': {},
+                    'r_squared': None, 'adjusted_r_squared': None,
+                    'error': 'insufficient data for factor regression'
+                }
 
-            positions_exp = {}
+            positions_exp: Dict[str, Any] = {}
             if not benchmark_returns.empty and len(benchmark_returns) > 10:
                 common_dates = returns.index.intersection(benchmark_returns.index)
                 if len(common_dates) > 10:
@@ -1104,49 +1125,51 @@ class AnalyticsEngine:
                     for ticker in aligned_returns.columns:
                         try:
                             s = aligned_returns[ticker]
-                            non_zero = s[s != 0.0]
-                            data_pts = len(non_zero)
+                            # dropna, not `!= 0.0`: keeps genuine 0% days, drops
+                            # pre-listing/no-trade NaN gaps
+                            active = s.dropna().index.intersection(aligned_benchmark.index)
+                            data_pts = int(len(active))
                             is_limited = data_pts < 30
 
                             if data_pts >= 10:
                                 # Active-history filter: regress only on days the asset
                                 # actually traded (zero-filled pre-listing rows would
                                 # attenuate beta toward 0). HAC SEs, statsmodels-local.
-                                active = s[s != 0.0].index.intersection(aligned_benchmark.index)
                                 X = sm.add_constant(aligned_benchmark.loc[active])
                                 y = s.loc[active]
                                 try:
                                     model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
                                 except Exception:
                                     model = sm.OLS(y, X).fit()
-                                alpha = float(model.params.iloc[0]) if len(model.params) > 0 else 0.0
-                                beta = float(model.params.iloc[1]) if len(model.params) > 1 else 1.0
+                                alpha = float(model.params.iloc[0]) if len(model.params) > 0 else None
+                                beta = float(model.params.iloc[1]) if len(model.params) > 1 else None
                             else:
-                                alpha = 0.0
-                                beta = 1.0
+                                alpha = None
+                                beta = None
 
                             positions_exp[ticker] = {
-                                'alpha': round(alpha, 6),
-                                'annualized_alpha': round(alpha * 252.0, 4),
-                                'market': round(beta, 4),
+                                'alpha': round(alpha, 6) if alpha is not None else None,
+                                'annualized_alpha': round(alpha * 252.0, 4) if alpha is not None else None,
+                                'market': round(beta, 4) if beta is not None else None,
                                 'is_limited_history': is_limited,
                                 'history_warning': f"Only {data_pts} active trading days in the analyzed window" if is_limited else None,
-                                'data_points': data_pts
+                                'data_points': data_pts,
+                                **({'error': 'insufficient history for factor regression'} if alpha is None else {})
                             }
                         except Exception:
                             positions_exp[ticker] = {
-                                'alpha': 0.0,
-                                'annualized_alpha': 0.0,
-                                'market': 1.0,
-                                'is_limited_history': False,
-                                'history_warning': None,
-                                'data_points': 0
+                                'alpha': None, 'annualized_alpha': None, 'market': None,
+                                'is_limited_history': False, 'history_warning': None,
+                                'data_points': 0, 'error': 'factor regression failed'
                             }
 
-                    port_returns = self._calculate_portfolio_returns(aligned_returns, weights)
+                    port_returns = self._calculate_portfolio_returns(aligned_returns, weights).dropna()
                     if not port_returns.empty:
                         try:
-                            port_active = port_returns[port_returns != 0.0].index.intersection(aligned_benchmark.index)
+                            # Portfolio is active when any constituent has a real
+                            # (non-NaN) return that day; 0% is a valid observation
+                            traded = aligned_returns.notna().any(axis=1)
+                            port_active = traded[traded].index.intersection(aligned_benchmark.index)
                             if len(port_active) < 10:
                                 raise ValueError("insufficient active portfolio history")
                             X_port = sm.add_constant(aligned_benchmark.loc[port_active])
@@ -1154,177 +1177,92 @@ class AnalyticsEngine:
                                 port_model = sm.OLS(port_returns.loc[port_active], X_port).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
                             except Exception:
                                 port_model = sm.OLS(port_returns.loc[port_active], X_port).fit()
-                            port_alpha = float(port_model.params.iloc[0]) if len(port_model.params) > 0 else 0.0
-                            port_beta = float(port_model.params.iloc[1]) if len(port_model.params) > 1 else 1.0
+                            port_alpha = float(port_model.params.iloc[0]) if len(port_model.params) > 0 else None
+                            port_beta = float(port_model.params.iloc[1]) if len(port_model.params) > 1 else None
+                            r_squared = round(float(port_model.rsquared), 4)
+                            adj_r_squared = round(float(max(0.0, port_model.rsquared_adj)), 4)
                             return {
                                 'portfolio': {
-                                    'alpha': round(port_alpha, 6),
-                                    'annualized_alpha': round(port_alpha * 252.0, 4),
-                                    'market': round(port_beta, 4)
+                                    'alpha': round(port_alpha, 6) if port_alpha is not None else None,
+                                    'annualized_alpha': round(port_alpha * 252.0, 4) if port_alpha is not None else None,
+                                    'market': round(port_beta, 4) if port_beta is not None else None
                                 },
-                                'positions': positions_exp
+                                'positions': positions_exp,
+                                'r_squared': r_squared,
+                                'adjusted_r_squared': adj_r_squared
                             }
-                        except Exception:
-                            pass
+                        except Exception as pe:
+                            logger.warning(f"Portfolio factor regression failed: {pe}")
+                            return {
+                                'portfolio': dict(err_portfolio),
+                                'positions': positions_exp,
+                                'r_squared': None, 'adjusted_r_squared': None,
+                                'error': 'portfolio factor regression failed'
+                            }
 
+            # No usable benchmark window: fill ONLY tickers not already computed
             for ticker in returns.columns:
-                positions_exp[ticker] = {
-                    'alpha': 0.0,
-                    'annualized_alpha': 0.0,
-                    'market': 1.0,
-                    'is_limited_history': False,
-                    'history_warning': None,
-                    'data_points': 0
-                }
+                if ticker not in positions_exp:
+                    positions_exp[ticker] = {
+                        'alpha': None, 'annualized_alpha': None, 'market': None,
+                        'is_limited_history': False, 'history_warning': None,
+                        'data_points': 0, 'error': 'insufficient data for factor regression'
+                    }
             return {
-                'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0},
-                'positions': positions_exp
+                'portfolio': dict(err_portfolio),
+                'positions': positions_exp,
+                'r_squared': None, 'adjusted_r_squared': None,
+                'error': 'insufficient data for factor regression'
             }
         except Exception as e:
             logger.error(f"Factor exposure calculation error: {e}")
-            return {'portfolio': {'alpha': 0.0, 'annualized_alpha': 0.0, 'market': 1.0}, 'positions': {}}
+            return {
+                'portfolio': dict(err_portfolio), 'positions': {},
+                'r_squared': None, 'adjusted_r_squared': None,
+                'error': 'factor exposure calculation failed'
+            }
 
-    def _calculate_r_squared(
-        self, 
-        returns: pd.DataFrame, 
-        benchmark_returns: pd.Series, 
-        weights: Dict[str, float]
-    ) -> float:
-        """Calculate portfolio R-squared against benchmark"""
-        try:
-            if not benchmark_returns.empty and len(benchmark_returns) > 10:
-                common_dates = returns.index.intersection(benchmark_returns.index)
-                if len(common_dates) > 10:
-                    aligned_returns = returns.loc[common_dates]
-                    aligned_benchmark = benchmark_returns.loc[common_dates]
-                    
-                    portfolio_returns = self._calculate_portfolio_returns(aligned_returns, weights)
-                    if not portfolio_returns.empty:
-                        X = sm.add_constant(aligned_benchmark)
-                        model = sm.OLS(portfolio_returns, X).fit()
-                        return round(float(model.rsquared), 4)
-            return 0.0
-        except Exception:
-            return 0.0
-
-    def _calculate_adjusted_r_squared(
-        self, 
-        returns: pd.DataFrame, 
-        benchmark_returns: pd.Series, 
-        weights: Dict[str, float]
-    ) -> float:
-        """Calculate adjusted R-squared against benchmark"""
-        try:
-            if not benchmark_returns.empty and len(benchmark_returns) > 10:
-                common_dates = returns.index.intersection(benchmark_returns.index)
-                if len(common_dates) > 10:
-                    aligned_returns = returns.loc[common_dates]
-                    aligned_benchmark = benchmark_returns.loc[common_dates]
-                    
-                    portfolio_returns = self._calculate_portfolio_returns(aligned_returns, weights)
-                    if not portfolio_returns.empty:
-                        X = sm.add_constant(aligned_benchmark)
-                        model = sm.OLS(portfolio_returns, X).fit()
-                        return round(float(max(0.0, model.rsquared_adj)), 4)
-            return 0.0
-        except Exception:
-            return 0.0
-    
-    def _calculate_max_drawdown(self, cumulative_returns: pd.Series) -> float:
-        """Calculate maximum drawdown"""
-        try:
-            if cumulative_returns.empty:
-                return 0
-            
-            peak = cumulative_returns.expanding().max()
-            drawdown = (cumulative_returns - peak) / peak
-            return drawdown.min()
-        except:
-            return 0
-    
-    def _simulate_stress_drawdown(self, weights: Dict[str, float]) -> float:
-        """Simulate stress drawdown based on weights"""
-        try:
-            # Simple stress simulation based on portfolio composition
-            # High weight in high-vol assets = higher stress
-            total_weight = sum(abs(w) for w in weights.values())
-            if total_weight == 0:
-                return -0.20
-            
-            # Simulate different stress levels based on concentration
-            largest_weight = max(abs(w) for w in weights.values()) if weights else 0
-            
-            if largest_weight > 0.5:
-                return -0.35  # High concentration stress
-            elif largest_weight > 0.3:
-                return -0.25  # Medium concentration stress
-            else:
-                return -0.15  # Diversified stress
-        except:
-            return -0.20
-    
-    def _estimate_recovery_time(self, drawdown_magnitude: float, scenario: str) -> int:
-        """Estimate recovery time in days"""
-        try:
-            # Simple recovery time estimation
-            base_recovery = 30  # Base recovery in days
-            
-            if "covid" in scenario.lower():
-                return int(base_recovery * 1.5)  # COVID took longer
-            elif "inflation" in scenario.lower():
-                return int(base_recovery * 1.2)  # Inflation recovery slower
-            elif drawdown_magnitude > 0.3:
-                return int(base_recovery * 1.3)  # Larger drawdowns take longer
-            elif drawdown_magnitude > 0.2:
-                return int(base_recovery * 1.1)
-            else:
-                return base_recovery
-        except:
-            return 30
-    
     # Empty result methods for error handling
     
     def _empty_metrics(self) -> Dict[str, Any]:
         return {
-            "annual_return": 0,
-            "annual_volatility": 0.20,
-            "sharpe_ratio": 0,
-            "sortino_ratio": 0,
-            "skewness": 0,
-            "kurtosis": 3,
-            "max_drawdown": 0,
-            "var_95": 0,
-            "cvar_95": 0,
-            "hit_ratio": 0.5,
+            "annual_return": None,
+            "annual_volatility": None,
+            "sharpe_ratio": None,
+            "sortino_ratio": None,
+            "skewness": None,
+            "kurtosis": None,
+            "max_drawdown": None,
+            "var_95": None,
+            "cvar_95": None,
+            "hit_ratio": None,
             "positions": {},
             "error": "Insufficient data for calculations"
         }
     
-    def _empty_forecast(self, horizon: int = 1) -> Dict[str, Any]:
+    def _empty_forecast(self, horizon: int = 1, model: str = "GARCH") -> Dict[str, Any]:
         h = max(1, horizon)
-        h_factor = np.sqrt(h / 252.0)
-        base_vol = 0.22
         return {
-            "model": "GARCH",
+            "model": model,
             "horizon": h,
-            "volatility_forecast": base_vol,
-            "var_forecast": float(-base_vol * 1.645 * h_factor),
-            "cvar_forecast": float(-base_vol * 2.06 * h_factor),
-            "confidence_interval": [0.18, 0.26],
-            "term_structure": [base_vol] * h,
-            "model_params": {"p": 1, "q": 1, "type": "GARCH"},
+            "volatility_forecast": None,
+            "var_forecast": None,
+            "cvar_forecast": None,
+            "confidence_interval": None,
+            "term_structure": None,
+            "model_params": None,
             "error": "Insufficient data for forecast"
         }
     
     def _empty_factor_exposure(self) -> Dict[str, Any]:
         return {
             "portfolio": {
-                "alpha": 0.0,
-                "market": 1.0
+                "alpha": None,
+                "market": None
             },
             "positions": {},
-            "r_squared": 0.0,
-            "adjusted_r_squared": 0.0,
+            "r_squared": None,
+            "adjusted_r_squared": None,
             "error": "Insufficient data for factor analysis"
         }
     
@@ -1343,15 +1281,6 @@ class AnalyticsEngine:
             "error": "No position data available"
         }
     
-    def _calculate_liquidation_days(self, score: float) -> str:
-        """Calculate liquidation time based on liquidity score"""
-        if score >= 8:
-            return "1-2"
-        elif score >= 6:
-            return "2-5"
-        else:
-            return "5-10"
-
     def _empty_liquidity(self) -> Dict[str, Any]:
         return {
             "overall_score": 5.0,
@@ -1371,10 +1300,10 @@ class AnalyticsEngine:
     def _empty_stress_test(self) -> Dict[str, Any]:
         return {
             "scenario": "unknown",
-            "max_drawdown": -0.20,
-            "portfolio_impact": -0.17,
+            "max_drawdown": None,
+            "portfolio_impact": None,
             "position_impacts": {},
-            "recovery_time": 30,
+            "recovery_time": None,
             "error": "Insufficient data for stress testing"
         }
     
@@ -1384,21 +1313,21 @@ class AnalyticsEngine:
             "recommended_weights": {},
             "trades": {},
             "target_volatility": 0.15,
-            "current_volatility": 0.20,
+            "current_volatility": None,
             "error": "Insufficient data for volatility sizing"
         }
     
     def _empty_risk_score(self) -> Dict[str, Any]:
         return {
-            "overall_score": 25.0,
-            "risk_level": "MEDIUM",
-            "change": 0,
+            "overall_score": None,
+            "risk_level": None,
+            "change": None,
             "components": {
-                "concentration": 15.0,
-                "volatility": 15.0,
-                "correlation": 10.0,
-                "factor_risk": 20.0,
-                "market_risk": 10.0
+                "concentration": None,
+                "volatility": None,
+                "correlation": None,
+                "factor_risk": None,
+                "market_risk": None
             },
             "alerts": ["Insufficient data for comprehensive risk analysis"],
             "error": "Insufficient data for risk scoring"

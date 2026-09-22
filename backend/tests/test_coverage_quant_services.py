@@ -16,8 +16,8 @@ from app.services.cointegration_service import (
     test_johansen_cointegration as _run_johansen
 )
 from app.services.correlation_service import (
-    CorrelationService,
-    compute_rolling_avg_correlation
+    compute_rolling_avg_correlation,
+    analyze_correlation_stability,
 )
 
 
@@ -83,7 +83,9 @@ class TestVolatilityService:
         s = pd.Series(np.random.normal(0, 0.01, 100))
         ewma_vol = VolatilityService.calculate_ewma_volatility(s)
         assert ewma_vol > 0
-        assert VolatilityService.calculate_ewma_volatility(pd.Series(dtype=float)) == 0.20
+        # Empty input must not fabricate a forecast (was: hardcoded 0.20)
+        with pytest.raises(ValueError, match="empty"):
+            VolatilityService.calculate_ewma_volatility(pd.Series(dtype=float))
         assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) > 0
 
     def test_forecast_garch_volatility(self):
@@ -159,7 +161,7 @@ class TestCointegrationService:
 class TestCorrelationService:
     def test_rolling_pairwise_correlation(self):
         df = _sample_returns(150, 3)
-        res = CorrelationService.analyze_stability(df, window_days=60)
+        res = analyze_correlation_stability(df, window_days=60)
         assert res.current_avg_correlation is not None
         assert res.historical_threshold_90th is not None
         assert res.alert_level in ["NORMAL", "ELEVATED", "CRITICAL"]

@@ -12,8 +12,6 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock
 
-from fastapi.testclient import TestClient
-
 from app.api.websocket import ConnectionManager, background_updates
 
 
@@ -71,17 +69,38 @@ class TestConnectionManager:
         assert ws_a.send_text.await_count == 2
         assert ws_b.send_text.await_count == 1
 
+    async def test_connect_rejects_duplicate_client_id(self, connection_manager):
+        ws_first, ws_second = AsyncMock(), AsyncMock()
+        assert await connection_manager.connect(ws_first, "dup") is True
+        assert await connection_manager.connect(ws_second, "dup") is False
+        ws_second.close.assert_awaited_once_with(code=1008)
+        # First registration survives; second never overwrites it
+        assert connection_manager.active_connections["dup"] is ws_first
+        assert "dup" in connection_manager.subscriptions
+
+    async def test_broadcast_survives_failing_socket(self, connection_manager):
+        ws_bad = AsyncMock()
+        ws_bad.send_text.side_effect = Exception("socket exploded")
+        ws_good = AsyncMock()
+        await connection_manager.connect(ws_bad, "bad")
+        await connection_manager.connect(ws_good, "good")
+        connection_manager.subscribe("bad", "t")
+        connection_manager.subscribe("good", "t")
+
+        # Must not raise RuntimeError from mutating subscriptions mid-iteration
+        await connection_manager.broadcast({"type": "x"}, topic="t")
+
+        assert "bad" not in connection_manager.active_connections
+        assert "good" in connection_manager.active_connections
+        assert ws_good.send_text.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Protocol: against the live app
-
-
-@pytest.fixture
-def client():
-    from main import app
-
-    with TestClient(app) as c:
-        yield c
+#
+# The `client` fixture comes from conftest.py: it redirects engine/SessionLocal
+# to a temp DB before lifespan (init_db self-heal) runs, so these tests never
+# touch production backend/data/daisy.db.
 
 
 def _subscribe(ws, topic="portfolio"):
@@ -149,6 +168,23 @@ class TestWebSocketEndpoint:
                 _subscribe(ws, f"topic{i}")
                 ws.send_json({"type": "unsubscribe", "topic": f"topic{i}"})
                 assert ws.receive_json()["type"] == "unsubscription_confirmed"
+
+    def test_status_reflects_active_connections(self, client):
+        from app.api.websocket import manager
+
+        resp = client.get("/api/v1/ws/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active_connections"] == len(manager.active_connections)
+        expected = "connected" if manager.active_connections else "disconnected"
+        assert data["status"] == expected
+
+        with client.websocket_connect("/api/v1/ws/ws/status_probe") as ws:
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json()["type"] == "pong"
+            resp2 = client.get("/api/v1/ws/status")
+            assert resp2.json()["active_connections"] >= 1
+            assert resp2.json()["status"] == "connected"
 
 
 # ---------------------------------------------------------------------------

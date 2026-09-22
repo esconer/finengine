@@ -60,7 +60,7 @@ def calls(monkeypatch):
 
 def test_symbol_bridge():
     assert to_av_symbol("RELIANCE.NS") == "RELIANCE.BSE"
-    assert to_av_symbol("TATASTEEL.BO") == "TATASTEEL.BO"
+    assert to_av_symbol("TATASTEEL.BO") == "TATASTEEL.BSE"
     assert to_av_symbol("AAPL") == "AAPL"
 
 

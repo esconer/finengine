@@ -38,7 +38,8 @@ async def test_currency_conversion_live_fx_or_fallback():
     """W2#6: Test USDINR=X retrieval and graceful fallback."""
     service = CurrencyConversionService()
 
-    with patch.object(service, "_fetch_exchange_rate", return_value=83.5):
+    # _fetch_exchange_rate returns (rate, is_fallback) since the B-07 never-cache rule
+    with patch.object(service, "_fetch_exchange_rate", return_value=(83.5, False)):
         converted = await service.convert_amount(100.0, "USD", "INR")
         assert converted == pytest.approx(8350.0)
 
@@ -108,7 +109,9 @@ class TestEmptyToPopulatedTransition:
 
         fe_resp = await async_client.get("/api/v1/analytics/factor-exposure")
         assert fe_resp.status_code == 200
-        assert fe_resp.json()["portfolio"]["market"] == 1.0
+        fe_body = fe_resp.json()
+        assert fe_body["portfolio"]["market"] is None
+        assert "error" in fe_body
 
         conc_resp = await async_client.get("/api/v1/analytics/concentration")
         assert conc_resp.status_code == 200

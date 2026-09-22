@@ -17,7 +17,7 @@ from app.services.currency_service import (
     get_exchange_rate_usd_inr
 )
 from app.services.cache_service import CacheService, GlobalCacheService
-from app.services.benchmark_service import BenchmarkService, get_benchmark_service, _close_series
+from app.services.benchmark_service import BenchmarkService, _close_series
 from app.services.indicators_service import StaleMarketDataError
 
 
@@ -201,11 +201,6 @@ class TestBenchmarkServiceComprehensive:
         # No benchmark data
         with patch.object(service.data_service, "fetch_historical_data", new=AsyncMock(return_value=None)):
             assert await service.get_returns() is None
-
-        # Registry test
-        svc1 = get_benchmark_service(test_db)
-        svc2 = get_benchmark_service(test_db)
-        assert svc1 is svc2
 
 
 @pytest.mark.api

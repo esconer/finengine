@@ -81,7 +81,7 @@ async def test_realized_risk_case_a_intersection_copy():
     mock_ds.fetch_historical_data = AsyncMock(return_value=long_frame)
     res = await get_realized_risk(
         tickers="OLD.NS,NEW.NS", start="2025-01-01", end="2026-09-07",
-        db=db, data_service=mock_ds, cache_service=Mock(),
+        db=db, data_service=mock_ds,
         analytics_engine=AnalyticsEngine(),
     )
     cov = res["history_coverage"]
@@ -106,7 +106,7 @@ async def test_realized_risk_case_b_short_feed_copy():
     mock_ds.fetch_historical_data = AsyncMock(return_value=_frame(10, seed=23))
     res = await get_realized_risk(
         tickers="SHORT.NS", start="2025-01-01", end="2026-09-07",
-        db=db, data_service=mock_ds, cache_service=Mock(),
+        db=db, data_service=mock_ds,
         analytics_engine=AnalyticsEngine(),
     )
     cov = res["history_coverage"]

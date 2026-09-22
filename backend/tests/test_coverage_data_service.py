@@ -185,11 +185,16 @@ class TestDataServiceQuotesAndValidation:
 
     async def test_fetch_quote_exception_fallback(self, test_db: AsyncSession):
         service = DataService(test_db)
+        DataService._quote_memo.clear()
+        # Bare input must reach the fallback with the ORIGINAL ticker — the old
+        # bug sent ticker.upper() ("RELIANCE") while the API layer expects the
+        # canonical symbol ("RELIANCE.NS"); both being "AAPL" would mask it.
         with patch("yfinance.Ticker", side_effect=Exception("API limit")), \
-             patch.object(service, "_fallback_quote", new=AsyncMock(return_value={"ticker": "AAPL", "current_price": 185.0})):
-            quote = await service.fetch_quote("AAPL")
+             patch.object(service, "_fallback_quote", new=AsyncMock(return_value={"ticker": "RELIANCE.NS", "current_price": 185.0})) as mock_fb:
+            quote = await service.fetch_quote("reliance")
             assert quote is not None
             assert quote["current_price"] == 185.0
+            mock_fb.assert_awaited_once_with("reliance", "RELIANCE.NS")
 
     async def test_validate_ticker_paths(self, test_db: AsyncSession):
         service = DataService(test_db)
@@ -333,7 +338,7 @@ class TestDataServiceAlphaVantageFallbacks:
         # Success
         mock_av_ok = Mock(enabled=True, fetch_global_quote=AsyncMock(return_value={"ticker": "RELIANCE.BSE", "current_price": 2500.0}))
         with patch("app.services.data_service.get_alpha_vantage_service", return_value=mock_av_ok):
-            q = await service._fallback_quote("RELIANCE.NS", "RELIANCE.BSE")
+            q = await service._fallback_quote("RELIANCE.NS", "RELIANCE.NS")
             assert q is not None
             assert q["current_price"] == 2500.0
             assert q["is_indian"] is True
@@ -444,14 +449,7 @@ class TestDataServiceNormalizationAndStorage:
 
     async def test_log_storage_metrics_and_error_analysis(self, test_db: AsyncSession):
         service = DataService(test_db)
-        
-        # High replacement ratio
-        await service._log_storage_metrics("TCS.NS", stored_count=1, replaced_count=5)
-        
-        # Exception during log metrics
-        with patch.object(test_db, "add", side_effect=Exception("Log fail")):
-            await service._log_storage_metrics("TCS.NS", 1, 1)
-            
+
         # Error analysis tests
         df = _sample_df("TEST", 2)
         service._analyze_storage_error("TEST", df, Exception("UNIQUE constraint failed: ..."))

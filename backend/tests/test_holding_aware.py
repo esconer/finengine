@@ -5,6 +5,8 @@ Regression gate for the phantom-history bug (14 positions bulk-imported
 days while the ledger showed +13.4% realized). No network; seeded only.
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -53,6 +55,10 @@ def test_coerce_holding_date():
     assert coerce_holding_date(datetime(2026, 8, 27, 14, 54)) == "2026-08-27"
     assert coerce_holding_date(None) is None
     assert coerce_holding_date("2024-05-01T00:00:00") == "2024-05-01"
+    # junk must never masquerade as an ISO holding start (audit B20)
+    assert coerce_holding_date("abc") is None
+    assert coerce_holding_date("None") is None
+    assert coerce_holding_date("") is None
 
 
 def test_implied_start_from_price():
@@ -116,6 +122,28 @@ def test_apply_annualization_gate():
     assert out["total_return"] == 0.1 and out["annualized"] is False
     out2 = apply_annualization_gate(dict(payload), ["cagr", "sharpe"], 300)
     assert out2["cagr"] == 5.0 and out2["annualized"] is True
+
+
+def test_holding_window_mask_failure_drops_series(monkeypatch, caplog):
+    """A series whose masking math explodes must be dropped with a warning,
+    never passed through unmasked (silent pre-purchase re-attribution)."""
+    dates = pd.date_range("2024-01-01", periods=10, freq="B")
+    frames = {"A": pd.Series(np.arange(10.0), index=dates)}
+
+    def _boom(self):
+        raise RuntimeError("normalize exploded")
+
+    monkeypatch.setattr(pd.DatetimeIndex, "normalize", _boom)
+    with caplog.at_level(logging.WARNING, logger="app.utils.holdings"):
+        masked, _ = holding_window(
+            frames, {"A": {"added_on": "2024-03-01", "buy_price": None}}
+        )
+
+    assert "A" not in masked
+    assert any(
+        "failed to mask" in record.getMessage() and "A" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_portfolio_regime_summary_branches():

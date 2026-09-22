@@ -65,6 +65,10 @@ class TestAnalyticsHelpersAndEdgeCases:
             raise RuntimeError("Unavailable")
         assert _q(raise_err) is None
 
+        # Non-finite results must not reach JSONResponse (allow_nan=False)
+        assert _q(lambda: float("nan")) is None
+        assert _q(lambda: float("inf")) is None
+
     def test_price_series_extraction(self):
         # None or empty
         assert _price_series(None) is None

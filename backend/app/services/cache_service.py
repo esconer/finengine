@@ -2,10 +2,11 @@
 Cache service for data storage and retrieval
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.models.database import AnalyticsCache, FetchLog
 from app.utils.logger import setup_logger
 
@@ -29,7 +30,7 @@ class CacheService:
             query = select(AnalyticsCache).where(
                 AnalyticsCache.ticker == ticker,
                 AnalyticsCache.metric_name == metric_name,
-                AnalyticsCache.expires_at > datetime.utcnow()
+                        AnalyticsCache.expires_at > datetime.now(timezone.utc).replace(tzinfo=None)
             )
             
             result = await self.db.execute(query)
@@ -58,35 +59,33 @@ class CacheService:
         calculation_date: datetime,
         model_params: Dict[str, Any] = None
     ) -> None:
-        """Set cached analytics data (upsert on ticker+metric).
+        """Set cached analytics data (race-safe upsert on ticker+metric).
 
-        Replaces any existing row for the key instead of blind-inserting:
-        duplicates previously made `get_cached_analytics` raise
-        MultipleResultsFound (caught -> perpetual miss). Delete-then-insert
-        keeps this portable across SQLite/Postgres without requiring a
-        UNIQUE constraint migration (P1 follow-up: add UQ(ticker,
-        metric_name) + native ON CONFLICT upsert).
+        Uses UNIQUE(ticker, metric_name) + ON CONFLICT DO UPDATE so two
+        concurrent writers cannot leave duplicate rows (which made
+        get_cached_analytics raise MultipleResultsFound -> perpetual miss).
         """
         try:
             # Calculate expiration
-            expires_at = datetime.utcnow() + timedelta(minutes=self.ttl_minutes)
+            expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=self.ttl_minutes)
 
-            await self.db.execute(
-                delete(AnalyticsCache).where(
-                    AnalyticsCache.ticker == ticker,
-                    AnalyticsCache.metric_name == metric_name,
-                )
-            )
-            cache_entry = AnalyticsCache(
+            stmt = sqlite_insert(AnalyticsCache).values(
                 ticker=ticker,
                 metric_name=metric_name,
                 metric_value=metric_value,
                 calculation_date=calculation_date,
                 expires_at=expires_at,
                 model_params=model_params or {}
+            ).on_conflict_do_update(
+                index_elements=["ticker", "metric_name"],
+                set_={
+                    "metric_value": metric_value,
+                    "calculation_date": calculation_date,
+                    "expires_at": expires_at,
+                    "model_params": model_params or {},
+                },
             )
-            
-            self.db.add(cache_entry)
+            await self.db.execute(stmt)
             await self.db.commit()
             
             logger.debug(f"Cached {ticker}:{metric_name} = {metric_value}")
@@ -123,21 +122,16 @@ class CacheService:
             await self.db.rollback()
     
     async def clear_expired_cache(self) -> int:
-        """Clear expired cache entries"""
+        """Clear expired cache entries with a single set-based DELETE."""
         try:
-            query = select(AnalyticsCache).where(
-                AnalyticsCache.expires_at <= datetime.utcnow()
+            result = await self.db.execute(
+                delete(AnalyticsCache).where(
+                        AnalyticsCache.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None)
+                )
             )
-            
-            result = await self.db.execute(query)
-            expired_entries = result.scalars().all()
-            
-            for entry in expired_entries:
-                await self.db.delete(entry)
-            
             await self.db.commit()
             
-            count = len(expired_entries)
+            count = result.rowcount or 0
             if count > 0:
                 logger.info(f"Cleared {count} expired cache entries")
             
@@ -149,43 +143,49 @@ class CacheService:
             return 0
     
     async def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+        """Get cache statistics (COUNT aggregates; never materializes rows)."""
         try:
-            # Total cache entries
-            total_query = select(AnalyticsCache)
-            total_result = await self.db.execute(total_query)
-            total_entries = len(total_result.scalars().all())
+            total_entries = (
+                await self.db.execute(select(func.count()).select_from(AnalyticsCache))
+            ).scalar() or 0
+            active_entries = (
+                await self.db.execute(
+                    select(func.count()).select_from(AnalyticsCache).where(
+                AnalyticsCache.expires_at > datetime.now(timezone.utc).replace(tzinfo=None)
+                    )
+                )
+            ).scalar() or 0
+            expired_entries = (
+                await self.db.execute(
+                    select(func.count()).select_from(AnalyticsCache).where(
+                    AnalyticsCache.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None)
+                    )
+                )
+            ).scalar() or 0
             
-            # Active cache entries
-            active_query = select(AnalyticsCache).where(
-                AnalyticsCache.expires_at > datetime.utcnow()
-            )
-            active_result = await self.db.execute(active_query)
-            active_entries = len(active_result.scalars().all())
-            
-            # Expired cache entries
-            expired_query = select(AnalyticsCache).where(
-                AnalyticsCache.expires_at <= datetime.utcnow()
-            )
-            expired_result = await self.db.execute(expired_query)
-            expired_entries = len(expired_result.scalars().all())
-            
-            # Recent fetch logs
-            recent_logs_query = select(FetchLog).where(
-                FetchLog.timestamp > datetime.utcnow() - timedelta(hours=24)
-            )
-            recent_logs_result = await self.db.execute(recent_logs_query)
-            recent_logs = recent_logs_result.scalars().all()
-            
-            # Success rate
-            successful_logs = [log for log in recent_logs if log.status == "success"]
-            success_rate = len(successful_logs) / len(recent_logs) * 100 if recent_logs else 0
+            recent_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+            recent_total = (
+                await self.db.execute(
+                    select(func.count()).select_from(FetchLog).where(
+                        FetchLog.timestamp > recent_cutoff
+                    )
+                )
+            ).scalar() or 0
+            recent_success = (
+                await self.db.execute(
+                    select(func.count()).select_from(FetchLog).where(
+                        FetchLog.timestamp > recent_cutoff,
+                        FetchLog.status == "success",
+                    )
+                )
+            ).scalar() or 0
+            success_rate = (recent_success / recent_total * 100) if recent_total else 0
             
             return {
                 "total_cache_entries": total_entries,
                 "active_entries": active_entries,
                 "expired_entries": expired_entries,
-                "recent_fetch_attempts": len(recent_logs),
+                "recent_fetch_attempts": recent_total,
                 "success_rate_24h": round(success_rate, 2),
                 "ttl_minutes": self.ttl_minutes
             }
@@ -258,6 +258,9 @@ async def clear_market_data_cache(db: AsyncSession) -> Dict[str, Any]:
     in_memory_reset = []
     try:
         DataService._in_memory_df_cache.clear()
+        if hasattr(DataService, "_quote_memo"):
+            DataService._quote_memo.clear()
+            in_memory_reset.append("data_service_quotes")
         in_memory_reset.append("data_service_frames")
     except Exception as e:
         logger.warning(f"Could not reset data service in-memory cache: {e}")
