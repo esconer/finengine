@@ -5,9 +5,8 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -265,7 +264,7 @@ const MODELS = [
   { id: 'EGARCH', name: 'EGARCH', description: 'Exponential GARCH with asymmetric market downturn leverage effects' },
 ];
 
-interface PositionSizing {
+type PositionSizing = {
   ticker: string;
   current_weight: number;
   target_weight: number;
@@ -510,7 +509,7 @@ export default function VolatilitySizingPage() {
   };
 
   // Position sizing table columns
-  const positionColumns: ColumnDef<PositionSizing>[] = [
+  const positionColumns: DataTableColumn<PositionSizing>[] = [
     {
       header: () => (
         <div className="flex items-center">

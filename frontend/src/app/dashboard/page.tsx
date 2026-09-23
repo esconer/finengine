@@ -3,9 +3,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
+
 import { PerformanceChart } from '@/components/charts/PerformanceChart';
 import { SectorAllocationChart } from '@/components/charts/SectorAllocationChart';
 import { RiskMetricsDisplay } from '@/components/charts/RiskMetricsDisplay';

@@ -5,9 +5,8 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
 import { MetricCardLoading, DataTableLoading } from '@/components/ui/LoadingState';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
@@ -255,7 +254,7 @@ interface LiquidityData {
   methodology?: string;
 }
 
-interface PositionLiquidity {
+type PositionLiquidity = {
   ticker: string;
   score: number | null;
   category: 'High' | 'Medium' | 'Low' | null;
@@ -410,7 +409,7 @@ export default function LiquidityPage() {
   const lowVolumeCount = positionData.filter(p => p.score != null && p.score < 6).length;
 
   // Position liquidity table columns with ? explainers
-  const positionColumns: ColumnDef<PositionLiquidity>[] = [
+  const positionColumns: DataTableColumn<PositionLiquidity>[] = [
     {
       header: () => (
         <div className="flex items-center">

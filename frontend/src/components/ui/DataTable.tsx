@@ -4,19 +4,41 @@
 
 import React, { useState } from 'react';
 import {
-  useReactTable,
-  getCoreRowModel,
-  getSortedRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  ColumnDef,
+  columnFilteringFeature,
+  createFilteredRowModel,
+  createPaginatedRowModel,
+  createSortedRowModel,
+  filterFns,
   flexRender,
-  SortingState,
+  globalFilteringFeature,
+  rowPaginationFeature,
+  rowSortingFeature,
+  sortFns,
+  tableFeatures,
+  useTable,
+  type ColumnDef,
+  type RowData,
+  type SortingState,
 } from '@tanstack/react-table';
 
-interface DataTableProps<T> {
+export const dataTableFeatures = tableFeatures({
+  columnFilteringFeature,
+  globalFilteringFeature,
+  rowPaginationFeature,
+  rowSortingFeature,
+  filteredRowModel: createFilteredRowModel(),
+  sortedRowModel: createSortedRowModel(),
+  paginatedRowModel: createPaginatedRowModel(),
+  filterFns,
+  sortFns,
+});
+
+export type DataTableFeatures = typeof dataTableFeatures;
+export type DataTableColumn<T extends RowData> = ColumnDef<DataTableFeatures, T, any>;
+
+interface DataTableProps<T extends RowData> {
   data: T[];
-  columns: ColumnDef<T, any>[];
+  columns: DataTableColumn<T>[];
   title?: string;
   actions?: React.ReactNode;
   loading?: boolean;
@@ -27,7 +49,7 @@ interface DataTableProps<T> {
   className?: string;
 }
 
-export function DataTable<T>({
+export function DataTable<T extends RowData>({
   data,
   columns,
   title,
@@ -42,7 +64,8 @@ export function DataTable<T>({
   const [sorting, setSorting] = useState<SortingState>([]);
   const [globalFilter, setGlobalFilter] = useState('');
 
-  const table = useReactTable({
+  const table = useTable({
+    features: dataTableFeatures,
     data,
     columns,
     state: {
@@ -51,12 +74,9 @@ export function DataTable<T>({
     },
     onSortingChange: setSorting,
     onGlobalFilterChange: setGlobalFilter,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
     initialState: {
       pagination: {
+        pageIndex: 0,
         pageSize: 10,
       },
     },
@@ -174,7 +194,7 @@ export function DataTable<T>({
           <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
             {table.getRowModel().rows.map((row, rowIndex) => (
               <tr key={`row-${row.id}-${rowIndex}`} className="hover:bg-gray-50 dark:hover:bg-gray-700">
-                {row.getVisibleCells().map((cell, cellIndex) => (
+                {row.getAllCells().map((cell, cellIndex) => (
                   <td key={`cell-${cell.id}-${rowIndex}-${cellIndex}`} className="px-6 py-4 whitespace-nowrap text-sm">
                     <span className="text-gray-900 dark:text-white">
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -192,8 +212,8 @@ export function DataTable<T>({
         <div className="text-sm text-gray-700 dark:text-gray-300">
           {filteredCount === 0
             ? 'No results'
-            : `Showing ${table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to ${Math.min(
-                (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
+            : `Showing ${table.state.pagination.pageIndex * table.state.pagination.pageSize + 1} to ${Math.min(
+                (table.state.pagination.pageIndex + 1) * table.state.pagination.pageSize,
                 filteredCount
               )} of ${filteredCount} results`}
         </div>
@@ -210,7 +230,7 @@ export function DataTable<T>({
           </button>
           
           <span className="text-sm text-gray-700 dark:text-gray-300">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+            Page {table.state.pagination.pageIndex + 1} of {table.getPageCount()}
           </span>
           
           <button

@@ -5,9 +5,8 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import {
@@ -393,7 +392,7 @@ export default function FactorExposurePage() {
   };
 
   // Position-level factor table columns with unicode Greek symbols and history warnings
-  const positionColumns: ColumnDef<any>[] = useMemo(
+  const positionColumns: DataTableColumn<any>[] = useMemo(
     () => [
       {
         header: 'Ticker',

@@ -20,15 +20,11 @@ import {
   BookOpen,
 } from 'lucide-react';
 import {
-  useReactTable,
-  getCoreRowModel,
-  getSortedRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
   flexRender,
-  ColumnDef,
-  SortingState,
+  useTable,
+  type SortingState,
 } from '@tanstack/react-table';
+import { dataTableFeatures, type DataTableColumn } from '@/components/ui/DataTable';
 
 import { screenerApi, portfolioApi } from '@/lib/api';
 import { ScreenerStock, ScreenerStrategyMeta, ScreenerStrategyResponse } from '@/types';
@@ -212,7 +208,7 @@ export default function ScreenerStudioPage() {
   };
 
   // TanStack Table columns
-  const columns = useMemo<ColumnDef<ScreenerStock>[]>(
+  const columns = useMemo<DataTableColumn<ScreenerStock>[]>(
     () => [
       {
         header: '#',
@@ -414,7 +410,8 @@ export default function ScreenerStudioPage() {
     [addedStocks, addingStock]
   );
 
-  const table = useReactTable({
+  const table = useTable({
+    features: dataTableFeatures,
     data: screenerData?.stocks || [],
     columns,
     state: {
@@ -423,12 +420,9 @@ export default function ScreenerStudioPage() {
     },
     onSortingChange: setSorting,
     onGlobalFilterChange: setGlobalFilter,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
     initialState: {
       pagination: {
+        pageIndex: 0,
         pageSize: 20,
       },
     },
@@ -695,7 +689,7 @@ export default function ScreenerStudioPage() {
                   ) : (
                     table.getRowModel().rows.map((row) => (
                       <tr key={row.id} className="hover:bg-slate-800/40 transition-colors">
-                        {row.getVisibleCells().map((cell) => (
+                        {row.getAllCells().map((cell) => (
                           <td key={cell.id} className="py-3 px-4">
                             {flexRender(cell.column.columnDef.cell, cell.getContext())}
                           </td>
@@ -711,9 +705,9 @@ export default function ScreenerStudioPage() {
             {table.getFilteredRowModel().rows.length > 0 && (
               <div className="p-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
                 <div>
-                  Showing {table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to{' '}
+                  Showing {table.state.pagination.pageIndex * table.state.pagination.pageSize + 1} to{' '}
                   {Math.min(
-                    (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
+                    (table.state.pagination.pageIndex + 1) * table.state.pagination.pageSize,
                     table.getFilteredRowModel().rows.length
                   )}{' '}
                   of {table.getFilteredRowModel().rows.length} screened stocks

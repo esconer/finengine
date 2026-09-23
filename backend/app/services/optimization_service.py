@@ -76,9 +76,11 @@ def _cluster_var(cov_ord: np.ndarray, items: list[int]) -> float:
 def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
     """Lopez de Prado HRP via public scipy APIs only."""
     corr = returns.corr().fillna(0.0)
-    np.fill_diagonal(corr.values, 1.0)
+    # pandas CoW: .values is read-only — take a writable copy before mutating
+    corr_np = corr.to_numpy(copy=True)
+    np.fill_diagonal(corr_np, 1.0)
     # distance matrix for linkage: sqrt(0.5 * (1 - r))
-    dist = np.sqrt(np.clip(0.5 * (1.0 - corr.values), 0.0, 1.0))
+    dist = np.sqrt(np.clip(0.5 * (1.0 - corr_np), 0.0, 1.0))
     condensed = squareform(dist, checks=False)
     link = sch.linkage(condensed, method="single")
 

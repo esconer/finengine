@@ -5,9 +5,8 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -580,7 +579,7 @@ export default function StressTestingPage() {
   }, [activeResult]);
 
   // Position impact table columns
-  const positionColumns: ColumnDef<any, any>[] = [
+  const positionColumns: DataTableColumn<any>[] = [
     {
       header: 'Ticker',
       accessorKey: 'ticker',

@@ -1,15 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import React from 'react';
-import { DataTable } from '@/components/ui/DataTable';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 
-interface SampleRow {
+type SampleRow = {
   ticker: string;
   weight: number;
-}
+};
 
-const columns: ColumnDef<SampleRow, any>[] = [
+const columns: DataTableColumn<SampleRow>[] = [
   {
     accessorKey: 'ticker',
     header: 'Ticker',

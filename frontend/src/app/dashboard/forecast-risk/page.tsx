@@ -5,9 +5,8 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ColumnDef } from '@tanstack/react-table';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
 import {
   ResponsiveContainer,
   LineChart,
@@ -505,7 +504,7 @@ export default function ForecastRiskPage() {
   };
 
   // Position forecast table columns
-  const positionColumns: ColumnDef<any>[] = useMemo(() => [
+  const positionColumns: DataTableColumn<any>[] = useMemo(() => [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
