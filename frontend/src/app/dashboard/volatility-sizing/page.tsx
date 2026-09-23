@@ -4,12 +4,13 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   Zap,
   Target,
@@ -63,7 +64,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   total_positions: {
     title: 'Total Analyzed Holdings',
     what: 'Number of active equity and ETF holdings in your current portfolio subject to risk parity rebalancing.',
-    howInferred: 'Counted from the active database position roster (N = 14).',
+    howInferred: 'Counted from the active database position roster.',
     whyImportant: 'Ensures the risk parity optimization universe covers 100% of invested capital.',
     howToInfer: 'Higher constituent count allows smoother risk equalization across non-correlated sectors.'
   },
@@ -132,13 +133,44 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   }
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+function HelpExplainerModal({
+  itemKey,
+  onClose,
+  positionCount,
+}: {
+  itemKey: string;
+  onClose: () => void;
+  positionCount?: number;
+}) {
   const info = EXPLAINERS[itemKey];
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   if (!info) return null;
 
+  const howInferred =
+    itemKey === 'total_positions'
+      ? `Counted from the active database position roster (N = ${positionCount ?? 0}).`
+      : info.howInferred;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={info.title}
+        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <button
           onClick={onClose}
           className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
@@ -160,9 +192,11 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-200">{info.what}</p>
           </div>
 
-          <div className="bg-slate-800/80 p-3.5 rounded-lg border border-slate-700/60">
+          <div
+            className="bg-slate-800/80 p-3.5 rounded-lg border border-slate-700/60"
+          >
             <h4 className="text-xs font-semibold text-teal-400 uppercase tracking-wider mb-1">How It Is Inferred</h4>
-            <p className="text-slate-300">{info.howInferred}</p>
+            <p className="text-slate-300">{howInferred}</p>
           </div>
 
           <div className="bg-slate-800/80 p-3.5 rounded-lg border border-slate-700/60">
@@ -202,7 +236,7 @@ function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
         e.stopPropagation();
         onClick();
       }}
-      className="inline-flex items-center justify-center w-4 h-4 ml-1.5 text-slate-400 hover:text-teal-400 rounded-full hover:bg-slate-800/60 transition-colors"
+      className="inline-flex items-center justify-center w-4 h-4 ml-1.5 text-slate-400 hover:text-teal-400 rounded-full hover:bg-slate-800/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
       title={label || 'Click to understand this metric'}
       aria-label={label || 'Explainer info'}
     >
@@ -252,16 +286,28 @@ export default function VolatilitySizingPage() {
   const [showRebalanceModal, setShowRebalanceModal] = useState(false);
   const [rebalancingInProgress, setRebalancingInProgress] = useState(false);
   const [rebalanceSuccessMsg, setRebalanceSuccessMsg] = useState<string | null>(null);
+  const [rebalanceErrorMsg, setRebalanceErrorMsg] = useState<string | null>(null);
+  const fetchSeq = useRef(0);
+  const inited = useRef(false);
+  const rebalanceCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
 
+  useEffect(() => {
+    return () => {
+      if (rebalanceCloseTimer.current) clearTimeout(rebalanceCloseTimer.current);
+    };
+  }, []);
+
   const fetchSizingData = async () => {
+    const seq = ++fetchSeq.current;
     setLoading(true);
     try {
       const data = await analyticsApi.getVolatilitySizing({
         model: selectedModel,
         target_volatility: targetVolatility
       });
+      if (seq !== fetchSeq.current) return;
       setSizingData(data);
       
       const currentWeights = data.current_weights || {};
@@ -296,22 +342,43 @@ export default function VolatilitySizingPage() {
       
       setPositionData(positionsList.sort((a, b) => b.current_weight - a.current_weight));
     } catch (error) {
+      if (seq !== fetchSeq.current) return;
       console.error('Failed to fetch volatility sizing data:', error);
     } finally {
-      setLoading(false);
+      if (seq === fetchSeq.current) setLoading(false);
     }
   };
 
+  // Always call the latest fetchSizingData (avoids stale model/target closures)
+  const fetchRef = useRef(fetchSizingData);
+  fetchRef.current = fetchSizingData;
+
   useEffect(() => {
-    const init = async () => {
-      await fetchPortfolio();
-      await fetchSizingData();
+    let alive = true;
+    (async () => {
+      try {
+        await fetchPortfolio();
+      } finally {
+        if (alive) {
+          inited.current = true;
+          fetchRef.current();
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+      fetchSeq.current++;
     };
-    init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (!inited.current) return;
     fetchSizingData();
+    return () => {
+      fetchSeq.current++;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedModel, targetVolatility]);
 
   const handleModelChange = (model: string) => {
@@ -329,15 +396,32 @@ export default function VolatilitySizingPage() {
   const [rebalanceMode, setRebalanceMode] = useState<'simulate' | 'live'>('simulate');
   const [simulationData, setSimulationData] = useState<any | null>(null);
 
+  const closeRebalanceModal = () => {
+    setShowRebalanceModal(false);
+    setSimulationData(null);
+    setRebalanceErrorMsg(null);
+  };
+
+  useEffect(() => {
+    if (!showRebalanceModal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeRebalanceModal();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showRebalanceModal]);
+
   const handleRunSimulation = async () => {
     if (!sizingData?.recommended_weights) return;
     setRebalancingInProgress(true);
+    setRebalanceErrorMsg(null);
     try {
       const result = await portfolioApi.rebalancePortfolio(sizingData.recommended_weights, true);
       setSimulationData(result);
     } catch (err: any) {
       console.error('Failed to run simulation:', err);
-      alert(`Simulation failed: ${err.message || 'Unknown error'}`);
+      setRebalanceErrorMsg(`Simulation failed: ${err.message || 'Unknown error'}`);
     } finally {
       setRebalancingInProgress(false);
     }
@@ -346,19 +430,21 @@ export default function VolatilitySizingPage() {
   const handleConfirmRebalance = async () => {
     if (!sizingData?.recommended_weights) return;
     setRebalancingInProgress(true);
+    setRebalanceErrorMsg(null);
     try {
       const result = await portfolioApi.rebalancePortfolio(sizingData.recommended_weights, false);
       setRebalanceSuccessMsg(result.message || 'Portfolio rebalancing executed successfully!');
       await fetchPortfolio();
       await fetchSizingData();
-      setTimeout(() => {
+      if (rebalanceCloseTimer.current) clearTimeout(rebalanceCloseTimer.current);
+      rebalanceCloseTimer.current = setTimeout(() => {
         setShowRebalanceModal(false);
         setRebalanceSuccessMsg(null);
         setSimulationData(null);
       }, 2000);
     } catch (err: any) {
       console.error('Failed to execute rebalance:', err);
-      alert(`Rebalancing failed: ${err.message || 'Unknown error'}`);
+      setRebalanceErrorMsg(`Rebalancing failed: ${err.message || 'Unknown error'}`);
     } finally {
       setRebalancingInProgress(false);
     }
@@ -375,7 +461,7 @@ export default function VolatilitySizingPage() {
 
   const formatCurrency = (value: number | undefined | null) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '₹0';
+      return 'N/A';
     }
     if (Math.abs(value) >= 10000000) return `₹${(value / 10000000).toFixed(2)} Cr`;
     if (Math.abs(value) >= 100000) return `₹${(value / 100000).toFixed(2)} L`;
@@ -403,7 +489,7 @@ export default function VolatilitySizingPage() {
     const rows = positionData.map(p => {
       const action = Math.abs(p.weight_change) < 0.005 ? 'Hold' : p.weight_change > 0 ? 'Buy' : 'Sell';
       return [
-        p.ticker,
+        escapeCsvCell(p.ticker),
         (p.current_weight * 100).toFixed(2) + '%',
         (p.recommended_weight * 100).toFixed(2) + '%',
         p.volatility == null ? 'N/A' : (p.volatility * 100).toFixed(2) + '%',
@@ -554,19 +640,27 @@ export default function VolatilitySizingPage() {
         <HelpExplainerModal
           itemKey={activeExplainer}
           onClose={() => setActiveExplainer(null)}
+          positionCount={positions.length}
         />
       )}
 
       {/* Rebalance Confirmation & Simulation Modal */}
       {showRebalanceModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fadeIn">
-          <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fadeIn"
+          onClick={closeRebalanceModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={rebalanceMode === 'simulate' ? 'Simulate Rebalance' : 'Execute Live Rebalance'}
+            className="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
             <button
-              onClick={() => {
-                setShowRebalanceModal(false);
-                setSimulationData(null);
-              }}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+              onClick={closeRebalanceModal}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+              aria-label="Close"
             >
               <X className="w-5 h-5" />
             </button>
@@ -611,6 +705,17 @@ export default function VolatilitySizingPage() {
               </button>
             </div>
 
+            {/* In-page rebalance error (replaces native alert) */}
+            {rebalanceErrorMsg && (
+              <div
+                data-testid="rebalance-error"
+                className="bg-red-950/40 border border-red-800/60 p-3 rounded-lg text-xs text-red-300 mb-4 flex items-start space-x-2"
+              >
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-red-400" />
+                <span>{rebalanceErrorMsg}</span>
+              </div>
+            )}
+
             {rebalanceSuccessMsg ? (
               <div className="bg-emerald-950/40 border border-emerald-800/60 p-6 rounded-xl text-center space-y-3 my-4">
                 <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto" />
@@ -630,7 +735,7 @@ export default function VolatilitySizingPage() {
                   </div>
                   <div className="text-center">
                     <span className="text-xs text-slate-400">Turnover Delta</span>
-                    <p className="text-lg font-bold text-teal-400">{formatPercentage(totalWeightChange)}</p>
+                    <p className="text-lg font-bold text-teal-400">{(totalWeightChange * 100).toFixed(1)}%</p>
                   </div>
                 </div>
 
@@ -702,10 +807,7 @@ export default function VolatilitySizingPage() {
 
                 <div className="flex items-center justify-end space-x-3 pt-4 border-t border-slate-800">
                   <button
-                    onClick={() => {
-                      setShowRebalanceModal(false);
-                      setSimulationData(null);
-                    }}
+                    onClick={closeRebalanceModal}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm transition-colors"
                   >
                     Close
@@ -861,12 +963,20 @@ export default function VolatilitySizingPage() {
             {MODELS.map((model) => (
               <div
                 key={model.id}
+                role="button"
+                tabIndex={0}
                 className={`p-4 border-2 rounded-xl cursor-pointer transition-all ${
                   selectedModel === model.id
                     ? 'border-teal-500 bg-teal-950/30 shadow-md'
                     : 'border-slate-800 hover:border-slate-700 bg-slate-800/30'
                 }`}
                 onClick={() => handleModelChange(model.id)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleModelChange(model.id);
+                  }
+                }}
               >
                 <div className="flex items-center justify-between">
                   <h4 className={`font-semibold ${
@@ -1060,7 +1170,11 @@ export default function VolatilitySizingPage() {
                 Export CSV
               </button>
               <button
-                onClick={() => setShowRebalanceModal(true)}
+                onClick={() => {
+                  setRebalanceErrorMsg(null);
+                  setRebalanceSuccessMsg(null);
+                  setShowRebalanceModal(true);
+                }}
                 className="flex items-center px-4 py-1.5 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors shadow-md"
               >
                 <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
@@ -1134,7 +1248,7 @@ export default function VolatilitySizingPage() {
               <div>
                 <h4 className="text-xs font-bold text-amber-300 uppercase tracking-wider">Significant Rebalancing Opportunity</h4>
                 <p className="text-xs text-slate-300 mt-0.5 leading-relaxed">
-                  Total weight adjustment of {formatPercentage(totalWeightChange)} will balance marginal risk contribution across all {positions.length} holdings.
+                  Total weight adjustment of {(totalWeightChange * 100).toFixed(1)}% will balance marginal risk contribution across all {positions.length} holdings.
                 </p>
               </div>
             </div>

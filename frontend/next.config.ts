@@ -14,22 +14,20 @@ const nextConfig: NextConfig = {
     optimizePackageImports: [
       'lucide-react',
       'recharts',
-      'date-fns',
       '@tanstack/react-table',
       '@tanstack/react-query',
-      'clsx',
-      'tailwind-merge',
-      'papaparse',
       'jspdf',
       'xlsx',
     ],
   },
-  // API proxy for FastAPI backend
+  // API proxy for FastAPI backend — origin derived from the same env axios uses
   async rewrites() {
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+    const backendOrigin = apiUrl.replace(/\/api\/v1\/?$/, '');
     return [
       {
         source: '/api/v1/:path*',
-        destination: 'http://localhost:8000/api/v1/:path*',
+        destination: `${backendOrigin}/api/v1/:path*`,
       },
     ];
   },

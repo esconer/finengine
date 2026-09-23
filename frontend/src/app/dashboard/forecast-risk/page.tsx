@@ -4,7 +4,7 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
@@ -21,7 +21,6 @@ import {
 } from 'recharts';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
-import { CSVExporter } from '@/lib/export';
 import {
   TrendingUp,
   TrendingDown,
@@ -88,12 +87,12 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
       'An annualized volatility of 20% translates to a daily volatility of roughly 20% / √252 ≈ 1.26%. Compare with historical volatility (e.g. 19.5%) to detect expanding or contracting volatility regimes.',
   },
   confidence: {
-    title: 'Volatility Confidence Interval (80% / 90% Band)',
-    subtitle: 'Parametric Uncertainty Range Around the Volatility Forecast',
+    title: 'Volatility Confidence Interval',
+    subtitle: 'Model Uncertainty Range Around the Volatility Forecast',
     whatItMeans:
-      'The expected lower and upper bounds within which the true future realized volatility is expected to lie with high statistical certainty.',
+      'The lower and upper bounds of the model-based uncertainty range around the forward volatility estimate, returned directly by the forecast engine.',
     howItsInferred:
-      'Calculated from the asymptotic standard errors of model parameter estimates and empirical innovation residuals: [σ_forecast × 0.8, σ_forecast × 1.2].',
+      'Provided by the backend forecast alongside σ_forecast as the model\'s uncertainty range. (The dashed ±20% lines on the term-structure chart are simple illustrative guides, not statistical confidence bounds.)',
     whyItsImportant:
       'Quantifies model estimation risk and uncertainty in regime transition environments.',
     howToInfer:
@@ -192,11 +191,25 @@ function HelpExplainerModal({
   content: ExplainerContent | null;
   onClose: () => void;
 }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   if (!content) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
+      onClick={onClose}
+    >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={content.title}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl shadow-2xl max-w-2xl w-full p-6 space-y-5 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
@@ -220,6 +233,7 @@ function HelpExplainerModal({
           <button
             onClick={onClose}
             className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            aria-label="Close"
           >
             <X className="w-5 h-5" />
           </button>
@@ -339,8 +353,10 @@ export default function ForecastRiskPage() {
   const [forecastHorizon, setForecastHorizon] = useState(1);
   const [forecastData, setForecastData] = useState<ForecastData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [positionData, setPositionData] = useState<any[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<ExplainerContent | null>(null);
+  const fetchSeq = useRef(0);
 
   const { positions } = usePortfolioStore();
   const { updateLastUpdated } = useUIStore();
@@ -375,9 +391,8 @@ export default function ForecastRiskPage() {
         termVol = Number((termStructure[day - 1] * 100).toFixed(2));
       } else if (termStructure.length > 0) {
         termVol = Number((termStructure[termStructure.length - 1] * 100).toFixed(2));
-      } else {
-        termVol = Number((baseVol * (1 + 0.01 * Math.log(day))).toFixed(2));
       }
+      // else: flat baseVol — no fabricated term shape when backend sent none
 
       volCurve.push({
         day: `Day ${day}`,
@@ -402,7 +417,9 @@ export default function ForecastRiskPage() {
   }, [forecastData, forecastHorizon]);
 
   const fetchForecastData = async () => {
+    const seq = ++fetchSeq.current;
     setLoading(true);
+    setFetchError(null);
     try {
       const tickers = positions.map((p) => p.ticker).join(',');
       const data = await analyticsApi.getForecastRisk({
@@ -410,6 +427,7 @@ export default function ForecastRiskPage() {
         horizon: forecastHorizon,
         tickers: tickers || undefined,
       });
+      if (seq !== fetchSeq.current) return;
 
       setForecastData(data);
 
@@ -439,15 +457,23 @@ export default function ForecastRiskPage() {
       setPositionData(positionsList);
       updateLastUpdated();
     } catch (error) {
+      if (seq !== fetchSeq.current) return;
       console.error('Failed to fetch forecast data:', error);
+      setFetchError(error instanceof Error ? error.message : 'Failed to load forecast data');
+      setForecastData(null);
       setPositionData([]);
     } finally {
-      setLoading(false);
+      if (seq === fetchSeq.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     fetchForecastData();
+    return () => {
+      // Invalidate in-flight responses when deps change / unmount
+      fetchSeq.current++;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [positions, selectedModel, forecastHorizon]);
 
   const handleModelChange = (model: string) => {
@@ -462,8 +488,10 @@ export default function ForecastRiskPage() {
     fetchForecastData();
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (positionData.length > 0) {
+      // Dynamic import keeps jsPDF/xlsx/file-saver out of the initial chunk (01-O1)
+      const { CSVExporter } = await import('@/lib/export');
       CSVExporter.exportToCSV(positionData, `position_risk_forecasts_${selectedModel}_${forecastHorizon}d`);
     }
   };
@@ -682,6 +710,23 @@ export default function ForecastRiskPage() {
         </div>
       )}
 
+      {/* Fetch Failure Banner (stale forecast data is cleared on failure) */}
+      {fetchError && (
+        <div data-testid="forecast-fetch-error" className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4">
+          <div className="flex items-center">
+            <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 mr-2" />
+            <h3 className="text-red-800 dark:text-red-300 font-medium">Error Loading Forecast Data</h3>
+          </div>
+          <p className="text-red-700 dark:text-red-400 text-sm mt-1">{fetchError}</p>
+          <button
+            onClick={handleRefresh}
+            className="mt-2 px-3 py-1 bg-red-100 dark:bg-red-800 text-red-700 dark:text-red-300 rounded text-sm hover:bg-red-200 dark:hover:bg-red-700 transition-colors"
+          >
+            Try Again
+          </button>
+        </div>
+      )}
+
       {/* Forecast Metrics Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <div className="relative">
@@ -762,12 +807,20 @@ export default function ForecastRiskPage() {
             {models.map((model) => (
               <div
                 key={model.name}
+                role="button"
+                tabIndex={0}
                 className={`p-4 border-2 rounded-xl cursor-pointer transition-all ${
                   selectedModel === model.name
                     ? 'border-blue-500 bg-blue-50/70 dark:bg-blue-900/20 shadow-sm'
                     : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 bg-transparent'
                 }`}
                 onClick={() => handleModelChange(model.name)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleModelChange(model.name);
+                  }
+                }}
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
@@ -886,8 +939,8 @@ export default function ForecastRiskPage() {
                     name === 'forecast'
                       ? 'Volatility Forecast'
                       : name === 'upperCI'
-                      ? 'Upper 90% CI'
-                      : 'Lower 90% CI',
+                      ? 'Upper +20% (illustrative)'
+                      : 'Lower −20% (illustrative)',
                   ]}
                 />
                 <Line

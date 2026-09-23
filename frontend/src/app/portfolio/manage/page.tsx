@@ -33,18 +33,12 @@ import { DashboardLayout } from '@/components/layout/DashboardLayout';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
-import { EditPositionModal } from '@/components/portfolio/EditPositionModal';
 import { PortfolioDropzone } from '@/components/portfolio/PortfolioDropzone';
 import { analyticsApi, portfolioApi } from '@/lib/api';
-import { cn } from '@/lib/utils';
+import { cn, formatCurrency as sharedFormatCurrency } from '@/lib/utils';
 
-// Simple position type for our table
-interface SimplePortfolioPosition extends PortfolioPosition {
-    totalCost: number;
-    unrealizedGainLoss: number;
-    unrealizedGainLossPct: number;
-    currentValue: number;
-}
+// Payload already carries snake_case calculated fields (PortfolioPosition)
+type SimplePortfolioPosition = PortfolioPosition;
 
 export default function PortfolioManagePage() {
     // State management
@@ -53,14 +47,14 @@ export default function PortfolioManagePage() {
     const [isLoading, setIsLoading] = useState(true);
     const [isLoadingForecast, setIsLoadingForecast] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [forecastNotice, setForecastNotice] = useState<string | null>(null);
     const [currency, setCurrency] = useState<Currency>('INR');
 
     // Modal states
     const [showAddModal, setShowAddModal] = useState(false);
     const [showImportModal, setShowImportModal] = useState(false);
-    const [showEditModal, setShowEditModal] = useState(false);
-    const [selectedPosition, setSelectedPosition] = useState<SimplePortfolioPosition | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+    const [isDeleting, setIsDeleting] = useState(false);
 
     // Editing states
     const [editingTicker, setEditingTicker] = useState<string | null>(null);
@@ -100,23 +94,41 @@ export default function PortfolioManagePage() {
             });
 
             const data = (response as any)?.data || response;
+            if (data) {
+                // Surface backend null+flag contract (error / is_limited_history)
+                setForecastNotice(
+                    data.error
+                        ? String(data.error)
+                        : data.is_limited_history
+                            ? 'Limited price history — forecasts may be unreliable.'
+                            : null
+                );
+            }
             if (data && data.positions) {
                 // Update positions with forecast risk data
                 const updatedPositions = positions.map(position => {
                     const tickerData = data.positions?.[position.ticker];
                     if (tickerData) {
+                        const vol =
+                            typeof tickerData.volatility_forecast === 'number'
+                                ? tickerData.volatility_forecast
+                                : undefined;
+                        const varFc =
+                            typeof tickerData.var_forecast === 'number'
+                                ? tickerData.var_forecast
+                                : undefined;
                         return {
                             ...position,
-                            volatility_forecast: tickerData.volatility_forecast,
-                            var_forecast: tickerData.var_forecast,
-                            risk_level: getRiskLevel(tickerData.volatility_forecast)
+                            volatility_forecast: vol,
+                            var_forecast: varFc,
+                            risk_level: vol !== undefined ? getRiskLevel(vol) : undefined
                         };
                     }
                     return {
                         ...position,
                         volatility_forecast: undefined,
                         var_forecast: undefined,
-                        risk_level: 'Low' as const
+                        risk_level: undefined
                     };
                 });
 
@@ -124,12 +136,13 @@ export default function PortfolioManagePage() {
             }
         } catch (err) {
             console.error('Failed to fetch forecast risk:', err);
-            // Set default values if forecast fails
+            // No forecast data → N/A, never a fabricated risk classification
+            setForecastNotice('Forecast risk unavailable — showing N/A.');
             const updatedPositions = positions.map(position => ({
                 ...position,
                 volatility_forecast: undefined,
                 var_forecast: undefined,
-                risk_level: 'Low' as const
+                risk_level: undefined
             }));
             setPositions(updatedPositions);
         } finally {
@@ -153,13 +166,16 @@ export default function PortfolioManagePage() {
             const data = await portfolioApi.getPortfolio({ currency });
 
             // Transform data to include calculated fields
-            const transformedPositions = data.positions.map((pos: any) => ({
-                ...pos,
-                total_cost: pos.quantity * pos.buy_price,
-                unrealized_gain_loss: pos.current_value - (pos.quantity * pos.buy_price),
-                unrealized_gain_loss_pct: ((pos.current_value - (pos.quantity * pos.buy_price)) / (pos.quantity * pos.buy_price)) * 100,
-                current_value: pos.current_value
-            }));
+            const transformedPositions = data.positions.map((pos: any) => {
+                const cost = pos.quantity * pos.buy_price;
+                return {
+                    ...pos,
+                    total_cost: cost,
+                    unrealized_gain_loss: pos.current_value - cost,
+                    unrealized_gain_loss_pct: cost > 0 ? ((pos.current_value - cost) / cost) * 100 : NaN,
+                    current_value: pos.current_value
+                };
+            });
 
             setPositions(transformedPositions);
             setSummary({
@@ -170,8 +186,9 @@ export default function PortfolioManagePage() {
                 sectors: data.sectors
             });
 
-            // Fetch forecast risk data after getting positions
-            await fetchForecastRisk(transformedPositions);
+            // Fire-and-forget: GARCH latency must not block first paint
+            // (forecast columns have their own isLoadingForecast skeletons).
+            void fetchForecastRisk(transformedPositions);
         } catch (err) {
             console.error('Failed to fetch portfolio:', err);
             setError('Failed to load portfolio data. Please try again.');
@@ -220,17 +237,21 @@ export default function PortfolioManagePage() {
 
     // Delete position
     const handleDeletePosition = async (ticker: string) => {
+        setIsDeleting(true);
         try {
             await portfolioApi.deletePosition(ticker);
 
             // Refresh portfolio data
             await fetchPortfolio();
             setDeleteConfirm(null);
+            setError(null);
 
             return true;
         } catch (error) {
             console.error('Failed to delete position:', error);
             throw error;
+        } finally {
+            setIsDeleting(false);
         }
     };
 
@@ -260,27 +281,38 @@ export default function PortfolioManagePage() {
     const saveEditing = async () => {
         if (!editingTicker) return;
 
-        try {
-            const position = positions.find(p => p.ticker === editingTicker);
-            if (!position) return;
+        const position = positions.find(p => p.ticker === editingTicker);
+        if (!position) return;
 
-            const today = new Date().toISOString().split('T')[0];
-            const positionDate = position.added_on ? position.added_on.slice(0, 10) : '';
-            const updates: PortfolioUpdateRequest = {
-                quantity: editingValues.quantity,
-                buy_price: editingValues.buy_price,
-                weight: editingValues.weight,
-                custom_name: editingValues.custom_name
-            };
-            if (editingValues.added_on && editingValues.added_on !== positionDate &&
-                /^\d{4}-\d{2}-\d{2}$/.test(editingValues.added_on) && editingValues.added_on <= today) {
+        // Block invalid input before the backend 422 arrives
+        if (!(editingValues.quantity > 0) || !(editingValues.buy_price > 0)) {
+            setError('Quantity and buy price must be greater than 0.');
+            return;
+        }
+
+        const today = new Date().toISOString().split('T')[0];
+        const positionDate = position.added_on ? position.added_on.slice(0, 10) : '';
+        const updates: PortfolioUpdateRequest = {
+            quantity: editingValues.quantity,
+            buy_price: editingValues.buy_price,
+            weight: editingValues.weight,
+            custom_name: editingValues.custom_name
+        };
+        if (editingValues.added_on && editingValues.added_on !== positionDate) {
+            if (/^\d{4}-\d{2}-\d{2}$/.test(editingValues.added_on) && editingValues.added_on <= today) {
                 updates.added_on = editingValues.added_on;
+            } else {
+                setError('Invalid buy date: must be a valid date, not in the future. Save cancelled.');
+                return;
             }
+        }
 
+        try {
             await handleUpdatePosition(position.id, updates);
             setEditingTicker(null);
+            setError(null);
         } catch (error) {
-            console.error('Failed to save changes:', error);
+            setError(error instanceof Error ? error.message : 'Failed to save changes');
         }
     };
 
@@ -329,14 +361,8 @@ export default function PortfolioManagePage() {
         ? (totalGainLoss / positions.reduce((sum, pos) => sum + pos.total_cost, 0)) * 100
         : 0;
 
-    const formatCurrency = (amount: number) => {
-        const symbol = currency === 'INR' ? '₹' : '$';
-        const sign = amount < 0 ? '-' : '';
-        return `${sign}${symbol}${Math.abs(amount).toLocaleString('en-US', {
-            minimumFractionDigits: 0,
-            maximumFractionDigits: 0
-        })}`;
-    };
+    const formatCurrency = (amount: number) =>
+        sharedFormatCurrency(amount, currency);
 
     if (isLoading) {
         return (
@@ -424,6 +450,16 @@ export default function PortfolioManagePage() {
                         <div className="flex items-center space-x-2">
                             <TrendingDown className="w-5 h-5 text-red-600" />
                             <p className="text-sm font-medium text-red-800 dark:text-red-200">{error}</p>
+                        </div>
+                    </div>
+                )}
+
+                {/* Forecast null+flag notice (error / is_limited_history) */}
+                {forecastNotice && (
+                    <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-4">
+                        <div className="flex items-center space-x-2">
+                            <AlertTriangle className="w-5 h-5 text-amber-600" />
+                            <p className="text-sm font-medium text-amber-800 dark:text-amber-200">{forecastNotice}</p>
                         </div>
                     </div>
                 )}
@@ -561,6 +597,12 @@ export default function PortfolioManagePage() {
                                         </th>
                                         <th
                                             className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
+                                            onClick={() => handleSort('weight')}
+                                        >
+                                            Weight {sortBy === 'weight' && (sortDirection === 'asc' ? '↑' : '↓')}
+                                        </th>
+                                        <th
+                                            className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
                                             onClick={() => handleSort('current_value')}
                                         >
                                             Current Value {sortBy === 'current_value' && (sortDirection === 'asc' ? '↑' : '↓')}
@@ -658,6 +700,11 @@ export default function PortfolioManagePage() {
                                                 )}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
+                                                {typeof position.weight === 'number'
+                                                    ? `${(position.weight * 100).toFixed(2)}%`
+                                                    : <span className="text-gray-500">N/A</span>}
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
                                                 {formatCurrency(position.current_value)}
                                             </td>
                                             <td className={cn(
@@ -671,8 +718,9 @@ export default function PortfolioManagePage() {
                                                 "px-6 py-4 whitespace-nowrap text-sm font-medium",
                                                 position.unrealized_gain_loss >= 0 ? "text-green-600" : "text-red-600"
                                             )}>
-                                                {position.unrealized_gain_loss >= 0 ? '+' : ''}
-                                                {position.unrealized_gain_loss_pct.toFixed(2)}%
+                                                {Number.isFinite(position.unrealized_gain_loss_pct)
+                                                    ? `${position.unrealized_gain_loss >= 0 ? '+' : ''}${position.unrealized_gain_loss_pct.toFixed(2)}%`
+                                                    : <span className="text-gray-500">N/A</span>}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
                                                 {isLoadingForecast ? (
@@ -680,7 +728,7 @@ export default function PortfolioManagePage() {
                                                         <Activity className="w-3 h-3 animate-pulse" />
                                                         <span>Loading...</span>
                                                     </div>
-                                                ) : position.volatility_forecast !== undefined ? (
+                                                ) : position.volatility_forecast != null ? (
                                                     <div className="flex items-center space-x-1">
                                                         <Activity className="w-4 h-4 text-blue-500" />
                                                         <span>{position.volatility_forecast.toFixed(2)}%</span>
@@ -695,7 +743,7 @@ export default function PortfolioManagePage() {
                                                         <Activity className="w-3 h-3 animate-pulse" />
                                                         <span>Loading...</span>
                                                     </div>
-                                                ) : position.var_forecast !== undefined ? (
+                                                ) : position.var_forecast != null ? (
                                                     <div className="flex items-center space-x-1">
                                                         <AlertTriangle className="w-4 h-4 text-orange-500" />
                                                         <span className={cn(
@@ -802,40 +850,45 @@ export default function PortfolioManagePage() {
                     onSuccess={fetchPortfolio}
                 />
 
-                {/* Edit Position Modal */}
-                <EditPositionModal
-                    isOpen={showEditModal}
-                    position={selectedPosition}
-                    onClose={() => {
-                        setShowEditModal(false);
-                        setSelectedPosition(null);
-                    }}
-                    onUpdate={handleUpdatePosition}
-                    currency={currency}
-                />
-
                 {/* Delete Confirmation Dialog */}
                 {deleteConfirm && (
-                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div
+                        className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="delete-confirm-title"
+                        onKeyDown={(e) => { if (e.key === 'Escape') setDeleteConfirm(null); }}
+                    >
                         <div className="bg-white dark:bg-gray-900 rounded-lg p-6 max-w-md w-full mx-4">
-                            <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-4">
+                            <h3 id="delete-confirm-title" className="text-lg font-medium text-gray-900 dark:text-white mb-4">
                                 Confirm Delete
                             </h3>
-                            <p className="text-gray-600 dark:text-gray-400 mb-6">
+                            <p className="text-gray-600 dark:text-gray-400 mb-4">
                                 Are you sure you want to delete position {deleteConfirm}? This action cannot be undone.
                             </p>
+                            {error && (
+                                <p className="text-sm text-red-600 dark:text-red-400 mb-4">{error}</p>
+                            )}
                             <div className="flex justify-end space-x-3">
                                 <button
-                                    onClick={() => setDeleteConfirm(null)}
+                                    onClick={() => { setDeleteConfirm(null); setError(null); }}
                                     className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
                                 >
                                     Cancel
                                 </button>
                                 <button
-                                    onClick={() => handleDeletePosition(deleteConfirm)}
-                                    className="px-4 py-2 text-sm font-medium text-white bg-red-600 border border-transparent rounded-md hover:bg-red-700"
+                                    onClick={async () => {
+                                        try {
+                                            await handleDeletePosition(deleteConfirm);
+                                        } catch (err) {
+                                            // Keep the dialog open and surface the real message
+                                            setError(err instanceof Error ? err.message : 'Failed to delete position');
+                                        }
+                                    }}
+                                    disabled={isDeleting}
+                                    className="px-4 py-2 text-sm font-medium text-white bg-red-600 border border-transparent rounded-md hover:bg-red-700 disabled:opacity-50"
                                 >
-                                    Delete
+                                    {isDeleting ? 'Deleting…' : 'Delete'}
                                 </button>
                             </div>
                         </div>

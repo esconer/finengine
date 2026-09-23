@@ -2,7 +2,7 @@
  * DataTable component for displaying portfolio positions and data
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState } from 'react';
 import {
   useReactTable,
   getCoreRowModel,
@@ -23,7 +23,6 @@ interface DataTableProps<T> {
   searchable?: boolean;
   exportable?: boolean;
   searchablePlaceholder?: string;
-  onSort?: (key: string, direction: 'asc' | 'desc') => void;
   onExport?: () => void;
   className?: string;
 }
@@ -37,7 +36,6 @@ export function DataTable<T>({
   searchable = true,
   exportable = false,
   searchablePlaceholder = "Search...",
-  onSort,
   onExport,
   className = '',
 }: DataTableProps<T>) {
@@ -64,41 +62,7 @@ export function DataTable<T>({
     },
   });
 
-  const handleSort = (column: string, direction: 'asc' | 'desc') => {
-    setSorting([{ id: column, desc: direction === 'desc' }]);
-    onSort?.(column, direction);
-  };
-
-  const formatCurrency = (value: number): string => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-    }).format(value);
-  };
-
-  const formatPercentage = (value: number | undefined | null): string => {
-    if (value === undefined || value === null || isNaN(value)) {
-      return '-';
-    }
-    return `${(value * 100).toFixed(2)}%`;
-  };
-
-  // Default formatters for common data types
-  const defaultFormatters = useMemo(() => ({
-    currency: (value: any) => {
-      const num = typeof value === 'string' ? parseFloat(value) : value;
-      return isNaN(num) ? '-' : formatCurrency(num);
-    },
-    percentage: (value: any) => {
-      const num = typeof value === 'string' ? parseFloat(value) : value;
-      return isNaN(num) ? '-' : formatPercentage(num);
-    },
-    number: (value: any) => {
-      const num = typeof value === 'string' ? parseFloat(value) : value;
-      return isNaN(num) ? '-' : num.toLocaleString();
-    },
-    text: (value: any) => value || '-',
-  }), []);
+  const filteredCount = table.getFilteredRowModel().rows.length;
 
   if (loading) {
     return (
@@ -135,13 +99,14 @@ export function DataTable<T>({
       <div className="p-4 border-b border-gray-200 dark:border-gray-700">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-            {title ? `${title} (${data.length})` : `Portfolio Positions (${data.length})`}
+            {title ? `${title} (${filteredCount})` : `Portfolio Positions (${filteredCount})`}
           </h3>
           
           <div className="flex items-center gap-3">
             {searchable && (
               <input
                 type="text"
+                aria-label="Search table"
                 placeholder={searchablePlaceholder}
                 value={globalFilter ?? ''}
                 onChange={(e) => setGlobalFilter(e.target.value)}
@@ -173,24 +138,36 @@ export function DataTable<T>({
           <thead className="bg-gray-50 dark:bg-gray-700">
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={`header-group-${headerGroup.id}`}>
-                {headerGroup.headers.map((header) => (
-                  <th
-                    key={`header-${header.id}-${header.column.id}`}
-                    className="px-6 py-3 text-left text-xs font-medium text-gray-500
-                             dark:text-gray-300 uppercase tracking-wider cursor-pointer
-                             hover:bg-gray-100 dark:hover:bg-gray-600"
-                    onClick={header.column.getToggleSortingHandler()}
-                  >
-                    <div className="flex items-center space-x-1.5 select-none">
-                      <span>
-                        {flexRender(header.column.columnDef.header, header.getContext())}
-                      </span>
-                      <span className="text-xs text-blue-500 font-bold">
-                        {header.column.getIsSorted() === 'asc' ? ' ↑' : header.column.getIsSorted() === 'desc' ? ' ↓' : ''}
-                      </span>
-                    </div>
-                  </th>
-                ))}
+                {headerGroup.headers.map((header) => {
+                  const headerLabel =
+                    typeof header.column.columnDef.header === 'string'
+                      ? header.column.columnDef.header
+                      : header.column.id;
+                  const sorted = header.column.getIsSorted();
+                  return (
+                    <th
+                      key={`header-${header.id}-${header.column.id}`}
+                      className="px-6 py-3 text-left text-xs font-medium text-gray-500
+                               dark:text-gray-300 uppercase tracking-wider"
+                      aria-sort={sorted === 'asc' ? 'ascending' : sorted === 'desc' ? 'descending' : undefined}
+                    >
+                      <button
+                        type="button"
+                        onClick={header.column.getToggleSortingHandler()}
+                        aria-label={`Sort by ${headerLabel}`}
+                        className="flex items-center space-x-1.5 select-none w-full text-left cursor-pointer
+                                 text-gray-500 dark:text-gray-300 hover:text-gray-700 dark:hover:text-white rounded"
+                      >
+                        <span>
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                        </span>
+                        <span className="text-xs text-blue-500 font-bold">
+                          {sorted === 'asc' ? ' ↑' : sorted === 'desc' ? ' ↓' : ''}
+                        </span>
+                      </button>
+                    </th>
+                  );
+                })}
               </tr>
             ))}
           </thead>
@@ -213,12 +190,12 @@ export function DataTable<T>({
       {/* Pagination */}
       <div className="px-6 py-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between">
         <div className="text-sm text-gray-700 dark:text-gray-300">
-          Showing {table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to{' '}
-          {Math.min(
-            (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
-            table.getFilteredRowModel().rows.length
-          )}{' '}
-          of {table.getFilteredRowModel().rows.length} results
+          {filteredCount === 0
+            ? 'No results'
+            : `Showing ${table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to ${Math.min(
+                (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
+                filteredCount
+              )} of ${filteredCount} results`}
         </div>
         
         <div className="flex items-center space-x-2">

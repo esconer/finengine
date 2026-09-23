@@ -102,22 +102,22 @@ describe('MetricCard', () => {
     })
 
     describe('Value Formatting', () => {
-        it('should format large numbers with K suffix', () => {
+        it('should format large numbers with en-IN grouping (no fake $ prefix)', () => {
             const props = createMockMetricCard({
                 value: 1234.56
             })
             render(<MetricCard {...props} />)
 
-            expect(screen.getByText('$1.2K')).toBeInTheDocument()
+            expect(screen.getByText('1,234.56')).toBeInTheDocument()
         })
 
-        it('should format large numbers with M suffix', () => {
+        it('should format large numbers with en-IN lakh grouping', () => {
             const props = createMockMetricCard({
                 value: 1234567.89
             })
             render(<MetricCard {...props} />)
 
-            expect(screen.getByText('$1.2M')).toBeInTheDocument()
+            expect(screen.getByText('12,34,567.89')).toBeInTheDocument()
         })
 
         it('should format small numbers with decimal places', () => {
@@ -298,7 +298,7 @@ describe('MetricCard', () => {
             })
             render(<MetricCard {...props} />)
 
-            expect(screen.getByText('$1000000.0M')).toBeInTheDocument()
+            expect(screen.getByText('9,99,99,99,99,999.00')).toBeInTheDocument()
         })
 
         it('should handle negative numbers', () => {
@@ -371,7 +371,34 @@ describe('MetricCard', () => {
             render(<MetricCard {...props} />)
 
             expect(screen.getByText('Portfolio Value')).toBeInTheDocument()
-            expect(screen.getByText('$1.2M')).toBeInTheDocument()
+            expect(screen.getByText('12,34,567.89')).toBeInTheDocument()
+        })
+    })
+
+    describe('B5 — formatting guards', () => {
+        it('formats INR prefix into crore', () => {
+            render(<MetricCard title="AUM" value={15000000} prefix="₹" />)
+            expect(screen.getByText('₹1.50Cr')).toBeInTheDocument()
+        })
+
+        it('formats INR prefix into lakh', () => {
+            render(<MetricCard title="AUM" value={250000} prefix="₹" />)
+            expect(screen.getByText('₹2.50L')).toBeInTheDocument()
+        })
+
+        it('renders N/A for NaN values', () => {
+            render(<MetricCard title="Broken" value={NaN} />)
+            expect(screen.getByText('N/A')).toBeInTheDocument()
+        })
+
+        it('hides change chip for non-finite change', () => {
+            render(<MetricCard title="Broken" value={1} change={NaN} />)
+            expect(screen.queryByText('NaN%')).not.toBeInTheDocument()
+        })
+
+        it('derives change color from sign, not changeType prop', () => {
+            render(<MetricCard title="Liar" value={1} change={-2} changeType="positive" />)
+            expect(screen.getByText('-2.00%')).toHaveClass('text-red-600', 'dark:text-red-400')
         })
     })
 

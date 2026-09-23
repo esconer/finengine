@@ -4,7 +4,7 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
@@ -268,18 +268,24 @@ interface FactorData {
   };
   lookback_days: number;
   methodology?: string;
+  /** Set by the backend on degraded/error payloads (r_squared may then be 0.0 filler) */
+  error?: string;
 }
 
 export default function FactorExposurePage() {
   const [factorData, setFactorData] = useState<FactorData | null>(null);
   const [lookbackDays, setLookbackDays] = useState(252);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [positionData, setPositionData] = useState<any[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
+  // Sequence guard so a stale response can never overwrite a newer lookback/positions result
+  const reqIdRef = useRef(0);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
 
   const fetchFactorData = async () => {
+    const reqId = ++reqIdRef.current;
     setLoading(true);
     try {
       const tickers = positions.map(p => p.ticker).join(',');
@@ -287,7 +293,9 @@ export default function FactorExposurePage() {
         tickers,
         lookback_days: lookbackDays
       });
+      if (reqId !== reqIdRef.current) return;
       setFactorData(data);
+      setFetchError(null);
 
       // Convert positions data for table
       const positionsList = Object.entries(data.positions || {}).map(([ticker, factors]: [string, any]) => ({
@@ -295,22 +303,29 @@ export default function FactorExposurePage() {
         ...factors
       }));
       setPositionData(positionsList);
-    } catch (error) {
+    } catch (error: any) {
+      if (reqId !== reqIdRef.current) return;
+      setFetchError(error?.message || 'Failed to fetch factor exposure data');
       console.error('Failed to fetch factor exposure data:', error);
     } finally {
-      setLoading(false);
+      if (reqId === reqIdRef.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     fetchPortfolio();
-    fetchFactorData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (positions.length > 0) {
-      fetchFactorData();
-    }
+    // Never fire the regression with an empty ticker list
+    if (positions.length === 0) return;
+    fetchFactorData();
+    return () => {
+      // Invalidate in-flight responses when deps change / unmount
+      reqIdRef.current++;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [positions, lookbackDays]);
 
   const handleLookbackChange = (days: number) => {
@@ -362,10 +377,10 @@ export default function FactorExposurePage() {
     const rows = positionData
       .map((p) => {
         const beta = p.market ?? null;
-        const alphaDaily = p.alpha ?? 0.0;
-        const alphaAnn = p.annualized_alpha ?? alphaDaily * 252;
+        const alphaDaily = p.alpha ?? null;
+        const alphaAnn = p.annualized_alpha ?? (alphaDaily != null ? alphaDaily * 252 : null);
         const sens = beta == null ? 'N/A' : beta > 1.2 ? 'High Beta' : beta < 0.8 ? 'Defensive' : 'Market-Like';
-        return `${p.ticker},${beta == null ? 'N/A' : beta.toFixed(4)},${(alphaDaily * 100).toFixed(4)}%,${(alphaAnn * 100).toFixed(2)}%,${sens}`;
+        return `${p.ticker},${beta == null ? 'N/A' : beta.toFixed(4)},${alphaDaily == null ? 'N/A' : `${(alphaDaily * 100).toFixed(4)}%`},${alphaAnn == null ? 'N/A' : `${(alphaAnn * 100).toFixed(2)}%`},${sens}`;
       })
       .join('\n');
     const blob = new Blob([headers + rows], { type: 'text/csv' });
@@ -423,7 +438,10 @@ export default function FactorExposurePage() {
         accessorKey: 'alpha',
         cell: ({ row }: any) => {
           const data = row.original || row;
-          const alphaDaily = (data.alpha ?? 0.0) * 100;
+          if (data.alpha == null) {
+            return <div className="font-mono text-gray-400">N/A</div>;
+          }
+          const alphaDaily = data.alpha * 100;
           const isPositive = alphaDaily >= 0;
           return (
             <div
@@ -442,7 +460,11 @@ export default function FactorExposurePage() {
         accessorKey: 'annualized_alpha',
         cell: ({ row }: any) => {
           const data = row.original || row;
-          const alphaAnn = (data.annualized_alpha ?? (data.alpha ?? 0.0) * 252) * 100;
+          const raw = data.annualized_alpha ?? (data.alpha != null ? data.alpha * 252 : null);
+          if (raw == null) {
+            return <div className="font-mono text-gray-400">N/A</div>;
+          }
+          const alphaAnn = raw * 100;
           const isPositive = alphaAnn >= 0;
           return (
             <div
@@ -489,7 +511,9 @@ export default function FactorExposurePage() {
     []
   );
 
-  const rSquared = factorData?.r_squared ?? null;
+  // Backend error payloads ship r_squared: 0.0 alongside `error` — never render that as a real fit
+  const factorApiError: string | null = factorData?.error ?? null;
+  const rSquared = factorApiError != null ? null : factorData?.r_squared ?? null;
   const systematicShare = rSquared == null ? null : Number((rSquared * 100).toFixed(1));
   const idiosyncraticShare = rSquared == null ? null : Number(((1 - rSquared) * 100).toFixed(1));
   const benchmarkCorr = rSquared == null ? null : Number((Math.sqrt(Math.max(0, rSquared)) * 100).toFixed(1));
@@ -498,7 +522,12 @@ export default function FactorExposurePage() {
   const portAlphaDaily = factorData?.portfolio?.alpha ?? null;
   const portAlphaAnn = factorData?.portfolio?.annualized_alpha ?? (portAlphaDaily != null ? portAlphaDaily * 252 : null);
 
-  const limitedHistoryCount = positionData.filter((p) => p.is_limited_history).length;
+  const limitedPositions = useMemo(
+    () => positionData.filter((p) => p.is_limited_history),
+    [positionData]
+  );
+  const limitedHistoryCount = limitedPositions.length;
+  const hasError = fetchError != null || factorApiError != null;
 
   return (
     <div className="space-y-6">
@@ -530,7 +559,7 @@ export default function FactorExposurePage() {
                 </div>
               )}
               <div className="px-2.5 py-1 rounded-md bg-teal-900/60 border border-teal-600/40 text-teal-200 text-xs font-medium">
-                R²: {factorData?.r_squared != null ? factorData.r_squared.toFixed(3) : 'N/A'}
+                R²: {rSquared != null ? rSquared.toFixed(3) : 'N/A'}
               </div>
             </div>
           </div>
@@ -550,6 +579,28 @@ export default function FactorExposurePage() {
         </div>
       </div>
 
+      {/* Factor regression error banner */}
+      {hasError && (
+        <div
+          data-testid="factor-error-banner"
+          className="p-4 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-xl flex items-start gap-3"
+        >
+          <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
+          <div className="text-xs text-amber-900 dark:text-amber-200 flex-1">
+            <span className="font-bold">Factor regression unavailable:</span>{' '}
+            {factorApiError ?? fetchError}
+          </div>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={loading}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white transition-colors shrink-0"
+          >
+            Try Again
+          </button>
+        </div>
+      )}
+
       {/* Data Quality Notice Banner */}
       {limitedHistoryCount > 0 && (
         <div className="p-4 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700/60 rounded-xl flex items-start gap-3">
@@ -557,10 +608,7 @@ export default function FactorExposurePage() {
           <div className="text-xs text-amber-900 dark:text-amber-200">
             <span className="font-bold">Data Quality Notice:</span>{' '}
             {limitedHistoryCount} instrument (
-            {positionData
-              .filter((p) => p.is_limited_history)
-              .map((p) => p.ticker)
-              .join(', ')}
+            {limitedPositions.map((p) => p.ticker).join(', ')}
             ) has fewer than 30 trading days of historical price history on the exchange feed. Univariate Beta and Alpha regression estimates for these newly listed tickers may be constrained.
           </div>
         </div>
@@ -583,7 +631,7 @@ export default function FactorExposurePage() {
         <div className="relative">
           <MetricCard
             title="Jensen's Alpha (α)"
-            value={portAlphaAnn != null ? `+${(portAlphaAnn * 100).toFixed(2)}%` : 'N/A'}
+            value={portAlphaAnn != null ? `${portAlphaAnn >= 0 ? '+' : ''}${(portAlphaAnn * 100).toFixed(2)}%` : 'N/A'}
             icon={TrendingUp}
             loading={loading}
           />
@@ -595,7 +643,7 @@ export default function FactorExposurePage() {
         <div className="relative">
           <MetricCard
             title="R-Squared (R²)"
-            value={factorData?.r_squared != null ? factorData.r_squared.toFixed(3) : 'N/A'}
+            value={rSquared != null ? rSquared.toFixed(3) : 'N/A'}
             icon={BarChart3}
             loading={loading}
           />
@@ -670,21 +718,21 @@ export default function FactorExposurePage() {
                   Jensen's Alpha (α)
                   <HelpBtn itemKey="jensens_alpha" onOpen={setActiveExplainer} />
                 </span>
-                <span className="font-mono font-semibold text-green-600 dark:text-green-400">
+                <span className={`font-mono font-semibold ${portAlphaDaily != null && portAlphaAnn != null ? (portAlphaAnn >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400') : 'text-gray-400'}`}>
                   {portAlphaDaily != null && portAlphaAnn != null
-                    ? `+${portAlphaDaily.toFixed(4)} (+${(portAlphaAnn * 100).toFixed(1)}% p.a.)`
+                    ? `${portAlphaDaily >= 0 ? '+' : ''}${portAlphaDaily.toFixed(4)} (${portAlphaAnn >= 0 ? '+' : ''}${(portAlphaAnn * 100).toFixed(1)}% p.a.)`
                     : 'N/A'}
                 </span>
               </div>
               <div className="flex items-center space-x-2">
                 <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
                   <div
-                    className="h-2.5 rounded-full bg-green-500"
-                    style={{ width: `${portAlphaDaily != null ? Math.min(Math.max(portAlphaDaily * 20000, 10), 100) : 0}%` }}
+                    className={`h-2.5 rounded-full ${portAlphaDaily == null ? 'bg-gray-400' : portAlphaDaily >= 0 ? 'bg-green-500' : 'bg-red-500'}`}
+                    style={{ width: `${portAlphaDaily != null ? Math.min(Math.abs(portAlphaDaily) * 20000, 100) : 0}%` }}
                   />
                 </div>
-                <span className="text-xs font-medium text-green-600 dark:text-green-400 w-24 text-right">
-                  {portAlphaDaily != null ? 'Positive Alpha' : 'N/A'}
+                <span className={`text-xs font-medium w-24 text-right ${portAlphaDaily == null ? 'text-gray-500 dark:text-gray-400' : portAlphaDaily >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                  {portAlphaDaily != null ? getFactorInterpretation('alpha', portAlphaDaily) : 'N/A'}
                 </span>
               </div>
             </div>
@@ -799,10 +847,16 @@ export default function FactorExposurePage() {
           <div className="flex items-start space-x-3 p-3.5 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-gray-200 dark:border-gray-800">
             <TrendingUp className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
             <div>
-              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Active Stock Selection (Alpha: {portAlphaAnn != null ? `+${(portAlphaAnn * 100).toFixed(2)}% p.a.` : 'N/A'})</h4>
+              <h4 className="font-semibold text-gray-900 dark:text-white text-sm">Active Stock Selection (Alpha: {portAlphaAnn != null ? `${portAlphaAnn >= 0 ? '+' : ''}${(portAlphaAnn * 100).toFixed(2)}% p.a.` : 'N/A'})</h4>
               <p className="text-xs text-gray-600 dark:text-gray-400 mt-1 leading-relaxed">
                 {portAlphaDaily != null && portAlphaAnn != null ? (
-                  <>The portfolio demonstrates strong active outperformance (+{(portAlphaDaily * 100).toFixed(3)}% daily or +{(portAlphaAnn * 100).toFixed(2)}% annualized) over its risk-adjusted CAPM baseline, confirming positive value contribution from individual asset picks.</>
+                  getFactorInterpretation('alpha', portAlphaDaily) === 'Negative Alpha' ? (
+                    <>The portfolio underperformed its risk-adjusted CAPM baseline ({(portAlphaDaily * 100).toFixed(3)}% daily or {(portAlphaAnn * 100).toFixed(2)}% annualized), indicating negative value contribution from stock selection.</>
+                  ) : getFactorInterpretation('alpha', portAlphaDaily) === 'Neutral Alpha' ? (
+                    <>The portfolio approximately matched its risk-adjusted CAPM baseline ({(portAlphaDaily * 100).toFixed(3)}% daily or {(portAlphaAnn * 100).toFixed(2)}% annualized) — no meaningful active edge this period.</>
+                  ) : (
+                    <>The portfolio outperformed its risk-adjusted CAPM baseline ({(portAlphaDaily * 100).toFixed(3)}% daily or {(portAlphaAnn * 100).toFixed(2)}% annualized), indicating positive value contribution from individual asset picks.</>
+                  )
                 ) : (
                   <>Alpha unavailable (N/A) — insufficient history for regression.</>
                 )}

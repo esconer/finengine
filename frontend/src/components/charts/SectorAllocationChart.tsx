@@ -86,7 +86,7 @@ const SectorCustomLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent
   );
 };
 
-export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
+const SectorAllocationChartImpl: React.FC<SectorAllocationChartProps> = ({
   data,
   loading = false,
   className = '',
@@ -175,5 +175,7 @@ export const SectorAllocationChart: React.FC<SectorAllocationChartProps> = ({
     </div>
   );
 };
+
+export const SectorAllocationChart = React.memo(SectorAllocationChartImpl);
 
 export default SectorAllocationChart;

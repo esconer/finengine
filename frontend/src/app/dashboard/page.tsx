@@ -23,8 +23,6 @@ import {
   BarChart3,
   Shield,
   RefreshCw,
-  Edit,
-  Trash2,
   Download,
   Radar,
   PieChart
@@ -32,7 +30,7 @@ import {
 
 const REGIME_CHIP: Record<string, string> = {
   calm: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300',
-  volatile: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
+  bull: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
   crisis: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
 };
 
@@ -59,8 +57,9 @@ function formatLastUpdated(timestamp: string | null) {
 export default function DashboardSummary() {
   const router = useRouter();
   const { positions, fetchPortfolio, isLoading, error, totalValue } = usePortfolioStore();
-  const { lastUpdated, updateLastUpdated } = useUIStore();
+  const { lastUpdated, updateLastUpdated, liveDataMode } = useUIStore();
   const [showAddModal, setShowAddModal] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const { data: analyticsData, loading: analyticsLoading, refresh: refreshAnalytics } = usePortfolioAnalytics();
   const { performanceData, loading: performanceLoading } = usePerformanceData(90);
   const sectorData = useSectorAllocation();
@@ -73,18 +72,21 @@ export default function DashboardSummary() {
 
   // Supplementary widgets: regime + risk drivers load quietly and never block the page
   useEffect(() => {
+    let mounted = true;
     analyticsApi
       .getRegime({ with_portfolio: false })
-      .then((r) => setRegimeInfo({ current_regime: r.current_regime, stability_pct: r.stability_pct }))
-      .catch(() => setRegimeInfo(null));
+      .then((r) => { if (mounted) setRegimeInfo({ current_regime: r.current_regime, stability_pct: r.stability_pct }); })
+      .catch(() => { if (mounted) setRegimeInfo(null); });
     analyticsApi
       .getRiskContribution()
       .then((r) => {
+        if (!mounted) return;
         const entries = Object.entries(r.positions?.volatility ?? {}) as [string, number][];
         entries.sort(([, a], [, b]) => b - a);
         setRiskDrivers(entries.slice(0, 3));
       })
-      .catch(() => setRiskDrivers(null));
+      .catch(() => { if (mounted) setRiskDrivers(null); });
+    return () => { mounted = false; };
   }, []);
 
   useEffect(() => {
@@ -126,24 +128,25 @@ export default function DashboardSummary() {
     }, 0);
   }, [positions]);
 
-  const totalGainLoss = (totalValue || 0) - totalCost;
-  const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
-
   // Calculate enhanced portfolio metrics
-  const portfolioMetrics = {
-    totalValue: totalValue || 0,
-    totalGainLoss,
-    totalGainLossPct,
-    positionsCount: positions.length,
-    totalWeight: positions.reduce((sum, pos) => sum + pos.weight, 0),
-    averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
-    topSector: sectorData.length > 0 ? sectorData[0]?.name || 'N/A' : 'N/A',
-    riskScore: analyticsData.riskScore?.overall_score ?? null,
-    volatility: analyticsData.summary?.realized_volatility ?? null,
-    sharpeRatio: analyticsData.summary?.sharpe_ratio ?? null,
-    maxDrawdown: analyticsData.summary?.max_drawdown || 0,
-    diversificationScore,
-  };
+  const portfolioMetrics = useMemo(() => {
+    const totalGainLoss = (totalValue || 0) - totalCost;
+    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
+    return {
+      totalValue: totalValue || 0,
+      totalGainLoss,
+      totalGainLossPct,
+      positionsCount: positions.length,
+      totalWeight: positions.reduce((sum, pos) => sum + pos.weight, 0),
+      averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
+      topSector: sectorData.length > 0 ? sectorData[0]?.name || 'N/A' : 'N/A',
+      riskScore: analyticsData.riskScore?.overall_score ?? null,
+      volatility: analyticsData.summary?.realized_volatility ?? null,
+      sharpeRatio: analyticsData.summary?.sharpe_ratio ?? null,
+      maxDrawdown: analyticsData.summary?.max_drawdown ?? null,
+      diversificationScore,
+    };
+  }, [positions, totalValue, sectorData, totalCost, analyticsData, diversificationScore]);
 
   // Phase 4: the Ann Vol card reads full-history asset vol (unmasked), so it
   // never N/A-gates on intersection length. Falls back to holding-window
@@ -154,7 +157,7 @@ export default function DashboardSummary() {
   const volCardValue = instrumentVol ?? portfolioMetrics.volatility;
 
   // DataTable columns with enhanced functionality
-  const positionColumns = [
+  const positionColumns = useMemo(() => [
     {
       header: 'Ticker',
       accessorKey: 'ticker' as keyof PortfolioPosition,
@@ -174,7 +177,10 @@ export default function DashboardSummary() {
         const data = row.original || row;
         const liveWeight = (totalValue && totalValue > 0 && data.market_value)
           ? (data.market_value / totalValue)
-          : (data.weight || 0);
+          : data.weight;
+        if (liveWeight == null || !Number.isFinite(liveWeight)) {
+          return <div className="text-gray-500">N/A</div>;
+        }
         return (
           <div className="text-gray-900 dark:text-white font-medium">
             {`${(liveWeight * 100).toFixed(2)}%`}
@@ -218,24 +224,7 @@ export default function DashboardSummary() {
         );
       },
     },
-    {
-      header: 'Actions',
-      accessorKey: 'id' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
-        return (
-          <div className="flex items-center space-x-2">
-            <button className="p-1 text-gray-600 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400">
-              <Edit className="w-4 h-4" />
-            </button>
-            <button className="p-1 text-gray-600 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400">
-              <Trash2 className="w-4 h-4" />
-            </button>
-          </div>
-        );
-      },
-    },
-  ];
+  ], [totalValue]);
 
   // Add position handler
   const handleAddPosition = async (positionData: any) => {
@@ -251,8 +240,11 @@ export default function DashboardSummary() {
 
   const handleExportCSV = async () => {
     try {
-      const response = await fetch('/api/v1/portfolio/export/csv');
-      const csvData = await response.text();
+      setExportError(null);
+      const csvData = await portfolioApi.exportCSV();
+      if (typeof csvData !== 'string' || csvData.trim().length === 0) {
+        throw new Error('Export returned an empty file');
+      }
 
       const blob = new Blob([csvData], { type: 'text/csv' });
       const url = window.URL.createObjectURL(blob);
@@ -263,8 +255,9 @@ export default function DashboardSummary() {
       a.click();
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to export CSV:', error);
+      setExportError(error?.message || 'Failed to export portfolio CSV');
     }
   };
 
@@ -298,12 +291,12 @@ export default function DashboardSummary() {
           <div>
             <h1 className="text-3xl font-bold mb-2">Portfolio Overview</h1>
             <p className="text-blue-100">
-              Real-time risk analysis and portfolio management
+              Portfolio analytics and risk management
             </p>
             <div className="flex items-center mt-2 space-x-4">
-              <div className="flex items-center text-green-300">
-                <div className="w-2 h-2 bg-green-400 rounded-full mr-2"></div>
-                <span className="text-sm">Live Data Active</span>
+              <div className={`flex items-center ${liveDataMode ? 'text-green-300' : 'text-blue-200'}`}>
+                <div className={`w-2 h-2 rounded-full mr-2 ${liveDataMode ? 'bg-green-400' : 'bg-blue-300'}`}></div>
+                <span className="text-sm">{liveDataMode ? 'Live Data Active' : 'Live Data Off'}</span>
               </div>
               {lastUpdated && (
                 <div className="text-blue-200 text-sm">
@@ -337,7 +330,7 @@ export default function DashboardSummary() {
         <MetricCard
           title="Unrealized P&L"
           value={`${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-          change={portfolioMetrics.totalGainLossPct}
+          change={totalCost > 0 ? portfolioMetrics.totalGainLossPct : undefined}
           changeType={portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
           icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
           loading={isOverallLoading}
@@ -450,8 +443,8 @@ export default function DashboardSummary() {
           annual_volatility: portfolioMetrics.volatility,
           sharpe_ratio: portfolioMetrics.sharpeRatio,
           max_drawdown: portfolioMetrics.maxDrawdown,
-          var_95: analyticsData.realizedRisk?.portfolio?.var_95 || 0,
-          cvar_95: analyticsData.realizedRisk?.portfolio?.cvar_95 || 0,
+          var_95: analyticsData.realizedRisk?.portfolio?.var_95 ?? null,
+          cvar_95: analyticsData.realizedRisk?.portfolio?.cvar_95 ?? null,
           // Add FORECAST RISK DATA - This fixes the N/A issue
           forecast_volatility: analyticsData.forecastRisk?.portfolio?.volatility_forecast || null,
           forecast_var: analyticsData.forecastRisk?.portfolio?.var_forecast || null,
@@ -476,6 +469,24 @@ export default function DashboardSummary() {
 
       {/* Portfolio Positions Table with Management */}
       <div>
+        {exportError && (
+          <div
+            data-testid="export-error-banner"
+            className="mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-3"
+          >
+            <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 mt-0.5 shrink-0" />
+            <div className="text-sm text-red-800 dark:text-red-300 flex-1">
+              <span className="font-semibold">CSV export failed:</span> {exportError}
+            </div>
+            <button
+              type="button"
+              onClick={() => setExportError(null)}
+              className="text-xs font-semibold text-red-700 dark:text-red-300 hover:underline shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <DataTable
           data={positions}
           columns={positionColumns}
@@ -581,8 +592,12 @@ export default function DashboardSummary() {
               </div>
             </div>
             <div className="text-center">
-              <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">
-                {Math.max(0, (portfolioMetrics.totalWeight - 1) * 100).toFixed(1)}%
+              <div className={`text-2xl font-bold ${
+                ((portfolioMetrics.totalWeight - 1) * 100) >= 0
+                  ? 'text-blue-600 dark:text-blue-400'
+                  : 'text-amber-500 dark:text-amber-400'
+              }`}>
+                {((portfolioMetrics.totalWeight - 1) * 100).toFixed(1)}%
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 Weight Drift

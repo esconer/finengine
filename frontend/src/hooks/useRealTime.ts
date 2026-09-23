@@ -5,6 +5,7 @@
 import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import { useRealTimeAnalytics } from '@/lib/websocket';
 import { usePortfolioStore, useAnalyticsStore, useUIStore } from '@/lib/store';
+import { toDateOnlyString } from '@/lib/utils';
 
 // Enhanced auto-refresh hook
 export function useAutoRefresh(enabled: boolean = true, interval: number = 300000) {
@@ -12,6 +13,7 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
     const fetchPortfolio = usePortfolioStore(state => state.fetchPortfolio);
     const updateRealTimeData = useAnalyticsStore(state => state.updateRealTimeData);
     const intervalRef = useRef<NodeJS.Timeout | null>(null);
+    const settleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const isRefreshingRef = useRef(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -22,8 +24,11 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
         isRefreshingRef.current = true;
         setIsRefreshing(true);
         try {
-            // Update portfolio
-            await fetchPortfolio();
+            // fetchPortfolio never rejects — it returns success/failure (B10)
+            const ok = await fetchPortfolio();
+            if (!ok) {
+                throw new Error(usePortfolioStore.getState().error || 'Portfolio refresh failed');
+            }
 
             // Update real-time analytics data
             updateRealTimeData('analytics', {
@@ -31,9 +36,12 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
                 timestamp: new Date().toISOString()
             });
 
+            // Only stamp lastRefresh on success
             setLastRefresh(new Date());
 
-            setTimeout(() => {
+            if (settleTimeoutRef.current) clearTimeout(settleTimeoutRef.current);
+            settleTimeoutRef.current = setTimeout(() => {
+                settleTimeoutRef.current = null;
                 updateRealTimeData('analytics', {
                     refreshing: false,
                     timestamp: new Date().toISOString()
@@ -68,6 +76,10 @@ export function useAutoRefresh(enabled: boolean = true, interval: number = 30000
             if (intervalRef.current) {
                 clearInterval(intervalRef.current);
                 intervalRef.current = null;
+            }
+            if (settleTimeoutRef.current) {
+                clearTimeout(settleTimeoutRef.current);
+                settleTimeoutRef.current = null;
             }
         };
     }, [enabled, liveDataMode, interval, performRefresh]);
@@ -422,6 +434,8 @@ export function useExportProgress() {
 }
 
 // Dashboard preferences hook
+// ponytail: darkMode + currency:'USD' here duplicate UIStore and the api's INR
+// default (04-B19/B14) — zero callers today; delete when prefs consolidation ships
 export function useDashboardPreferences() {
     const [preferences, setPreferences] = useState({
         autoRefresh: true,
@@ -547,9 +561,10 @@ export function useDateRangeSelection() {
     }, []);
 
     const formatDateRange = useCallback(() => {
+        // Local calendar components — toISOString() would shift IST evenings to UTC+1 day (B20)
         return {
-            start: dateRange.start.toISOString().split('T')[0],
-            end: dateRange.end.toISOString().split('T')[0]
+            start: toDateOnlyString(dateRange.start),
+            end: toDateOnlyString(dateRange.end)
         };
     }, [dateRange]);
 

@@ -10,6 +10,7 @@ import { X, Plus, Loader } from 'lucide-react';
 import { PortfolioCreateRequest, Currency } from '@/types';
 import { portfolioApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 
 interface AddPositionModalProps {
   isOpen: boolean;
@@ -33,6 +34,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
   const [existingCount, setExistingCount] = useState(0);
+  const [portfolioLoaded, setPortfolioLoaded] = useState(false);
+  const [fetchError, setFetchError] = useState(false);
 
   const fetchTotalPortfolioValue = useCallback(async () => {
     try {
@@ -40,10 +43,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       const posList = data.positions || [];
       setExistingCount(posList.length);
       setTotalPortfolioValue(data.total_value || 0);
+      setPortfolioLoaded(true);
+      setFetchError(false);
     } catch (error) {
       console.error('Failed to fetch portfolio total:', error);
-      setTotalPortfolioValue(0);
-      setExistingCount(0);
+      setFetchError(true);
     }
   }, [currency]);
 
@@ -67,14 +71,17 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         added_on: new Date().toISOString().split('T')[0]
       });
       setErrors({});
+      setPortfolioLoaded(false);
+      setFetchError(false);
     }
   }, [isOpen, currency]);
 
-  // Auto-calculate weight when quantity or buy price changes
+  // Auto-calculate weight when quantity or buy price changes (only after a successful fetch)
   useEffect(() => {
+    if (!portfolioLoaded) return;
     if (formData.quantity > 0 && formData.buy_price > 0) {
       const positionValue = formData.quantity * formData.buy_price;
-      if (existingCount === 0 || totalPortfolioValue <= 0) {
+      if (existingCount === 0) {
         // First position in an empty portfolio is always 100% (1.0)
         setFormData(prev => ({ ...prev, weight: 1.0 }));
       } else {
@@ -83,7 +90,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         setFormData(prev => ({ ...prev, weight: estimatedWeight }));
       }
     }
-  }, [formData.quantity, formData.buy_price, totalPortfolioValue, existingCount]);
+  }, [formData.quantity, formData.buy_price, totalPortfolioValue, existingCount, portfolioLoaded]);
 
   // Validate form
   const validateForm = (): boolean => {
@@ -122,7 +129,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   // Handle form submission
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
+    if (fetchError) {
+      return;
+    }
+
     if (!validateForm()) {
       return;
     }
@@ -164,23 +175,20 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   }
 
   return (
-    <div
-      className="fixed inset-0 z-[9999] overflow-y-auto bg-gray-900 bg-opacity-75"
-      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}
-      onClick={onClose}
-    >
-      <div
-        className="bg-white dark:bg-gray-900 rounded-xl shadow-2xl p-6 w-full max-w-lg mx-4 border border-gray-200 dark:border-gray-700"
-        onClick={(e) => e.stopPropagation()}
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        closeOnOutsideClick={false}
+        className="p-0 gap-0 max-w-lg"
       >
         {/* Header */}
-        <div className="flex items-center justify-between mb-6 pb-4 border-b border-gray-200 dark:border-gray-700">
+        <div className="flex items-center justify-between px-6 pt-6 pb-4 border-b border-gray-200 dark:border-gray-700">
           <div>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Add New Position</h2>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Add a stock position to your portfolio</p>
+            <DialogTitle className="text-xl font-semibold">Add New Position</DialogTitle>
+            <DialogDescription className="text-sm mt-1">Add a stock position to your portfolio</DialogDescription>
           </div>
           <button
             onClick={onClose}
+            aria-label="Close"
             className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
           >
             <X className="w-5 h-5" />
@@ -188,13 +196,28 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-5">
+        <form onSubmit={handleSubmit} className="space-y-5 px-6 pb-6">
+          {/* Portfolio fetch failure banner */}
+          {fetchError && (
+            <div className="p-3 text-sm text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg flex items-center justify-between">
+              <span>Couldn&apos;t load portfolio total — retry</span>
+              <button
+                type="button"
+                onClick={fetchTotalPortfolioValue}
+                className="ml-3 font-semibold underline shrink-0"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
           {/* Ticker Symbol */}
           <div>
-            <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+            <label htmlFor="add-ticker" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
               Stock Ticker *
             </label>
             <input
+              id="add-ticker"
               type="text"
               value={formData.ticker}
               onChange={(e) => handleInputChange('ticker', e.target.value.toUpperCase())}
@@ -213,10 +236,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* Quantity */}
             <div>
-              <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+              <label htmlFor="add-quantity" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
                 Quantity *
               </label>
               <input
+                id="add-quantity"
                 type="number"
                 value={formData.quantity || ''}
                 onChange={(e) => handleInputChange('quantity', parseFloat(e.target.value) || 0)}
@@ -235,10 +259,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
             {/* Buy Price */}
             <div>
-              <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+              <label htmlFor="add-buy-price" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
                 Buy Price ({effectiveCurrency}) *
               </label>
               <input
+                id="add-buy-price"
                 type="number"
                 value={formData.buy_price || ''}
                 onChange={(e) => handleInputChange('buy_price', parseFloat(e.target.value) || 0)}
@@ -258,11 +283,12 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
 
           {/* Portfolio Weight Display */}
           <div>
-            <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+            <label htmlFor="add-weight" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
               Portfolio Weight (Auto-calculated)
             </label>
             <div className="relative">
               <input
+                id="add-weight"
                 type="text"
                 value={formData.weight > 0 ? `${(formData.weight * 100).toFixed(2)}%` : 'Auto-calculated'}
                 readOnly
@@ -283,10 +309,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
           {/* Custom Name + Purchase Date */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+            <label htmlFor="add-custom-name" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
               Custom Name (Optional)
             </label>
             <input
+              id="add-custom-name"
               type="text"
               value={formData.custom_name || ''}
               onChange={(e) => handleInputChange('custom_name', e.target.value)}
@@ -295,10 +322,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             />
           </div>
           <div>
-            <label className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+            <label htmlFor="add-purchased-on" className="block text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
               Purchase Date
             </label>
             <input
+              id="add-purchased-on"
               type="date"
               value={formData.added_on || ''}
               max={new Date().toISOString().split('T')[0]}
@@ -332,7 +360,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             </button>
             <button
               type="submit"
-              disabled={isSubmitting}
+              disabled={isSubmitting || fetchError}
               className="flex-1 flex items-center justify-center space-x-2 px-4 py-3 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {isSubmitting ? (
@@ -344,8 +372,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             </button>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

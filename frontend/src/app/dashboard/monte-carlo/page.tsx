@@ -49,6 +49,7 @@ function FanChart({ fan, target }: { fan: MonteCarloResult['fan']; target: numbe
     const vals = fan.flatMap((p) => [p.p5, p.p95, target]);
     return { min: Math.min(...vals), max: Math.max(...vals) };
   }, [fan, target]);
+  if (fan.length === 0) return null;
   const span = max - min || 1;
   const x = (yr: number) => PAD + (yr / fan[fan.length - 1].year) * (W - 2 * PAD);
   const y = (v: number) => H - PAD - ((v - min) / span) * (H - 2 * PAD);
@@ -222,9 +223,9 @@ export default function MonteCarloPage() {
         </div>
       )}
 
-      {/* Results */}
-      {!running && result && (
-        <>
+      {/* Results — kept visible (dimmed) while a re-run is in flight */}
+      {result && (
+        <div className={`space-y-6 ${running ? 'opacity-50 pointer-events-none' : ''}`}>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             <MetricCard
               title="Probability of Success"
@@ -256,6 +257,8 @@ export default function MonteCarloPage() {
               <span className="text-xs text-gray-500 dark:text-gray-400">
                 {result.num_paths.toLocaleString('en-IN')} paths · {result.method} engine
                 {result.student_t_df !== null && ` · tail df ${result.student_t_df}`}
+                {' · '}hist. μ {(result.historical_mu_annual * 100).toFixed(1)}% · σ{' '}
+                {(result.historical_sigma_annual * 100).toFixed(1)}%
               </span>
             </div>
             <FanChart fan={result.fan} target={result.target_value} />
@@ -282,7 +285,7 @@ export default function MonteCarloPage() {
             <Info className="w-5 h-5 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
             <p className="text-sm text-blue-800 dark:text-blue-300">{result.disclaimer}</p>
           </div>
-        </>
+        </div>
       )}
     </div>
   );

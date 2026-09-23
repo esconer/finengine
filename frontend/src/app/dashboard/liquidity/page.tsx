@@ -4,13 +4,14 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
 import { MetricCardLoading, DataTableLoading } from '@/components/ui/LoadingState';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   Droplets,
   Clock,
@@ -38,7 +39,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   overall_score: {
     title: 'Overall Liquidity Score (0 - 10)',
     what: 'A composite portfolio score measuring how easily active positions can be converted into cash without causing significant market price slippage or impact.',
-    howInferred: 'Derived by aggregating individual constituent liquidity scores weighted by trading volume, daily turnover (Volume × Price), and market capitalization across all 14 active holdings.',
+    howInferred: 'Derived by aggregating individual constituent liquidity scores weighted by trading volume, daily turnover (Volume × Price), and market capitalization across all active holdings.',
     whyImportant: 'High liquidity ensures you can enter, exit, or rebalance positions rapidly during market stress without paying steep liquidity penalties or moving the market against yourself.',
     howToInfer: '8.0 – 10.0 indicates strong institutional liquidity (liquidate within 1-2 days). 6.0 – 8.0 represents adequate liquidity (2-5 days). Below 6.0 indicates potential trading bottlenecks.',
     benchmark: 'Institutional target ≥ 7.5/10 for actively managed retail and multi-cap equity portfolios.'
@@ -62,7 +63,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   high_liquidity_positions: {
     title: 'High Liquidity Constituents Count & Ratio',
     what: 'The number and percentage of portfolio positions that achieve a High liquidity rating (Score ≥ 8.0/10).',
-    howInferred: 'Count of positions where Category = "High" divided by total active holdings (N = 14).',
+    howInferred: 'Count of positions where Category = "High" divided by total active holdings.',
     whyImportant: 'Shows the concentration of cash-convertible assets that can be tapped immediately to meet unexpected capital calls or redeploy into new opportunities.',
     howToInfer: 'A higher percentage (> 50%) provides strong structural stability and ensures that large redemptions can be fulfilled by trimming large-caps without touching small-cap core holdings.',
     benchmark: 'Prudent institutional baseline: ≥ 40% – 60%.'
@@ -78,7 +79,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   distribution: {
     title: 'Portfolio Liquidity Distribution',
     what: 'Breakdown of active positions across three primary liquidity tiers: High (8-10), Medium (6-8), and Low (0-6).',
-    howInferred: 'Classifies the 14 constituents by their individual liquidity score and visualizes the allocation across the three tiers.',
+    howInferred: 'Classifies constituents by their individual liquidity score and visualizes the allocation across the three tiers.',
     whyImportant: 'Prevents the illusion of safety where a portfolio has high overall value but is heavily concentrated in a long tail of illiquid small-caps.',
     howToInfer: 'Healthy portfolios have a pyramidal or top-heavy distribution with the majority of positions in High and Medium tiers.',
     benchmark: 'Target: < 20% of portfolio positions in the Low Liquidity tier.'
@@ -135,12 +136,29 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
 };
 
 function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={info.title}
+        onClick={(e) => e.stopPropagation()}
+        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+      >
         <button
           onClick={onClose}
           className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
@@ -239,13 +257,13 @@ interface LiquidityData {
 
 interface PositionLiquidity {
   ticker: string;
-  score: number;
-  category: 'High' | 'Medium' | 'Low';
-  liquidation_days: string;
-  volume_30d: number;
-  avg_turnover: number;
-  market_cap: number;
-  bid_ask_spread: number;
+  score: number | null;
+  category: 'High' | 'Medium' | 'Low' | null;
+  liquidation_days: string | null;
+  volume_30d: number | null;
+  avg_turnover: number | null;
+  market_cap: number | null;
+  bid_ask_spread: number | null;
 }
 
 export default function LiquidityPage() {
@@ -256,13 +274,16 @@ export default function LiquidityPage() {
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
+  const fetchSeq = useRef(0);
 
   const fetchLiquidityData = async () => {
+    const seq = ++fetchSeq.current;
     setLoading(true);
     setError(null);
 
     try {
       const data = await analyticsApi.getLiquidityMetrics();
+      if (seq !== fetchSeq.current) return;
       setLiquidityData(data);
 
       // Convert by_position data for table
@@ -270,48 +291,28 @@ export default function LiquidityPage() {
 
       if (data.by_position && Object.keys(data.by_position).length > 0) {
         Object.entries(data.by_position).forEach(([ticker, posData]: [string, any]) => {
-          const posObj = positions.find(p => p.ticker === ticker);
-          
-          // Use real market cap from backend or fallback to dynamic turnover capitalization
-          const realMarketCap = posData.market_cap && posData.market_cap > 0
-            ? posData.market_cap
-            : (posData.avg_turnover ? posData.avg_turnover * 250 : 5000000000);
-
           positionsList.push({
             ticker,
-            score: posData.score || 0,
-            category: posData.category || (posData.score >= 8 ? 'High' : posData.score >= 6 ? 'Medium' : 'Low'),
-            liquidation_days: posData.liquidation_days || (posData.score >= 8 ? '1-2' : posData.score >= 6 ? '2-3' : '5-10'),
-            volume_30d: posData.avg_volume || 0,
-            avg_turnover: posData.avg_turnover || (posData.avg_volume && posObj?.last_price ? posData.avg_volume * posObj.last_price : 0),
-            market_cap: realMarketCap,
-            bid_ask_spread: posData.spread && posData.spread > 0 ? posData.spread : (posData.score >= 8 ? 0.0004 : posData.score >= 6 ? 0.0012 : 0.0035),
+            score: posData.score ?? null,
+            category: posData.category ?? null,
+            liquidation_days: posData.liquidation_days ?? null,
+            volume_30d: posData.avg_volume ?? null,
+            avg_turnover: posData.avg_turnover ?? (posData.avg_volume && positions.find(p => p.ticker === ticker)?.last_price ? posData.avg_volume * positions.find(p => p.ticker === ticker)!.last_price : null),
+            market_cap: posData.market_cap && posData.market_cap > 0 ? posData.market_cap : null,
+            bid_ask_spread: posData.spread && posData.spread > 0 ? posData.spread : null,
           });
         });
       }
 
-      setPositionData(positionsList.sort((a, b) => b.score - a.score));
+      setPositionData(positionsList.sort((a, b) => (b.score ?? -1) - (a.score ?? -1)));
     } catch (err) {
+      if (seq !== fetchSeq.current) return;
       console.error('Failed to fetch liquidity data:', err);
       setError(err instanceof Error ? err.message : 'Failed to load liquidity data');
-
-      setLiquidityData({
-        overall_score: 7.8,
-        liquidation_time_days: '1-2',
-        risk_level: 'Low',
-        by_position: {},
-        volume_stats: {
-          avg_volume: 5000000,
-          total_portfolio_volume: 25000000,
-          high_volume_pct: 60,
-          medium_volume_pct: 30,
-          low_volume_pct: 10
-        }
-      });
-
+      setLiquidityData(null);
       setPositionData([]);
     } finally {
-      setLoading(false);
+      if (seq === fetchSeq.current) setLoading(false);
     }
   };
 
@@ -340,7 +341,7 @@ export default function LiquidityPage() {
 
   const formatCurrency = (value: number | undefined | null) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '₹0';
+      return 'N/A';
     }
     if (value >= 10000000000000) return `₹${(value / 1000000000000).toFixed(2)} L Cr`;
     if (value >= 10000000) return `₹${(value / 10000000).toLocaleString('en-IN', { maximumFractionDigits: 2 })} Cr`;
@@ -350,7 +351,7 @@ export default function LiquidityPage() {
 
   const formatVolume = (value: number | undefined | null) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '0';
+      return 'N/A';
     }
     if (value >= 10000000) return `${(value / 10000000).toFixed(2)} Cr`;
     if (value >= 100000) return `${(value / 100000).toFixed(2)} L`;
@@ -360,19 +361,21 @@ export default function LiquidityPage() {
 
   const formatPercentage = (value: number | undefined | null, decimals = 2) => {
     if (value === undefined || value === null || isNaN(value)) {
-      return '0.00%';
+      return 'N/A';
     }
     const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
     return `${scaled.toFixed(decimals)}%`;
   };
 
-  const getScoreColor = (score: number): string => {
+  const getScoreColor = (score: number | null): string => {
+    if (score == null || isNaN(score)) return 'text-gray-500 dark:text-gray-400 font-medium';
     if (score >= 8) return 'text-emerald-500 dark:text-emerald-400 font-bold';
     if (score >= 6) return 'text-amber-500 dark:text-amber-400 font-bold';
     return 'text-rose-500 dark:text-rose-400 font-bold';
   };
 
-  const getScoreBgColor = (score: number): string => {
+  const getScoreBgColor = (score: number | null): string => {
+    if (score == null || isNaN(score)) return 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700';
     if (score >= 8) return 'bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800/40';
     if (score >= 6) return 'bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800/40';
     return 'bg-rose-50 dark:bg-rose-950/20 border-rose-200 dark:border-rose-800/40';
@@ -384,14 +387,14 @@ export default function LiquidityPage() {
     const headers = ['Ticker', 'Liquidity Score', 'Category', 'Avg Volume (30D)', 'Market Cap (INR)', 'Bid-Ask Spread (%)', 'Liquidation Time (Days)'];
     const rows = positionData.map(p => [
       p.ticker,
-      p.score.toFixed(1),
-      p.category,
+      p.score != null ? p.score.toFixed(1) : 'N/A',
+      p.category ?? 'N/A',
       p.volume_30d,
-      p.market_cap,
-      (p.bid_ask_spread * 100).toFixed(2) + '%',
-      p.liquidation_days
-    ]);
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+      p.market_cap ?? 'N/A',
+      p.bid_ask_spread != null ? (p.bid_ask_spread * 100).toFixed(2) + '%' : 'N/A',
+      p.liquidation_days ?? 'N/A'
+    ].map(escapeCsvCell));
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.map(escapeCsvCell).join(','), ...rows.map(r => r.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
@@ -402,9 +405,9 @@ export default function LiquidityPage() {
   };
 
   const overallScore: number | null = liquidityData?.overall_score ?? null;
-  const highVolumeCount = positionData.filter(p => p.score >= 8).length;
-  const mediumVolumeCount = positionData.filter(p => p.score >= 6 && p.score < 8).length;
-  const lowVolumeCount = positionData.filter(p => p.score < 6).length;
+  const highVolumeCount = positionData.filter(p => p.score != null && p.score >= 8).length;
+  const mediumVolumeCount = positionData.filter(p => p.score != null && p.score >= 6 && p.score < 8).length;
+  const lowVolumeCount = positionData.filter(p => p.score != null && p.score < 6).length;
 
   // Position liquidity table columns with ? explainers
   const positionColumns: ColumnDef<PositionLiquidity>[] = [
@@ -454,10 +457,11 @@ export default function LiquidityPage() {
         const data = row.original || row;
         const colorClass = data.category === 'High' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' :
           data.category === 'Medium' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' :
-            'bg-rose-500/20 text-rose-300 border border-rose-500/40';
+            data.category === 'Low' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40' :
+              'bg-slate-500/20 text-slate-300 border border-slate-500/40';
         return (
           <span className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${colorClass}`}>
-            {data.category}
+            {data.category ?? 'N/A'}
           </span>
         );
       },
@@ -692,9 +696,10 @@ export default function LiquidityPage() {
                       <span className={`px-2 py-0.5 text-xs rounded-full font-semibold ${
                         position.category === 'High' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
                         position.category === 'Medium' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' :
-                        'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                        position.category === 'Low' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' :
+                        'bg-slate-500/20 text-slate-300 border border-slate-500/30'
                       }`}>
-                        {position.category}
+                        {position.category ?? 'N/A'}
                       </span>
                     </div>
                     <div className="flex items-center space-x-3">
@@ -702,9 +707,10 @@ export default function LiquidityPage() {
                         <div
                           className={`h-full rounded-full transition-all duration-500 ${
                             position.category === 'High' ? 'bg-emerald-500' :
-                            position.category === 'Medium' ? 'bg-amber-500' : 'bg-rose-500'
+                            position.category === 'Medium' ? 'bg-amber-500' :
+                            position.category === 'Low' ? 'bg-rose-500' : 'bg-slate-500'
                           }`}
-                          style={{ width: `${(position.score / 10) * 100}%` }}
+                          style={{ width: `${((position.score ?? 0) / 10) * 100}%` }}
                         />
                       </div>
                       <span className={`text-sm font-mono ${getScoreColor(position.score)} w-12 text-right`}>
@@ -826,10 +832,10 @@ export default function LiquidityPage() {
               <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-800/40">
                 <div className="flex items-center justify-between mb-1.5">
                   <h4 className="font-semibold text-emerald-300 text-sm">
-                    {((overallScore ?? 0) >= 8 ? 'Robust Market Depth' : (overallScore ?? 0) >= 6 ? 'Adequate Liquidity Buffer' : 'Limited Liquidity')}
+                    {overallScore == null ? 'Liquidity Data Unavailable' : overallScore >= 8 ? 'Robust Market Depth' : overallScore >= 6 ? 'Adequate Liquidity Buffer' : 'Limited Liquidity'}
                   </h4>
                   <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300">
-                    LOW RISK
+                    {overallScore == null ? 'N/A' : overallScore >= 8 ? 'LOW RISK' : overallScore >= 6 ? 'MEDIUM RISK' : 'HIGH RISK'}
                   </span>
                 </div>
                 <p className="text-xs text-slate-300 leading-relaxed">

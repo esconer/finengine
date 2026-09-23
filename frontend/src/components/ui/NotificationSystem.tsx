@@ -5,6 +5,7 @@
 import React, { useEffect } from 'react';
 import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react';
 import { useNotifications, useEnhancedRealTimeAnalytics, useExportProgress } from '@/hooks/useRealTime';
+import { formatRelativeTime } from '@/components/ui/LoadingState';
 
 interface NotificationProps {
     id: string;
@@ -12,8 +13,6 @@ interface NotificationProps {
     title: string;
     message: string;
     onClose: (id: string) => void;
-    autoHide?: boolean;
-    duration?: number;
 }
 
 const NotificationItem: React.FC<NotificationProps> = ({
@@ -21,18 +20,8 @@ const NotificationItem: React.FC<NotificationProps> = ({
     type,
     title,
     message,
-    onClose,
-    autoHide = true,
-    duration = 5000
+    onClose
 }) => {
-    useEffect(() => {
-        if (autoHide) {
-            const timer = setTimeout(() => {
-                onClose(id);
-            }, duration);
-            return () => clearTimeout(timer);
-        }
-    }, [id, autoHide, duration, onClose]);
 
     const icons = {
         success: CheckCircle,
@@ -70,6 +59,7 @@ const NotificationItem: React.FC<NotificationProps> = ({
                 <div className="ml-4 flex-shrink-0">
                     <button
                         onClick={() => onClose(id)}
+                        aria-label="Dismiss notification"
                         className={`inline-flex rounded-md ${iconColors[type]} hover:opacity-75 focus:outline-none focus:ring-2 focus:ring-offset-2`}
                     >
                         <X className="h-4 w-4" />
@@ -84,7 +74,11 @@ export const NotificationContainer: React.FC = () => {
     const { notifications, removeNotification } = useNotifications();
 
     return (
-        <div className="fixed top-4 right-4 z-50 w-96 space-y-2 pointer-events-none">
+        <div
+            className="fixed top-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] space-y-2 pointer-events-none"
+            role="status"
+            aria-live="polite"
+        >
             {notifications.map((notification) => (
                 <div key={notification.id} className="pointer-events-auto">
                     <NotificationItem
@@ -226,22 +220,6 @@ export const RefreshButton: React.FC<{
     lastRefresh?: Date | null;
     disabled?: boolean;
 }> = ({ onRefresh, isRefreshing, lastRefresh, disabled = false }) => {
-    const formatLastRefresh = (date: Date | null) => {
-        if (!date) return 'Never';
-
-        const now = new Date();
-        const diffMs = now.getTime() - date.getTime();
-        const diffMins = Math.floor(diffMs / 60000);
-
-        if (diffMins < 1) return 'Just now';
-        if (diffMins < 60) return `${diffMins}m ago`;
-
-        const diffHours = Math.floor(diffMins / 60);
-        if (diffHours < 24) return `${diffHours}h ago`;
-
-        return date.toLocaleDateString();
-    };
-
     return (
         <button
             onClick={onRefresh}
@@ -263,7 +241,7 @@ export const RefreshButton: React.FC<{
             {isRefreshing ? 'Refreshing...' : 'Refresh'}
             {lastRefresh && (
                 <span className="ml-2 text-xs text-gray-500">
-                    {formatLastRefresh(lastRefresh)}
+                    {formatRelativeTime(lastRefresh)}
                 </span>
             )}
         </button>

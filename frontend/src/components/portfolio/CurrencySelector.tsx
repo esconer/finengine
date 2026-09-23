@@ -24,7 +24,7 @@ const currencies: { code: Currency; name: string; symbol: string; icon: React.Co
 
 export function CurrencySelector({ selectedCurrency, onCurrencyChange, className }: CurrencySelectorProps) {
   return (
-    <div className={cn("flex items-center space-x-1 bg-gray-100 dark:bg-gray-800 rounded-lg p-1", className)}>
+    <div role="group" aria-label="Currency" className={cn("flex items-center space-x-1 bg-gray-100 dark:bg-gray-800 rounded-lg p-1", className)}>
       {currencies.map((currency) => {
         const Icon = currency.icon;
         const isSelected = selectedCurrency === currency.code;
@@ -33,6 +33,7 @@ export function CurrencySelector({ selectedCurrency, onCurrencyChange, className
           <button
             key={currency.code}
             onClick={() => onCurrencyChange(currency.code)}
+            aria-pressed={isSelected}
             className={cn(
               "flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium transition-all duration-200",
               isSelected

@@ -5,11 +5,9 @@ import { useUIStore, usePortfolioStore } from '@/lib/store';
 import { dataApi } from '@/lib/api';
 import {
     Settings,
-    DollarSign,
     Shield,
     RefreshCw,
     CheckCircle2,
-    Sliders,
     Server,
     HardDrive,
     Trash2,
@@ -39,18 +37,19 @@ export default function SettingsPage() {
     const { darkMode, toggleDarkMode } = useUIStore();
     const { fetchPortfolio } = usePortfolioStore();
 
-    const [currency, setCurrency] = useState<'INR' | 'USD'>('INR');
-    const [benchmark, setBenchmark] = useState<string>('^NSEI');
-    const [lookbackDays, setLookbackDays] = useState<number>(756);
-    const [riskFreeRate, setRiskFreeRate] = useState<number>(7.0);
-    const [targetVol, setTargetVol] = useState<number>(15.0);
     const [primarySource, setPrimarySource] = useState<PrimarySource>('bfinance');
+    const [savedSource, setSavedSource] = useState<PrimarySource | null>(null);
     const [isSaving, setIsSaving] = useState(false);
     const [saveSuccess, setSaveSuccess] = useState(false);
     const [saveError, setSaveError] = useState<string | null>(null);
     const [isClearingCache, setIsClearingCache] = useState(false);
     const [cacheMessage, setCacheMessage] = useState<string | null>(null);
     const [cacheClearedSummary, setCacheClearedSummary] = useState<CacheClearResult | null>(null);
+
+    // Only the primary data-source preference is persisted (backend
+    // PUT /data/config accepts primary_source|cache_ttl_minutes|enable_cache).
+    // No placebo controls: nothing else is offered until a real backend key exists.
+    const dirty = savedSource === null || primarySource !== savedSource;
 
     // Load the persisted primary source so the selector reflects backend truth
     useEffect(() => {
@@ -59,6 +58,7 @@ export default function SettingsPage() {
             .then((cfg) => {
                 if (!cancelled && cfg?.primary_source) {
                     setPrimarySource(cfg.primary_source);
+                    setSavedSource(cfg.primary_source);
                 }
             })
             .catch(() => {
@@ -82,11 +82,16 @@ export default function SettingsPage() {
             // Persist the data-source preference; the backend cascade honors
             // it on every subsequent fetch (no restart needed).
             await dataApi.updateConfig({ primary_source: primarySource });
+            setSavedSource(primarySource);
             setSaveSuccess(true);
             setTimeout(() => setSaveSuccess(false), 3000);
         } catch (err) {
-            setSaveError('Could not save the data-source preference. Is the backend running?');
-            setTimeout(() => setSaveError(null), 5000);
+            // Keep the error until the next save — validation text must stay readable
+            setSaveError(
+                err instanceof Error && err.message
+                    ? err.message
+                    : 'Could not save the data-source preference. Is the backend running?'
+            );
         } finally {
             setIsSaving(false);
         }
@@ -114,8 +119,11 @@ export default function SettingsPage() {
             await fetchPortfolio();
             setTimeout(() => setCacheMessage(null), 6000);
         } catch (err) {
-            setCacheMessage('Cache purge failed. Is the backend running?');
-            setTimeout(() => setCacheMessage(null), 5000);
+            setCacheMessage(
+                err instanceof Error && err.message
+                    ? err.message
+                    : 'Cache purge failed. Is the backend running?'
+            );
         } finally {
             setIsClearingCache(false);
         }
@@ -136,14 +144,14 @@ export default function SettingsPage() {
                     <span>Terminal Settings & Quantitative Preferences</span>
                 </h1>
                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                    Manage valuation currencies, default benchmark indices, statistical model lookback parameters, and data pipelines.
+                    Configure the primary market data source and purge cached vendor data.
                 </p>
             </div>
 
             {saveSuccess && (
                 <div className="p-4 bg-emerald-950/40 border border-emerald-800/60 rounded-xl flex items-center space-x-3 text-emerald-300 text-sm">
                     <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0" />
-                    <span>Preferences updated and applied across all quantitative terminal views.</span>
+                    <span>Data-source preference saved.</span>
                 </div>
             )}
 
@@ -169,115 +177,7 @@ export default function SettingsPage() {
             )}
 
             <form onSubmit={handleSavePreferences} className="space-y-6">
-                {/* 1. General Valuation & Reporting */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-                    <h2 className="text-base font-semibold text-white flex items-center space-x-2 mb-4">
-                        <DollarSign className="h-5 w-5 text-emerald-400" />
-                        <span>Currency & Primary Benchmark</span>
-                    </h2>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <div>
-                            <label className="block text-xs font-medium text-slate-300 mb-2">
-                                Valuation Currency
-                            </label>
-                            <select
-                                value={currency}
-                                onChange={(e) => setCurrency(e.target.value as 'INR' | 'USD')}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                            >
-                                <option value="INR">₹ INR (Indian Rupee - Default)</option>
-                                <option value="USD">$ USD (US Dollar)</option>
-                            </select>
-                            <p className="text-xs text-slate-500 mt-1">
-                                Base currency for portfolio valuations, metrics, and tear-sheets.
-                            </p>
-                        </div>
-
-                        <div>
-                            <label className="block text-xs font-medium text-slate-300 mb-2">
-                                Primary Benchmark Index
-                            </label>
-                            <select
-                                value={benchmark}
-                                onChange={(e) => setBenchmark(e.target.value)}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                            >
-                                <option value="^NSEI">NIFTY 50 (^NSEI) — Primary Indian Equity</option>
-                                <option value="^BSESN">BSE SENSEX (^BSESN) — 30 Large Cap Index</option>
-                                <option value="NIFTY_MIDCAP">NIFTY Midcap 100</option>
-                                <option value="SPY">S&P 500 (SPY) — Global Benchmark</option>
-                            </select>
-                            <p className="text-xs text-slate-500 mt-1">
-                                Used for beta calculations, excess return attribution, and tear-sheet comparisons.
-                            </p>
-                        </div>
-                    </div>
-                </div>
-
-                {/* 2. Quantitative Model Defaults */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-                    <h2 className="text-base font-semibold text-white flex items-center space-x-2 mb-4">
-                        <Sliders className="h-5 w-5 text-indigo-400" />
-                        <span>Risk Models & Lookback Parameters</span>
-                    </h2>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div>
-                            <label className="block text-xs font-medium text-slate-300 mb-2">
-                                Default Lookback Window (Days)
-                            </label>
-                            <select
-                                value={lookbackDays}
-                                onChange={(e) => setLookbackDays(Number(e.target.value))}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                            >
-                                <option value={252}>252 Days (1 Year)</option>
-                                <option value={756}>756 Days (3 Years — Recommended)</option>
-                                <option value={1260}>1,260 Days (5 Years)</option>
-                            </select>
-                            <p className="text-xs text-slate-500 mt-1">
-                                Historical bar depth for covariance, EVT, and GARCH volatility cones.
-                            </p>
-                        </div>
-
-                        <div>
-                            <label className="block text-xs font-medium text-slate-300 mb-2">
-                                Risk-Free Rate (%)
-                            </label>
-                            <input
-                                type="number"
-                                step="0.1"
-                                min="0"
-                                max="20"
-                                value={riskFreeRate}
-                                onChange={(e) => setRiskFreeRate(Number(e.target.value))}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                            />
-                            <p className="text-xs text-slate-500 mt-1">
-                                Annualized risk-free benchmark (RBI 91-day T-Bill rate).
-                            </p>
-                        </div>
-
-                        <div>
-                            <label className="block text-xs font-medium text-slate-300 mb-2">
-                                Target Volatility Sizing (%)
-                            </label>
-                            <input
-                                type="number"
-                                step="0.5"
-                                min="5"
-                                max="50"
-                                value={targetVol}
-                                onChange={(e) => setTargetVol(Number(e.target.value))}
-                                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                            />
-                            <p className="text-xs text-slate-500 mt-1">
-                                Portfolio target annualized volatility for dynamic sizing.
-                            </p>
-                        </div>
-                    </div>
-                </div>
-
-                {/* 3. Data Sources & Engine Connectivity */}
+                {/* Data Sources & Engine Connectivity */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
                     <h2 className="text-base font-semibold text-white flex items-center space-x-2 mb-4">
                         <Server className="h-5 w-5 text-amber-400" />
@@ -332,38 +232,21 @@ export default function SettingsPage() {
                         </p>
                     </div>
 
+                    {/* Feed descriptions — status pills removed: no health endpoint backs them */}
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                         <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
-                            <div className="flex items-center justify-between mb-1">
-                                <span className="text-xs font-medium text-slate-300">Market Price Feed</span>
-                                <span className="flex items-center space-x-1 text-xs text-emerald-400">
-                                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                                    <span>Active</span>
-                                </span>
-                            </div>
-                            <p className="text-[11px] text-slate-500">Live & historical daily OHLCV prices</p>
+                            <span className="text-xs font-medium text-slate-300">Market Price Feed</span>
+                            <p className="text-[11px] text-slate-500 mt-1">Live & historical daily OHLCV prices</p>
                         </div>
 
                         <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
-                            <div className="flex items-center justify-between mb-1">
-                                <span className="text-xs font-medium text-slate-300">Screener.in Live API</span>
-                                <span className="flex items-center space-x-1 text-xs text-emerald-400">
-                                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                                    <span>Active</span>
-                                </span>
-                            </div>
-                            <p className="text-[11px] text-slate-500">NSE fundamental ratios & quarterly results</p>
+                            <span className="text-xs font-medium text-slate-300">Screener.in Live API</span>
+                            <p className="text-[11px] text-slate-500 mt-1">NSE fundamental ratios & quarterly results</p>
                         </div>
 
                         <div className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg">
-                            <div className="flex items-center justify-between mb-1">
-                                <span className="text-xs font-medium text-slate-300">NSE Bhavcopy Microstructure</span>
-                                <span className="flex items-center space-x-1 text-xs text-emerald-400">
-                                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                                    <span>Active</span>
-                                </span>
-                            </div>
-                            <p className="text-[11px] text-slate-500">Delivery %, FII/DII institutional cash flows</p>
+                            <span className="text-xs font-medium text-slate-300">NSE Bhavcopy Microstructure</span>
+                            <p className="text-[11px] text-slate-500 mt-1">Delivery %, FII/DII institutional cash flows</p>
                         </div>
                     </div>
                 </div>
@@ -392,7 +275,7 @@ export default function SettingsPage() {
 
                     <button
                         type="submit"
-                        disabled={isSaving}
+                        disabled={isSaving || !dirty}
                         className="flex items-center space-x-2 px-6 py-2.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 rounded-lg transition shadow-lg shadow-blue-600/20 disabled:opacity-50"
                     >
                         {isSaving ? (
@@ -400,7 +283,7 @@ export default function SettingsPage() {
                         ) : (
                             <CheckCircle2 className="w-4 h-4" />
                         )}
-                        <span>Save Preferences</span>
+                        <span>Save Data Source Preference</span>
                     </button>
                 </div>
             </form>

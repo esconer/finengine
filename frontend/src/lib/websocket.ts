@@ -32,6 +32,8 @@ export class WebSocketClient {
     private isConnecting = false;
     private shouldReconnect = true;
     private options: WebSocketOptions;
+    private connectPromise: Promise<void> | null = null;
+    private settleConnect: ((error?: Error) => void) | null = null;
   
     constructor(options: WebSocketOptions = {}) {
       this._clientId = this.generateClientId();
@@ -59,18 +61,30 @@ export class WebSocketClient {
     }
 
     connect(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            if (this.ws?.readyState === WebSocket.OPEN) {
-                resolve();
-                return;
-            }
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            return Promise.resolve();
+        }
 
-            if (this.isConnecting) {
-                return;
-            }
+        // While a connection attempt is in flight, hand back the SAME promise
+        // so every awaiter settles — never hang (B3).
+        if (this.connectPromise) {
+            return this.connectPromise;
+        }
 
-            this.isConnecting = true;
-            this.shouldReconnect = true;
+        this.isConnecting = true;
+        this.shouldReconnect = true;
+        // Fresh clientId per connection attempt — backend rejects duplicate
+        // live ids with close code 1008 (B4).
+        this._clientId = this.generateClientId();
+
+        this.connectPromise = new Promise((resolve, reject) => {
+            this.settleConnect = (error?: Error) => {
+                this.connectPromise = null;
+                this.settleConnect = null;
+                this.isConnecting = false;
+                if (error) reject(error);
+                else resolve();
+            };
 
             try {
                 const wsUrl = this.getWebSocketUrl();
@@ -78,7 +92,6 @@ export class WebSocketClient {
 
                 this.ws.onopen = () => {
                     console.log(`WebSocket connected: ${this._clientId}`);
-                    this.isConnecting = false;
                     this.reconnectAttempts = 0;
                     this.startHeartbeat();
 
@@ -88,7 +101,7 @@ export class WebSocketClient {
                     });
 
                     this.options.onConnect?.();
-                    resolve();
+                    this.settleConnect?.();
                 };
 
                 this.ws.onmessage = (event) => {
@@ -102,9 +115,21 @@ export class WebSocketClient {
 
                 this.ws.onclose = (event) => {
                     console.log(`WebSocket disconnected: ${this._clientId}`, event.code, event.reason);
-                    this.isConnecting = false;
                     this.stopHeartbeat();
                     this.options.onDisconnect?.();
+
+                    // Branch on close code (B17): 1008 = id-conflict policy close
+                    // → reset backoff so the next attempt (with a fresh id) starts clean.
+                    if (event.code === 1008) {
+                        this.reconnectAttempts = 0;
+                    }
+
+                    // 1000 with shouldReconnect=false is a deliberate disconnect → no reconnect.
+                    this.settleConnect?.(
+                        event.code === 1008
+                            ? new Error('Connection rejected: client id conflict (1008)')
+                            : new Error(`Connection closed before open (${event.code})`)
+                    );
 
                     if (this.shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
                         this.scheduleReconnect();
@@ -113,16 +138,17 @@ export class WebSocketClient {
 
                 this.ws.onerror = (error) => {
                     console.error('WebSocket error:', error);
-                    this.isConnecting = false;
                     this.options.onError?.(error);
-                    reject(error);
+                    // onclose follows onerror and schedules any reconnect
+                    this.settleConnect?.(error instanceof Error ? error : new Error('WebSocket error'));
                 };
 
             } catch (error) {
-                this.isConnecting = false;
-                reject(error);
+                this.settleConnect?.(error instanceof Error ? error : new Error(String(error)));
             }
         });
+
+        return this.connectPromise;
     }
 
     disconnect(): void {
@@ -130,9 +156,18 @@ export class WebSocketClient {
         this.stopHeartbeat();
 
         if (this.ws) {
+            // Detach handlers BEFORE close so orphan sockets can't mutate
+            // client state across generations (B18).
+            this.ws.onopen = null;
+            this.ws.onmessage = null;
+            this.ws.onclose = null;
+            this.ws.onerror = null;
             this.ws.close(1000, 'Client disconnect');
             this.ws = null;
         }
+
+        // Settle any in-flight connect() so awaiters never hang (B3)
+        this.settleConnect?.(new Error('Disconnected'));
     }
 
     private scheduleReconnect(): void {
@@ -304,7 +339,9 @@ export function useWebSocket(options: WebSocketOptions = {}) {
   // Auto-connect when liveDataMode is enabled
   useEffect(() => {
     if (liveDataMode) {
-      connect();
+      // Rejection is handled by onclose backoff — swallow to avoid
+      // unhandled rejection from the floating promise (B3).
+      connect().catch(() => {});
     } else {
       disconnect();
     }

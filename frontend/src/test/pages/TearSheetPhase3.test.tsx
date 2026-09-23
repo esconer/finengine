@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import React from 'react';
 import TearSheetPage from '@/app/dashboard/tear-sheet/page';
+import { analyticsApi } from '@/lib/api';
 
 const updateLastUpdatedMock = vi.fn();
 
@@ -99,5 +100,57 @@ describe('TearSheetPage — Phase 3 full-history headlines', () => {
     // Full-history β 1.07 / α +28.51%, not the gated holding nulls.
     expect(screen.getAllByText('1.07').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/\+28\.51%/).length).toBeGreaterThan(0);
+  });
+
+  it('Portfolio Vol / Nifty Vol help buttons open their explainers (B24)', async () => {
+    render(<TearSheetPage />);
+    await screen.findByTestId('headline-caption');
+
+    const volLabel = screen.getByText('Portfolio Vol');
+    const volBtn = volLabel.parentElement!.querySelector('button')!;
+    fireEvent.click(volBtn);
+    await waitFor(() => {
+      expect(screen.getByRole('dialog')).toBeDefined();
+    });
+    expect(screen.getByText('Portfolio Volatility (Realized)')).toBeDefined();
+
+    fireEvent.click(screen.getByText('Got It'));
+    const niftyLabel = screen.getByText('Nifty Vol');
+    const niftyBtn = niftyLabel.parentElement!.querySelector('button')!;
+    fireEvent.click(niftyBtn);
+    await waitFor(() => {
+      expect(screen.getByText('NIFTY 50 Volatility (Realized)')).toBeDefined();
+    });
+  });
+
+  it('holding-window fallback caption + single-point underwater path stays finite (B25 + B26)', async () => {
+    (analyticsApi.getTearSheet as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      window: { start: '2026-08-04', end: '2026-09-07' },
+      holdings: { 'OLD.NS': 1.0 },
+      metrics: {
+        total_return: 0.0548,
+        days: 25,
+        max_drawdown: -0.05,
+      },
+      full_history: null,
+      relative_vs_nifty: {},
+      monthly_returns: {},
+      underwater: [{ date: '2026-09-07', drawdown: -0.05 }],
+      methodology: 'test',
+      history_coverage: null,
+    });
+
+    render(<TearSheetPage />);
+
+    // Headline is captioned as holding-window, not implied full-history.
+    const caption = await screen.findByTestId('headline-caption');
+    expect(caption.textContent).toBe('Holding window · 25 trading days');
+
+    // Single drawdown point must not produce a NaN SVG path.
+    await waitFor(() => {
+      const path = document.querySelector('path');
+      expect(path).not.toBeNull();
+      expect(path!.getAttribute('d')).not.toMatch(/NaN/);
+    });
   });
 });

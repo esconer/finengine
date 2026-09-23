@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { portfolioApi, analyticsApi, dataApi } from './api';
 import { WebSocketClient } from './websocket';
+import { escapeCsvCell } from './utils';
 import { PortfolioCreateRequest, PortfolioUpdateRequest } from '@/types';
 
 // Types
@@ -29,7 +30,7 @@ export interface PortfolioStore {
     totalWeight: number;
 
     // Actions
-    fetchPortfolio: () => Promise<void>;
+    fetchPortfolio: () => Promise<boolean>;
     addPosition: (position: {
         ticker: string;
         weight: number;
@@ -112,21 +113,23 @@ export const usePortfolioStore = create<PortfolioStore>()(
                         totalWeight: data.total_weight || 0,
                         isLoading: false,
                     });
+                    return true;
                 } catch (error: any) {
                     set({
-                        error: error.response?.data?.detail || error.message || 'Failed to fetch portfolio',
+                        error: error?.message || 'Failed to fetch portfolio',
                         isLoading: false,
                     });
+                    return false;
                 }
             },
 
             addPosition: async (positionData) => {
                 set({ isLoading: true, error: null });
                 try {
-                    // Ensure region has a default value if not provided
+                    // Ensure region has a default value if not provided (INR/NSE-first product)
                     const completePositionData = {
                         ...positionData,
-                        region: positionData.region || 'US'
+                        region: positionData.region || 'IN'
                     };
                     const newPosition = await portfolioApi.addPosition(completePositionData);
                     const currentPositions = get().positions;
@@ -138,7 +141,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
-                        error: error.response?.data?.detail || error.message || 'Failed to add position',
+                        error: error?.message || 'Failed to add position',
                         isLoading: false,
                     });
                 }
@@ -150,7 +153,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     // Ensure all positions have required region field
                     const completePositions = positions.map(position => ({
                         ...position,
-                        region: position.region || 'US'
+                        region: position.region || 'IN'
                     }));
                     const result = await portfolioApi.bulkAddPositions({
                         positions: completePositions,
@@ -159,9 +162,15 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     set({ isLoading: false });
                     // Refresh portfolio to get updated data
                     await get().fetchPortfolio();
+                    // Surface partial import failures (fetchPortfolio clears error first)
+                    if (result.failed > 0) {
+                        set({
+                            error: `${result.failed} of ${result.added + result.failed} positions failed to add`,
+                        });
+                    }
                 } catch (error: any) {
                     set({
-                        error: error.response?.data?.detail || error.message || 'Failed to add positions',
+                        error: error?.message || 'Failed to add positions',
                         isLoading: false,
                     });
                 }
@@ -175,7 +184,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
-                        error: error.response?.data?.detail || error.message || 'Failed to update position',
+                        error: error?.message || 'Failed to update position',
                         isLoading: false,
                     });
                 }
@@ -194,7 +203,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
-                        error: error.response?.data?.detail || error.message || 'Failed to remove position',
+                        error: error?.message || 'Failed to remove position',
                         isLoading: false,
                     });
                 }
@@ -223,12 +232,18 @@ export const usePortfolioStore = create<PortfolioStore>()(
             partialize: (state) => ({
                 positions: state.positions,
                 selectedTickers: state.selectedTickers,
+                // Persist totals with positions so the hydration window never
+                // sees non-empty positions against totalValue === 0 (zero-state invariant)
+                totalValue: state.totalValue,
+                totalWeight: state.totalWeight,
             }),
         }
     )
 );
 
 // UI Store
+// ponytail: useDashboardPreferences (useRealTime.ts) keeps a second darkMode copy —
+// zero callers today; delete it when dashboard prefs are consolidated (04-B19)
 export const useUIStore = create<UIStore>()(
     persist(
         (set) => ({
@@ -386,16 +401,9 @@ const convertToCSV = (data: any[]): string => {
 
     const headers = Object.keys(data[0]);
     const csvRows = [
-        headers.join(','), // Header row
+        headers.map(escapeCsvCell).join(','),
         ...data.map(row =>
-            headers.map(header => {
-                const value = row[header];
-                // Handle values that might contain commas
-                if (typeof value === 'string' && value.includes(',')) {
-                    return `"${value}"`;
-                }
-                return value;
-            }).join(',')
+            headers.map(header => escapeCsvCell(row[header])).join(',')
         )
     ];
 

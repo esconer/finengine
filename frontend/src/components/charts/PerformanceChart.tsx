@@ -72,7 +72,7 @@ const PerformanceCustomTooltip = ({ active, payload, label, currency = 'INR' }: 
   return null;
 };
 
-export const PerformanceChart: React.FC<PerformanceChartProps> = ({
+const PerformanceChartImpl: React.FC<PerformanceChartProps> = ({
   data,
   loading = false,
   showBenchmark = false,
@@ -190,5 +190,7 @@ export const PerformanceChart: React.FC<PerformanceChartProps> = ({
     </div>
   );
 };
+
+export const PerformanceChart = React.memo(PerformanceChartImpl);
 
 export default PerformanceChart;

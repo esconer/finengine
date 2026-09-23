@@ -34,6 +34,7 @@ export function PortfolioFilters({
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
           <input
             type="text"
+            aria-label="Search positions"
             placeholder="Search by ticker, name, or sector..."
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
@@ -42,6 +43,7 @@ export function PortfolioFilters({
           {searchQuery && (
             <button
               onClick={() => onSearchChange('')}
+              aria-label="Clear search"
               className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
             >
               <X className="w-4 h-4" />
@@ -55,6 +57,7 @@ export function PortfolioFilters({
           <select
             value={sectorFilter}
             onChange={(e) => onSectorChange(e.target.value)}
+            aria-label="Filter by sector"
             className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
           >
             <option value="">All Sectors</option>
@@ -72,6 +75,7 @@ export function PortfolioFilters({
                 onSearchChange('');
                 onSectorChange('');
               }}
+              aria-label="Clear all filters"
               className="flex items-center space-x-1 px-3 py-2 text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
             >
               <X className="w-4 h-4" />
@@ -89,6 +93,7 @@ export function PortfolioFilters({
               <span>Search: "{searchQuery}"</span>
               <button
                 onClick={() => onSearchChange('')}
+                aria-label="Remove search filter"
                 className="hover:text-blue-900 dark:hover:text-blue-200"
               >
                 <X className="w-3 h-3" />
@@ -101,6 +106,7 @@ export function PortfolioFilters({
               <span>Sector: {sectorFilter}</span>
               <button
                 onClick={() => onSectorChange('')}
+                aria-label="Remove sector filter"
                 className="hover:text-green-900 dark:hover:text-green-200"
               >
                 <X className="w-3 h-3" />

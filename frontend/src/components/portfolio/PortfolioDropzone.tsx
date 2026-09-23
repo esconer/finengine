@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useState, useRef } from 'react';
-import { UploadCloud, FileText, CheckCircle2, AlertCircle, X, Loader2 } from 'lucide-react';
-import apiClient from '@/lib/api';
+import { UploadCloud, CheckCircle2, AlertCircle, X, Loader2 } from 'lucide-react';
+import apiClient, { portfolioApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 
 interface ParsedRow {
     ticker: string;
@@ -46,6 +47,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
     const [parsedRows, setParsedRows] = useState<ParsedRow[]>([]);
     const [parseError, setParseError] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [ackWeights, setAckWeights] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     if (!isOpen) return null;
@@ -82,7 +84,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
         let priceIdx = headers.findIndex(h => 
             h === 'buy_price' || h === 'avg. cost' || h === 'avg cost' || h === 'average price' || h === 'avg price' || h === 'buy price' || h === 'price'
         );
-        let dateIdx = headers.findIndex(h =>
+        const dateIdx = headers.findIndex(h =>
             h === 'date' || h === 'purchase date' || h === 'purchase_date' || h === 'added_on' || h === 'buy date' || h === 'trade date'
         );
 
@@ -115,10 +117,19 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
             setParseError('Could not parse any valid position rows from the CSV. Expected format: Ticker, Quantity, Buy Price');
         } else {
             setParsedRows(results);
+            setAckWeights(false);
         }
     };
 
     const handleFile = (file: File) => {
+        if (!/\.(csv|txt)$/i.test(file.name)) {
+            setParseError('Only .csv or .txt files are supported.');
+            return;
+        }
+        if (file.size > 5 * 1024 * 1024) {
+            setParseError('File is too large (max 5 MB).');
+            return;
+        }
         setFileName(file.name);
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -142,21 +153,29 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
     };
 
     const handleSubmit = async () => {
-        if (parsedRows.length === 0) return;
+        if (parsedRows.length === 0 || !ackWeights) return;
         try {
             setIsSubmitting(true);
             setParseError(null);
+
+            // Value-share weights: each row's weight = its value / (existing portfolio + batch).
+            // Backend auto-normalizes globally; equal-split would overwrite existing weights.
+            const summary = await portfolioApi.getPortfolio({ currency: 'INR' });
+            const existingTotal = summary.total_value || 0;
+            const batchTotal = parsedRows.reduce((acc, r) => acc + r.quantity * r.buy_price, 0);
+            const denom = existingTotal + batchTotal;
 
             const payload = {
                 positions: parsedRows.map(r => ({
                     ticker: r.ticker,
                     quantity: r.quantity,
                     buy_price: r.buy_price,
-                    weight: 1.0 / parsedRows.length,
+                    weight: denom > 0 ? (r.quantity * r.buy_price) / denom : 1 / parsedRows.length,
                     custom_name: r.custom_name,
                     region: 'IN',
                     ...(r.added_on ? { added_on: r.added_on } : {})
-                }))
+                })),
+                auto_normalize: true
             };
 
             await apiClient.post('/portfolio/bulk_add', payload);
@@ -173,16 +192,21 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
     const totalEstimatedCost = parsedRows.reduce((acc, r) => acc + r.quantity * r.buy_price, 0);
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
+        <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+            <DialogContent
+                closeOnOutsideClick={false}
+                className="p-0 gap-0 bg-slate-900 border-slate-700 max-w-2xl max-h-[90vh] grid-rows-[auto_1fr_auto]"
+                overlayClassName="bg-black/70 backdrop-blur-sm"
+            >
                 {/* Header */}
                 <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900/50">
                     <div className="flex items-center space-x-2">
                         <UploadCloud className="h-5 w-5 text-blue-400" />
-                        <h2 className="text-lg font-semibold text-white">Import Portfolio (CSV / Excel)</h2>
+                        <DialogTitle className="text-lg font-semibold text-white">Import Portfolio (CSV)</DialogTitle>
                     </div>
                     <button
                         onClick={onClose}
+                        aria-label="Close"
                         className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
                     >
                         <X className="h-5 w-5" />
@@ -190,14 +214,23 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                 </div>
 
                 {/* Body */}
-                <div className="p-6 space-y-4 overflow-y-auto flex-1">
+                <div className="p-6 space-y-4 overflow-y-auto min-h-0">
                     {/* Supported brokers notice */}
-                    <div className="p-3 bg-blue-950/40 border border-blue-800/60 rounded-lg text-xs text-blue-300">
+                    <DialogDescription className="p-3 bg-blue-950/40 border border-blue-800/60 rounded-lg text-xs text-blue-300">
                         <span className="font-semibold text-blue-200">Supported Formats:</span> Direct exports from <strong>Zerodha Kite</strong> (Holdings CSV), <strong>Groww</strong>, <strong>AngelOne</strong>, <strong>Upstox</strong>, or generic CSV (<code className="bg-blue-900/50 px-1 py-0.5 rounded">ticker,quantity,buy_price</code> + optional <code className="bg-blue-900/50 px-1 py-0.5 rounded">purchase_date</code>).
-                    </div>
+                    </DialogDescription>
 
                     {/* Dropzone Area */}
                     <div
+                        role="button"
+                        tabIndex={0}
+                        aria-label="Upload tradebook CSV"
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                fileInputRef.current?.click();
+                            }
+                        }}
                         onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
                         onDragLeave={() => setIsDragging(false)}
                         onDrop={handleDrop}
@@ -272,6 +305,15 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                                     </tbody>
                                 </table>
                             </div>
+                            <label className="flex items-start space-x-2 text-xs text-slate-300 cursor-pointer pt-1">
+                                <input
+                                    type="checkbox"
+                                    checked={ackWeights}
+                                    onChange={(e) => setAckWeights(e.target.checked)}
+                                    className="mt-0.5"
+                                />
+                                <span>I understand each imported position&apos;s weight will be set to its share of total portfolio value (existing + imported).</span>
+                            </label>
                         </div>
                     )}
                 </div>
@@ -287,7 +329,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                     </button>
                     <button
                         onClick={handleSubmit}
-                        disabled={parsedRows.length === 0 || isSubmitting}
+                        disabled={parsedRows.length === 0 || isSubmitting || !ackWeights}
                         className="flex items-center space-x-2 px-4 py-2 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 rounded-lg transition disabled:opacity-50 shadow-lg shadow-blue-500/20"
                     >
                         {isSubmitting ? (
@@ -303,7 +345,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                         )}
                     </button>
                 </div>
-            </div>
-        </div>
+            </DialogContent>
+        </Dialog>
     );
 }

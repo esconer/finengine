@@ -20,27 +20,29 @@ export function cn(...inputs: ClassValue[]) {
  * @param currency - Currency code (default: 'INR' for Indian market)
  * @returns Formatted currency string with Indian formatting for INR
  */
-export function formatCurrency(value: number, currency: string = 'INR'): string {
+export function formatCurrency(
+  value: number | null | undefined,
+  currency: string = 'INR'
+): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'N/A';
+  }
   if (currency === 'INR') {
     // Indian formatting for INR with ₹ symbol and Indian number system
-    const formatted = new Intl.NumberFormat('en-IN', {
+    return new Intl.NumberFormat('en-IN', {
       style: 'currency',
       currency: 'INR',
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     }).format(value);
-    
-    // Replace '₹' symbol and ensure proper formatting
-    return formatted.replace('₹', '₹').replace(',', ',');
-  } else {
-    // Default USD formatting
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency,
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(value);
   }
+  // Default USD formatting
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 /**
@@ -48,9 +50,36 @@ export function formatCurrency(value: number, currency: string = 'INR'): string 
  * @param value - Numeric value to format as percentage
  * @param decimals - Number of decimal places (default: 2)
  * @returns Formatted percentage string
+ * Input contract: FRACTION — 0.12 renders as "12.00%". Do not pass
+ * already-percent fields (e.g. backend `*_pct` values like 6.67).
  */
 export function formatPercentage(value: number, decimals: number = 2): string {
   return `${(value * 100).toFixed(decimals)}%`;
+}
+
+/**
+ * Escape a single CSV cell (shared by all CSV builders).
+ * Neutralizes Excel/LibreOffice formula injection (OWASP CSV Injection):
+ * cells starting with =, +, -, @, CR or TAB get a leading `'`.
+ * Always quotes and doubles embedded `"` so commas/newlines survive.
+ */
+export function escapeCsvCell(value: unknown): string {
+  let s = value === null || value === undefined ? '' : String(value);
+  if (/^[=+\-@\r\t]/.test(s)) {
+    s = `'${s}`;
+  }
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Format a Date as YYYY-MM-DD from LOCAL calendar components
+ * (toISOString converts to UTC and can shift the day for IST users).
+ */
+export function toDateOnlyString(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 export const formatPercent = formatPercentage;

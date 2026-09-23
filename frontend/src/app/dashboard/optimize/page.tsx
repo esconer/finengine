@@ -33,8 +33,8 @@ import {
 interface OptimizeResult {
   strategy: string;
   weights: Record<string, number>;
-  expected_annual_return: number;
-  expected_annual_volatility: number;
+  expected_annual_return: number | null;
+  expected_annual_volatility: number | null;
   expected_sharpe: number | null;
   solver: string;
   universe: string[];
@@ -104,37 +104,20 @@ export default function OptimizePage() {
       ? 'N/A'
       : `${(v * 100).toFixed(decimals)}%`;
 
-  const frontierPoints = useMemo(() => {
-    if (!result) return [];
-    return Array.from({ length: 21 }, (_, i) => {
-      const f = i / 20;
-      const v = (result.expected_annual_volatility * 0.82) + (result.expected_annual_volatility * 0.7 * f);
-      const r = (result.expected_annual_return * 0.7) + (result.expected_annual_return * 0.8 * Math.sqrt(f));
-      return {
-        volatility: +(v * 100).toFixed(2),
-        return: +(r * 100).toFixed(2),
-        name: `Frontier Portfolio #${i + 1}`,
-        type: 'frontier'
-      };
-    });
-  }, [result]);
+  const hasFrontierCoords =
+    result != null &&
+    result.expected_annual_return != null &&
+    result.expected_annual_volatility != null &&
+    !Number.isNaN(result.expected_annual_return) &&
+    !Number.isNaN(result.expected_annual_volatility);
 
   const optimalPoint = useMemo(() => {
-    if (!result) return [];
+    if (!result || result.expected_annual_return == null || result.expected_annual_volatility == null) return [];
     return [{
       volatility: +(result.expected_annual_volatility * 100).toFixed(2),
       return: +(result.expected_annual_return * 100).toFixed(2),
       name: `Optimal Portfolio (${result.strategy.toUpperCase()})`,
       sharpe: result.expected_sharpe?.toFixed(2)
-    }];
-  }, [result]);
-
-  const currentPoint = useMemo(() => {
-    if (!result) return [];
-    return [{
-      volatility: +((result.expected_annual_volatility * 1.08) * 100).toFixed(2),
-      return: +((result.expected_annual_return * 0.92) * 100).toFixed(2),
-      name: 'Current Portfolio (Pre-Rebalance)',
     }];
   }, [result]);
 
@@ -154,7 +137,7 @@ export default function OptimizePage() {
           <div>
             <h1 className="text-3xl font-bold mb-2">Portfolio Optimizer</h1>
             <p className="text-zinc-200">
-              Find better mixes within your own holdings — four strategies, one click
+              Find better mixes within your own holdings — five strategies, one click
             </p>
           </div>
           <SlidersHorizontal className="hidden md:block w-16 h-16 text-zinc-300" />
@@ -166,7 +149,7 @@ export default function OptimizePage() {
         <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
           Choose a strategy
         </h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
           {STRATEGIES.map((s) => (
             <button
               key={s.id}
@@ -325,35 +308,38 @@ export default function OptimizePage() {
             </div>
           </div>
 
-          {/* Markowitz Efficient Frontier Scatter Curve */}
+          {/* Optimal Portfolio Risk / Return */}
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center space-x-2">
                   <TrendingUp className="h-5 w-5 text-emerald-500" />
-                  <span>Markowitz Efficient Frontier & Portfolio Positioning</span>
+                  <span>Optimal Portfolio Risk / Return</span>
                 </h3>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  Risk-return frontier curve plotting optimal portfolio allocations vs your current positioning.
+                  Solved risk-return position for the chosen strategy.
                 </p>
               </div>
               <div className="flex items-center space-x-4 text-xs">
                 <span className="flex items-center space-x-1.5">
-                  <span className="w-3 h-3 rounded-full bg-amber-500 inline-block"></span>
-                  <span className="text-gray-700 dark:text-gray-300">Current Position</span>
-                </span>
-                <span className="flex items-center space-x-1.5">
                   <span className="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span>
                   <span className="text-gray-700 dark:text-gray-300">Optimal ({result.strategy.toUpperCase()})</span>
-                </span>
-                <span className="flex items-center space-x-1.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500/60 inline-block"></span>
-                  <span className="text-gray-500 dark:text-gray-400">Frontier Curve</span>
                 </span>
               </div>
             </div>
 
             <div className="h-72 w-full">
+              {!hasFrontierCoords ? (
+                <div data-testid="frontier-empty" className="h-full flex flex-col items-center justify-center text-center px-6">
+                  <AlertTriangle className="w-8 h-8 text-amber-400 mb-3" />
+                  <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Efficient frontier unavailable
+                  </p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    The optimizer returned no expected risk/return estimates for this run.
+                  </p>
+                </div>
+              ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 10 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.3} />
@@ -394,13 +380,6 @@ export default function OptimizePage() {
                       return null;
                     }}
                   />
-                  {/* Simulated Frontier Points */}
-                  <Scatter
-                    name="Efficient Frontier"
-                    data={frontierPoints}
-                    fill="#3b82f6"
-                    opacity={0.4}
-                  />
                   {/* Recommended Optimal Point */}
                   <Scatter
                     name="Optimal Portfolio"
@@ -409,16 +388,9 @@ export default function OptimizePage() {
                   >
                     <Cell fill="#10b981" stroke="#059669" strokeWidth={2} />
                   </Scatter>
-                  {/* Current Portfolio Point */}
-                  <Scatter
-                    name="Current Portfolio"
-                    data={currentPoint}
-                    fill="#f59e0b"
-                  >
-                    <Cell fill="#f59e0b" stroke="#d97706" strokeWidth={2} />
-                  </Scatter>
                 </ScatterChart>
               </ResponsiveContainer>
+              )}
             </div>
           </div>
 

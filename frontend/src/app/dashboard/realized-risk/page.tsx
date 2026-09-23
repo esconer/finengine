@@ -34,16 +34,12 @@ import {
 } from 'lucide-react';
 
 export default function RealizedRiskPage() {
-  const [dateRange, setDateRange] = useState({
-    start: '',
-    end: '',
-  });
   const [loading, setLoading] = useState(false);
   const [positionData, setPositionData] = useState<any[]>([]);
   const [showCoverageDetail, setShowCoverageDetail] = useState(false);
 
   const { data: analyticsData, loading: analyticsLoading, refresh } = usePortfolioAnalytics();
-  const { performanceData } = usePerformanceData(252);
+  const { performanceData, loading: perfLoading } = usePerformanceData(252);
   const { positions } = usePortfolioStore();
   const { updateLastUpdated } = useUIStore();
 
@@ -76,10 +72,12 @@ export default function RealizedRiskPage() {
       });
 
       if (i > 0) {
-        const prev = performanceData[i - 1].portfolio_value || 1;
-        returns.push((val - prev) / prev);
+        const prev = performanceData[i - 1].portfolio_value;
+        if (prev) {
+          returns.push((val - prev) / prev);
+        }
       }
-      if (returns.length >= 10) {
+      if (returns.length >= 21) {
         const windowRet = returns.slice(-21);
         const mean = windowRet.reduce((a, b) => a + b, 0) / windowRet.length;
         const variance =
@@ -112,18 +110,6 @@ export default function RealizedRiskPage() {
       setPositionData(positionsList);
     }
   }, [realizedRisk]);
-
-  // Default date range to last year
-  useEffect(() => {
-    const end = new Date();
-    const start = new Date();
-    start.setFullYear(start.getFullYear() - 1);
-
-    setDateRange({
-      start: start.toISOString().split('T')[0],
-      end: end.toISOString().split('T')[0],
-    });
-  }, []);
 
   const handleRefresh = async () => {
     setLoading(true);
@@ -297,9 +283,6 @@ export default function RealizedRiskPage() {
               <span className="bg-white/10 px-2.5 py-1 rounded">
                 Universe: {positions.length} active positions
               </span>
-              <span className="bg-white/10 px-2.5 py-1 rounded">
-                Period: {dateRange.start || '252d lookback'} to {dateRange.end || 'Latest'}
-              </span>
               {realizedRisk?.data_range && (
                 <span className="bg-white/10 px-2.5 py-1 rounded">
                   Data Span: {realizedRisk.data_range.start} → {realizedRisk.data_range.end}
@@ -467,7 +450,7 @@ export default function RealizedRiskPage() {
               </ResponsiveContainer>
             ) : (
               <div className="h-full flex items-center justify-center text-gray-400 text-sm">
-                Loading volatility history...
+                {perfLoading ? 'Loading...' : 'No performance history yet'}
               </div>
             )}
           </div>
@@ -496,7 +479,7 @@ export default function RealizedRiskPage() {
               </ResponsiveContainer>
             ) : (
               <div className="h-full flex items-center justify-center text-gray-400 text-sm">
-                Loading drawdown history...
+                {perfLoading ? 'Loading...' : 'No performance history yet'}
               </div>
             )}
           </div>
@@ -534,7 +517,10 @@ export default function RealizedRiskPage() {
               <div>
                 <h4 className="font-medium text-gray-900 dark:text-white">Drawdown Vulnerability</h4>
                 <p className="text-sm text-gray-600 dark:text-gray-400">
-                  Portfolio experienced a peak-to-trough drawdown of {formatPercentage(realizedRisk.portfolio.max_drawdown)} over the 252-day lookback window.
+                  Portfolio experienced a peak-to-trough drawdown of {formatPercentage(realizedRisk.portfolio.max_drawdown)}
+                  {realizedRisk?.data_range
+                    ? ` over ${realizedRisk.data_range.start} → ${realizedRisk.data_range.end}`
+                    : ' over the available history window'}.
                 </p>
               </div>
             </div>

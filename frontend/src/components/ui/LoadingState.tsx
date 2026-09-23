@@ -5,6 +5,23 @@
 import React from 'react';
 import { Loader2 } from 'lucide-react';
 
+/** Shared relative-time formatter for timestamps (string or Date). */
+export function formatRelativeTime(timestamp: string | Date | null | undefined): string {
+  if (!timestamp) return 'Never';
+
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  const diffMs = Date.now() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+
+  return date.toLocaleDateString();
+}
+
 interface LoadingSpinnerProps {
   size?: 'sm' | 'md' | 'lg' | 'xl';
   className?: string;
@@ -56,7 +73,7 @@ export const LoadingState: React.FC<LoadingStateProps> = ({
   return (
     <div className={`flex flex-col items-center justify-center space-y-3 p-8 ${className}`}>
       <LoadingSpinner size="lg" />
-      <p className="text-gray-600 text-sm">{message}</p>
+      <p className="text-gray-600 dark:text-gray-400 text-sm">{message}</p>
     </div>
   );
 };
@@ -77,7 +94,7 @@ export const DataTableLoading: React.FC<DataTableLoadingProps> = ({
       {/* Header */}
       <div className="grid gap-4" style={{ gridTemplateColumns: `repeat(${columns}, 1fr)` }}>
         {Array.from({ length: columns }).map((_, i) => (
-          <div key={i} className="h-6 bg-gray-200 rounded animate-pulse" />
+          <div key={i} className="h-6 bg-gray-200 dark:bg-gray-600 rounded animate-pulse" />
         ))}
       </div>
 
@@ -91,7 +108,7 @@ export const DataTableLoading: React.FC<DataTableLoadingProps> = ({
           {Array.from({ length: columns }).map((_, colIndex) => (
             <div
               key={colIndex}
-              className="h-4 bg-gray-100 rounded animate-pulse"
+              className="h-4 bg-gray-100 dark:bg-gray-700 rounded animate-pulse"
               style={{ animationDelay: `${(rowIndex * columns + colIndex) * 50}ms` }}
             />
           ))}
@@ -111,10 +128,10 @@ export const ChartLoading: React.FC<ChartLoadingProps> = ({
   className = ''
 }) => {
   return (
-    <div className={`${height} ${className} bg-gray-50 rounded-lg flex items-center justify-center`}>
+    <div className={`${height} ${className} bg-gray-50 dark:bg-gray-800 rounded-lg flex items-center justify-center`}>
       <div className="text-center">
         <LoadingSpinner size="lg" />
-        <p className="text-gray-500 text-sm mt-2">Loading chart data...</p>
+        <p className="text-gray-500 dark:text-gray-400 text-sm mt-2">Loading chart data...</p>
       </div>
     </div>
   );
@@ -132,11 +149,11 @@ export const MetricCardLoading: React.FC<MetricCardLoadingProps> = ({
   return (
     <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 ${className}`}>
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="bg-white p-6 rounded-lg border shadow-sm">
+        <div key={i} className="bg-white dark:bg-gray-800 p-6 rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm">
           <div className="animate-pulse">
-            <div className="h-4 bg-gray-200 rounded w-3/4 mb-2" />
-            <div className="h-8 bg-gray-200 rounded w-1/2 mb-1" />
-            <div className="h-3 bg-gray-100 rounded w-1/4" />
+            <div className="h-4 bg-gray-200 dark:bg-gray-600 rounded w-3/4 mb-2" />
+            <div className="h-8 bg-gray-200 dark:bg-gray-600 rounded w-1/2 mb-1" />
+            <div className="h-3 bg-gray-100 dark:bg-gray-700 rounded w-1/4" />
           </div>
         </div>
       ))}
@@ -153,8 +170,8 @@ export const DashboardLoading: React.FC<DashboardLoadingProps> = ({ className = 
     <div className={`space-y-6 p-6 ${className}`}>
       {/* Header */}
       <div className="animate-pulse">
-        <div className="h-8 bg-gray-200 rounded w-1/3 mb-2" />
-        <div className="h-4 bg-gray-100 rounded w-1/2" />
+        <div className="h-8 bg-gray-200 dark:bg-gray-600 rounded w-1/3 mb-2" />
+        <div className="h-4 bg-gray-100 dark:bg-gray-700 rounded w-1/2" />
       </div>
 
       {/* Metric Cards */}
@@ -167,7 +184,7 @@ export const DashboardLoading: React.FC<DashboardLoadingProps> = ({ className = 
       </div>
 
       {/* Data Table */}
-      <div className="bg-white p-6 rounded-lg border shadow-sm">
+      <div className="bg-white dark:bg-gray-800 p-6 rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm">
         <div className="animate-pulse">
           <div className="h-6 bg-gray-200 rounded w-1/4 mb-4" />
           <DataTableLoading rows={6} columns={5} />
@@ -190,30 +207,14 @@ export const RefreshIndicator: React.FC<RefreshIndicatorProps> = ({
   autoRefreshEnabled = false,
   className = ''
 }) => {
-  const formatLastRefresh = (date: Date | null | undefined) => {
-    if (!date) return 'Never';
-    
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    
-    if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
-    
-    const diffHours = Math.floor(diffMins / 60);
-    if (diffHours < 24) return `${diffHours}h ago`;
-    
-    return date.toLocaleDateString();
-  };
-
   return (
     <div className={`flex items-center space-x-2 text-xs ${className}`}>
       {isRefreshing && <LoadingSpinner size="sm" />}
-      <span className={isRefreshing ? 'text-blue-600' : 'text-gray-500'}>
-        {isRefreshing ? 'Refreshing...' : `Last updated: ${formatLastRefresh(lastRefresh)}`}
+      <span className={isRefreshing ? 'text-blue-600 dark:text-blue-400' : 'text-gray-500 dark:text-gray-400'}>
+        {isRefreshing ? 'Refreshing...' : `Last updated: ${formatRelativeTime(lastRefresh)}`}
       </span>
       {autoRefreshEnabled && (
-        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs bg-green-100 text-green-800">
+        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300">
           Auto
         </span>
       )}
@@ -252,8 +253,8 @@ export class ErrorBoundary extends React.Component<
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
             </svg>
           </div>
-          <h3 className="text-lg font-semibold text-gray-900">Something went wrong</h3>
-          <p className="text-gray-600 text-center max-w-md">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Something went wrong</h3>
+          <p className="text-gray-600 dark:text-gray-400 text-center max-w-md">
             An error occurred while loading this component. Please try refreshing the page.
           </p>
           <button

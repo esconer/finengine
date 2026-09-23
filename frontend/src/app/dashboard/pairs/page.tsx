@@ -4,21 +4,22 @@ import React, { useState, useEffect } from 'react';
 import { RefreshCw, Radar, AlertCircle } from 'lucide-react';
 import api from '@/lib/api';
 
+const LOOKBACK_DAYS = 252;
+const P_VALUE_THRESHOLD = 0.05;
+
 export default function PairsScannerPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [pairs, setPairs] = useState<any[]>([]);
-    const [lookbackDays] = useState(252);
-    const [pValueThreshold] = useState(0.05);
 
     const fetchPairs = async () => {
         setLoading(true);
         setError(null);
         try {
-            const res = await api.get(`/analytics/coint?lookback_days=${lookbackDays}&p_value_threshold=${pValueThreshold}`);
+            const res = await api.get(`/analytics/coint?lookback_days=${LOOKBACK_DAYS}&p_value_threshold=${P_VALUE_THRESHOLD}`);
             setPairs(res.data.pairs || []);
         } catch (err: any) {
-            setError(err.response?.data?.detail || 'Failed to scan cointegrated pairs');
+            setError(err?.message || 'Failed to scan cointegrated pairs');
         } finally {
             setLoading(false);
         }
@@ -26,7 +27,8 @@ export default function PairsScannerPage() {
 
     useEffect(() => {
         fetchPairs();
-    }, [lookbackDays, pValueThreshold]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     return (
         <div className="space-y-6">
@@ -65,7 +67,7 @@ export default function PairsScannerPage() {
                     <div className="py-12 text-center text-gray-500">Scanning pairs across your universe...</div>
                 ) : pairs.length === 0 ? (
                     <div className="py-12 text-center text-gray-500">
-                        No cointegrated pairs found at p &lt; {pValueThreshold}. Add more holdings to expand scanning universe.
+                        No cointegrated pairs found at p &lt; {P_VALUE_THRESHOLD}. Add more holdings to expand scanning universe.
                     </div>
                 ) : (
                     <div className="overflow-x-auto">

@@ -41,6 +41,44 @@ const apiClient: AxiosInstance = axios.create({
   },
 });
 
+// Typed error carrying HTTP status + raw detail so callers can branch on it
+export class AppError extends Error {
+  status?: number;
+  detail?: unknown;
+
+  constructor(message: string, options: { status?: number; detail?: unknown } = {}) {
+    super(message);
+    this.name = 'AppError';
+    this.status = options.status;
+    this.detail = options.detail;
+  }
+}
+
+// Pure message builder (unit-tested): reads FastAPI `{detail}` for ALL statuses,
+// string detail → message; array detail (422 shape) → joined; else message/error/HTTP.
+export function buildApiErrorMessage(status: number, data: unknown): string {
+  const body = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+
+  const { detail, message, error } = body;
+  if (detail !== undefined && detail !== null && detail !== '') {
+    if (Array.isArray(detail)) {
+      const formatted = detail
+        .map((err) => `${err?.loc?.[err.loc.length - 1]}: ${err?.msg}`)
+        .join(', ');
+      if (formatted) return formatted;
+    } else if (typeof detail === 'string') {
+      return detail;
+    }
+  }
+
+  if (typeof message === 'string' && message) return message;
+  if (typeof error === 'string' && error) return error;
+
+  if (status === 422) return 'Validation failed. Please check your input data.';
+  if (status === 409) return 'This ticker already exists in your portfolio';
+  return `HTTP ${status}`;
+}
+
 // Request interceptor
 apiClient.interceptors.request.use(
   (config) => config,
@@ -52,56 +90,25 @@ apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     let errorMessage = 'Unknown API error';
+    let status: number | undefined;
+    let detail: unknown;
 
     if (error.response) {
-      const { status, data } = error.response;
-
-      if (status === 422) {
-        // Handle validation errors specifically
-        if (data.detail) {
-          if (Array.isArray(data.detail)) {
-            // FastAPI validation error format: [{field, msg}]
-            errorMessage = data.detail.map((err: any) => `${err.loc?.[err.loc.length - 1]}: ${err.msg}`).join(', ');
-          } else if (typeof data.detail === 'string') {
-            errorMessage = data.detail;
-          }
-        } else if (data.message) {
-          errorMessage = data.message;
-        } else if (data.error) {
-          errorMessage = data.error;
-        } else {
-          errorMessage = 'Validation failed. Please check your input data.';
-        }
-      } else if (status === 409) {
-        // Handle duplicate ticker errors specifically
-        if (data.detail) {
-          errorMessage = data.detail;
-        } else if (data.message) {
-          errorMessage = data.message;
-        } else if (data.error) {
-          errorMessage = data.error;
-        } else {
-          errorMessage = 'This ticker already exists in your portfolio';
-        }
-      } else if (data?.message) {
-        errorMessage = data.message;
-      } else if (data?.error) {
-        errorMessage = data.error;
-      } else {
-        errorMessage = `HTTP ${status}: ${error.message}`;
-      }
+      status = error.response.status;
+      detail = error.response.data?.detail;
+      errorMessage = buildApiErrorMessage(error.response.status, error.response.data);
     } else if (error.message) {
       errorMessage = error.message;
     }
 
     console.error('API Error:', {
-      status: error.response?.status,
+      status,
       url: error.config?.url,
       message: errorMessage,
       data: error.response?.data
     });
 
-    return Promise.reject(new Error(errorMessage));
+    return Promise.reject(new AppError(errorMessage, { status, detail }));
   }
 );
 

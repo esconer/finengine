@@ -4,7 +4,7 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
@@ -20,6 +20,7 @@ import {
 } from 'recharts';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   BarChart3,
   Target,
@@ -58,9 +59,9 @@ interface ConcentrationData {
 interface ConcentrationMetric {
   name: string;
   key: string;
-  value: number;
+  value: number | undefined;
   threshold: number;
-  status: 'Good' | 'Warning' | 'Risk';
+  status: 'Good' | 'Warning' | 'Risk' | 'N/A';
   color_class: string;
   description: string;
 }
@@ -198,12 +199,26 @@ interface HelpExplainerModalProps {
 }
 
 function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   if (!itemKey || !EXPLAINERS[itemKey]) return null;
   const exp = EXPLAINERS[itemKey];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
+      onClick={onClose}
+    >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={exp.title}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl p-6 relative text-gray-900 dark:text-gray-100"
         onClick={(e) => e.stopPropagation()}
       >
@@ -320,7 +335,7 @@ function HelpBtn({ itemKey, onOpen }: { itemKey: string; onOpen: (key: string) =
         e.stopPropagation();
         onOpen(itemKey);
       }}
-      className="inline-flex items-center justify-center w-5 h-5 rounded-full text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition-colors focus:outline-none"
+      className="inline-flex items-center justify-center w-5 h-5 rounded-full text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 focus-visible:ring-offset-2"
       title="Click to understand what this means and how it is calculated"
       aria-label="Help"
     >
@@ -332,10 +347,12 @@ function HelpBtn({ itemKey, onOpen }: { itemKey: string; onOpen: (key: string) =
 export default function ConcentrationPage() {
   const [concentrationData, setConcentrationData] = useState<ConcentrationData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [positionData, setPositionData] = useState<any[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
+  const fetchSeq = useRef(0);
 
   // Compute Lorenz Inequality Curve
   const lorenzCurveData = useMemo(() => {
@@ -361,15 +378,20 @@ export default function ConcentrationPage() {
 
   const handleExportCSV = () => {
     if (!positionData || positionData.length === 0) return;
-    const headers = 'Ticker,Weight,Cumulative Weight,Sector,Concentration Risk\n';
-    const rows = positionData
-      .map(p => {
-        const weightVal = p.weight ?? 0;
-        const riskLevel = weightVal > 0.15 ? 'High' : weightVal > 0.10 ? 'Medium' : 'Low';
-        return `${p.ticker},${(p.weight * 100).toFixed(2)}%,${(p.cumulative_weight * 100).toFixed(2)}%,${p.sector},${riskLevel}`;
-      })
-      .join('\n');
-    const blob = new Blob([headers + rows], { type: 'text/csv' });
+    const headers = ['Ticker', 'Weight', 'Cumulative Weight', 'Sector', 'Concentration Risk'];
+    const rows = positionData.map(p => {
+      const weightVal = p.weight ?? 0;
+      const riskLevel = weightVal > 0.15 ? 'High' : weightVal > 0.10 ? 'Medium' : 'Low';
+      return [
+        p.ticker,
+        (p.weight * 100).toFixed(2) + '%',
+        (p.cumulative_weight * 100).toFixed(2) + '%',
+        p.sector ?? 'N/A',
+        riskLevel,
+      ].map(escapeCsvCell).join(',');
+    });
+    const csvContent = [headers.map(escapeCsvCell).join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -379,9 +401,12 @@ export default function ConcentrationPage() {
   };
 
   const fetchConcentrationData = async () => {
+    const seq = ++fetchSeq.current;
     setLoading(true);
+    setError(null);
     try {
       const data = await analyticsApi.getConcentrationMetrics();
+      if (seq !== fetchSeq.current) return;
       setConcentrationData(data);
       useUIStore.getState().updateLastUpdated();
 
@@ -395,14 +420,18 @@ export default function ConcentrationPage() {
           ticker,
           weight: weight as number,
           cumulative_weight: cumWeight,
-          sector: pos?.sector || 'General'
+          sector: pos?.sector || null
         };
       });
       setPositionData(positionsList);
     } catch (error) {
+      if (seq !== fetchSeq.current) return;
       console.error('Failed to fetch concentration data:', error);
+      setError(error instanceof Error ? error.message : 'Failed to load concentration data');
+      setConcentrationData(null);
+      setPositionData([]);
     } finally {
-      setLoading(false);
+      if (seq === fetchSeq.current) setLoading(false);
     }
   };
 
@@ -453,36 +482,36 @@ export default function ConcentrationPage() {
     {
       name: 'Largest Position',
       key: 'largest_position',
-      value: concentrationData?.largest_position || 0,
+      value: concentrationData?.largest_position,
       threshold: 0.15,
-      status: getConcentrationStatus('largest_position', concentrationData?.largest_position || 0),
+      status: concentrationData?.largest_position == null ? 'N/A' : getConcentrationStatus('largest_position', concentrationData.largest_position),
       color_class: 'bg-blue-500',
       description: 'Weight of the largest individual holding'
     },
     {
       name: 'Top 3 Holdings',
       key: 'top_3_holdings',
-      value: concentrationData?.top_3 || 0,
+      value: concentrationData?.top_3,
       threshold: 0.50,
-      status: getConcentrationStatus('top_3', concentrationData?.top_3 || 0),
+      status: concentrationData?.top_3 == null ? 'N/A' : getConcentrationStatus('top_3', concentrationData.top_3),
       color_class: 'bg-purple-500',
       description: 'Combined weight of top 3 positions'
     },
     {
       name: 'Herfindahl Index',
       key: 'herfindahl_index',
-      value: concentrationData?.herfindahl_index || 0,
+      value: concentrationData?.herfindahl_index,
       threshold: 0.18,
-      status: getConcentrationStatus('herfindahl_index', concentrationData?.herfindahl_index || 0),
+      status: concentrationData?.herfindahl_index == null ? 'N/A' : getConcentrationStatus('herfindahl_index', concentrationData.herfindahl_index),
       color_class: 'bg-amber-500',
       description: 'Sum of squared constituent weights'
     },
     {
       name: 'Effective Positions',
       key: 'effective_positions',
-      value: concentrationData?.effective_positions || 0,
+      value: concentrationData?.effective_positions,
       threshold: 8,
-      status: 'Good',
+      status: concentrationData?.effective_positions == null ? 'N/A' : 'Good',
       color_class: 'bg-emerald-500',
       description: 'Equal-weighted diversification equivalent'
     },
@@ -533,7 +562,7 @@ export default function ConcentrationPage() {
         const data = row.original || row;
         return (
           <div className="text-gray-600 dark:text-gray-400 text-xs">
-            {data.sector}
+            {data.sector ?? 'N/A'}
           </div>
         );
       },
@@ -560,16 +589,16 @@ export default function ConcentrationPage() {
   // Sector concentration data
   const sectorData = concentrationData?.by_sector ? Object.entries(concentrationData.by_sector)
     .map(([sector, weight]) => ({
-      sector: sector.replace('_', ' '),
+      sector: sector.replace(/_/g, ' '),
       weight,
       percentage: formatPercentage(weight)
     }))
     .filter(s => s.weight > 0.01)
     .sort((a, b) => b.weight - a.weight) : [];
 
-  const divScore = positions.length <= 1 ? 0.0 : (concentrationData?.diversification_score ?? 
-    (concentrationData?.herfindahl_index ? 
-      Number((((1 - concentrationData.herfindahl_index) / (1 - 1 / positions.length)) * 100).toFixed(1)) : 0.0));
+  const divScore: number | null = positions.length <= 1 ? 0.0 : (concentrationData?.diversification_score ??
+    (concentrationData?.herfindahl_index != null ?
+      Number((((1 - concentrationData.herfindahl_index) / (1 - 1 / positions.length)) * 100).toFixed(1)) : null));
 
   return (
     <div className="space-y-6">
@@ -597,11 +626,11 @@ export default function ConcentrationPage() {
             <div className="flex flex-wrap items-center mt-3 gap-4 text-xs text-purple-200">
               <div className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                Effective Positions: <strong className="text-white">{concentrationData?.effective_positions?.toFixed(1) || (positions.length > 0 ? '1.0' : '0.0')} of {positions.length}</strong>
+                Effective Positions: <strong className="text-white">{concentrationData?.effective_positions != null ? concentrationData.effective_positions.toFixed(1) : 'N/A'} of {positions.length}</strong>
               </div>
               <div>•</div>
               <div className="flex items-center gap-1">
-                Diversification Score: <strong className="text-white">{divScore}%</strong>
+                Diversification Score: <strong className="text-white">{divScore == null ? 'N/A' : `${divScore}%`}</strong>
                 <HelpBtn itemKey="diversification_score" onOpen={setActiveExplainer} />
               </div>
             </div>
@@ -619,6 +648,23 @@ export default function ConcentrationPage() {
           </div>
         </div>
       </div>
+
+      {/* Error State */}
+      {error && (
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4">
+          <div className="flex items-center">
+            <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 mr-2" />
+            <h3 className="text-red-800 dark:text-red-300 font-medium">Error Loading Concentration Data</h3>
+          </div>
+          <p className="text-red-700 dark:text-red-400 text-sm mt-1">{error}</p>
+          <button
+            onClick={handleRefresh}
+            className="mt-2 px-3 py-1 bg-red-100 dark:bg-red-800 text-red-700 dark:text-red-300 rounded text-sm hover:bg-red-200 dark:hover:bg-red-700 transition-colors"
+          >
+            Try Again
+          </button>
+        </div>
+      )}
 
       {/* 4 Concentration Metric Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -760,6 +806,11 @@ export default function ConcentrationPage() {
                   </div>
                 </div>
               ))}
+              {sectorData.length > 6 && (
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  +{sectorData.length - 6} more sector{sectorData.length - 6 !== 1 ? 's' : ''} not shown
+                </p>
+              )}
             </div>
           ) : (
             <div className="h-64 flex items-center justify-center text-gray-400 text-sm">
@@ -814,10 +865,12 @@ export default function ConcentrationPage() {
               <Target className="w-7 h-7" />
             </div>
             <h4 className="font-bold text-gray-900 dark:text-white">
-              {concentrationMetrics.filter(m => m.status === 'Good').length >= 3 ? 'Well Diversified' : 'Moderate Diversification'}
+              {concentrationData == null ? 'N/A' : concentrationMetrics.filter(m => m.status === 'Good').length >= 3 ? 'Well Diversified' : 'Moderate Diversification'}
             </h4>
             <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-              Portfolio shows good diversification across holdings (HHI = {concentrationData?.herfindahl_index ? formatRatio(concentrationData.herfindahl_index) : '0.09'}).
+              {concentrationData == null
+                ? 'HHI = N/A — concentration metrics unavailable.'
+                : <>Portfolio shows good diversification across holdings (HHI = {concentrationData.herfindahl_index != null ? formatRatio(concentrationData.herfindahl_index) : 'N/A'}).</>}
             </p>
           </div>
 
@@ -827,9 +880,11 @@ export default function ConcentrationPage() {
             </div>
             <h4 className="font-bold text-gray-900 dark:text-white">Monitor Closely</h4>
             <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-              {concentrationMetrics.filter(m => m.status === 'Warning').length > 0
-                ? `${concentrationMetrics.filter(m => m.status === 'Warning').length} concentration metrics near upper threshold.`
-                : 'All position weights within standard risk limits.'
+              {concentrationData == null
+                ? 'N/A'
+                : concentrationMetrics.filter(m => m.status === 'Warning').length > 0
+                  ? `${concentrationMetrics.filter(m => m.status === 'Warning').length} concentration metrics near upper threshold.`
+                  : 'All position weights within standard risk limits.'
               }
             </p>
           </div>
@@ -839,12 +894,14 @@ export default function ConcentrationPage() {
               <AlertTriangle className="w-7 h-7" />
             </div>
             <h4 className="font-bold text-gray-900 dark:text-white">
-              {concentrationMetrics.filter(m => m.status === 'Risk').length > 0 ? 'High Concentration Risk' : 'Risk Managed'}
+              {concentrationData == null ? 'N/A' : concentrationMetrics.filter(m => m.status === 'Risk').length > 0 ? 'High Concentration Risk' : 'Risk Managed'}
             </h4>
             <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-              {concentrationMetrics.filter(m => m.status === 'Risk').length > 0
-                ? 'Consider rebalancing largest positions.'
-                : 'Concentration risk appears well managed and bounded.'
+              {concentrationData == null
+                ? 'N/A'
+                : concentrationMetrics.filter(m => m.status === 'Risk').length > 0
+                  ? 'Consider rebalancing largest positions.'
+                  : 'Concentration risk appears well managed and bounded.'
               }
             </p>
           </div>

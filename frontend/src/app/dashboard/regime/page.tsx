@@ -10,6 +10,7 @@ import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   Radar,
   AlertTriangle,
@@ -52,7 +53,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The statistical stability of the current market state, reflecting low day-over-day state flipping.',
     howInferred: 'Computed as 1.0 minus the historical empirical regime transition frequency: Stability = (1 - State_Flips) × 100%.',
     whyImportant: 'A high stability score (> 70%) ensures regime signals are persistent trends rather than noisy high-frequency oscillations.',
-    howToInfer: '74.0% stability indicates that once NIFTY enters this regime, it reliably stays for extended multi-week durations.',
+    howToInfer: 'e.g. 74.0% stability would indicate that once NIFTY enters this regime, it reliably stays for extended multi-week durations.',
     benchmark: 'Institutional threshold for stable regime trading: ≥ 65.0%.'
   },
   benchmark_vol: {
@@ -60,7 +61,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The annualized standard deviation of NIFTY 50 returns specifically during periods classified as this regime.',
     howInferred: 'Computed as σ_{regime} = std(R_{NIFTY} | State = Active) × √252.',
     whyImportant: 'Demonstrates the baseline market risk environment you are currently operating in.',
-    howToInfer: '10.3% benchmark volatility in Calm regime confirms market swings are well below the long-term 15.5% average.',
+    howToInfer: 'e.g. 10.3% benchmark volatility in Calm regime would confirm market swings are well below the long-term 15.5% average.',
     benchmark: 'NIFTY long-term historical average volatility: 14.5% – 16.5%.'
   },
   days_in_regime: {
@@ -89,7 +90,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'Your actual portfolio\'s annualized return and realized volatility during days when NIFTY was in the active market regime.',
     howInferred: 'Evaluates your book\'s returns filtered strictly to the overlapping trading days of the current regime.',
     whyImportant: 'Validates whether your portfolio is effectively capturing upside or defending capital under the prevailing macro conditions.',
-    howToInfer: 'Your portfolio annualized +45.3% return with low volatility in Calm conditions, outperforming the benchmark.',
+    howToInfer: 'e.g. Your portfolio annualized +45.3% return with low volatility in Calm conditions would outperform the benchmark.',
     benchmark: 'Alpha generation benchmark: Portfolio Return > Benchmark Return with lower relative drawdowns.'
   },
   regime_probabilities: {
@@ -233,12 +234,6 @@ const REGIME_STYLES: Record<string, { label: string; chip: string; dot: string; 
     dot: 'bg-blue-500',
     bg: 'bg-blue-500/20'
   },
-  volatile: {
-    label: 'Volatile',
-    chip: 'bg-amber-950/60 border border-amber-800/60 text-amber-300',
-    dot: 'bg-amber-500',
-    bg: 'bg-amber-500/20'
-  },
   crisis: {
     label: 'Crisis',
     chip: 'bg-rose-950/60 border border-rose-800/60 text-rose-300',
@@ -289,6 +284,11 @@ export default function RegimePage() {
       : `${(v * 100).toFixed(decimals)}%`;
 
   const current = data ? regimeStyle(data.current_regime) : null;
+  const currentState = data
+    ? data.states.find(
+        (st) => st.regime.toLowerCase() === data.current_regime.toLowerCase()
+      ) ?? null
+    : null;
 
   const portBlock = data?.portfolio_in_current_regime;
   const portShowTotal = portBlock?.annualized === false;
@@ -307,7 +307,7 @@ export default function RegimePage() {
     rows.push('Daisy Risk Engine - Hidden Markov Market Regime Classification');
     rows.push(`As of Date,${data.as_of}`);
     rows.push(`Observations Analyzed,${data.observations} trading days`);
-    rows.push(`Current Active Regime,${current?.label || data.current_regime}`);
+    rows.push(`Current Active Regime,${escapeCsvCell(current?.label || data.current_regime)}`);
     rows.push(`Regime Stability,${data.stability_pct.toFixed(1)}%`);
     if (data.label_overrides && data.label_overrides.crash_veto_days > 0) {
       rows.push(`Crash-Guard Relabeled Days,${data.label_overrides.crash_veto_days}`);
@@ -316,7 +316,7 @@ export default function RegimePage() {
     rows.push('HMM Latent State Parameters');
     rows.push('Regime,Annualized Return (%),Annualized Volatility (%),Share of History (%)');
     for (const st of data.states) {
-      rows.push(`${regimeStyle(st.regime).label},${(st.ann_ret * 100).toFixed(2)}%,${(st.ann_vol * 100).toFixed(2)}%,${st.historical_days_pct.toFixed(1)}%`);
+      rows.push(`${escapeCsvCell(regimeStyle(st.regime).label)},${(st.ann_ret * 100).toFixed(2)}%,${(st.ann_vol * 100).toFixed(2)}%,${st.historical_days_pct.toFixed(1)}%`);
     }
     rows.push('');
     if (data.portfolio_in_current_regime) {
@@ -329,7 +329,7 @@ export default function RegimePage() {
     rows.push('Recent Daily Regime History (Last 120 Days)');
     rows.push('Date,Assigned Regime');
     for (const d of data.recent_history) {
-      rows.push(`${d.date},${regimeStyle(d.regime).label}`);
+      rows.push(`${escapeCsvCell(d.date)},${escapeCsvCell(regimeStyle(d.regime).label)}`);
     }
 
     const csvContent = 'data:text/csv;charset=utf-8,' + rows.join('\n');
@@ -431,7 +431,7 @@ export default function RegimePage() {
       )}
 
       {/* Main Content */}
-      {!loading && !error && data && current && (
+      {data && current && (
         <>
           {/* Current Regime Headline Metrics */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -456,12 +456,7 @@ export default function RegimePage() {
             <div className="relative group">
               <MetricCard
                 title="Benchmark Vol (this regime)"
-                value={(() => {
-                  const s = data.states.find(
-                    (st) => st.regime.toLowerCase() === data.current_regime.toLowerCase()
-                  );
-                  return s ? fmtPct(s.ann_vol) : 'N/A';
-                })()}
+                value={currentState ? fmtPct(currentState.ann_vol) : 'N/A'}
                 icon={Waves}
               />
               <div className="absolute top-4 right-4 z-10">
@@ -472,12 +467,7 @@ export default function RegimePage() {
             <div className="relative group">
               <MetricCard
                 title="Days in Regime (hist.)"
-                value={(() => {
-                  const s = data.states.find(
-                    (st) => st.regime.toLowerCase() === data.current_regime.toLowerCase()
-                  );
-                  return s ? `${s.historical_days_pct.toFixed(0)}%` : 'N/A';
-                })()}
+                value={currentState ? `${currentState.historical_days_pct.toFixed(0)}%` : 'N/A'}
                 icon={CalendarRange}
               />
               <div className="absolute top-4 right-4 z-10">
@@ -505,39 +495,32 @@ export default function RegimePage() {
                   Continuous probability distribution across all 3 market states for today's trading session.
                 </p>
 
-                {data.regime_probabilities && (
+                {data.regime_probabilities && Object.keys(data.regime_probabilities).length > 0 && (
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-xs font-mono">
-                      <span className="text-emerald-400 flex items-center">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 mr-1.5" />
-                        Calm: <strong className="ml-1 text-white">{data.regime_probabilities.calm ?? 0}%</strong>
-                      </span>
-                      <span className="text-blue-400 flex items-center">
-                        <span className="w-2 h-2 rounded-full bg-blue-500 mr-1.5" />
-                        Bull Rally: <strong className="ml-1 text-white">{data.regime_probabilities.bull ?? 0}%</strong>
-                      </span>
-                      <span className="text-rose-400 flex items-center">
-                        <span className="w-2 h-2 rounded-full bg-rose-500 mr-1.5" />
-                        Crisis: <strong className="ml-1 text-white">{data.regime_probabilities.crisis ?? 0}%</strong>
-                      </span>
+                      {Object.entries(data.regime_probabilities).map(([stateKey, val]) => {
+                        const st = regimeStyle(stateKey);
+                        return (
+                          <span key={stateKey} className="text-slate-300 flex items-center">
+                            <span className={`w-2 h-2 rounded-full mr-1.5 ${st.dot}`} />
+                            {st.label}: <strong className="ml-1 text-white">{val}%</strong>
+                          </span>
+                        );
+                      })}
                     </div>
 
                     <div className="w-full bg-slate-950 rounded-full h-3 overflow-hidden flex border border-slate-800">
-                      <div
-                        className="bg-emerald-500 transition-all duration-500"
-                        style={{ width: `${data.regime_probabilities.calm ?? 0}%` }}
-                        title={`Calm: ${data.regime_probabilities.calm ?? 0}%`}
-                      />
-                      <div
-                        className="bg-blue-500 transition-all duration-500"
-                        style={{ width: `${data.regime_probabilities.bull ?? 0}%` }}
-                        title={`Bull Rally: ${data.regime_probabilities.bull ?? 0}%`}
-                      />
-                      <div
-                        className="bg-rose-500 transition-all duration-500"
-                        style={{ width: `${data.regime_probabilities.crisis ?? 0}%` }}
-                        title={`Crisis: ${data.regime_probabilities.crisis ?? 0}%`}
-                      />
+                      {Object.entries(data.regime_probabilities).map(([stateKey, val]) => {
+                        const st = regimeStyle(stateKey);
+                        return (
+                          <div
+                            key={stateKey}
+                            className={`transition-all duration-500 ${st.dot}`}
+                            style={{ width: `${val}%` }}
+                            title={`${st.label}: ${val}%`}
+                          />
+                        );
+                      })}
                     </div>
                   </div>
                 )}

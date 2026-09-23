@@ -10,6 +10,7 @@ import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   PieChart,
   AlertTriangle,
@@ -46,7 +47,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The total annualized standard deviation of daily portfolio returns, reflecting aggregate fluctuation magnitude.',
     howInferred: 'Calculated as σ_p = √(w^T Σ w) × √252 using the full empirical covariance matrix of constituent returns.',
     whyImportant: 'The core risk denominator in Sharpe ratios and institutional risk budgeting.',
-    howToInfer: '18.08% indicates standard annual fluctuation bounds of ±18.08% under normal market conditions.',
+    howToInfer: 'e.g. 18.08% indicates standard annual fluctuation bounds of ±18.08% under normal market conditions.',
     benchmark: 'Balanced multi-cap Indian portfolio benchmark: 14.0% – 18.0%.'
   },
   var_95: {
@@ -54,7 +55,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The minimum percentage loss expected on the 5% worst trading sessions over a 1-day holding period.',
     howInferred: 'Non-parametric empirical 5th percentile of daily portfolio historical returns: VaR_95 = Percentile(R_daily, 5%).',
     whyImportant: 'Mandated by Basel III risk regulations; establishes everyday stop-loss capital buffers.',
-    howToInfer: '-1.82% means on 95 out of 100 days, daily loss will not exceed 1.82% of total portfolio value.',
+    howToInfer: 'e.g. -1.82% means on 95 out of 100 days, daily loss will not exceed 1.82% of total portfolio value.',
     benchmark: 'Standard daily VaR limit: ≥ -2.25%.'
   },
   cvar_95: {
@@ -62,7 +63,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The average expected loss conditioned on the portfolio breaching its 95% VaR threshold.',
     howInferred: 'CVaR_95 = E[R_daily | R_daily ≤ VaR_95], measuring the conditional average of tail loss events.',
     whyImportant: 'Superior to VaR because it captures the severity of tail crashes rather than just the cutoff threshold.',
-    howToInfer: '-2.53% means when a crisis or tail-shock day occurs, the average expected daily drawdown is 2.53%.',
+    howToInfer: 'e.g. -2.53% means when a crisis or tail-shock day occurs, the average expected daily drawdown is 2.53%.',
     benchmark: 'Institutional risk ceiling: CVaR ≥ -3.50%.'
   },
   top_risk_driver: {
@@ -70,7 +71,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The single individual holding contributing the largest marginal share to aggregate portfolio volatility.',
     howInferred: 'Identified as argmax_i (Euler Volatility Risk Contribution %RC_i).',
     whyImportant: 'Highlights portfolio vulnerability to idiosyncratic single-stock shocks regardless of nominal portfolio value.',
-    howToInfer: 'Motherson (19.9% risk share vs 13.6% capital weight) is the primary engine of portfolio volatility.',
+    howToInfer: 'e.g. Motherson (19.9% risk share vs 13.6% capital weight) would be the primary engine of portfolio volatility.',
     benchmark: 'Single-stock risk share ceiling: ≤ 20.0%.'
   },
   euler_volatility_share: {
@@ -106,7 +107,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The ratio of percentage risk contribution to percentage capital allocation: Ratio = %RC_i / Weight_i.',
     howInferred: 'Calculated as %RC_i / w_i. A ratio of 1.0 represents exact proportional risk parity.',
     whyImportant: 'The key quantitative metric used by risk managers to identify over-leveraged risk contributors (> 1.0) and risk diversifiers (< 1.0).',
-    howToInfer: 'Redington (1.70x) is an aggressive risk magnifier; JuniorBees (0.77x) and Cipla (0.44x) are strong risk dampeners.'
+    howToInfer: 'e.g. Redington (1.70x) would be an aggressive risk magnifier; JuniorBees (0.77x) and Cipla (0.44x) would be strong risk dampeners.'
   }
 };
 
@@ -208,15 +209,15 @@ interface RiskContributionData {
 function ContributionBars({
   entries,
   colorClass,
+  emptyMessage = 'Not enough tail observations to attribute this model.',
 }: {
   entries: [string, number][];
   colorClass: string;
+  emptyMessage?: string;
 }) {
   if (entries.length === 0) {
     return (
-      <p className="text-sm text-slate-400">
-        Not enough tail observations to attribute this model.
-      </p>
+      <p className="text-sm text-slate-400">{emptyMessage}</p>
     );
   }
   const max = Math.max(...entries.map(([, v]) => v), 0.000001);
@@ -302,14 +303,16 @@ export default function RiskContributionPage() {
     rows.push(`Annualized Volatility,${fmtPct(data.portfolio_volatility_annualized)}`);
     rows.push(`Daily VaR (95%),${fmtPct(data.portfolio_var_95_daily)}`);
     rows.push(`Daily CVaR (95%),${fmtPct(data.portfolio_cvar_95_daily)}`);
-    rows.push(`Top Risk Driver,${topDriver ? `${topDriver[0]} (${(topDriver[1] * 100).toFixed(1)}%)` : 'N/A'}`);
+    rows.push(`Top Risk Driver,${topDriver ? `${escapeCsvCell(topDriver[0])} (${(topDriver[1] * 100).toFixed(1)}%)` : 'N/A'}`);
     rows.push('');
     rows.push('Position Level Risk Decomposition');
     rows.push('Ticker,Volatility Risk Share (%),CVaR Tail Loss Share (%),Risk Divergence (%)');
     for (const [ticker, volShare] of volEntries) {
-      const cvarShare = data.positions.cvar_tail[ticker] ?? 0;
-      const diff = cvarShare - volShare;
-      rows.push(`${ticker},${(volShare * 100).toFixed(2)}%,${(cvarShare * 100).toFixed(2)}%,${(diff * 100).toFixed(2)}%`);
+      const cvarShare = data.positions.cvar_tail[ticker];
+      const diff = cvarShare != null ? cvarShare - volShare : null;
+      rows.push(
+        `${escapeCsvCell(ticker)},${(volShare * 100).toFixed(2)}%,${cvarShare != null ? `${(cvarShare * 100).toFixed(2)}%` : 'N/A'},${diff != null ? `${(diff * 100).toFixed(2)}%` : 'N/A'}`
+      );
     }
     rows.push('');
     rows.push('Sector Risk Rollup');
@@ -319,9 +322,11 @@ export default function RiskContributionPage() {
       ...Object.keys(data.sector_rollup.cvar || {})
     ]));
     for (const sec of allSectors) {
-      const vShare = data.sector_rollup.volatility[sec] ?? 0;
-      const cShare = data.sector_rollup.cvar[sec] ?? 0;
-      rows.push(`${sec},${(vShare * 100).toFixed(2)}%,${(cShare * 100).toFixed(2)}%`);
+      const vShare = data.sector_rollup.volatility[sec];
+      const cShare = data.sector_rollup.cvar[sec];
+      rows.push(
+        `${escapeCsvCell(sec)},${vShare != null ? `${(vShare * 100).toFixed(2)}%` : 'N/A'},${cShare != null ? `${(cShare * 100).toFixed(2)}%` : 'N/A'}`
+      );
     }
 
     const csvContent = 'data:text/csv;charset=utf-8,' + rows.join('\n');
@@ -425,7 +430,7 @@ export default function RiskContributionPage() {
       )}
 
       {/* Main Content */}
-      {!loading && !error && data && (
+      {data && (
         <>
           {/* Portfolio-Level Headline Metrics */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -434,7 +439,6 @@ export default function RiskContributionPage() {
                 title="Portfolio Volatility (ann.)"
                 value={fmtPct(data.portfolio_volatility_annualized)}
                 icon={Activity}
-                loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
                 <HelpBtn onClick={() => setActiveExplainer('portfolio_volatility')} />
@@ -446,7 +450,6 @@ export default function RiskContributionPage() {
                 title="Daily VaR 95%"
                 value={fmtPct(data.portfolio_var_95_daily)}
                 icon={Crosshair}
-                loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
                 <HelpBtn onClick={() => setActiveExplainer('var_95')} />
@@ -462,7 +465,6 @@ export default function RiskContributionPage() {
                     : fmtPct(data.portfolio_cvar_95_daily)
                 }
                 icon={Layers}
-                loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
                 <HelpBtn onClick={() => setActiveExplainer('cvar_95')} />
@@ -474,7 +476,6 @@ export default function RiskContributionPage() {
                 title="Top Risk Driver"
                 value={topDriver ? `${topDriver[0]} · ${(topDriver[1] * 100).toFixed(1)}%` : 'N/A'}
                 icon={BarChart3}
-                loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
                 <HelpBtn onClick={() => setActiveExplainer('top_risk_driver')} />
@@ -495,7 +496,11 @@ export default function RiskContributionPage() {
                 </span>
               </div>
               <p className="text-xs text-slate-400 mb-4">Percentage contribution of each scrip to day-to-day portfolio volatility.</p>
-              <ContributionBars entries={volEntries} colorClass="bg-gradient-to-r from-orange-500 to-amber-500" />
+              <ContributionBars
+                entries={volEntries}
+                colorClass="bg-gradient-to-r from-orange-500 to-amber-500"
+                emptyMessage="No volatility contribution data available."
+              />
             </div>
 
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
@@ -514,8 +519,7 @@ export default function RiskContributionPage() {
           </div>
 
           {/* Sector Rollup with Vol / CVaR Switcher */}
-          {sectorEntries.length > 0 && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center space-x-2">
                   <h3 className="text-lg font-bold text-white">Risk Contribution by Sector</h3>
@@ -547,9 +551,9 @@ export default function RiskContributionPage() {
               <ContributionBars
                 entries={sectorEntries}
                 colorClass={selectedSectorModel === 'volatility' ? 'bg-amber-500' : 'bg-rose-500'}
+                emptyMessage="No sector risk contribution data available."
               />
             </div>
-          )}
 
           {/* Divergence Insight */}
           {volEntries.length > 0 && cvarEntries.length > 0 && (
@@ -565,7 +569,7 @@ export default function RiskContributionPage() {
                     diff: (data.positions.cvar_tail[t] ?? 0) - v,
                   }))
                   .sort((a, b) => b.diff - a.diff)[0];
-                if (!tailHeavier || Math.abs(tailHeavier.diff) < 0.05) {
+                if (!tailHeavier || tailHeavier.diff <= 0.05) {
                   return (
                     <div className="p-4 rounded-lg bg-slate-800/40 border border-slate-700/50 flex items-start space-x-3">
                       <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
@@ -585,7 +589,7 @@ export default function RiskContributionPage() {
                       </span>{' '}
                       contributes{' '}
                       <span className="font-bold text-rose-400 font-mono">
-                        +{(Math.abs(tailHeavier.diff) * 100).toFixed(1)}%
+                        {tailHeavier.diff >= 0 ? '+' : ''}{(tailHeavier.diff * 100).toFixed(1)}%
                       </span>{' '}
                       more to your tail losses than it does to everyday volatility — its downturn drawdowns are steeper than routine moves indicate.
                     </p>

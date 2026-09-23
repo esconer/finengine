@@ -2,7 +2,7 @@
  * Analytics service hook for portfolio analytics
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 
@@ -29,8 +29,10 @@ export const usePortfolioAnalytics = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { positions } = usePortfolioStore();
+  const requestIdRef = useRef(0);
 
   const fetchAnalyticsData = async () => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
 
@@ -57,6 +59,9 @@ export const usePortfolioAnalytics = () => {
         analyticsApi.getRiskScore(),
       ]);
 
+      // Discard stale responses — a newer fetch (or unmount) superseded this one (B11)
+      if (requestId !== requestIdRef.current) return;
+
       const results = [summary, realizedRisk, forecastRisk, factorExposure, concentration, liquidity, riskScore];
       const rejectedCount = results.filter(r => r.status === 'rejected').length;
 
@@ -77,9 +82,12 @@ export const usePortfolioAnalytics = () => {
       });
 
     } catch (err: any) {
+      if (requestId !== requestIdRef.current) return;
       setError(err.message || 'Failed to fetch analytics data');
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -91,6 +99,10 @@ export const usePortfolioAnalytics = () => {
     } else {
       setLoading(false);
     }
+    // Invalidate in-flight fetches when tickers change or on unmount (B11)
+    return () => {
+      requestIdRef.current++;
+    };
   }, [tickerKey]);
 
   return {

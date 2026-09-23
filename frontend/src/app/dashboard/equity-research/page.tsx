@@ -1,12 +1,12 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import {
   Search,
   Download,
   Sparkles,
   ShieldAlert,
-  TrendingUp,
   Volume2,
   FileText,
   Building,
@@ -20,10 +20,7 @@ import {
   BarChart2,
   PieChart as PieChartIcon,
   Layers,
-  ArrowUpRight,
-  ArrowDownRight,
   Play,
-  Pause,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -41,21 +38,23 @@ import {
   EquityResearchProfile,
   ShareholdingDataResponse,
   ConcallItem,
-  CustomRatiosDataResponse,
 } from '@/types';
-import { formatCurrency, formatPercent, formatIndianRupees } from '@/lib/utils';
 
-export default function EquityResearchPage() {
-  const [tickerInput, setTickerInput] = useState('RELIANCE');
-  const [activeTicker, setActiveTicker] = useState('RELIANCE');
+function EquityResearchContent() {
+  const searchParams = useSearchParams();
+  const initialTicker = (searchParams.get('ticker') || 'RELIANCE').trim().toUpperCase();
+  const [tickerInput, setTickerInput] = useState(initialTicker);
+  const [activeTicker, setActiveTicker] = useState(initialTicker);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const [profile, setProfile] = useState<EquityResearchProfile | null>(null);
   const [shareholding, setShareholding] = useState<ShareholdingDataResponse | null>(null);
+  const [shareholdingError, setShareholdingError] = useState<string | null>(null);
   const [concalls, setConcalls] = useState<ConcallItem[]>([]);
-  const [customRatios, setCustomRatios] = useState<CustomRatiosDataResponse | null>(null);
+  const [concallError, setConcallError] = useState<string | null>(null);
   const [financials, setFinancials] = useState<any>(null);
+  const [statementsError, setStatementsError] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<
     'overview' | 'shareholding' | 'concalls' | 'financials' | 'ai-dossier'
@@ -69,50 +68,58 @@ export default function EquityResearchPage() {
   const [aiModalTitle, setAiModalTitle] = useState('');
   const [aiPromptContent, setAiPromptContent] = useState('');
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [aiLoading, setAiLoading] = useState<'memo' | 'forensic' | null>(null);
 
   // Audio player state
   const [activeAudioUrl, setActiveAudioUrl] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
+
+  // Monotonic sequence: stale fetch resolutions are dropped (rapid ticker switches)
+  const fetchSeq = useRef(0);
+  const stmtSeq = useRef(0);
 
   const fetchAllData = async (ticker: string) => {
+    const seq = ++fetchSeq.current;
     setLoading(true);
     setError(null);
+    // Clear previous company's data so a failed switch never shows stale rows
+    setProfile(null);
+    setShareholding(null);
+    setShareholdingError(null);
+    setConcalls([]);
+    setConcallError(null);
+    setFinancials(null);
+    setStatementsError(null);
+    setActiveAudioUrl(null);
     try {
-      const [profData, shData, concallData, ratioData] = await Promise.allSettled([
+      const [profData, shData, concallData] = await Promise.allSettled([
         equityResearchApi.getFullProfile(ticker),
         equityResearchApi.getShareholding(ticker),
         equityResearchApi.getConcalls(ticker),
-        equityResearchApi.getCustomRatios(ticker),
       ]);
+      if (seq !== fetchSeq.current) return;
 
       if (profData.status === 'fulfilled') {
         setProfile(profData.value);
       } else {
-        throw new Error(profData.reason?.response?.data?.detail || 'Failed to fetch company profile');
+        throw new Error(profData.reason?.message || 'Failed to fetch company profile');
       }
 
       if (shData.status === 'fulfilled') {
         setShareholding(shData.value);
+      } else {
+        setShareholdingError(shData.reason?.message || 'Failed to load shareholding data');
       }
       if (concallData.status === 'fulfilled') {
         setConcalls(concallData.value.concalls || []);
-      }
-      if (ratioData.status === 'fulfilled') {
-        setCustomRatios(ratioData.value);
-      }
-
-      // Also pull 10-year statements
-      try {
-        const stmtData = await companyDataApi.getFinancialStatements(ticker, financialStmt, financialFreq);
-        setFinancials(stmtData);
-      } catch (e) {
-        console.warn('Statements load warning:', e);
+      } else {
+        setConcallError(concallData.reason?.message || 'Failed to load conference calls');
       }
     } catch (err: any) {
+      if (seq !== fetchSeq.current) return;
       console.error('Error fetching equity research:', err);
       setError(err.message || 'Error loading equity research data');
     } finally {
-      setLoading(false);
+      if (seq === fetchSeq.current) setLoading(false);
     }
   };
 
@@ -120,20 +127,36 @@ export default function EquityResearchPage() {
     fetchAllData(activeTicker);
   }, [activeTicker]);
 
-  useEffect(() => {
-    // Refetch financial statement when statement or freq changes
-    const fetchStmt = async () => {
-      try {
-        const stmtData = await companyDataApi.getFinancialStatements(activeTicker, financialStmt, financialFreq);
-        setFinancials(stmtData);
-      } catch (e) {
-        console.warn('Statement switch failed:', e);
+  // Statements load lazily on tab entry (no waterfall in fetchAllData)
+  const fetchStatements = async () => {
+    const seq = ++stmtSeq.current;
+    setStatementsError(null);
+    try {
+      const stmtData = await companyDataApi.getFinancialStatements(activeTicker, financialStmt, financialFreq);
+      if (seq === stmtSeq.current) setFinancials(stmtData);
+    } catch (e) {
+      if (seq === stmtSeq.current) {
+        setStatementsError(e instanceof Error ? e.message : 'Failed to load statement records');
       }
-    };
-    if (activeTab === 'financials') {
-      fetchStmt();
     }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'financials') {
+      fetchStatements();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [financialStmt, financialFreq, activeTab, activeTicker]);
+
+  // Close AI modal on Escape (a11y)
+  useEffect(() => {
+    if (!aiModalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setAiModalOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [aiModalOpen]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -157,13 +180,15 @@ export default function EquityResearchPage() {
       document.body.removeChild(a);
     } catch (err) {
       console.error('Failed to export Excel:', err);
-      alert('Failed to export Excel model. Please try again.');
+      setError(err instanceof Error ? err.message : 'Failed to export Excel model');
     } finally {
       setExportingExcel(false);
     }
   };
 
   const handleOpenAiMemo = async () => {
+    if (aiLoading) return;
+    setAiLoading('memo');
     try {
       const res = await equityResearchApi.getAiMemoPrompt(activeTicker);
       setAiModalTitle(`AI Investment Memo Prompt: ${activeTicker}`);
@@ -172,10 +197,15 @@ export default function EquityResearchPage() {
       setCopiedPrompt(false);
     } catch (err) {
       console.error(err);
+      setError(err instanceof Error ? err.message : 'Failed to load AI memo prompt');
+    } finally {
+      setAiLoading(null);
     }
   };
 
   const handleOpenAiForensic = async () => {
+    if (aiLoading) return;
+    setAiLoading('forensic');
     try {
       const res = await equityResearchApi.getAiForensicPrompt(activeTicker);
       setAiModalTitle(`AI Forensic Audit Prompt: ${activeTicker}`);
@@ -184,13 +214,20 @@ export default function EquityResearchPage() {
       setCopiedPrompt(false);
     } catch (err) {
       console.error(err);
+      setError(err instanceof Error ? err.message : 'Failed to load AI forensic prompt');
+    } finally {
+      setAiLoading(null);
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedPrompt(true);
-    setTimeout(() => setCopiedPrompt(false), 2500);
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedPrompt(true);
+      setTimeout(() => setCopiedPrompt(false), 2500);
+    } catch {
+      setError('Failed to copy prompt to clipboard');
+    }
   };
 
   const formatCr = (num?: number | null) => {
@@ -255,17 +292,27 @@ export default function EquityResearchPage() {
 
           <button
             onClick={handleOpenAiMemo}
-            className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 rounded-lg text-sm font-medium transition-colors"
+            disabled={aiLoading !== null}
+            className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
           >
-            <Sparkles className="w-4 h-4" />
+            {aiLoading === 'memo' ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4" />
+            )}
             <span>AI Memo</span>
           </button>
 
           <button
             onClick={handleOpenAiForensic}
-            className="flex items-center gap-1.5 px-3 py-2 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/40 rounded-lg text-sm font-medium transition-colors"
+            disabled={aiLoading !== null}
+            className="flex items-center gap-1.5 px-3 py-2 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/40 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
           >
-            <ShieldAlert className="w-4 h-4" />
+            {aiLoading === 'forensic' ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : (
+              <ShieldAlert className="w-4 h-4" />
+            )}
             <span>Forensic Audit</span>
           </button>
         </div>
@@ -359,12 +406,14 @@ export default function EquityResearchPage() {
               {/* Live Price & Range */}
               <div className="flex items-baseline lg:items-end flex-col">
                 <div className="text-3xl font-extrabold text-emerald-400 tracking-tight font-mono">
-                  ₹{profile.current_price?.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {profile.current_price != null
+                    ? `₹${profile.current_price.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                    : <span className="text-slate-500">N/A</span>}
                 </div>
                 <div className="text-xs text-slate-400 flex items-center gap-2 mt-1">
-                  <span>52W Low: ₹{profile.low_52w?.toLocaleString('en-IN')}</span>
+                  <span>52W Low: {profile.low_52w != null ? `₹${profile.low_52w.toLocaleString('en-IN')}` : 'N/A'}</span>
                   <span>•</span>
-                  <span>52W High: ₹{profile.high_52w?.toLocaleString('en-IN')}</span>
+                  <span>52W High: {profile.high_52w != null ? `₹${profile.high_52w.toLocaleString('en-IN')}` : 'N/A'}</span>
                 </div>
               </div>
             </div>
@@ -409,8 +458,9 @@ export default function EquityResearchPage() {
               <div className="bg-slate-950/80 p-3 rounded-lg border border-slate-800/80">
                 <div className="text-[11px] text-slate-400 font-medium">Div. Yield</div>
                 <div className="text-sm font-bold text-cyan-300 mt-1 font-mono">
-                  {profile.dividend_yield !== undefined && profile.dividend_yield !== null
-                    ? `${(profile.dividend_yield > 1 ? profile.dividend_yield : profile.dividend_yield * 100).toFixed(2)}%`
+                  {/* Raw vendor value rendered as-is — matches the peer table unit */}
+                  {profile.dividend_yield != null
+                    ? `${profile.dividend_yield.toFixed(2)}%`
                     : 'N/A'}
                 </div>
               </div>
@@ -427,14 +477,18 @@ export default function EquityResearchPage() {
                 <div className="flex items-center gap-2">
                   <span
                     className={`px-2.5 py-1 text-sm font-bold rounded-md font-mono ${
-                      (profile.custom_ratios.piotroski_score || 0) >= 7
+                      profile.custom_ratios.piotroski_score == null
+                        ? 'bg-slate-800 text-slate-400 border border-slate-700'
+                        : profile.custom_ratios.piotroski_score >= 7
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                        : (profile.custom_ratios.piotroski_score || 0) >= 4
+                        : profile.custom_ratios.piotroski_score >= 4
                         ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                         : 'bg-red-500/20 text-red-300 border border-red-500/40'
                     }`}
                   >
-                    {profile.custom_ratios.piotroski_score || 0}/9
+                    {profile.custom_ratios.piotroski_score == null
+                      ? 'N/A'
+                      : `${profile.custom_ratios.piotroski_score}/9`}
                   </span>
                 </div>
               </div>
@@ -632,7 +686,11 @@ export default function EquityResearchPage() {
                             <td className="py-2.5 px-4 text-slate-400">{peer.rank || idx + 1}</td>
                             <td className="py-2.5 px-4">
                               <button
-                                onClick={() => setActiveTicker(peer.symbol || peer.name)}
+                                onClick={() => {
+                                  const peerTicker = (peer.symbol || peer.name).trim().toUpperCase();
+                                  setActiveTicker(peerTicker);
+                                  setTickerInput(peerTicker);
+                                }}
                                 className="text-blue-400 hover:underline text-left font-medium"
                               >
                                 {peer.name}
@@ -660,7 +718,7 @@ export default function EquityResearchPage() {
           )}
 
           {/* Tab 2: Shareholding Trends (12Q / 11Y) */}
-          {activeTab === 'shareholding' && shareholding && (
+          {activeTab === 'shareholding' && (shareholding ? (
             <div className="space-y-6">
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -811,7 +869,11 @@ export default function EquityResearchPage() {
                 </div>
               </div>
             </div>
-          )}
+          ) : (
+            <div className="bg-slate-900 border border-slate-800 p-10 rounded-xl text-center text-sm text-slate-400" data-testid="shareholding-tab-empty">
+              {shareholdingError || 'No shareholding data available for this ticker.'}
+            </div>
+          ))}
 
           {/* Tab 3: Earnings Concalls & Audio Player */}
           {activeTab === 'concalls' && (
@@ -853,8 +915,8 @@ export default function EquityResearchPage() {
                 </div>
 
                 {concalls.length === 0 ? (
-                  <div className="p-10 text-center text-slate-400 text-sm">
-                    No conference call recordings available for this ticker.
+                  <div className="p-10 text-center text-slate-400 text-sm" data-testid="concalls-tab-empty">
+                    {concallError || 'No conference call recordings available for this ticker.'}
                   </div>
                 ) : (
                   <div className="divide-y divide-slate-800">
@@ -1022,6 +1084,16 @@ export default function EquityResearchPage() {
                     </table>
                   </div>
                 </div>
+              ) : statementsError ? (
+                <div className="bg-slate-900 p-8 text-center text-sm rounded-xl" data-testid="statements-error">
+                  <p className="text-red-300 mb-4">{statementsError}</p>
+                  <button
+                    onClick={fetchStatements}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold"
+                  >
+                    Retry
+                  </button>
+                </div>
               ) : (
                 <div className="bg-slate-900 p-8 text-center text-slate-400 text-sm rounded-xl">
                   Loading statement records...
@@ -1043,13 +1115,14 @@ export default function EquityResearchPage() {
                   </div>
                   <p className="text-xs text-slate-400">
                     Institutional prompt containing 10-year audited metrics, CAGR trends, and qualitative analysis
-                    ready for feeding to Claude 3.7 / ChatGPT o3.
+                    ready for feeding to your AI assistant.
                   </p>
                   <button
                     onClick={handleOpenAiMemo}
-                    className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-colors"
+                    disabled={aiLoading !== null}
+                    className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
                   >
-                    View & Copy Memo Prompt
+                    {aiLoading === 'memo' ? 'Loading memo prompt…' : 'View & Copy Memo Prompt'}
                   </button>
                 </div>
 
@@ -1066,9 +1139,10 @@ export default function EquityResearchPage() {
                   </p>
                   <button
                     onClick={handleOpenAiForensic}
-                    className="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold transition-colors"
+                    disabled={aiLoading !== null}
+                    className="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
                   >
-                    View & Copy Forensic Prompt
+                    {aiLoading === 'forensic' ? 'Loading forensic prompt…' : 'View & Copy Forensic Prompt'}
                   </button>
                 </div>
               </div>
@@ -1079,8 +1153,17 @@ export default function EquityResearchPage() {
 
       {/* AI Prompt Modal */}
       {aiModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setAiModalOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={aiModalTitle}
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl"
+          >
             <div className="p-4 border-b border-slate-800 flex items-center justify-between">
               <h3 className="font-bold text-white text-sm flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-indigo-400" />
@@ -1088,6 +1171,7 @@ export default function EquityResearchPage() {
               </h3>
               <button
                 onClick={() => setAiModalOpen(false)}
+                aria-label="Close dialog"
                 className="text-slate-400 hover:text-white text-sm font-bold"
               >
                 ✕
@@ -1098,7 +1182,7 @@ export default function EquityResearchPage() {
             </div>
             <div className="p-4 border-t border-slate-800 flex justify-between items-center bg-slate-900">
               <span className="text-xs text-slate-400">
-                Paste directly into Claude 3.7 Sonnet, DeepSeek R1, or ChatGPT o3.
+                Paste directly into your AI assistant.
               </span>
               <button
                 onClick={() => copyToClipboard(aiPromptContent)}
@@ -1112,5 +1196,20 @@ export default function EquityResearchPage() {
         </div>
       )}
     </div>
+  );
+}
+
+// useSearchParams requires a Suspense boundary (App Router prerender rule)
+export default function EquityResearchPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-950 text-slate-100 p-4 lg:p-6 text-sm text-slate-400">
+          Loading Equity Research…
+        </div>
+      }
+    >
+      <EquityResearchContent />
+    </Suspense>
   );
 }

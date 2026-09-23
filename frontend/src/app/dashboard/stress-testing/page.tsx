@@ -4,12 +4,13 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ColumnDef } from '@tanstack/react-table';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   TestTube,
   AlertTriangle,
@@ -47,8 +48,6 @@ interface Scenario {
   name: string;
   type: 'Historical' | 'Hypothetical';
   description: string;
-  impact: number;
-  recovery_time: string;
   icon: React.ComponentType<{ className?: string }>;
   color_class: string;
 }
@@ -172,7 +171,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     howInferred: 'The engine applies your custom market shock percentage and scales individual constituent impacts by active volatility factors.',
     whyImportant: 'Enables tailored stress testing for specific upcoming macroeconomic events, policy announcements, or geopolitical risks.',
     howToInterpret: [
-      'Enter negative numbers (e.g. -20 for a 20% decline) and choose a duration.',
+      'Enter a market shock percentage (e.g. -20 for a 20% decline).',
       'Use this to stress test specific downside scenarios tailored to your investment thesis.'
     ]
   },
@@ -223,12 +222,26 @@ interface HelpExplainerModalProps {
 }
 
 function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   if (!itemKey || !EXPLAINERS[itemKey]) return null;
   const exp = EXPLAINERS[itemKey];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
+      onClick={onClose}
+    >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={exp.title}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl p-6 relative text-gray-900 dark:text-gray-100"
         onClick={(e) => e.stopPropagation()}
       >
@@ -250,6 +263,7 @@ function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
           <button
             onClick={onClose}
             className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            aria-label="Close"
           >
             <X className="w-5 h-5" />
           </button>
@@ -344,7 +358,7 @@ function HelpBtn({ itemKey, onOpen }: { itemKey: string; onOpen: (key: string) =
         e.stopPropagation();
         onOpen(itemKey);
       }}
-      className="inline-flex items-center justify-center w-5 h-5 rounded-full text-gray-400 hover:text-orange-600 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-950/40 transition-colors focus:outline-none"
+      className="inline-flex items-center justify-center w-5 h-5 rounded-full text-gray-400 hover:text-orange-600 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-950/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 focus-visible:ring-offset-2"
       title="Click to understand what this means and how it is calculated"
       aria-label="Help"
     >
@@ -359,8 +373,6 @@ export default function StressTestingPage() {
       name: 'Market Crash',
       type: 'Historical',
       description: 'Recession scenario based on 2008 financial crisis (-35% NIFTY shock)',
-      impact: -41.9,
-      recovery_time: '24 months',
       icon: AlertTriangle,
       color_class: 'text-red-500'
     },
@@ -368,8 +380,6 @@ export default function StressTestingPage() {
       name: 'Interest Rate Shock',
       type: 'Hypothetical',
       description: '300bp RBI / central bank rate increase scenario (-15% shock)',
-      impact: -17.3,
-      recovery_time: '9 months',
       icon: TrendingDown,
       color_class: 'text-orange-500'
     },
@@ -377,8 +387,6 @@ export default function StressTestingPage() {
       name: 'Volatility Spike',
       type: 'Historical',
       description: 'COVID-19 market panic volatility scenario (-22% shock)',
-      impact: -28.8,
-      recovery_time: '5 months',
       icon: Activity,
       color_class: 'text-blue-500'
     },
@@ -386,8 +394,6 @@ export default function StressTestingPage() {
       name: 'Tech Sector Correction',
       type: 'Hypothetical',
       description: 'Major technology and growth multiple decline (-18% shock)',
-      impact: -23.4,
-      recovery_time: '12 months',
       icon: TestTube,
       color_class: 'text-purple-500'
     },
@@ -399,13 +405,13 @@ export default function StressTestingPage() {
   const [customScenario, setCustomScenario] = useState({
     name: '',
     market_shock: '',
-    duration: '',
     type: 'Hypothetical' as 'Historical' | 'Hypothetical'
   });
   const [showCustomForm, setShowCustomForm] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [runningAll, setRunningAll] = useState(false);
+  const runSeq = useRef(0);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
 
@@ -423,17 +429,22 @@ export default function StressTestingPage() {
       setActiveScenarioName(scenarioName);
     } catch (error) {
       console.error('Failed to run stress test:', error);
+      setRunError(error instanceof Error ? error.message : 'Failed to run stress test');
     } finally {
       setLoading(false);
     }
   };
 
   const runAllScenarios = async () => {
+    const seq = ++runSeq.current;
     setRunningAll(true);
     setLoading(true);
+    setRunError(null);
     try {
       const results: Record<string, StressTestResult> = {};
+      const failures: string[] = [];
       for (const sc of scenarios) {
+        if (seq !== runSeq.current) return;
         try {
           const data = await analyticsApi.runStressTest({
             scenario: sc.name
@@ -441,11 +452,17 @@ export default function StressTestingPage() {
           results[sc.name] = data;
         } catch (e) {
           console.error(`Failed to run scenario ${sc.name}:`, e);
+          failures.push(sc.name);
         }
       }
+      if (seq !== runSeq.current) return;
       setStressResults(prev => ({ ...prev, ...results }));
-      if (scenarios.length > 0) {
-        setActiveScenarioName(scenarios[0].name);
+      const firstSuccess = Object.keys(results)[0];
+      if (firstSuccess) {
+        setActiveScenarioName(firstSuccess);
+      }
+      if (failures.length > 0) {
+        setRunError(`${failures.length} of ${scenarios.length} scenarios failed (${failures.join(', ')}).`);
       }
     } finally {
       setRunningAll(false);
@@ -455,15 +472,16 @@ export default function StressTestingPage() {
 
   const runCustomStressTest = async () => {
     if (!customScenario.name || !customScenario.market_shock) {
-      alert('Please fill in all required fields');
+      setRunError('Please fill in all required fields');
       return;
     }
 
     setLoading(true);
     setRunError(null);
     try {
+      const shockPct = Number(customScenario.market_shock);
       const data = await analyticsApi.runStressTest({
-        scenario: `Custom: ${customScenario.name}`,
+        scenario: `Custom: ${customScenario.name} (${shockPct}%)`,
         tickers: positions.map(p => p.ticker)
       });
 
@@ -472,12 +490,12 @@ export default function StressTestingPage() {
         return;
       }
       
+      // scenario_description is returned by the backend but missing from StressTestResponse (system-layer handoff)
+      const backendDescription = (data as { scenario_description?: string }).scenario_description;
       const newScenario: Scenario = {
         name: customScenario.name,
         type: customScenario.type,
-        description: `${customScenario.market_shock}% shock over ${customScenario.duration || '30'} days`,
-        impact: data.portfolio_impact,
-        recovery_time: data.recovery_time != null ? `${data.recovery_time} months` : 'N/A',
+        description: backendDescription || `${shockPct}% market shock`,
         icon: TestTube,
         color_class: 'text-emerald-500'
       };
@@ -490,9 +508,10 @@ export default function StressTestingPage() {
       setActiveScenarioName(customScenario.name);
       
       setShowCustomForm(false);
-      setCustomScenario({ name: '', market_shock: '', duration: '', type: 'Hypothetical' });
+      setCustomScenario({ name: '', market_shock: '', type: 'Hypothetical' });
     } catch (error) {
       console.error('Failed to run custom stress test:', error);
+      setRunError(error instanceof Error ? error.message : 'Failed to run custom stress test');
     } finally {
       setLoading(false);
     }
@@ -506,6 +525,10 @@ export default function StressTestingPage() {
     if (positions.length > 0 && Object.keys(stressResults).length === 0) {
       runAllScenarios();
     }
+    return () => {
+      // Cancel in-flight auto-run on unmount / positions change
+      runSeq.current++;
+    };
   }, [positions]);
 
   const formatPercentage = (value: number | undefined | null, decimals = 1) => {
@@ -563,20 +586,11 @@ export default function StressTestingPage() {
       accessorKey: 'ticker',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const isLimited = data.ticker === 'NIFTYIETF.NS';
         return (
           <div className="flex items-center space-x-2">
             <span className="font-semibold text-gray-900 dark:text-white">
               {data.ticker}
             </span>
-            {isLimited && (
-              <span
-                className="px-1.5 py-0.5 text-[10px] font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 rounded border border-amber-300 dark:border-amber-700"
-                title="Newly listed ETF on data feed"
-              >
-                ⚠️ ETF Benchmark
-              </span>
-            )}
           </div>
         );
       },
@@ -617,18 +631,23 @@ export default function StressTestingPage() {
 
   const handleExportCSV = () => {
     if (!positionData || positionData.length === 0) return;
-    const headers = 'Ticker,Scenario,Impact,Severity\n';
+    const headers = ['Ticker', 'Scenario', 'Impact', 'Severity'];
     const rows = positionData
       .map(p => {
         const sev = severityFor(p.impact);
-        return `${p.ticker},${activeScenarioName},${formatPercentage(p.impact, 2)},${sev ? sev.label : 'N/A'}`;
-      })
-      .join('\n');
-    const blob = new Blob([headers + rows], { type: 'text/csv' });
+        return [
+          p.ticker,
+          activeScenarioName,
+          formatPercentage(p.impact, 2),
+          sev ? sev.label : 'N/A'
+        ].map(escapeCsvCell).join(',');
+      });
+    const csvContent = [headers.map(escapeCsvCell).join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `stress-impact-${activeScenarioName.toLowerCase().replace(/\\s+/g, '-')}.csv`;
+    a.download = `stress-impact-${activeScenarioName.toLowerCase().replace(/\s+/g, '-')}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -639,6 +658,15 @@ export default function StressTestingPage() {
   const worstCase = impacts.length > 0 ? Math.min(...impacts) : null;
   const bestCase = impacts.length > 0 ? Math.max(...impacts) : null;
   const avgImpact = impacts.length > 0 ? (impacts.reduce((sum: number, v) => sum + v, 0) / impacts.length) : null;
+  const worstCaseScenario = worstCase != null
+    ? (stressTestResults.find(r => r.portfolio_impact === worstCase)?.scenario ?? null)
+    : null;
+  const recoveryTimes = stressTestResults
+    .map(r => r.recovery_time)
+    .filter((v): v is number => v != null);
+  const avgRecovery = recoveryTimes.length > 0
+    ? recoveryTimes.reduce((sum, v) => sum + v, 0) / recoveryTimes.length
+    : null;
 
   return (
     <div className="space-y-6">
@@ -712,7 +740,7 @@ export default function StressTestingPage() {
               <X className="w-5 h-5" />
             </button>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
             <div>
               <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
                 Scenario Name *
@@ -735,18 +763,6 @@ export default function StressTestingPage() {
                 onChange={(e) => setCustomScenario(prev => ({ ...prev, market_shock: e.target.value }))}
                 className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:outline-none"
                 placeholder="-20"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-                Duration (days)
-              </label>
-              <input
-                type="number"
-                value={customScenario.duration}
-                onChange={(e) => setCustomScenario(prev => ({ ...prev, duration: e.target.value }))}
-                className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:outline-none"
-                placeholder="30"
               />
             </div>
             <div className="flex items-end">
@@ -827,8 +843,16 @@ export default function StressTestingPage() {
           return (
             <div
               key={scenario.name}
+              role="button"
+              tabIndex={0}
               onClick={() => {
                 if (result) {
+                  setActiveScenarioName(scenario.name);
+                }
+              }}
+              onKeyDown={(e) => {
+                if ((e.key === 'Enter' || e.key === ' ') && result) {
+                  e.preventDefault();
                   setActiveScenarioName(scenario.name);
                 }
               }}
@@ -886,7 +910,9 @@ export default function StressTestingPage() {
                     <div className="flex justify-between items-center text-gray-600 dark:text-gray-400">
                       <span>Confidence Level</span>
                       <span className="font-semibold text-gray-900 dark:text-white">
-                        {result.confidence_level ? (result.confidence_level < 1 ? (result.confidence_level * 100).toFixed(0) : result.confidence_level) : 95}%
+                        {result.confidence_level != null
+                          ? `${result.confidence_level < 1 ? (result.confidence_level * 100).toFixed(0) : result.confidence_level}%`
+                          : 'N/A'}
                       </span>
                     </div>
                     <button
@@ -992,7 +1018,11 @@ export default function StressTestingPage() {
                 <HelpBtn itemKey="worst_case" onOpen={setActiveExplainer} />
               </div>
               <p className="text-xs text-red-800 dark:text-red-300/80 mt-1">
-                Portfolio worst-case loss is <strong>{formatPercentage(worstCase, 1)}</strong> under the Market Crash scenario. Review high-beta cyclical holdings to manage catastrophic drawdown risk.
+                {worstCase != null ? (
+                  <>Portfolio worst-case loss is <strong>{formatPercentage(worstCase, 1)}</strong> under the {worstCaseScenario ?? 'tested'} scenario. Review high-beta cyclical holdings to manage catastrophic drawdown risk.</>
+                ) : (
+                  <>No scenario results yet — run a stress test to measure worst-case tail risk.</>
+                )}
               </p>
             </div>
           </div>
@@ -1007,7 +1037,11 @@ export default function StressTestingPage() {
                 <HelpBtn itemKey="recovery_analysis" onOpen={setActiveExplainer} />
               </div>
               <p className="text-xs text-blue-800 dark:text-blue-300/80 mt-1">
-                Average recovery time across tested scenarios is <strong>{(stressTestResults.reduce((sum, r) => sum + (r.recovery_time || 0), 0) / (stressTestResults.length || 1)).toFixed(1)} months</strong>. Ensure liquidity buffers match this horizon.
+                {avgRecovery != null ? (
+                  <>Average recovery time is <strong>{avgRecovery.toFixed(1)} months</strong> across {recoveryTimes.length} of {stressTestResults.length} tested scenarios. Ensure liquidity buffers match this horizon.</>
+                ) : (
+                  <>No recovery data yet — average recovery time is <strong>N/A</strong>.</>
+                )}
               </p>
             </div>
           </div>

@@ -2,11 +2,10 @@
  * Export panel component with all export options
  */
 
-import React, { useState } from 'react';
-import { Download, FileText, FileSpreadsheet, Table, Image, Loader2 } from 'lucide-react';
+import React, { useState, useCallback } from 'react';
+import { Download, FileText, FileSpreadsheet, Table, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import { ExportService, ExportableData } from '@/lib/export';
-import { useExportProgress } from '@/hooks/useRealTime';
-import { LoadingState } from './LoadingState';
+import { useExportProgress, useNotifications } from '@/hooks/useRealTime';
 
 interface ExportPanelProps {
     data: ExportableData[];
@@ -15,26 +14,133 @@ interface ExportPanelProps {
     className?: string;
 }
 
-export const ExportPanel: React.FC<ExportPanelProps> = ({
+/**
+ * Subscribing child: reads the store job so progress ticks re-render only this
+ * view, not the button grid (05-B11, 05-O5).
+ */
+const ExportProgressView: React.FC<{ exportId: string }> = ({ exportId }) => {
+    const { exports } = useExportProgress();
+    const job = exports[exportId];
+    if (!job) return null;
+
+    const isDone = job.status === 'completed';
+    const isError = job.status === 'error';
+    const pct = Math.round(job.progress);
+
+    return (
+        <div className="mb-6">
+            <div className="flex justify-between text-sm text-gray-600 mb-2">
+                <span>
+                    {isError ? 'Export Failed' : isDone ? 'Export Complete' : 'Export Progress'}
+                </span>
+                <span>{pct}%</span>
+            </div>
+            <div
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={pct}
+                aria-label="Export progress"
+                className="w-full bg-gray-200 rounded-full h-2"
+            >
+                <div
+                    className={`${isError ? 'bg-red-600' : 'bg-blue-600'} h-2 rounded-full transition-all duration-300`}
+                    style={{ width: `${job.progress}%` }}
+                />
+            </div>
+            {isError && (
+                <p className="mt-2 text-sm text-red-600 flex items-center">
+                    <AlertCircle className="w-4 h-4 mr-1 shrink-0" />
+                    {job.error || 'Export failed'}
+                </p>
+            )}
+            {isDone && (
+                <p className="mt-2 text-sm text-green-600 flex items-center">
+                    <CheckCircle2 className="w-4 h-4 mr-1 shrink-0" />
+                    {job.filename} is ready
+                </p>
+            )}
+        </div>
+    );
+};
+
+const exportOptions = [
+    {
+        id: 'pdf' as const,
+        label: 'PDF Report',
+        description: 'Comprehensive PDF with charts and data',
+        icon: FileText,
+        color: 'text-red-600 bg-red-50 hover:bg-red-100'
+    },
+    {
+        id: 'excel' as const,
+        label: 'Excel File',
+        description: 'Detailed spreadsheet with multiple sheets',
+        icon: FileSpreadsheet,
+        color: 'text-green-600 bg-green-50 hover:bg-green-100'
+    },
+    {
+        id: 'csv' as const,
+        label: 'CSV Data',
+        description: 'Raw data for external analysis',
+        icon: Table,
+        color: 'text-blue-600 bg-blue-50 hover:bg-blue-100'
+    },
+    {
+        id: 'all' as const,
+        label: 'All Formats',
+        description: 'Export in all available formats',
+        icon: Download,
+        color: 'text-purple-600 bg-purple-50 hover:bg-purple-100'
+    }
+];
+
+const ExportOptionsGrid = React.memo<{
+    isExporting: boolean;
+    onExport: (format: 'pdf' | 'excel' | 'csv' | 'all') => void;
+}>(function ExportOptionsGrid({ isExporting, onExport }) {
+    return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {exportOptions.map((option) => {
+                const Icon = option.icon;
+                return (
+                    <button
+                        key={option.id}
+                        onClick={() => onExport(option.id)}
+                        disabled={isExporting}
+                        className={`p-4 rounded-lg border-2 border-transparent transition-all duration-200 text-left ${option.color} disabled:opacity-50 disabled:cursor-not-allowed`}
+                    >
+                        <div className="flex items-start space-x-3">
+                            <Icon className="w-6 h-6 mt-1 flex-shrink-0" />
+                            <div className="flex-1">
+                                <h4 className="font-medium">{option.label}</h4>
+                                <p className="text-sm opacity-75 mt-1">{option.description}</p>
+                            </div>
+                        </div>
+                    </button>
+                );
+            })}
+        </div>
+    );
+});
+
+const ExportPanelImpl: React.FC<ExportPanelProps> = ({
     data,
     chartElement,
     filename = 'dashboard_export',
     className = ''
 }) => {
-    const { startExport, updateExportProgress, completeExport, getActiveExports } = useExportProgress();
+    const { startExport, updateExportProgress, completeExport } = useExportProgress();
+    const { addNotification } = useNotifications();
     const [isExporting, setIsExporting] = useState(false);
-    const [selectedFormat, setSelectedFormat] = useState<'pdf' | 'excel' | 'csv' | 'all'>('pdf');
-    const [exportProgress, setExportProgress] = useState<number>(0);
+    const [activeExportId, setActiveExportId] = useState<string | null>(null);
 
-    const activeExports = getActiveExports();
-
-    const handleExport = async (format: 'pdf' | 'excel' | 'csv' | 'all') => {
+    const handleExport = useCallback(async (format: 'pdf' | 'excel' | 'csv' | 'all') => {
         if (isExporting) return;
 
         setIsExporting(true);
-        setExportProgress(0);
-
         const exportId = startExport(`${filename}_${format}`, format);
+        setActiveExportId(exportId);
 
         try {
             if (format === 'pdf') {
@@ -51,7 +157,6 @@ export const ExportPanel: React.FC<ExportPanelProps> = ({
                 await ExportService.exportCSV(csvData, `${filename}_summary`);
                 updateExportProgress(exportId, 100);
             } else if (format === 'all') {
-                // Export all formats
                 const formats: Array<'pdf' | 'excel' | 'csv'> = ['pdf', 'excel', 'csv'];
                 let completed = 0;
 
@@ -72,9 +177,7 @@ export const ExportPanel: React.FC<ExportPanelProps> = ({
 
                     updateExportProgress(id, 100);
                     completed++;
-
-                    // Update main progress
-                    setExportProgress((completed / formats.length) * 100);
+                    updateExportProgress(exportId, (completed / formats.length) * 100);
                 }
             }
 
@@ -92,46 +195,15 @@ export const ExportPanel: React.FC<ExportPanelProps> = ({
             }
 
             completeExport(exportId);
-
+            addNotification('success', 'Export Complete', `${filename}_${format} is ready`);
         } catch (error) {
-            console.error('Export failed:', error);
-            completeExport(exportId, error instanceof Error ? error.message : 'Unknown error');
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            completeExport(exportId, message);
+            addNotification('error', 'Export Failed', message);
         } finally {
             setIsExporting(false);
-            setExportProgress(0);
         }
-    };
-
-    const exportOptions = [
-        {
-            id: 'pdf' as const,
-            label: 'PDF Report',
-            description: 'Comprehensive PDF with charts and data',
-            icon: FileText,
-            color: 'text-red-600 bg-red-50 hover:bg-red-100'
-        },
-        {
-            id: 'excel' as const,
-            label: 'Excel File',
-            description: 'Detailed spreadsheet with multiple sheets',
-            icon: FileSpreadsheet,
-            color: 'text-green-600 bg-green-50 hover:bg-green-100'
-        },
-        {
-            id: 'csv' as const,
-            label: 'CSV Data',
-            description: 'Raw data for external analysis',
-            icon: Table,
-            color: 'text-blue-600 bg-blue-50 hover:bg-blue-100'
-        },
-        {
-            id: 'all' as const,
-            label: 'All Formats',
-            description: 'Export in all available formats',
-            icon: Download,
-            color: 'text-purple-600 bg-purple-50 hover:bg-purple-100'
-        }
-    ];
+    }, [isExporting, filename, data, chartElement, startExport, updateExportProgress, completeExport, addNotification]);
 
     return (
         <div className={`bg-white rounded-lg border p-6 ${className}`}>
@@ -150,111 +222,14 @@ export const ExportPanel: React.FC<ExportPanelProps> = ({
                 )}
             </div>
 
-            {isExporting && (
-                <div className="mb-6">
-                    <div className="flex justify-between text-sm text-gray-600 mb-2">
-                        <span>Export Progress</span>
-                        <span>{Math.round(exportProgress)}%</span>
-                    </div>
-                    <div className="w-full bg-gray-200 rounded-full h-2">
-                        <div
-                            className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                            style={{ width: `${exportProgress}%` }}
-                        />
-                    </div>
-                </div>
-            )}
+            {activeExportId && <ExportProgressView exportId={activeExportId} />}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {exportOptions.map((option) => {
-                    const Icon = option.icon;
-                    return (
-                        <button
-                            key={option.id}
-                            onClick={() => handleExport(option.id)}
-                            disabled={isExporting}
-                            className={`p-4 rounded-lg border-2 border-transparent transition-all duration-200 text-left ${option.color} disabled:opacity-50 disabled:cursor-not-allowed ${selectedFormat === option.id ? 'border-current' : ''}`}
-                        >
-                            <div className="flex items-start space-x-3">
-                                <Icon className="w-6 h-6 mt-1 flex-shrink-0" />
-                                <div className="flex-1">
-                                    <h4 className="font-medium">{option.label}</h4>
-                                    <p className="text-sm opacity-75 mt-1">{option.description}</p>
-                                </div>
-                            </div>
-                        </button>
-                    );
-                })}
-            </div>
-
-            {/* Export History */}
-            {activeExports.length > 0 && (
-                <div className="mt-6">
-                    <h4 className="text-sm font-medium text-gray-900 mb-3">Active Exports</h4>
-                    <div className="space-y-2">
-                        {activeExports.map((exportJob: any) => (
-                            <div key={exportJob.id} className="bg-gray-50 rounded-lg p-3">
-                                <div className="flex items-center justify-between mb-2">
-                                    <span className="text-sm font-medium text-gray-900">
-                                        {exportJob.filename}
-                                    </span>
-                                    <span className="text-xs text-gray-500">
-                                        {exportJob.progress}%
-                                    </span>
-                                </div>
-                                <div className="w-full bg-gray-200 rounded-full h-1">
-                                    <div
-                                        className="bg-blue-600 h-1 rounded-full transition-all duration-300"
-                                        style={{ width: `${exportJob.progress}%` }}
-                                    />
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
-
-            {/* Export Settings */}
-            <div className="mt-6 pt-6 border-t border-gray-200">
-                <h4 className="text-sm font-medium text-gray-900 mb-3">Export Settings</h4>
-                <div className="space-y-3">
-                    <label className="flex items-center">
-                        <input
-                            type="checkbox"
-                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            defaultChecked
-                        />
-                        <span className="ml-2 text-sm text-gray-700">
-                            Include metadata and generation timestamp
-                        </span>
-                    </label>
-                    <label className="flex items-center">
-                        <input
-                            type="checkbox"
-                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            defaultChecked
-                        />
-                        <span className="ml-2 text-sm text-gray-700">
-                            Compress large datasets
-                        </span>
-                    </label>
-                    {chartElement && (
-                        <label className="flex items-center">
-                            <input
-                                type="checkbox"
-                                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                                defaultChecked
-                            />
-                            <span className="ml-2 text-sm text-gray-700">
-                                Include charts and visualizations
-                            </span>
-                        </label>
-                    )}
-                </div>
-            </div>
+            <ExportOptionsGrid isExporting={isExporting} onExport={handleExport} />
         </div>
     );
 };
+
+export const ExportPanel = React.memo(ExportPanelImpl);
 
 // Quick export buttons for individual datasets
 export const QuickExportButtons: React.FC<{
@@ -262,11 +237,16 @@ export const QuickExportButtons: React.FC<{
     filename: string;
     className?: string;
 }> = ({ data, filename, className = '' }) => {
+    const { addNotification } = useNotifications();
+    const [isBusy, setIsBusy] = useState(false);
+
     const handleQuickExport = async (format: 'csv' | 'excel') => {
+        if (isBusy) return;
+        setIsBusy(true);
         try {
             if (format === 'csv') {
                 await ExportService.exportCSV(data, filename);
-            } else if (format === 'excel') {
+            } else {
                 const exportData: ExportableData = {
                     title: filename,
                     data,
@@ -276,8 +256,15 @@ export const QuickExportButtons: React.FC<{
                 };
                 await ExportService.exportExcel([exportData], filename);
             }
+            addNotification('success', 'Export Complete', `${filename}.${format === 'csv' ? 'csv' : 'xlsx'} is ready`);
         } catch (error) {
-            console.error('Quick export failed:', error);
+            addNotification(
+                'error',
+                'Export Failed',
+                error instanceof Error ? error.message : 'Unknown error'
+            );
+        } finally {
+            setIsBusy(false);
         }
     };
 
@@ -287,16 +274,18 @@ export const QuickExportButtons: React.FC<{
         <div className={`flex space-x-2 ${className}`}>
             <button
                 onClick={() => handleQuickExport('csv')}
-                className="inline-flex items-center px-3 py-1 text-xs font-medium text-blue-700 bg-blue-50 rounded-md hover:bg-blue-100 transition-colors"
+                disabled={isBusy}
+                className="inline-flex items-center px-3 py-1 text-xs font-medium text-blue-700 bg-blue-50 rounded-md hover:bg-blue-100 transition-colors disabled:opacity-50"
             >
-                <Table className="w-3 h-3 mr-1" />
+                {isBusy ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Table className="w-3 h-3 mr-1" />}
                 CSV
             </button>
             <button
                 onClick={() => handleQuickExport('excel')}
-                className="inline-flex items-center px-3 py-1 text-xs font-medium text-green-700 bg-green-50 rounded-md hover:bg-green-100 transition-colors"
+                disabled={isBusy}
+                className="inline-flex items-center px-3 py-1 text-xs font-medium text-green-700 bg-green-50 rounded-md hover:bg-green-100 transition-colors disabled:opacity-50"
             >
-                <FileSpreadsheet className="w-3 h-3 mr-1" />
+                {isBusy ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <FileSpreadsheet className="w-3 h-3 mr-1" />}
                 Excel
             </button>
         </div>

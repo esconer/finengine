@@ -5,6 +5,7 @@
 import { jsPDF } from 'jspdf';
 import * as XLSX from 'xlsx';
 import { saveAs } from 'file-saver';
+import { escapeCsvCell } from './utils';
 
 // Types for export data
 export interface ExportableData {
@@ -118,7 +119,7 @@ export class PDFExporter {
     private formatCellValue(value: any): string {
         if (value === null || value === undefined) return '';
         if (typeof value === 'number') {
-            return value.toLocaleString('en-US', {
+            return value.toLocaleString('en-IN', {
                 minimumFractionDigits: 2,
                 maximumFractionDigits: 2
             });
@@ -198,16 +199,9 @@ export class CSVExporter {
 
         const headers = Object.keys(data[0]);
         const csvContent = [
-            headers.join(','),
+            headers.map(escapeCsvCell).join(','),
             ...data.map(row =>
-                headers.map(header => {
-                    const value = row[header];
-                    // Escape values that contain commas or quotes
-                    if (typeof value === 'string' && (value.includes(',') || value.includes('"'))) {
-                        return `"${value.replace(/"/g, '""')}"`;
-                    }
-                    return value;
-                }).join(',')
+                headers.map(header => escapeCsvCell(row[header])).join(',')
             )
         ].join('\n');
 
@@ -389,7 +383,16 @@ export class ExportService {
         doc.setFont('helvetica', 'normal');
         doc.setTextColor(30, 41, 59);
 
+        const pageBottom = () => doc.internal.pageSize.height - margin;
+        const checkBreak = (rowH: number) => {
+            if (y + rowH > pageBottom()) {
+                doc.addPage();
+                y = margin;
+            }
+        };
+
         portfolioData.positions.forEach(p => {
+            checkBreak(7);
             currentX = margin + 2;
             const values = [
                 String(p.ticker || ''),
@@ -412,6 +415,7 @@ export class ExportService {
         });
 
         y += 10;
+        checkBreak(60);
 
         // Risk Attributions
         doc.setFontSize(12);
@@ -428,10 +432,11 @@ export class ExportService {
         doc.text('• Market Microstructure: ADV Liquidity Sizing ensures liquidation horizon within 10%-20% market volume.', margin, y);
         y += 15;
 
-        // Disclaimer Footer
+        // Disclaimer on the last page (not a fixed y=280 that overlaps mid-table)
+        checkBreak(16);
         doc.setFontSize(8);
         doc.setTextColor(148, 163, 184);
-        doc.text('CONFIDENTIAL — Generated for internal investment management purposes only. Daisy Risk Engine.', margin, 280);
+        doc.text('CONFIDENTIAL — Generated for internal investment management purposes only. Daisy Risk Engine.', margin, Math.min(y + 8, pageBottom() - 4));
 
         doc.save(`${filename}.pdf`);
     }
@@ -459,7 +464,7 @@ export class ExportProgress {
 
 // Utility functions for data formatting
 export const formatNumber = (value: number, decimals: number = 2): string => {
-    return value.toLocaleString('en-US', {
+    return value.toLocaleString('en-IN', {
         minimumFractionDigits: decimals,
         maximumFractionDigits: decimals
     });
@@ -469,12 +474,9 @@ export const formatPercentage = (value: number, decimals: number = 2): string =>
     return `${formatNumber(value * 100, decimals)}%`;
 };
 
-export const formatCurrency = (value: number, currency: string = 'USD'): string => {
-    return value.toLocaleString('en-US', {
-        style: 'currency',
-        currency
-    });
-};
+// Single en-IN/INR-correct implementation lives in utils.ts (04-B8);
+// USD formatting still routes through utils with an explicit 'USD' argument.
+export { formatCurrency } from './utils';
 
 // Data transformation utilities
 export const transformTableData = (data: any[], columnMap?: Record<string, string>): any[] => {

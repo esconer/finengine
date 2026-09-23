@@ -1,5 +1,5 @@
 // Test setup file for Vitest
-import { expect, afterEach, vi, describe, it, beforeEach } from 'vitest'
+import { afterEach, vi } from 'vitest'
 import { cleanup } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
@@ -64,10 +64,3 @@ class MockIntersectionObserver {
     disconnect = vi.fn()
 }
 global.IntersectionObserver = MockIntersectionObserver as any
-
-// Mock console methods to reduce noise in tests
-global.console = {
-    ...console,
-    warn: vi.fn(),
-    error: vi.fn(),
-}

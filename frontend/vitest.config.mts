@@ -18,7 +18,8 @@ export default defineConfig({
                 '**/*.d.ts',
                 '**/*.config.*',
                 '**/coverage/**',
-                '**/dist/**'
+                '**/dist/**',
+                'src/**/layout.tsx'
             ],
             thresholds: {
                 global: {
@@ -29,10 +30,8 @@ export default defineConfig({
                 }
             }
         },
-        includeSource: ['src/**/*.{js,ts,tsx}'],
         css: true,
-        reporters: ['default', 'html'],
-        outputFile: 'test-results.xml'
+        reporters: ['default']
     },
     resolve: {
         alias: {

@@ -1,28 +1,35 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Zap } from 'lucide-react';
+import { RefreshCw, Zap, AlertCircle } from 'lucide-react';
 import api from '@/lib/api';
 
 export default function IndiaFlowsPage() {
     const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
     const [flows, setFlows] = useState<any[]>([]);
     const [anomalies, setAnomalies] = useState<any[]>([]);
     const [liquidity, setLiquidity] = useState<any>(null);
+    const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
     const fetchData = async () => {
         setLoading(true);
+        setError(null);
         try {
+            // No per-request .catch: an outage must surface as an error,
+            // never as a fabricated "no anomalies" success.
             const [flowRes, anomalyRes, liqRes] = await Promise.all([
-                api.get('/analytics/india-flows?lookback_days=30').catch(() => ({ data: { flows: [] } })),
-                api.get('/analytics/delivery-anomalies').catch(() => ({ data: { anomalies: [] } })),
-                api.get('/analytics/liquidity-limits').catch(() => ({ data: { positions: [] } }))
+                api.get('/analytics/india-flows?lookback_days=30'),
+                api.get('/analytics/delivery-anomalies'),
+                api.get('/analytics/liquidity-limits')
             ]);
             setFlows(flowRes.data.flows || []);
             setAnomalies(anomalyRes.data.anomalies || []);
             setLiquidity(liqRes.data);
+            setLastUpdated(new Date().toISOString());
         } catch (err) {
             console.error('Error fetching India microstructure data', err);
+            setError(err instanceof Error ? err.message : 'Failed to load India microstructure data');
         } finally {
             setLoading(false);
         }
@@ -42,6 +49,11 @@ export default function IndiaFlowsPage() {
                     </h1>
                     <p className="text-sm text-gray-500 dark:text-gray-400">
                         NSE delivery anomalies, FII/DII institutional net flows, and participation ADV limits.
+                        {lastUpdated && (
+                            <span className="ml-2 text-xs text-gray-400 dark:text-gray-500">
+                                As of {new Date(lastUpdated).toLocaleTimeString('en-IN')}
+                            </span>
+                        )}
                     </p>
                 </div>
                 <button
@@ -54,14 +66,64 @@ export default function IndiaFlowsPage() {
                 </button>
             </div>
 
+            {error && (
+                <div className="p-4 rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-300 flex items-center gap-2" data-testid="india-flows-error">
+                    <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                    <span>{error}</span>
+                </div>
+            )}
+
+            {/* FII/DII Institutional Net Flows (30D) */}
+            {!loading && !error && (
+                <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                        FII/DII Institutional Net Flows (30D)
+                    </h3>
+                    {flows.length === 0 ? (
+                        <div className="py-8 text-center text-gray-500">No institutional flow records available for the last 30 sessions.</div>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-left text-sm text-gray-500 dark:text-gray-400">
+                                <thead className="bg-gray-50 dark:bg-gray-700/50 text-xs uppercase text-gray-700 dark:text-gray-300">
+                                    <tr>
+                                        <th className="px-4 py-3">Date</th>
+                                        <th className="px-4 py-3">FII Net (₹ Cr)</th>
+                                        <th className="px-4 py-3">DII Net (₹ Cr)</th>
+                                        <th className="px-4 py-3">Total Net (₹ Cr)</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                                    {flows.map((f, idx) => (
+                                        <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/30">
+                                            <td className="px-4 py-3 font-semibold text-gray-900 dark:text-white">{f.date}</td>
+                                            <td className={`px-4 py-3 font-mono ${(f.fii_net_crores ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                                {f.fii_net_crores}
+                                            </td>
+                                            <td className={`px-4 py-3 font-mono ${(f.dii_net_crores ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                                {f.dii_net_crores}
+                                            </td>
+                                            <td className="px-4 py-3 font-mono font-semibold">
+                                                {f.total_net_crores}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Delivery Anomalies */}
             <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 shadow-sm">
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                     Delivery % Spikes & Institutional Accumulation Alerts
                 </h3>
-                {anomalies.length === 0 ? (
+                {loading ? (
+                    <div className="py-8 text-center text-gray-500">Loading delivery anomalies…</div>
+                ) : !error && anomalies.length === 0 ? (
                     <div className="py-8 text-center text-gray-500">No &gt;2σ delivery spikes detected in portfolio holdings today.</div>
-                ) : (
+                ) : anomalies.length > 0 ? (
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm text-gray-500 dark:text-gray-400">
                             <thead className="bg-gray-50 dark:bg-gray-700/50 text-xs uppercase text-gray-700 dark:text-gray-300">
@@ -79,7 +141,9 @@ export default function IndiaFlowsPage() {
                                         <td className="px-4 py-3 font-semibold text-gray-900 dark:text-white">{a.symbol}</td>
                                         <td className="px-4 py-3 font-bold text-green-600">{a.current_delivery_pct}%</td>
                                         <td className="px-4 py-3">{a.avg_20d_delivery_pct}%</td>
-                                        <td className="px-4 py-3 font-semibold">+{a.z_score}σ</td>
+                                        <td className="px-4 py-3 font-semibold">
+                                            {a.z_score > 0 ? `+${a.z_score}` : a.z_score}σ
+                                        </td>
                                         <td className="px-4 py-3">
                                             <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${a.is_anomaly ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300' : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300'}`}>
                                                 {a.signal}
@@ -90,7 +154,7 @@ export default function IndiaFlowsPage() {
                             </tbody>
                         </table>
                     </div>
-                )}
+                ) : null}
             </div>
 
             {/* ADV Liquidity Limits */}

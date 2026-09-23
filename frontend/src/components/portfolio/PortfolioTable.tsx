@@ -16,7 +16,7 @@ import {
   ArrowDown
 } from 'lucide-react';
 import { PortfolioPosition, Currency } from '@/types';
-import { cn } from '@/lib/utils';
+import { cn, formatCurrency } from '@/lib/utils';
 
 interface PortfolioTableProps {
   positions: PortfolioPosition[];
@@ -37,16 +37,12 @@ export function PortfolioTable({
   sortConfig,
   loading = false
 }: PortfolioTableProps) {
-  // Format currency
-  const formatCurrency = (amount: number) => {
-    const symbol = currency === 'INR' ? '₹' : '$';
-    return `${symbol}${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  };
+  // Guarded money/percent rendering — missing or non-finite values show an em dash
+  const money = (amount?: number | null) =>
+    amount != null && Number.isFinite(amount) ? formatCurrency(amount, currency) : '—';
 
-  // Format percentage
-  const formatPercentage = (value: number) => {
-    return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
-  };
+  const formatPercentage = (value: number) =>
+    Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '—';
 
   // Handle sort
   const handleSort = (key: keyof PortfolioPosition) => {
@@ -63,6 +59,33 @@ export function PortfolioTable({
     return sortConfig.direction === 'asc' ? 
       <ArrowUp className="w-4 h-4 text-blue-600" /> : 
       <ArrowDown className="w-4 h-4 text-blue-600" />;
+  };
+
+  // Sortable column header with accessible button + aria-sort (05-B12)
+  const sortableTh = (label: string, key: keyof PortfolioPosition) => {
+    const ariaSort =
+      sortConfig != null && sortConfig.key === key
+        ? sortConfig.direction === 'asc'
+          ? 'ascending'
+          : 'descending'
+        : undefined;
+    return (
+      <th
+        aria-sort={ariaSort}
+        className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider"
+      >
+        <button
+          type="button"
+          onClick={() => handleSort(key)}
+          aria-label={`Sort by ${label}`}
+          className="flex items-center space-x-1 select-none w-full text-left cursor-pointer
+                   text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 rounded"
+        >
+          <span>{label}</span>
+          {getSortIcon(key)}
+        </button>
+      </th>
+    );
   };
 
   if (loading) {
@@ -96,87 +119,15 @@ export function PortfolioTable({
       <table className="w-full">
         <thead className="bg-gray-50 dark:bg-gray-800">
           <tr>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('ticker')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Symbol</span>
-                {getSortIcon('ticker')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('quantity')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Quantity</span>
-                {getSortIcon('quantity')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('buy_price')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Avg Cost</span>
-                {getSortIcon('buy_price')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('last_price')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Current Price</span>
-                {getSortIcon('last_price')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('current_value')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Market Value</span>
-                {getSortIcon('current_value')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('total_cost')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Total Cost</span>
-                {getSortIcon('total_cost')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('unrealized_gain_loss')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>P&L</span>
-                {getSortIcon('unrealized_gain_loss')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('unrealized_gain_loss_pct')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>P&L %</span>
-                {getSortIcon('unrealized_gain_loss_pct')}
-              </div>
-            </th>
-            <th 
-              className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700"
-              onClick={() => handleSort('weight')}
-            >
-              <div className="flex items-center space-x-1">
-                <span>Weight</span>
-                {getSortIcon('weight')}
-              </div>
-            </th>
+            {sortableTh('Symbol', 'ticker')}
+            {sortableTh('Quantity', 'quantity')}
+            {sortableTh('Avg Cost', 'buy_price')}
+            {sortableTh('Current Price', 'last_price')}
+            {sortableTh('Market Value', 'current_value')}
+            {sortableTh('Total Cost', 'total_cost')}
+            {sortableTh('P&L', 'unrealized_gain_loss')}
+            {sortableTh('P&L %', 'unrealized_gain_loss_pct')}
+            {sortableTh('Weight', 'weight')}
             <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
               Actions
             </th>
@@ -198,19 +149,19 @@ export function PortfolioTable({
                 </div>
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                {position.quantity.toLocaleString()}
+                {Number.isFinite(position.quantity) ? position.quantity.toLocaleString() : '—'}
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                {formatCurrency(position.buy_price)}
+                {money(position.buy_price)}
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                {formatCurrency(position.last_price)}
+                {money(position.last_price)}
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
-                {formatCurrency(position.current_value)}
+                {money(position.current_value)}
               </td>
               <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                {formatCurrency(position.total_cost)}
+                {money(position.total_cost)}
               </td>
               <td className="px-6 py-4 whitespace-nowrap">
                 <div className="flex items-center space-x-1">
@@ -223,7 +174,7 @@ export function PortfolioTable({
                     "text-sm font-medium",
                     position.unrealized_gain_loss >= 0 ? "text-green-600" : "text-red-600"
                   )}>
-                    {formatCurrency(position.unrealized_gain_loss)}
+                    {money(position.unrealized_gain_loss)}
                   </span>
                 </div>
               </td>
@@ -244,6 +195,7 @@ export function PortfolioTable({
                 <div className="flex items-center justify-end space-x-2">
                   <button
                     onClick={() => onEdit(position)}
+                    aria-label={`Edit ${position.ticker}`}
                     className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300"
                     title="Edit position"
                   >
@@ -251,6 +203,7 @@ export function PortfolioTable({
                   </button>
                   <button
                     onClick={() => onDelete(position.id, position.ticker)}
+                    aria-label={`Delete ${position.ticker}`}
                     className="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300"
                     title="Delete position"
                   >

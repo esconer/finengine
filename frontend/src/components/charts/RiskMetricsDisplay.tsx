@@ -18,9 +18,9 @@ interface RiskMetricsData {
   risk_level: string;
   annual_volatility: number | null;
   sharpe_ratio: number | null;
-  max_drawdown: number;
-  var_95: number;
-  cvar_95: number;
+  max_drawdown: number | null;
+  var_95: number | null;
+  cvar_95: number | null;
   concentration_score?: number;
   liquidity_score?: number;
   realized_volatility?: number;
@@ -34,20 +34,20 @@ interface RiskMetricsDisplayProps {
   className?: string;
 }
 
-export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
+const RiskMetricsDisplayImpl: React.FC<RiskMetricsDisplayProps> = ({
   data,
   loading = false,
   className = '',
 }) => {
-  // Default data when none provided
+  // All-null defaults — never fabricate zeros; cards route through N/A branches (05-B4)
   const defaultData: RiskMetricsData = {
     risk_score: null,
     risk_level: 'Unknown',
-    annual_volatility: 0,
-    sharpe_ratio: 0,
-    max_drawdown: 0,
-    var_95: 0,
-    cvar_95: 0,
+    annual_volatility: null,
+    sharpe_ratio: null,
+    max_drawdown: null,
+    var_95: null,
+    cvar_95: null,
   };
 
   const metrics = data || defaultData;
@@ -85,7 +85,10 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
     return `${(value * 100).toFixed(2)}%`;
   };
 
-  const getVaRInterpretation = (var95: number): { level: string; color: string } => {
+  const getVaRInterpretation = (var95: number | null): { level: string; color: string } => {
+    if (var95 == null || isNaN(var95)) {
+      return { level: 'N/A', color: 'text-gray-600 dark:text-gray-400' };
+    }
     const varPct = Math.abs(var95);
     if (varPct <= 0.02) return { level: 'Low', color: 'text-green-600 dark:text-green-400' };
     if (varPct <= 0.05) return { level: 'Medium', color: 'text-yellow-600 dark:text-yellow-400' };
@@ -164,7 +167,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
             {formatPercentage(metrics.var_95)}
           </div>
           <div className={`text-sm ${varInterpretation.color}`}>
-            {varInterpretation.level} Risk
+            {varInterpretation.level === 'N/A' ? 'N/A' : `${varInterpretation.level} Risk`}
           </div>
         </div>
 
@@ -214,5 +217,7 @@ export const RiskMetricsDisplay: React.FC<RiskMetricsDisplayProps> = ({
     </div>
   );
 };
+
+export const RiskMetricsDisplay = React.memo(RiskMetricsDisplayImpl);
 
 export default RiskMetricsDisplay;

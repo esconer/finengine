@@ -89,4 +89,50 @@ describe('LiquidityPage — first-load skeleton (never 0.0/10)', () => {
     });
     expect(screen.queryByLabelText('Loading overall score')).toBeNull();
   });
+
+  it('on fetch failure shows the error banner and never a fabricated 7.8/1-2/Low payload', async () => {
+    render(<LiquidityPage />);
+
+    await waitFor(() => {
+      expect(liquidityDeferred).not.toBeNull();
+    });
+    liquidityDeferred!.reject(new Error('network down'));
+
+    await waitFor(() => {
+      expect(screen.getByText('network down')).toBeDefined();
+    });
+    expect(screen.queryByText('7.8/10')).toBeNull();
+    expect(screen.queryByText('1-2 days')).toBeNull();
+    expect(screen.queryByText('Low')).toBeNull();
+    expect(screen.queryByText('LOW RISK')).toBeNull();
+  });
+
+  it('missing market_cap / spread render N/A, never ₹500 Cr or a score-tier spread', async () => {
+    render(<LiquidityPage />);
+
+    await waitFor(() => {
+      expect(liquidityDeferred).not.toBeNull();
+    });
+    liquidityDeferred!.resolve({
+      ...LoadedPayload,
+      by_position: {
+        'RELIANCE.NS': {
+          score: 8.5,
+          category: 'High',
+          avg_volume: 5000000,
+          avg_turnover: 1000000000,
+          liquidation_days: '1-2',
+        },
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('RELIANCE.NS').length).toBeGreaterThan(0);
+    });
+    // No fabricated ₹500 Cr market cap, no score-tier fabricated spread (0.04% for score>=8).
+    expect(screen.queryByText(/500 Cr/)).toBeNull();
+    expect(screen.queryByText('0.04%')).toBeNull();
+    // Market-cap + spread cells both fall back to N/A.
+    expect(screen.getAllByText('N/A').length).toBeGreaterThanOrEqual(2);
+  });
 });

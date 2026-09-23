@@ -1,8 +1,59 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import EquityResearchPage from '@/app/dashboard/equity-research/page';
-import * as api from '@/lib/api';
+
+const navMocks = vi.hoisted(() => ({ search: '' }));
+
+const mocks = vi.hoisted(() => {
+  const baseProfile = {
+    symbol: 'RELIANCE',
+    ticker: 'RELIANCE.NS',
+    name: 'Reliance Industries Limited',
+    sector: 'Energy',
+    industry_group: 'Oil & Gas',
+    industry: 'Refining',
+    sub_industry: 'Integrated',
+    indices: ['NIFTY 50'],
+    current_price: 2900.0,
+    market_cap_cr: 1900000.0,
+    stock_pe: 24.5,
+    roce: 16.2,
+    roe: 14.5,
+    book_value: 1200.0,
+    dividend_yield: 0.4,
+    custom_ratios: {
+      piotroski_score: 7,
+      graham_number: 3250.0,
+      graham_upside_pct: 12.0,
+      enterprise_value_cr: 1950000.0,
+      ev_to_ebitda: 12.4,
+      interest_coverage: 8.5,
+      cfo_to_pat_ratio: 1.15,
+    },
+    pros: ['Company is almost debt free'],
+    cons: ['Stock trading high'],
+    peers: [],
+    concall_count: 1,
+    annual_reports: [],
+    credit_ratings: [],
+  };
+  return {
+    baseProfile,
+    getFullProfile: vi.fn(),
+    getShareholding: vi.fn(),
+    getConcalls: vi.fn(),
+    getCustomRatios: vi.fn(),
+    downloadExcelModel: vi.fn(),
+    getAiMemoPrompt: vi.fn(),
+    getAiForensicPrompt: vi.fn(),
+    getFinancialStatements: vi.fn(),
+  };
+});
+
+vi.mock('next/navigation', () => ({
+  useSearchParams: () => new URLSearchParams(navMocks.search),
+}));
 
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: any) => <div>{children}</div>,
@@ -17,39 +68,8 @@ vi.mock('recharts', () => ({
 
 vi.mock('@/lib/api', () => ({
   equityResearchApi: {
-    getFullProfile: vi.fn().mockResolvedValue({
-      symbol: 'RELIANCE',
-      ticker: 'RELIANCE.NS',
-      name: 'Reliance Industries Limited',
-      sector: 'Energy',
-      industry_group: 'Oil & Gas',
-      industry: 'Refining',
-      sub_industry: 'Integrated',
-      indices: ['NIFTY 50'],
-      current_price: 2900.0,
-      market_cap_cr: 1900000.0,
-      stock_pe: 24.5,
-      roce: 16.2,
-      roe: 14.5,
-      book_value: 1200.0,
-      dividend_yield: 0.4,
-      custom_ratios: {
-        piotroski_score: 7,
-        graham_number: 3250.0,
-        graham_upside_pct: 12.0,
-        enterprise_value_cr: 1950000.0,
-        ev_to_ebitda: 12.4,
-        interest_coverage: 8.5,
-        cfo_to_pat_ratio: 1.15,
-      },
-      pros: ['Company is almost debt free'],
-      cons: ['Stock trading high'],
-      peers: [],
-      concall_count: 1,
-      annual_reports: [],
-      credit_ratings: [],
-    }),
-    getShareholding: vi.fn().mockResolvedValue({
+    getFullProfile: mocks.getFullProfile.mockResolvedValue(mocks.baseProfile),
+    getShareholding: mocks.getShareholding.mockResolvedValue({
       ticker: 'RELIANCE.NS',
       quarterly: {
         periods: ['2025-09-30'],
@@ -62,7 +82,7 @@ vi.mock('@/lib/api', () => ({
         chart_series: [{ period: '2025', promoters: 50.3 }],
       },
     }),
-    getConcalls: vi.fn().mockResolvedValue({
+    getConcalls: mocks.getConcalls.mockResolvedValue({
       ticker: 'RELIANCE.NS',
       count: 1,
       concalls: [
@@ -74,7 +94,7 @@ vi.mock('@/lib/api', () => ({
         },
       ],
     }),
-    getCustomRatios: vi.fn().mockResolvedValue({
+    getCustomRatios: mocks.getCustomRatios.mockResolvedValue({
       ticker: 'RELIANCE.NS',
       piotroski_score: 7,
       graham_number: 3250.0,
@@ -82,17 +102,22 @@ vi.mock('@/lib/api', () => ({
       current_price: 2900.0,
       ratios_history: { periods: [], rows: {} },
     }),
-    downloadExcelModel: vi.fn().mockResolvedValue(new Blob()),
-    getAiMemoPrompt: vi.fn().mockResolvedValue({ ticker: 'RELIANCE.NS', prompt: 'Memo prompt' }),
-    getAiForensicPrompt: vi.fn().mockResolvedValue({ ticker: 'RELIANCE.NS', prompt: 'Forensic prompt' }),
+    downloadExcelModel: mocks.downloadExcelModel.mockResolvedValue(new Blob()),
+    getAiMemoPrompt: mocks.getAiMemoPrompt.mockResolvedValue({ ticker: 'RELIANCE.NS', prompt: 'Memo prompt' }),
+    getAiForensicPrompt: mocks.getAiForensicPrompt.mockResolvedValue({ ticker: 'RELIANCE.NS', prompt: 'Forensic prompt' }),
   },
   companyDataApi: {
-    getFinancialStatements: vi.fn().mockResolvedValue({
+    getFinancialStatements: mocks.getFinancialStatements.mockResolvedValue({
       columns: ['2025'],
       data: { Sales: { '2025': 900000 } },
     }),
   },
 }));
+
+beforeEach(() => {
+  navMocks.search = '';
+  vi.clearAllMocks();
+});
 
 describe('EquityResearchPage', () => {
   it('renders research terminal and stock profile', async () => {
@@ -106,5 +131,36 @@ describe('EquityResearchPage', () => {
     expect(screen.getByText('Piotroski F-Score')).toBeDefined();
     expect(screen.getByText('7/9')).toBeDefined();
     expect(screen.getByText('8-Tab Excel Model')).toBeDefined();
+
+    // B9: dividend yield is a raw percent — 0.4 means 0.40%, never 40.00%
+    expect(screen.getByText('0.40%')).toBeDefined();
+    expect(screen.queryByText('40.00%')).toBeNull();
+  });
+
+  it('null Piotroski score renders N/A, never a fabricated 0/9 (B10)', async () => {
+    mocks.getFullProfile.mockResolvedValueOnce({
+      ...mocks.baseProfile,
+      custom_ratios: { ...mocks.baseProfile.custom_ratios, piotroski_score: null },
+    });
+
+    render(<EquityResearchPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Reliance Industries Limited')).toBeDefined();
+    });
+
+    const card = screen.getByText('Piotroski F-Score').parentElement?.parentElement;
+    expect(card?.textContent).toContain('N/A');
+    expect(screen.queryByText('7/9')).toBeNull();
+    expect(screen.queryByText('0/9')).toBeNull();
+  });
+
+  it('reads ?ticker= deep-link as the initial symbol (B8)', async () => {
+    navMocks.search = 'ticker=TCS.NS';
+
+    render(<EquityResearchPage />);
+
+    await waitFor(() => {
+      expect(mocks.getFullProfile).toHaveBeenCalledWith('TCS.NS');
+    });
   });
 });

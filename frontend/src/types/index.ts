@@ -49,31 +49,40 @@ export interface PortfolioSummary {
 }
 
 // Realized Risk Metrics Type
+// Fabricable metrics are `number | null` — never invent numbers; pages render N/A.
+// Optional flags mirror the backend null+flag contract (model_fitted /
+// is_limited_history / error) on endpoints without a response_model.
 export interface RealizedRiskMetrics {
-  annual_return: number;
-  annual_volatility: number;
-  sharpe_ratio: number;
-  sortino_ratio: number;
-  skewness: number;
-  kurtosis: number;
-  max_drawdown: number;
-  var_95: number;
-  cvar_95: number;
-  hit_ratio: number;
-  beta_vs_benchmark?: number;
-  up_capture?: number;
-  down_capture?: number;
+  annual_return: number | null;
+  annual_volatility: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  skewness: number | null;
+  kurtosis: number | null;
+  max_drawdown: number | null;
+  var_95: number | null;
+  cvar_95: number | null;
+  hit_ratio: number | null;
+  beta_vs_benchmark?: number | null;
+  up_capture?: number | null;
+  down_capture?: number | null;
+  model_fitted?: boolean;
+  is_limited_history?: boolean;
+  error?: string;
 }
 
-// Forecast Risk Metrics Type
+// Forecast Risk Metrics Type (null+flag contract, see RealizedRiskMetrics)
 export interface ForecastRiskMetrics {
   model: "EWMA" | "GARCH" | "EGARCH";
   horizon: number;
-  volatility_forecast: number;
-  var_forecast: number;
-  cvar_forecast: number;
-  confidence_interval: [number, number];
-  model_params: Record<string, any>;
+  volatility_forecast: number | null;
+  var_forecast: number | null;
+  cvar_forecast: number | null;
+  confidence_interval?: [number, number] | null;
+  model_params?: Record<string, any>;
+  model_fitted?: boolean;
+  is_limited_history?: boolean;
+  error?: string;
 }
 
 // Factor Exposure Type
@@ -210,6 +219,10 @@ export interface ExchangeRate {
   last_updated: string;
 }
 
+// ponytail: phantom contract — no implementation exists anywhere; the UI
+// "currency toggle" is symbol-swap only around the same number (04-B14).
+// Handoff: implement a real FX source behind this interface or delete it
+// and drop the USD toggle's pretense of conversion.
 export interface CurrencyContextType {
   currentCurrency: Currency;
   exchangeRate: number;
@@ -289,12 +302,18 @@ export interface ForecastRiskResponse {
     var_forecast?: number | null;
     cvar_forecast?: number | null;
     confidence_interval?: [number, number];
+    model_fitted?: boolean;
+    is_limited_history?: boolean;
+    error?: string;
   };
   positions: Record<string, {
     volatility_forecast?: number | null;
     var_forecast?: number | null;
   }>;
   model_params?: Record<string, any>;
+  model_fitted?: boolean;
+  is_limited_history?: boolean;
+  error?: string;
 }
 
 export interface LiquidityResponse {
@@ -382,6 +401,7 @@ export interface RiskContributionResponse {
 
 export interface StressTestResponse {
   scenario: string;
+  scenario_description?: string;
   max_drawdown: number | null;
   portfolio_impact: number | null;
   position_impacts: Record<string, number>;

@@ -15,7 +15,7 @@ import {
   Target
 } from 'lucide-react';
 import { PortfolioPosition, Currency } from '@/types';
-import { cn } from '@/lib/utils';
+import { cn, formatCurrency } from '@/lib/utils';
 
 interface PortfolioStatsProps {
   positions: PortfolioPosition[];
@@ -75,15 +75,11 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
     };
   }, [positions]);
 
-  const formatCurrency = (amount: number) => {
-    const symbol = currency === 'INR' ? '₹' : '$';
-    return `${symbol}${Math.abs(amount).toLocaleString('en-US', { 
-      minimumFractionDigits: 0, 
-      maximumFractionDigits: 0 
-    })}`;
-  };
+  const money = (amount?: number | null) =>
+    amount != null && Number.isFinite(amount) ? formatCurrency(amount, currency) : '—';
 
-  const formatPercent = (value: number) => {
+  const formatPercent = (value: number | null | undefined) => {
+    if (value == null || !Number.isFinite(value)) return '—';
     const sign = value >= 0 ? '+' : '';
     return `${sign}${value.toFixed(2)}%`;
   };
@@ -119,7 +115,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
                 {stats.bestPerformer?.ticker}
               </p>
               <p className="text-sm text-green-700 dark:text-green-300">
-                {formatPercent(stats.bestPerformer?.unrealized_gain_loss_pct || 0)}
+                {formatPercent(stats.bestPerformer?.unrealized_gain_loss_pct)}
               </p>
             </div>
             <TrendingUp className="h-8 w-8 text-green-600" />
@@ -137,7 +133,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
                 {stats.worstPerformer?.ticker}
               </p>
               <p className="text-sm text-red-700 dark:text-red-300">
-                {formatPercent(stats.worstPerformer?.unrealized_gain_loss_pct || 0)}
+                {formatPercent(stats.worstPerformer?.unrealized_gain_loss_pct)}
               </p>
             </div>
             <TrendingDown className="h-8 w-8 text-red-600" />
@@ -189,7 +185,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
             Total Investment
           </p>
           <p className="text-xl font-semibold text-gray-900 dark:text-white">
-            {formatCurrency(stats.totalCost)}
+            {money(stats.totalCost)}
           </p>
         </div>
 
@@ -199,7 +195,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
             Current Value
           </p>
           <p className="text-xl font-semibold text-gray-900 dark:text-white">
-            {formatCurrency(stats.totalCurrentValue)}
+            {money(stats.totalCurrentValue)}
           </p>
         </div>
 

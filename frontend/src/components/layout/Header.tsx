@@ -1,25 +1,23 @@
 /**
- * Header component for the Daisy Risk Engine dashboard
+ * Header component for the FinEngine dashboard
  * Features user controls, notifications, and responsive mobile navigation
  */
 
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import { 
-  Bell, 
-  User, 
   Moon, 
   Sun, 
   Menu, 
-  Settings,
-  LogOut,
   RefreshCw,
   Activity,
   FileDown
 } from 'lucide-react';
 import { useUIStore, usePortfolioStore } from '@/lib/store';
 import { ExportService } from '@/lib/export';
+import { useNotifications } from '@/hooks/useRealTime';
+import { formatRelativeTime } from '@/components/ui/LoadingState';
 import { cn } from '@/lib/utils';
 
 interface HeaderProps {
@@ -30,32 +28,42 @@ interface HeaderProps {
 }
 
 export function Header({ title, subtitle, onMenuClick, className }: HeaderProps) {
-  const { darkMode, toggleDarkMode, liveDataMode, toggleLiveDataMode, lastUpdated } = useUIStore();
-  const { positions, fetchPortfolio, isLoading } = usePortfolioStore();
+  const darkMode = useUIStore((s) => s.darkMode);
+  const toggleDarkMode = useUIStore((s) => s.toggleDarkMode);
+  const liveDataMode = useUIStore((s) => s.liveDataMode);
+  const toggleLiveDataMode = useUIStore((s) => s.toggleLiveDataMode);
+  const lastUpdated = useUIStore((s) => s.lastUpdated);
+  const positions = usePortfolioStore((s) => s.positions);
+  const fetchPortfolio = usePortfolioStore((s) => s.fetchPortfolio);
+  const isLoading = usePortfolioStore((s) => s.isLoading);
+  const { addNotification } = useNotifications();
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
 
   const handleRefresh = async () => {
     try {
       await fetchPortfolio();
     } catch (error) {
       console.error('Failed to refresh portfolio:', error);
+      addNotification('error', 'Refresh Failed', "Couldn't fetch portfolio data. Try again.");
     }
   };
 
-  const formatLastUpdated = (timestamp: string | null) => {
-    if (!timestamp) return 'Never';
-    
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    
-    if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins}m ago`;
-    
-    const diffHours = Math.floor(diffMins / 60);
-    if (diffHours < 24) return `${diffHours}h ago`;
-    
-    return date.toLocaleDateString();
+  const handleExportPdf = async () => {
+    setIsExportingPdf(true);
+    try {
+      const totalVal = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+      await ExportService.exportInstitutionalReviewPDF({
+        positions,
+        totalValue: totalVal,
+        currency: 'INR'
+      });
+      addNotification('success', 'PDF Exported', 'Institutional review downloaded.');
+    } catch (error) {
+      console.error('Failed to export PDF:', error);
+      addNotification('error', 'Export Failed', "Couldn't generate the PDF review.");
+    } finally {
+      setIsExportingPdf(false);
+    }
   };
 
   return (
@@ -99,13 +107,15 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
               <span>{positions.length} positions</span>
             </div>
             <div className="flex items-center space-x-1">
-              <span>Last updated: {formatLastUpdated(lastUpdated)}</span>
+              <span>Last updated: {formatRelativeTime(lastUpdated)}</span>
             </div>
           </div>
 
           {/* Live data toggle */}
           <button
             onClick={toggleLiveDataMode}
+            aria-label="Toggle live data"
+            aria-pressed={liveDataMode}
             className={cn(
               'flex items-center space-x-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
               liveDataMode
@@ -122,19 +132,12 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
 
           {/* Export PDF Tear-Sheet */}
           <button
-            onClick={() => {
-              const totalVal = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
-              ExportService.exportInstitutionalReviewPDF({
-                positions,
-                totalValue: totalVal,
-                currency: 'INR'
-              });
-            }}
-            disabled={positions.length === 0}
+            onClick={handleExportPdf}
+            disabled={positions.length === 0 || isExportingPdf}
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 transition disabled:opacity-50"
             title="Download Institutional PDF Review"
           >
-            <FileDown className="w-3.5 h-3.5 text-indigo-500" />
+            <FileDown className={cn('w-3.5 h-3.5 text-indigo-500', isExportingPdf && 'animate-spin')} />
             <span className="hidden md:inline">Export PDF</span>
           </button>
 
@@ -154,8 +157,9 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
           {/* Dark mode toggle */}
           <button
             onClick={toggleDarkMode}
-            className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
             aria-label="Toggle dark mode"
+            aria-pressed={darkMode}
+            className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
           >
             {darkMode ? (
               <Sun className="w-5 h-5 text-gray-600 dark:text-gray-400" />
@@ -163,30 +167,6 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
               <Moon className="w-5 h-5 text-gray-600 dark:text-gray-400" />
             )}
           </button>
-
-          {/* Notifications */}
-          <button className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors relative">
-            <Bell className="w-5 h-5 text-gray-600 dark:text-gray-400" />
-            {/* Notification badge */}
-            <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full"></span>
-          </button>
-
-          {/* User menu */}
-          <div className="relative">
-            <button className="flex items-center space-x-2 p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
-              <div className="w-8 h-8 bg-gray-200 dark:bg-gray-700 rounded-full flex items-center justify-center">
-                <User className="w-4 h-4 text-gray-600 dark:text-gray-400" />
-              </div>
-              <div className="hidden sm:block text-left">
-                <p className="text-sm font-medium text-gray-900 dark:text-white">
-                  Portfolio Manager
-                </p>
-                <p className="text-xs text-gray-600 dark:text-gray-400">
-                  admin@company.com
-                </p>
-              </div>
-            </button>
-          </div>
         </div>
       </div>
     </header>

@@ -156,16 +156,50 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     howInferred: 'Derived from current portfolio database holdings and normalized to sum to 100.0%.',
     whyImportant: 'Reveals which specific scrips drove the tear-sheet performance results.',
     howToInfer: 'Check largest weights (Motherson 13.6%, JuniorBees 12.8%, Midcap ETF 10.5%) to understand return drivers.'
+  },
+  portfolio_volatility: {
+    title: 'Portfolio Volatility (Realized)',
+    what: 'Annualized standard deviation of portfolio returns over the headline measurement window.',
+    howInferred: 'Computed as σ_annual = std(daily returns) × sqrt(252) across the reported window (full-history when available, otherwise the holding window).',
+    whyImportant: 'Realized risk of the actual book; anchors risk-budget comparisons and position sizing.',
+    howToInfer: 'Sustained realized vol above your target volatility means the book is over-risked relative to its budget.',
+    benchmark: 'Typical Indian multi-cap equity realized volatility: 12% – 20% annualized.'
+  },
+  benchmark_volatility: {
+    title: 'NIFTY 50 Volatility (Realized)',
+    what: 'Annualized standard deviation of the NIFTY 50 (^NSEI) index over the same measurement window.',
+    howInferred: 'σ_annual = std(daily index returns) × sqrt(252) computed on the benchmark series for an apples-to-apples window.',
+    whyImportant: 'Market baseline risk for contextualizing portfolio volatility and beta.',
+    howToInfer: 'Portfolio volatility far above index volatility signals concentrated or high-beta holdings.',
+    benchmark: 'NIFTY 50 long-run realized volatility: roughly 12% – 18% annualized.'
   }
 };
 
 function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
   const info = EXPLAINERS[itemKey];
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   if (!info) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={info.title}
+        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
         <button
           onClick={onClose}
           className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
@@ -339,7 +373,11 @@ export default function TearSheetPage() {
     rows.push('Daisy Risk Engine - Performance Tear-Sheet Report');
     rows.push(`Analysis Window,${data.window.start} to ${data.window.end}`);
     rows.push('');
-    rows.push('Headline QuantStats Metrics (full-history asset characteristics)');
+    rows.push(
+      data.full_history?.metrics
+        ? 'Headline QuantStats Metrics (full-history asset characteristics)'
+        : `Headline QuantStats Metrics (holding window${hlDays !== null ? `, ${hlDays} trading days` : ''})`
+    );
     rows.push(`Total Return,${fmt(hl.total_return, 2, '%')}`);
     rows.push(`CAGR,${fmt(hl.cagr, 2, '%')}`);
     rows.push(`Sharpe Ratio,${fmtRatio(hl.sharpe)}`);
@@ -487,6 +525,11 @@ export default function TearSheetPage() {
           {data.full_history?.metrics && hlDays !== null && (
             <p data-testid="headline-caption" className="text-xs text-emerald-300/80 font-mono -mt-2">
               Full-history · {hlDays} trading days
+            </p>
+          )}
+          {!data.full_history?.metrics && hlDays !== null && (
+            <p data-testid="headline-caption" className="text-xs text-amber-300/80 font-mono -mt-2">
+              Holding window · {hlDays} trading days
             </p>
           )}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -885,7 +928,8 @@ export default function TearSheetPage() {
                     <path
                       d={`M 0 10 ${drawdownPoints
                         .map((p, i) => {
-                          const x = (i / (drawdownPoints.length - 1)) * 600;
+                          const denom = Math.max(1, drawdownPoints.length - 1);
+                          const x = (i / denom) * 600;
                           const depth = Math.min(1, Math.abs(p.drawdown) / Math.abs(worstDrawdown || 1));
                           const y = 10 + depth * 110;
                           return `L ${x.toFixed(1)} ${y.toFixed(1)}`;

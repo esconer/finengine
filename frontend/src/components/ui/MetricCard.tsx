@@ -21,7 +21,6 @@ export const MetricCard: React.FC<MetricCardProps> = ({
   title,
   value,
   change,
-  changeType = 'neutral',
   icon: Icon,
   loading = false,
   className = '',
@@ -30,22 +29,30 @@ export const MetricCard: React.FC<MetricCardProps> = ({
 }) => {
   const formatValue = (val: number | string): string => {
     if (typeof val === 'number') {
-      if (isNaN(val) || val === null || val === undefined) {
+      if (!Number.isFinite(val)) {
         return 'N/A';
       }
-      const sym = prefix !== undefined ? prefix : '$';
-      const numStr =
-        prefix === '₹' && val >= 10000000
-          ? `${sym}${(val / 10000000).toFixed(2)}Cr`
-          : prefix === '₹' && val >= 100000
-          ? `${sym}${(val / 100000).toFixed(2)}L`
-          : val >= 1000000
-          ? `${sym}${(val / 1000000).toFixed(1)}M`
-          : val >= 1000
-          ? `${sym}${(val / 1000).toFixed(1)}K`
-          : prefix !== undefined
-          ? `${sym}${val.toFixed(2)}`
-          : val.toFixed(2);
+      if (prefix === undefined) {
+        return `${val.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${suffix}`;
+      }
+      const sign = val < 0 ? '-' : '';
+      const abs = Math.abs(val);
+      let numStr: string;
+      if (prefix === '₹') {
+        numStr =
+          abs >= 10000000
+            ? `${sign}₹${(abs / 10000000).toFixed(2)}Cr`
+            : abs >= 100000
+            ? `${sign}₹${(abs / 100000).toFixed(2)}L`
+            : `${sign}₹${abs.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      } else {
+        numStr =
+          abs >= 1000000
+            ? `${sign}${prefix}${(abs / 1000000).toFixed(1)}M`
+            : abs >= 1000
+            ? `${sign}${prefix}${(abs / 1000).toFixed(1)}K`
+            : `${sign}${prefix}${abs.toFixed(2)}`;
+      }
       return `${numStr}${suffix}`;
     }
     if (!val || val === 'NaN%') {
@@ -116,9 +123,13 @@ export const MetricCard: React.FC<MetricCardProps> = ({
           {formatValue(value)}
         </p>
         
-        {change !== undefined && (
+        {change !== undefined && Number.isFinite(change) && (
           <div className="flex items-center">
-            <span className={`text-sm px-2 py-1 rounded-full font-medium ${getChangeBgColor(changeType)} ${getChangeColor(changeType)}`}>
+            <span
+              className={`text-sm px-2 py-1 rounded-full font-medium ${getChangeBgColor(
+                change > 0 ? 'positive' : change < 0 ? 'negative' : 'neutral'
+              )} ${getChangeColor(change > 0 ? 'positive' : change < 0 ? 'negative' : 'neutral')}`}
+            >
               {formatChange(change)}
             </span>
           </div>

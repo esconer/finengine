@@ -1,9 +1,10 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { MetricCard } from '@/components/ui/MetricCard';
 import apiClient from '@/lib/api';
+import { escapeCsvCell } from '@/lib/utils';
 import {
   ShieldAlert,
   TrendingUp,
@@ -52,8 +53,8 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The annualized standard deviation of daily portfolio returns, reflecting overall day-to-day fluctuation magnitude.',
     howInferred: 'Computed as σ_p = √(w^T Σ w) × √252 using the full empirical covariance matrix of constituent returns.',
     whyImportant: 'The cornerstone metric for asset pricing, Sharpe ratios, and standard risk budgeting.',
-    howToInfer: '18.08% indicates normal fluctuation bounds of ±18.08% annually across current asset allocations.',
-    benchmark: 'Balanced multi-cap Indian portfolio benchmark: 14.0% – 18.0%.'
+    howToInfer: 'e.g. 18.08% indicates normal fluctuation bounds of ±18.08% annually across current asset allocations.',
+    benchmark: 'e.g. Balanced multi-cap Indian portfolio benchmark: 14.0% – 18.0%.'
   },
   evt_pot_var_99: {
     title: '99% EVT-POT Value at Risk (1-Day)',
@@ -76,7 +77,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'Real-time diagnostic indicating whether portfolio assets are co-moving normally or experiencing liquidity breakdown contagion.',
     howInferred: 'Calculates the average 60-day rolling pairwise correlation across all holding pairs and compares it to the historical 90th percentile threshold.',
     whyImportant: 'During market-wide panics, cross-asset correlations spike toward +1.0, destroying diversification benefits.',
-    howToInfer: 'NORMAL (0.158 < 0.382 threshold) confirms holdings remain well-diversified without systemic contagion.',
+    howToInfer: 'e.g. NORMAL (0.158 < 0.382 threshold) would confirm holdings remain well-diversified without systemic contagion.',
     benchmark: 'Threshold for Regime Break Alert: Avg Correlation > 0.38.'
   },
   euler_tail_share: {
@@ -84,7 +85,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'Side-by-side grouped comparison showing each stock\'s contribution to routine volatility (Blue) versus crisis tail losses (Red).',
     howInferred: 'Euler volatility shares derived from w_i(Σ w)_i / σ_p; Tail CVaR shares derived from mean loss on worst 5% days scaled by weight.',
     whyImportant: 'Identifies positions that seem safe day-to-day but become dominant loss drivers during steep market downturns.',
-    howToInfer: 'Motherson (19.9% Vol / 19.5% CVaR) and JuniorBees (9.9% Vol / 11.3% CVaR) are primary risk drivers.'
+    howToInfer: 'e.g. Motherson (19.9% Vol / 19.5% CVaR) and JuniorBees (9.9% Vol / 11.3% CVaR) would be primary risk drivers.'
   },
   copula_tail_dependence: {
     title: 'Bivariate Student-t Copula Lower-Tail Dependence (λL)',
@@ -95,10 +96,10 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   },
   volatility_cones: {
     title: 'Volatility Term Structure & Quantile Cones',
-    what: 'Multi-tenor volatility distribution envelope plotting current realized volatility against historical percentiles (P10 to P90) and forward GARCH forecast.',
-    howInferred: 'Calculates rolling historical annualized volatilities across 10D, 21D, 63D, 126D, and 252D windows and overlays forward GARCH projections.',
+    what: 'Multi-tenor volatility distribution envelope plotting current realized volatility against the historical min/max envelope with quartile bands and a forward GARCH forecast.',
+    howInferred: 'Calculates rolling historical annualized volatilities across 10D, 21D, 63D, 126D, and 252D windows and overlays the forward GARCH projection.',
     whyImportant: 'Shows whether current portfolio volatility is compressed (mean-reversion upside) or elevated (mean-reversion downside) relative to history.',
-    howToInfer: 'If current realized volatility sits near the P10 boundary, volatility is historically subdued; if near P90, it is elevated.'
+    howToInfer: 'If current realized volatility sits near the Min boundary, volatility is historically subdued; if near the Max, it is elevated.'
   },
   correlation_stability: {
     title: '60-Day Rolling Correlation Stability Gauge',
@@ -216,6 +217,14 @@ export default function RiskStudioPage() {
         apiClient.get('/analytics/correlation-stability')
       ]);
 
+      const results = [rcRes, trRes, vcRes, corrRes];
+      const rejectedCount = results.filter(r => r.status === 'rejected').length;
+      if (rejectedCount === results.length) {
+        setError('Failed to load Risk Studio analytics');
+      } else if (rejectedCount > 0) {
+        console.warn(`Partial Risk Studio failure: ${rejectedCount} endpoints were unreachable.`);
+      }
+
       if (rcRes.status === 'fulfilled') setRiskContribution(rcRes.value.data);
       if (trRes.status === 'fulfilled') setTailRisk(trRes.value.data);
       if (vcRes.status === 'fulfilled') setVolCone(vcRes.value.data);
@@ -237,26 +246,32 @@ export default function RiskStudioPage() {
     fetchData();
   };
 
-  // Format helpers
+  // Format helpers — API contract is fractions; null/undefined → em dash, never scaled guesses
   const fmtPct = (val: number | undefined | null) => {
     if (val === undefined || val === null || isNaN(val)) return '—';
-    const scaled = Math.abs(val) <= 1.0 && val !== 0 ? val * 100 : val;
-    return `${scaled.toFixed(2)}%`;
+    return `${(val * 100).toFixed(2)}%`;
   };
 
   // Null-aware correlation regime values (never substitute plausible constants)
   const corrAvg = correlation?.current_avg_correlation ?? null;
   const corrThreshold = correlation?.historical_threshold_90th ?? correlation?.percentile_90_threshold ?? null;
+  // Unknown fat-tail conclusion stays unknown — never coerced to "No"
+  const fatTailed: boolean | null = tailRisk?.is_fat_tailed ?? tailRisk?.gpd_parameters?.is_fat_tailed ?? null;
 
-  // Prepare Euler Chart Data
-  const eulerPositions = riskContribution?.positions?.volatility
-    ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
-        ticker: ticker.replace('.NS', '').replace('.BO', ''),
-        fullTicker: ticker,
-        vol_contrib: +((volShare || 0) * 100).toFixed(1),
-        cvar_contrib: +(((riskContribution.positions.cvar_tail?.[ticker] ?? volShare ?? 0)) * 100).toFixed(1)
-      }))
-    : [];
+  // Prepare Euler Chart Data — CVaR share stays null when tail attribution is absent
+  const eulerPositions = useMemo(() =>
+    riskContribution?.positions?.volatility
+      ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
+          ticker: ticker.replace('.NS', '').replace('.BO', ''),
+          fullTicker: ticker,
+          vol_contrib: +((volShare || 0) * 100).toFixed(1),
+          cvar_contrib: riskContribution.positions.cvar_tail?.[ticker] != null
+            ? +((riskContribution.positions.cvar_tail[ticker]) * 100).toFixed(1)
+            : null
+        }))
+      : [],
+    [riskContribution]);
+  const hasCvarTail = eulerPositions.some(p => p.cvar_contrib != null);
 
   const sectorRollup = riskContribution?.sector_rollup?.volatility || riskContribution?.sector_vol_shares;
   const copulaTickers: string[] = Array.isArray(tailRisk?.tail_dependence_matrix?.tickers)
@@ -270,32 +285,25 @@ export default function RiskStudioPage() {
       ? tailRisk.matrix
       : [];
 
-  // Prepare Vol Cone Chart Data
-  const coneWindows = [10, 21, 63, 126, 252];
-  const coneChartData = Array.isArray(volCone?.windows)
-    ? volCone.windows.map((w: any) => ({
-        window: `${w.window_days}D`,
-        p10: +(w.min * 100 || 0).toFixed(1),
-        p25: +(w.p25 * 100 || 0).toFixed(1),
-        p50: +(w.median * 100 || 0).toFixed(1),
-        p75: +(w.p75 * 100 || 0).toFixed(1),
-        p90: +(w.max * 100 || 0).toFixed(1),
-        realized: +(w.current_realized * 100 || 0).toFixed(1),
-        garch: volCone?.garch_forecast_vol ? +(volCone.garch_forecast_vol * 100).toFixed(1) : undefined
-      }))
-    : coneWindows.map(w => {
-        const q = volCone?.quantiles?.[String(w)] || {};
-        return {
-          window: `${w}D`,
-          p10: +(q.p10 * 100 || 0).toFixed(1),
-          p25: +(q.p25 * 100 || 0).toFixed(1),
-          p50: +(q.p50 * 100 || 0).toFixed(1),
-          p75: +(q.p75 * 100 || 0).toFixed(1),
-          p90: +(q.p90 * 100 || 0).toFixed(1),
-          realized: q.realized != null ? +(q.realized * 100).toFixed(1) : undefined,
-          garch: volCone?.garch_forecast_vol ? +(volCone.garch_forecast_vol * 100).toFixed(1) : undefined
-        };
-      });
+  // Prepare Vol Cone Chart Data — null quantiles stay undefined (gaps), never 0
+  const coneChartData = useMemo(() => {
+    if (!Array.isArray(volCone?.windows)) return [];
+    const garchVol = volCone?.current_forecast?.annualized_vol;
+    const pct = (v: unknown) => (v != null ? +(Number(v) * 100).toFixed(1) : undefined);
+    return volCone.windows.map((w: any) => ({
+      window: `${w.window_days}D`,
+      min: pct(w.min),
+      p25: pct(w.p25),
+      median: pct(w.median),
+      p75: pct(w.p75),
+      max: pct(w.max),
+      realized: pct(w.current_realized),
+      garch: pct(garchVol),
+      insufficient_data: w.insufficient_data === true
+    }));
+  }, [volCone]);
+  const volConeAllInsufficient =
+    coneChartData.length > 0 && coneChartData.every((w: any) => w.insufficient_data);
 
   // Export CSV
   const handleExportCSV = () => {
@@ -305,20 +313,20 @@ export default function RiskStudioPage() {
     rows.push('');
     rows.push('Core Risk Metrics');
     rows.push(`Annualized Portfolio Volatility,${fmtPct(riskContribution?.portfolio_volatility_annualized)}`);
-    rows.push(`99% EVT-POT VaR (1-Day),${fmtPct(tailRisk?.evt_pot_var_99 || tailRisk?.evt_var_99)}`);
-    rows.push(`99% EVT Expected Shortfall,${fmtPct(tailRisk?.evt_pot_es_99 || tailRisk?.evt_es_99)}`);
-    rows.push(`Correlation Regime,${correlation?.alert_level || 'NORMAL'}`);
+    rows.push(`99% EVT-POT VaR (1-Day),${fmtPct(tailRisk?.evt_pot_var_99 ?? tailRisk?.evt_var_99)}`);
+    rows.push(`99% EVT Expected Shortfall,${fmtPct(tailRisk?.evt_pot_es_99 ?? tailRisk?.evt_es_99)}`);
+    rows.push(`Correlation Regime,${escapeCsvCell(correlation?.alert_level ?? 'N/A')}`);
     rows.push('');
     rows.push('Euler Volatility & Tail CVaR Position Decomposition');
     rows.push('Ticker,Volatility Risk Share (%),Tail CVaR Loss Share (%)');
     for (const p of eulerPositions) {
-      rows.push(`${p.fullTicker},${p.vol_contrib}%,${p.cvar_contrib}%`);
+      rows.push(`${escapeCsvCell(p.fullTicker)},${p.vol_contrib}%,${p.cvar_contrib != null ? `${p.cvar_contrib}%` : 'N/A'}`);
     }
     rows.push('');
     rows.push('Bivariate Student-t Copula Lower-Tail Dependence Matrix');
-    rows.push(['Asset', ...copulaTickers].join(','));
+    rows.push([escapeCsvCell('Asset'), ...copulaTickers.map(escapeCsvCell)].join(','));
     for (let r = 0; r < copulaTickers.length; r++) {
-      const rowVals = [copulaTickers[r]];
+      const rowVals = [escapeCsvCell(copulaTickers[r])];
       for (let c = 0; c < copulaTickers.length; c++) {
         rowVals.push((copulaMatrix[r]?.[c] ?? (r === c ? 1.0 : 0.0)).toFixed(4));
       }
@@ -400,7 +408,7 @@ export default function RiskStudioPage() {
         <div className="relative group">
           <MetricCard
             title="Portfolio Volatility (ann.)"
-            value={fmtPct(riskContribution?.portfolio_volatility_annualized || riskContribution?.portfolio_volatility)}
+            value={fmtPct(riskContribution?.portfolio_volatility_annualized)}
             icon={Activity}
           />
           <div className="absolute top-4 right-4 z-10">
@@ -411,7 +419,7 @@ export default function RiskStudioPage() {
         <div className="relative group">
           <MetricCard
             title="99% EVT-POT VaR (1-Day)"
-            value={fmtPct(tailRisk?.evt_pot_var_99 || tailRisk?.evt_var_99)}
+            value={fmtPct(tailRisk?.evt_pot_var_99 ?? tailRisk?.evt_var_99)}
             icon={Flame}
           />
           <div className="absolute top-4 right-4 z-10">
@@ -422,7 +430,7 @@ export default function RiskStudioPage() {
         <div className="relative group">
           <MetricCard
             title="99% Expected Shortfall"
-            value={fmtPct(tailRisk?.evt_pot_es_99 || tailRisk?.evt_es_99)}
+            value={fmtPct(tailRisk?.evt_pot_es_99 ?? tailRisk?.evt_es_99)}
             icon={ShieldAlert}
           />
           <div className="absolute top-4 right-4 z-10">
@@ -433,7 +441,7 @@ export default function RiskStudioPage() {
         <div className="relative group">
           <MetricCard
             title="Correlation Regime"
-            value={correlation?.alert_level || 'NORMAL'}
+            value={correlation?.alert_level ?? 'N/A'}
             icon={Layers}
           />
           <div className="absolute top-4 right-4 z-10">
@@ -461,6 +469,11 @@ export default function RiskStudioPage() {
               Exact percentage of portfolio variance and worst 5% tail losses driven by each asset.
             </p>
             <div className="h-64 w-full">
+              {eulerPositions.length === 0 ? (
+                <div data-testid="euler-empty" className="h-full flex items-center justify-center text-xs text-slate-500">
+                  No risk contribution data available
+                </div>
+              ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={eulerPositions} margin={{ top: 10, right: 10, left: -20, bottom: 25 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
@@ -474,7 +487,7 @@ export default function RiskStudioPage() {
                           <div className="bg-slate-950 border border-slate-700 p-2.5 rounded-lg text-xs text-slate-200 shadow-xl">
                             <p className="font-semibold text-white mb-1">{d.fullTicker}</p>
                             <p className="text-blue-400">Vol Share: {d.vol_contrib}%</p>
-                            <p className="text-rose-400">CVaR Share: {d.cvar_contrib}%</p>
+                            <p className="text-rose-400">CVaR Share: {d.cvar_contrib != null ? `${d.cvar_contrib}%` : 'N/A'}</p>
                           </div>
                         );
                       }
@@ -482,10 +495,18 @@ export default function RiskStudioPage() {
                     }}
                   />
                   <Bar dataKey="vol_contrib" name="Vol Share (%)" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="cvar_contrib" name="CVaR Share (%)" fill="#f43f5e" radius={[4, 4, 0, 0]} />
+                  {hasCvarTail && (
+                    <Bar dataKey="cvar_contrib" name="CVaR Share (%)" fill="#f43f5e" radius={[4, 4, 0, 0]} />
+                  )}
                 </BarChart>
               </ResponsiveContainer>
+              )}
             </div>
+            {eulerPositions.length > 0 && !hasCvarTail && (
+              <p className="text-xs text-slate-500 mt-2">
+                Not enough tail observations to attribute CVaR shares — volatility shares only.
+              </p>
+            )}
           </div>
           {sectorRollup && (
             <div className="mt-4 pt-3 border-t border-slate-800 flex flex-wrap gap-2 text-xs">
@@ -556,10 +577,10 @@ export default function RiskStudioPage() {
             )}
           </div>
           <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-            <span>EVT Shape (ξ): <strong className="text-white font-mono">{tailRisk?.gpd_shape_xi !== undefined ? Number(tailRisk.gpd_shape_xi).toFixed(4) : (tailRisk?.gpd_parameters?.shape_xi?.toFixed(4) || '—')}</strong></span>
-            <span>Scale (β): <strong className="text-white font-mono">{tailRisk?.gpd_scale_beta !== undefined ? Number(tailRisk.gpd_scale_beta).toFixed(4) : (tailRisk?.gpd_parameters?.scale_beta?.toFixed(4) || '—')}</strong></span>
+            <span>EVT Shape (ξ): <strong className="text-white font-mono">{tailRisk?.gpd_shape_xi != null ? Number(tailRisk.gpd_shape_xi).toFixed(4) : (tailRisk?.gpd_parameters?.shape_xi?.toFixed(4) || '—')}</strong></span>
+            <span>Scale (β): <strong className="text-white font-mono">{tailRisk?.gpd_scale_beta != null ? Number(tailRisk.gpd_scale_beta).toFixed(4) : (tailRisk?.gpd_parameters?.scale_beta?.toFixed(4) || '—')}</strong></span>
             <div className="flex items-center space-x-1.5">
-              <span>Fat Tailed: <strong className="text-emerald-400 font-bold">{(tailRisk?.is_fat_tailed !== undefined ? tailRisk.is_fat_tailed : tailRisk?.gpd_parameters?.is_fat_tailed) ? 'Yes' : 'No'}</strong></span>
+              <span>Fat Tailed: <strong className={`font-bold ${fatTailed == null ? 'text-slate-400' : fatTailed ? 'text-emerald-400' : 'text-rose-400'}`}>{fatTailed == null ? '—' : fatTailed ? 'Yes' : 'No'}</strong></span>
               <HelpBtn onClick={() => setActiveExplainer('gpd_parameters')} />
             </div>
           </div>
@@ -578,9 +599,18 @@ export default function RiskStudioPage() {
             </span>
           </div>
           <p className="text-xs text-slate-400 mb-4">
-            Multi-window historical realized volatility quantiles alongside forward GARCH forecast.
+            Multi-window historical realized volatility bands alongside forward GARCH forecast.
           </p>
           <div className="h-64 w-full">
+            {!volCone || coneChartData.length === 0 ? (
+              <div data-testid="vol-cone-empty" className="h-full flex items-center justify-center text-xs text-slate-500">
+                Volatility cone data unavailable
+              </div>
+            ) : volConeAllInsufficient ? (
+              <div data-testid="vol-cone-insufficient" className="h-full flex items-center justify-center text-xs text-slate-500">
+                Insufficient history to build volatility cones for these windows
+              </div>
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={coneChartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
@@ -594,10 +624,10 @@ export default function RiskStudioPage() {
                         <div className="bg-slate-950 border border-slate-700 p-2.5 rounded-lg text-xs text-slate-200 shadow-xl">
                            <p className="font-semibold text-white mb-1">{d.window} Lookback Window</p>
                            <p className="text-amber-300 font-bold">Realized: {d.realized != null ? `${d.realized}%` : 'N/A'}</p>
-                          <p className="text-slate-400">P90 (Max): {d.p90}%</p>
-                          <p className="text-slate-400">P50 (Median): {d.p50}%</p>
-                          <p className="text-slate-400">P10 (Min): {d.p10}%</p>
-                          {d.garch && <p className="text-emerald-400 font-semibold">GARCH Forecast: {d.garch}%</p>}
+                          <p className="text-slate-400">Max: {d.max != null ? `${d.max}%` : 'N/A'}</p>
+                          <p className="text-slate-400">Median: {d.median != null ? `${d.median}%` : 'N/A'}</p>
+                          <p className="text-slate-400">Min: {d.min != null ? `${d.min}%` : 'N/A'}</p>
+                          {d.garch != null && <p className="text-emerald-400 font-semibold">GARCH Forecast: {d.garch}%</p>}
                         </div>
                       );
                     }
@@ -605,12 +635,13 @@ export default function RiskStudioPage() {
                   }}
                 />
                 <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '10px' }} />
-                <Line type="monotone" dataKey="p90" stroke="#f59e0b" strokeDasharray="4 4" name="P90 (Ceiling)" dot={false} />
-                <Line type="monotone" dataKey="realized" stroke="#fbbf24" strokeWidth={2.5} name="Realized Vol" />
-                <Line type="monotone" dataKey="p10" stroke="#f59e0b" strokeDasharray="4 4" name="P10 (Floor)" dot={false} />
+                <Line type="monotone" dataKey="max" stroke="#f59e0b" strokeDasharray="4 4" name="Max (Ceiling)" dot={false} connectNulls={false} />
+                <Line type="monotone" dataKey="realized" stroke="#fbbf24" strokeWidth={2.5} name="Realized Vol" connectNulls={false} />
+                <Line type="monotone" dataKey="min" stroke="#f59e0b" strokeDasharray="4 4" name="Min (Floor)" dot={false} connectNulls={false} />
                 <Line type="monotone" dataKey="garch" stroke="#10b981" strokeWidth={2} name="GARCH Forecast" />
               </LineChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -624,11 +655,13 @@ export default function RiskStudioPage() {
                 <HelpBtn onClick={() => setActiveExplainer('correlation_stability')} />
               </div>
               <span className={`text-xs px-2.5 py-0.5 rounded border font-mono ${
-                correlation?.breakdown_alert
-                  ? 'bg-rose-950 border-rose-800 text-rose-300'
-                  : 'bg-emerald-950 border-emerald-800 text-emerald-300'
+                correlation?.is_regime_break == null
+                  ? 'bg-slate-800 border-slate-700 text-slate-400'
+                  : correlation.is_regime_break
+                    ? 'bg-rose-950 border-rose-800 text-rose-300'
+                    : 'bg-emerald-950 border-emerald-800 text-emerald-300'
               }`}>
-                {correlation?.breakdown_alert ? 'Regime Break Alert' : 'Diversified Regime'}
+                {correlation?.is_regime_break == null ? 'N/A' : correlation.is_regime_break ? 'Regime Break Alert' : 'Diversified Regime'}
               </span>
             </div>
             <p className="text-xs text-slate-400 mb-4">

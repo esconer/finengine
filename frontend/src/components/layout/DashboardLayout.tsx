@@ -1,5 +1,5 @@
 /**
- * Main dashboard layout component for Daisy Risk Engine
+ * Main dashboard layout component for FinEngine
  * Provides responsive layout with sidebar navigation and header
  */
 
@@ -7,8 +7,9 @@
 
 import React, { useState, useEffect } from 'react';
 import { usePathname } from 'next/navigation';
-import { Sidebar } from './Sidebar';
+import { Sidebar, navigation } from './Sidebar';
 import { Header } from './Header';
+import { NotificationContainer } from '@/components/ui/NotificationSystem';
 import { useUIStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
 
@@ -19,76 +20,9 @@ interface DashboardLayoutProps {
   className?: string;
 }
 
-const routeTitles: Record<string, { title: string; subtitle?: string }> = {
-  '/dashboard': {
-    title: 'Portfolio Summary',
-    subtitle: 'Overview of your portfolio performance and key metrics'
-  },
-  '/dashboard/realized-risk': {
-    title: 'Realized Risk',
-    subtitle: 'Historical risk metrics and portfolio performance analysis'
-  },
-  '/dashboard/forecast-risk': {
-    title: 'Forecast Risk',
-    subtitle: 'Future risk projections and Value-at-Risk forecasts'
-  },
-  '/dashboard/factor-exposure': {
-    title: 'Factor Exposure',
-    subtitle: 'Multi-factor risk analysis and exposure metrics'
-  },
-  '/dashboard/stress-testing': {
-    title: 'Stress Testing',
-    subtitle: 'Portfolio stress testing scenarios and impact analysis'
-  },
-  '/dashboard/concentration': {
-    title: 'Concentration',
-    subtitle: 'Portfolio concentration metrics and diversification analysis'
-  },
-  '/dashboard/liquidity': {
-    title: 'Liquidity',
-    subtitle: 'Portfolio liquidity analysis and trading constraints'
-  },
-  '/dashboard/volatility-sizing': {
-    title: 'Volatility Sizing',
-    subtitle: 'Dynamic position sizing based on volatility models'
-  },
-  '/dashboard/tear-sheet': {
-    title: 'Performance Tear-Sheet',
-    subtitle: 'Your portfolio against NIFTY 50 via the quantstats suite'
-  },
-  '/dashboard/risk-contribution': {
-    title: 'Risk Contribution',
-    subtitle: 'Euler decomposition of risk per position and tail attribution'
-  },
-  '/dashboard/risk-studio': {
-    title: 'Risk Studio',
-    subtitle: 'Consolidated Euler attribution, EVT tail risk, Copula matrix & Vol Cones'
-  },
-  '/dashboard/optimize': {
-    title: 'Portfolio Optimizer',
-    subtitle: 'Rebalance within your holdings across four strategies'
-  },
-  '/dashboard/regime': {
-    title: 'Market Regime',
-    subtitle: 'Hidden-Markov state of NIFTY and your portfolio inside it'
-  },
-  '/dashboard/monte-carlo': {
-    title: 'Goal Probability',
-    subtitle: 'Monte Carlo odds of hitting a target from your own return history'
-  },
-  '/dashboard/pairs': {
-    title: 'Cointegration & Pairs Scanner',
-    subtitle: 'Engle-Granger & Johansen rank tests with OU half-life estimates'
-  },
-  '/dashboard/india-flows': {
-    title: 'India Flows & Microstructure',
-    subtitle: 'NSE delivery % spikes, institutional cash flows, and ADV limits'
-  },
-  '/dashboard/settings': {
-    title: 'Settings',
-    subtitle: 'Configure dashboard preferences and data sources'
-  }
-};
+const routeTitles: Record<string, { title: string; subtitle?: string }> = Object.fromEntries(
+  navigation.map((item) => [item.href, { title: item.title ?? item.name, subtitle: item.subtitle ?? item.description }])
+);
 
 export function DashboardLayout({ 
   children, 
@@ -97,25 +31,30 @@ export function DashboardLayout({
   className 
 }: DashboardLayoutProps) {
   const pathname = usePathname();
-  const { sidebarOpen, toggleSidebar, darkMode } = useUIStore();
+  const sidebarOpen = useUIStore((s) => s.sidebarOpen);
+  const toggleSidebar = useUIStore((s) => s.toggleSidebar);
+  const darkMode = useUIStore((s) => s.darkMode);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
 
+  // Re-apply persisted dark mode after zustand hydration
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode);
+  }, [darkMode]);
+
   // Handle responsive behavior
   useEffect(() => {
-    const checkScreenSize = () => {
-      const mobile = window.innerWidth < 1024; // lg breakpoint
-      setIsMobile(mobile);
-      
-      if (!mobile) {
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const onChange = () => {
+      setIsMobile(!mq.matches);
+      if (mq.matches) {
         setMobileSidebarOpen(false);
       }
     };
 
-    checkScreenSize();
-    window.addEventListener('resize', checkScreenSize);
-    
-    return () => window.removeEventListener('resize', checkScreenSize);
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
   }, []);
 
   // Handle overlay click on mobile
@@ -139,10 +78,13 @@ export function DashboardLayout({
       )}
 
       {/* Sidebar */}
-      <div className={cn(
-        'fixed inset-y-0 left-0 z-50 transform transition-transform duration-300 ease-in-out lg:relative lg:translate-x-0',
-        mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
-      )}>
+      <div
+        className={cn(
+          'fixed inset-y-0 left-0 z-50 transform transition-transform duration-300 ease-in-out lg:relative lg:translate-x-0',
+          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
+        )}
+        inert={isMobile && !mobileSidebarOpen}
+      >
         <Sidebar
           isCollapsed={!isMobile && !sidebarOpen}
           onToggleCollapse={!isMobile ? toggleSidebar : undefined}
@@ -169,6 +111,8 @@ export function DashboardLayout({
           </div>
         </main>
       </div>
+
+      <NotificationContainer />
     </div>
   );
 }

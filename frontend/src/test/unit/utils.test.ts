@@ -10,6 +10,7 @@ import {
   camelToTitle,
   truncate,
   stringToColor,
+  toDateOnlyString,
 } from '@/lib/utils';
 
 describe('Frontend Utils', () => {
@@ -37,6 +38,13 @@ describe('Frontend Utils', () => {
       expect(formatPercentage(0.1234)).toBe('12.34%');
       expect(formatPercentage(0.05, 1)).toBe('5.0%');
       expect(formatPercentage(1.0)).toBe('100.00%');
+    });
+  });
+
+  describe('toDateOnlyString', () => {
+    it('formats from local calendar components, not UTC (04-B20)', () => {
+      expect(toDateOnlyString(new Date(2026, 0, 5))).toBe('2026-01-05');
+      expect(toDateOnlyString(new Date(2026, 11, 31))).toBe('2026-12-31');
     });
   });
 

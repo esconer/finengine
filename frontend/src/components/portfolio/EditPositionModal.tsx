@@ -8,7 +8,8 @@
 import React, { useState, useEffect } from 'react';
 import { X, Save, Loader } from 'lucide-react';
 import { PortfolioPosition, PortfolioUpdateRequest, Currency } from '@/types';
-import { cn } from '@/lib/utils';
+import { cn, formatCurrency } from '@/lib/utils';
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 
 interface EditPositionModalProps {
   isOpen: boolean;
@@ -98,6 +99,7 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
       }
 
       await onUpdate(position.id, updates);
+      onClose();
     } catch (error) {
       console.error('Failed to update position:', error);
       setErrors({ submit: 'Failed to update position. Please try again.' });
@@ -118,39 +120,33 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
 
   // Calculate current metrics
   const currentValue = position.current_value;
-  const totalCost = position.total_cost;
   const unrealizedGainLoss = position.unrealized_gain_loss;
   const unrealizedGainLossPct = position.unrealized_gain_loss_pct;
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto">
-      <div className="flex items-center justify-center min-h-screen px-4 pt-4 pb-20 text-center sm:block sm:p-0">
-        {/* Overlay */}
-        <div 
-          className="fixed inset-0 transition-opacity bg-gray-500 bg-opacity-75"
-          onClick={onClose}
-        />
-
-        {/* Modal */}
-        <div className="inline-block w-full max-w-lg p-6 my-8 overflow-hidden text-left align-middle transition-all transform bg-white dark:bg-gray-900 shadow-xl rounded-lg">
-          {/* Header */}
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h3 className="text-lg font-medium leading-6 text-gray-900 dark:text-white">
-                Edit Position
-              </h3>
-              <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                {position.ticker} - {position.custom_name || 'No custom name'}
-              </p>
-            </div>
-            <button
-              onClick={onClose}
-              className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-            >
-              <X className="w-5 h-5" />
-            </button>
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        closeOnOutsideClick={false}
+        className="p-0 gap-0 max-w-lg"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 pt-6 pb-4">
+          <div>
+            <DialogTitle className="text-lg font-medium">Edit Position</DialogTitle>
+            <DialogDescription className="text-sm mt-1">
+              {position.ticker} - {position.custom_name || 'No custom name'}
+            </DialogDescription>
           </div>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
 
+        <div className="px-6">
           {/* Current Position Info */}
           <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-4 mb-6">
             <h4 className="text-sm font-medium text-gray-900 dark:text-white mb-3">Current Position</h4>
@@ -164,13 +160,13 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
               <div>
                 <span className="text-gray-500 dark:text-gray-400">Avg Cost:</span>
                 <span className="ml-2 font-medium text-gray-900 dark:text-white">
-                  {currency === 'INR' ? '₹' : '$'}{position.buy_price.toFixed(2)}
+                  {formatCurrency(position.buy_price, currency)}
                 </span>
               </div>
               <div>
                 <span className="text-gray-500 dark:text-gray-400">Current Value:</span>
                 <span className="ml-2 font-medium text-gray-900 dark:text-white">
-                  {currency === 'INR' ? '₹' : '$'}{currentValue.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  {formatCurrency(currentValue, currency)}
                 </span>
               </div>
               <div>
@@ -180,164 +176,169 @@ export function EditPositionModal({ isOpen, position, onClose, onUpdate, currenc
                   unrealizedGainLoss >= 0 ? "text-green-600" : "text-red-600"
                 )}>
                   {unrealizedGainLoss >= 0 ? '+' : ''}
-                  {currency === 'INR' ? '₹' : '$'}{unrealizedGainLoss.toFixed(2)} 
+                  {formatCurrency(unrealizedGainLoss, currency)}{' '}
                   ({unrealizedGainLossPct.toFixed(2)}%)
                 </span>
               </div>
             </div>
           </div>
-
-          {/* Form */}
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Portfolio Weight */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Portfolio Weight
-              </label>
-              <input
-                type="number"
-                value={formData.weight || ''}
-                onChange={(e) => handleInputChange('weight', parseFloat(e.target.value) || 0)}
-                placeholder="0.15"
-                min="0"
-                max="1"
-                step="0.01"
-                className={cn(
-                  "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
-                  errors.weight ? "border-red-300" : "border-gray-300 dark:border-gray-600"
-                )}
-              />
-              {errors.weight && (
-                <p className="mt-1 text-sm text-red-600">{errors.weight}</p>
-              )}
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Current: {(position.weight * 100).toFixed(2)}% | Enter as decimal (0.15 = 15%)
-              </p>
-            </div>
-
-            {/* Quantity */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Quantity
-              </label>
-              <input
-                type="number"
-                value={formData.quantity || ''}
-                onChange={(e) => handleInputChange('quantity', parseFloat(e.target.value) || 0)}
-                placeholder="100"
-                min="0"
-                step="0.01"
-                className={cn(
-                  "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
-                  errors.quantity ? "border-red-300" : "border-gray-300 dark:border-gray-600"
-                )}
-              />
-              {errors.quantity && (
-                <p className="mt-1 text-sm text-red-600">{errors.quantity}</p>
-              )}
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Current: {position.quantity.toLocaleString()} shares
-              </p>
-            </div>
-
-            {/* Buy Price */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Average Buy Price ({currency})
-              </label>
-              <input
-                type="number"
-                value={formData.buy_price || ''}
-                onChange={(e) => handleInputChange('buy_price', parseFloat(e.target.value) || 0)}
-                placeholder="150.00"
-                min="0"
-                step="0.01"
-                className={cn(
-                  "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
-                  errors.buy_price ? "border-red-300" : "border-gray-300 dark:border-gray-600"
-                )}
-              />
-              {errors.buy_price && (
-                <p className="mt-1 text-sm text-red-600">{errors.buy_price}</p>
-              )}
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Current: {currency === 'INR' ? '₹' : '$'}{position.buy_price.toFixed(2)}
-              </p>
-            </div>
-
-            {/* Custom Name */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Custom Name
-              </label>
-              <input
-                type="text"
-                value={formData.custom_name || ''}
-                onChange={(e) => handleInputChange('custom_name', e.target.value)}
-                placeholder="Apple Inc."
-                className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
-              />
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Current: {position.custom_name || 'None'}
-              </p>
-            </div>
-
-            {/* Purchase Date */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Purchase Date
-              </label>
-              <input
-                type="date"
-                value={formData.added_on || ''}
-                max={new Date().toISOString().split('T')[0]}
-                onChange={(e) => handleInputChange('added_on', e.target.value)}
-                className={cn(
-                  "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white",
-                  errors.added_on ? "border-red-300" : "border-gray-300 dark:border-gray-600"
-                )}
-              />
-              {errors.added_on && (
-                <p className="mt-1 text-sm text-red-600">{errors.added_on}</p>
-              )}
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Current: {position.added_on ? position.added_on.slice(0, 10) : 'Unknown'}
-              </p>
-            </div>
-
-            {/* Error Message */}
-            {errors.submit && (
-              <div className="p-3 text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
-                {errors.submit}
-              </div>
-            )}
-
-            {/* Actions */}
-            <div className="flex space-x-3 pt-4">
-              <button
-                type="button"
-                onClick={onClose}
-                className="flex-1 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className="flex-1 flex items-center justify-center space-x-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {isSubmitting ? (
-                  <Loader className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Save className="w-4 h-4" />
-                )}
-                <span>{isSubmitting ? 'Updating...' : 'Update Position'}</span>
-              </button>
-            </div>
-          </form>
         </div>
-      </div>
-    </div>
+
+        {/* Form */}
+        <form onSubmit={handleSubmit} className="px-6 pb-6 space-y-4">
+          {/* Portfolio Weight */}
+          <div>
+            <label htmlFor="edit-weight" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Portfolio Weight
+            </label>
+            <input
+              id="edit-weight"
+              type="number"
+              value={formData.weight || ''}
+              onChange={(e) => handleInputChange('weight', parseFloat(e.target.value) || 0)}
+              placeholder="0.15"
+              min="0"
+              max="1"
+              step="0.01"
+              className={cn(
+                "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
+                errors.weight ? "border-red-300" : "border-gray-300 dark:border-gray-600"
+              )}
+            />
+            {errors.weight && (
+              <p className="mt-1 text-sm text-red-600">{errors.weight}</p>
+            )}
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Current: {(position.weight * 100).toFixed(2)}% | Enter as decimal (0.15 = 15%)
+            </p>
+          </div>
+
+          {/* Quantity */}
+          <div>
+            <label htmlFor="edit-quantity" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Quantity
+            </label>
+            <input
+              id="edit-quantity"
+              type="number"
+              value={formData.quantity || ''}
+              onChange={(e) => handleInputChange('quantity', parseFloat(e.target.value) || 0)}
+              placeholder="100"
+              min="0"
+              step="0.01"
+              className={cn(
+                "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
+                errors.quantity ? "border-red-300" : "border-gray-300 dark:border-gray-600"
+              )}
+            />
+            {errors.quantity && (
+              <p className="mt-1 text-sm text-red-600">{errors.quantity}</p>
+            )}
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Current: {position.quantity.toLocaleString()} shares
+            </p>
+          </div>
+
+          {/* Buy Price */}
+          <div>
+            <label htmlFor="edit-buy-price" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Average Buy Price ({currency})
+            </label>
+            <input
+              id="edit-buy-price"
+              type="number"
+              value={formData.buy_price || ''}
+              onChange={(e) => handleInputChange('buy_price', parseFloat(e.target.value) || 0)}
+              placeholder="150.00"
+              min="0"
+              step="0.01"
+              className={cn(
+                "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400",
+                errors.buy_price ? "border-red-300" : "border-gray-300 dark:border-gray-600"
+              )}
+            />
+            {errors.buy_price && (
+              <p className="mt-1 text-sm text-red-600">{errors.buy_price}</p>
+            )}
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Current: {formatCurrency(position.buy_price, currency)}
+            </p>
+          </div>
+
+          {/* Custom Name */}
+          <div>
+            <label htmlFor="edit-custom-name" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Custom Name
+            </label>
+            <input
+              id="edit-custom-name"
+              type="text"
+              value={formData.custom_name || ''}
+              onChange={(e) => handleInputChange('custom_name', e.target.value)}
+              placeholder="Apple Inc."
+              className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
+            />
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Current: {position.custom_name || 'None'}
+            </p>
+          </div>
+
+          {/* Purchase Date */}
+          <div>
+            <label htmlFor="edit-purchased-on" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Purchase Date
+            </label>
+            <input
+              id="edit-purchased-on"
+              type="date"
+              value={formData.added_on || ''}
+              max={new Date().toISOString().split('T')[0]}
+              onChange={(e) => handleInputChange('added_on', e.target.value)}
+              className={cn(
+                "w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white dark:bg-gray-800 text-gray-900 dark:text-white",
+                errors.added_on ? "border-red-300" : "border-gray-300 dark:border-gray-600"
+              )}
+            />
+            {errors.added_on && (
+              <p className="mt-1 text-sm text-red-600">{errors.added_on}</p>
+            )}
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Current: {position.added_on ? position.added_on.slice(0, 10) : 'Unknown'}
+            </p>
+          </div>
+
+          {/* Error Message */}
+          {errors.submit && (
+            <div className="p-3 text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+              {errors.submit}
+            </div>
+          )}
+
+          {/* Actions */}
+          <div className="flex space-x-3 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="flex-1 flex items-center justify-center space-x-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSubmitting ? (
+                <Loader className="w-4 h-4 animate-spin" />
+              ) : (
+                <Save className="w-4 h-4" />
+              )}
+              <span>{isSubmitting ? 'Updating...' : 'Update Position'}</span>
+            </button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
   );
 }
 

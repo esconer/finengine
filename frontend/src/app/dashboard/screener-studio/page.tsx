@@ -8,13 +8,11 @@ import {
   TrendingUp,
   Shield,
   Coins,
-  Percent,
   Search,
   Plus,
   Check,
   RefreshCw,
   ExternalLink,
-  ChevronRight,
   Sliders,
   AlertCircle,
   BarChart3,
@@ -34,18 +32,28 @@ import {
 
 import { screenerApi, portfolioApi } from '@/lib/api';
 import { ScreenerStock, ScreenerStrategyMeta, ScreenerStrategyResponse } from '@/types';
-import { formatCurrency, formatPercent } from '@/lib/utils';
+
+const STRATEGY_ICONS: Record<string, React.ReactNode> = {
+  coffee_can: <TrendingUp className="w-4 h-4 text-emerald-400" />,
+  magic_formula: <Sparkles className="w-4 h-4 text-indigo-400" />,
+  debt_free: <Shield className="w-4 h-4 text-cyan-400" />,
+  high_dividend: <Coins className="w-4 h-4 text-amber-400" />,
+  undervalued_growth: <BarChart3 className="w-4 h-4 text-purple-400" />,
+};
 
 export default function ScreenerStudioPage() {
   const [strategies, setStrategies] = useState<ScreenerStrategyMeta[]>([]);
+  const [strategiesError, setStrategiesError] = useState<string | null>(null);
   const [activeStrategy, setActiveStrategy] = useState<string>('coffee_can');
   const [screenerData, setScreenerData] = useState<ScreenerStrategyResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
   // Escalating feedback for cold-cache runs: the first screen can take up to a
   // minute server-side; after 8s of pending, surface an explanation below the spinner.
   const [slowRunHint, setSlowRunHint] = useState<boolean>(false);
   const slowHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const addedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Custom filters
   const [showCustomFilters, setShowCustomFilters] = useState(false);
@@ -63,23 +71,18 @@ export default function ScreenerStudioPage() {
   const [addedStocks, setAddedStocks] = useState<Record<string, boolean>>({});
   const [addingStock, setAddingStock] = useState<string | null>(null);
 
-  const STRATEGY_ICONS: Record<string, React.ReactNode> = {
-    coffee_can: <TrendingUp className="w-4 h-4 text-emerald-400" />,
-    magic_formula: <Sparkles className="w-4 h-4 text-indigo-400" />,
-    debt_free: <Shield className="w-4 h-4 text-cyan-400" />,
-    high_dividend: <Coins className="w-4 h-4 text-amber-400" />,
-    undervalued_growth: <BarChart3 className="w-4 h-4 text-purple-400" />,
+  const fetchStrategies = async () => {
+    try {
+      setStrategiesError(null);
+      const meta = await screenerApi.getStrategies();
+      setStrategies(meta);
+    } catch (err) {
+      console.error('Error fetching strategies:', err);
+      setStrategiesError(err instanceof Error ? err.message : 'Failed to load screening strategies');
+    }
   };
 
   useEffect(() => {
-    const fetchStrategies = async () => {
-      try {
-        const meta = await screenerApi.getStrategies();
-        setStrategies(meta);
-      } catch (err) {
-        console.error('Error fetching strategies:', err);
-      }
-    };
     fetchStrategies();
   }, []);
 
@@ -100,6 +103,7 @@ export default function ScreenerStudioPage() {
   useEffect(() => {
     return () => {
       if (slowHintTimerRef.current) clearTimeout(slowHintTimerRef.current);
+      if (addedTimerRef.current) clearTimeout(addedTimerRef.current);
     };
   }, []);
 
@@ -112,7 +116,7 @@ export default function ScreenerStudioPage() {
       setScreenerData(result);
     } catch (err: any) {
       console.error('Error running screen:', err);
-      setError(err?.response?.data?.detail || err.message || 'Screen execution failed');
+      setError(err?.message || 'Screen execution failed');
     } finally {
       setLoading(false);
       clearSlowHintTimer();
@@ -127,6 +131,16 @@ export default function ScreenerStudioPage() {
 
   const handleCustomScreenSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (
+      !(minRoce > 0) ||
+      !(minRoe > 0) ||
+      !(maxPe > 0) ||
+      !(minMcapCr > 0) ||
+      !(minDivYield >= 0)
+    ) {
+      setError('Custom filters must be positive numbers (div. yield ≥ 0).');
+      return;
+    }
     setLoading(true);
     setError(null);
     setActiveStrategy('custom');
@@ -143,7 +157,7 @@ export default function ScreenerStudioPage() {
       setScreenerData(result);
     } catch (err: any) {
       console.error('Error running custom screen:', err);
-      setError(err?.response?.data?.detail || err.message || 'Custom screen failed');
+      setError(err?.message || 'Custom screen failed');
     } finally {
       setLoading(false);
       clearSlowHintTimer();
@@ -152,21 +166,38 @@ export default function ScreenerStudioPage() {
 
   const handleAddToPortfolio = async (stock: ScreenerStock) => {
     setAddingStock(stock.symbol);
+    setAddError(null);
     try {
+      const price = stock.price || 0;
+      // Mirror AddPositionModalSimple weight math: first position in an empty
+      // portfolio is 1.0 (zero-state invariant); otherwise value/(total+value).
+      const portfolio = await portfolioApi.getPortfolio({ currency: 'INR' });
+      const posList = portfolio.positions || [];
+      const totalValue = portfolio.total_value || 0;
+      const positionValue = 1 * price;
+      const weight =
+        posList.length === 0 || totalValue <= 0
+          ? 1.0
+          : positionValue / (totalValue + positionValue);
       await portfolioApi.addPosition({
         ticker: stock.ticker,
         quantity: 1,
-        buy_price: stock.price || 0,
-        weight: 0,
+        buy_price: price,
+        weight,
         region: 'IN',
       });
       setAddedStocks((prev) => ({ ...prev, [stock.symbol]: true }));
-      setTimeout(() => {
+      if (addedTimerRef.current) clearTimeout(addedTimerRef.current);
+      addedTimerRef.current = setTimeout(() => {
         setAddedStocks((prev) => ({ ...prev, [stock.symbol]: false }));
       }, 3000);
     } catch (err) {
       console.error('Failed to add to portfolio:', err);
-      alert(`Could not add ${stock.symbol} to portfolio.`);
+      setAddError(
+        err instanceof Error && err.message
+          ? err.message
+          : `Could not add ${stock.symbol} to portfolio.`
+      );
     } finally {
       setAddingStock(null);
     }
@@ -434,37 +465,65 @@ export default function ScreenerStudioPage() {
       </div>
 
       {/* Pre-built Strategy Selector Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-        {strategies.map((strat) => {
-          const isActive = activeStrategy === strat.key;
-          return (
-            <button
-              key={strat.key}
-              onClick={() => setActiveStrategy(strat.key)}
-              className={`p-3.5 rounded-xl border text-left transition-all relative overflow-hidden flex flex-col justify-between ${
-                isActive
-                  ? 'bg-slate-900 border-blue-500 shadow-md ring-1 ring-blue-500/30'
-                  : 'bg-slate-900/60 border-slate-800 hover:bg-slate-900 hover:border-slate-700'
-              }`}
-            >
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <div className="p-1.5 bg-slate-950 rounded border border-slate-800">
-                    {STRATEGY_ICONS[strat.key] || <TrendingUp className="w-4 h-4 text-blue-400" />}
-                  </div>
-                  {isActive && (
-                    <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                  )}
+      {strategiesError ? (
+        <div className="bg-red-950/40 border border-red-800 text-red-300 p-4 rounded-xl flex items-center justify-between gap-3 text-xs">
+          <span className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-400" />
+            {strategiesError}
+          </span>
+          <button
+            onClick={fetchStrategies}
+            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded font-semibold"
+          >
+            Retry
+          </button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+          {activeStrategy === 'custom' && (
+            <div className="p-3.5 rounded-xl border bg-slate-900 border-blue-500 shadow-md ring-1 ring-blue-500/30 relative overflow-hidden">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="p-1.5 bg-slate-950 rounded border border-slate-800">
+                  <Sliders className="w-4 h-4 text-indigo-400" />
                 </div>
-                <div className="text-xs font-bold text-white">{strat.name}</div>
-                <p className="text-[11px] text-slate-400 line-clamp-2 leading-snug">
-                  {strat.description}
-                </p>
+                <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
               </div>
-            </button>
-          );
-        })}
-      </div>
+              <div className="text-xs font-bold text-white">Custom Screen</div>
+              <p className="text-[11px] text-slate-400 leading-snug">Your multi-parameter filters</p>
+            </div>
+          )}
+          {strategies.map((strat) => {
+            const isActive = activeStrategy === strat.key;
+            return (
+              <button
+                key={strat.key}
+                onClick={() => setActiveStrategy(strat.key)}
+                disabled={loading}
+                className={`p-3.5 rounded-xl border text-left transition-all relative overflow-hidden flex flex-col justify-between disabled:opacity-60 ${
+                  isActive
+                    ? 'bg-slate-900 border-blue-500 shadow-md ring-1 ring-blue-500/30'
+                    : 'bg-slate-900/60 border-slate-800 hover:bg-slate-900 hover:border-slate-700'
+                }`}
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <div className="p-1.5 bg-slate-950 rounded border border-slate-800">
+                      {STRATEGY_ICONS[strat.key] || <TrendingUp className="w-4 h-4 text-blue-400" />}
+                    </div>
+                    {isActive && (
+                      <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                    )}
+                  </div>
+                  <div className="text-xs font-bold text-white">{strat.name}</div>
+                  <p className="text-[11px] text-slate-400 line-clamp-2 leading-snug">
+                    {strat.description}
+                  </p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Custom Screener Builder Drawer */}
       {showCustomFilters && (
@@ -482,9 +541,12 @@ export default function ScreenerStudioPage() {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 text-xs">
             <div>
-              <label className="block text-slate-300 font-semibold mb-1">Min ROCE (%)</label>
+              <label htmlFor="sf-min-roce" className="block text-slate-300 font-semibold mb-1">Min ROCE (%)</label>
               <input
+                id="sf-min-roce"
                 type="number"
+                min="0"
+                step="0.5"
                 value={minRoce}
                 onChange={(e) => setMinRoce(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
@@ -492,9 +554,12 @@ export default function ScreenerStudioPage() {
             </div>
 
             <div>
-              <label className="block text-slate-300 font-semibold mb-1">Min ROE (%)</label>
+              <label htmlFor="sf-min-roe" className="block text-slate-300 font-semibold mb-1">Min ROE (%)</label>
               <input
+                id="sf-min-roe"
                 type="number"
+                min="0"
+                step="0.5"
                 value={minRoe}
                 onChange={(e) => setMinRoe(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
@@ -502,9 +567,12 @@ export default function ScreenerStudioPage() {
             </div>
 
             <div>
-              <label className="block text-slate-300 font-semibold mb-1">Max P/E Multiple</label>
+              <label htmlFor="sf-max-pe" className="block text-slate-300 font-semibold mb-1">Max P/E Multiple</label>
               <input
+                id="sf-max-pe"
                 type="number"
+                min="0"
+                step="0.5"
                 value={maxPe}
                 onChange={(e) => setMaxPe(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
@@ -512,9 +580,12 @@ export default function ScreenerStudioPage() {
             </div>
 
             <div>
-              <label className="block text-slate-300 font-semibold mb-1">Min Market Cap (₹ Cr)</label>
+              <label htmlFor="sf-min-mcap" className="block text-slate-300 font-semibold mb-1">Min Market Cap (₹ Cr)</label>
               <input
+                id="sf-min-mcap"
                 type="number"
+                min="0"
+                step="100"
                 value={minMcapCr}
                 onChange={(e) => setMinMcapCr(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
@@ -522,9 +593,12 @@ export default function ScreenerStudioPage() {
             </div>
 
             <div>
-              <label className="block text-slate-300 font-semibold mb-1">Min Div. Yield (%)</label>
+              <label htmlFor="sf-min-div" className="block text-slate-300 font-semibold mb-1">Min Div. Yield (%)</label>
               <input
+                id="sf-min-div"
                 type="number"
+                min="0"
+                step="0.1"
                 value={minDivYield}
                 onChange={(e) => setMinDivYield(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
@@ -545,9 +619,15 @@ export default function ScreenerStudioPage() {
         </form>
       )}
 
-      {/* Screen Results Workspace */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg space-y-4">
-        {/* Active Strategy Header & Search Filter */}
+        {/* Screen Results Workspace */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg space-y-4">
+          {addError && (
+            <div className="mx-4 mt-4 p-3 bg-red-950/40 border border-red-800 text-red-300 rounded-lg text-xs flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              {addError}
+            </div>
+          )}
+          {/* Active Strategy Header & Search Filter */}
         <div className="p-4 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90">
           <div>
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
@@ -628,32 +708,34 @@ export default function ScreenerStudioPage() {
             </div>
 
             {/* Pagination Controls */}
-            <div className="p-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-              <div>
-                Showing {table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to{' '}
-                {Math.min(
-                  (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
-                  table.getFilteredRowModel().rows.length
-                )}{' '}
-                of {table.getFilteredRowModel().rows.length} screened stocks
+            {table.getFilteredRowModel().rows.length > 0 && (
+              <div className="p-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+                <div>
+                  Showing {table.getState().pagination.pageIndex * table.getState().pagination.pageSize + 1} to{' '}
+                  {Math.min(
+                    (table.getState().pagination.pageIndex + 1) * table.getState().pagination.pageSize,
+                    table.getFilteredRowModel().rows.length
+                  )}{' '}
+                  of {table.getFilteredRowModel().rows.length} screened stocks
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => table.previousPage()}
+                    disabled={!table.getCanPreviousPage()}
+                    className="px-3 py-1 bg-slate-800 text-slate-200 rounded disabled:opacity-40"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    onClick={() => table.nextPage()}
+                    disabled={!table.getCanNextPage()}
+                    className="px-3 py-1 bg-slate-800 text-slate-200 rounded disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => table.previousPage()}
-                  disabled={!table.getCanPreviousPage()}
-                  className="px-3 py-1 bg-slate-800 text-slate-200 rounded disabled:opacity-40"
-                >
-                  Previous
-                </button>
-                <button
-                  onClick={() => table.nextPage()}
-                  disabled={!table.getCanNextPage()}
-                  className="px-3 py-1 bg-slate-800 text-slate-200 rounded disabled:opacity-40"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
+            )}
           </>
         )}
       </div>
