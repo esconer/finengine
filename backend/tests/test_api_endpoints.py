@@ -454,6 +454,13 @@ class TestHealthAndStatus:
         assert "status" in data
         assert "service" in data
     
+    def test_openai_model_discovery_is_honestly_empty(self, client: TestClient):
+        """FinEngine is not an LLM server and must not fabricate model IDs."""
+        response = client.get("/v1/models")
+
+        assert response.status_code == 200
+        assert response.json() == {"object": "list", "data": []}
+
     def test_root_endpoint(self, client: TestClient):
         """Test root endpoint"""
         response = client.get("/")

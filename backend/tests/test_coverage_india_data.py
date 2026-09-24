@@ -30,8 +30,8 @@ class TestIndiaDataService:
         amihud = compute_amihud_illiquidity(returns, rupee_vol)
         assert amihud > 0.0
 
-        # Empty fallback
-        assert compute_amihud_illiquidity(pd.Series([]), pd.Series([])) == 0.0
+        # Missing history is unavailable, not a synthetic zero.
+        assert compute_amihud_illiquidity(pd.Series([]), pd.Series([])) is None
 
         # 2. Days to liquidate
         # ₹5L position in ₹1Cr ADV stock @ 10% participation = 0.5d (500000 / 1000000 = 0.5)
@@ -41,7 +41,7 @@ class TestIndiaDataService:
 
         # Zero fallback
         assert compute_days_to_liquidate(0.0, 1000.0, 0.10) == 0.0
-        assert compute_days_to_liquidate(1000.0, 0.0, 0.10) == 0.0
+        assert compute_days_to_liquidate(1000.0, 0.0, 0.10) is None
 
     async def test_india_data_service_db_lifecycle(self, test_db: AsyncSession):
         service = IndiaDataService(db=test_db)
@@ -89,7 +89,8 @@ class TestIndiaDataService:
                     "symbol": "SBIN", "open": 800.0, "high": 810.0, "low": 795.0,
                     "close": 800.0, "prev_close": 800.0, "avg_price": 800.0,
                     "ttl_trd_qnty": 800000, "turnover_lacs": 6400.0,
-                    "deliv_qty": 200000, "deliv_per": 25.0
+                    "no_of_trades": 40000,
+                    "deliv_qty": 200000, "deliv_per": 20.0 + (i % 3)
                 }
             ], d)
 

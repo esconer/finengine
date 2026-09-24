@@ -17,7 +17,10 @@ vi.mock('next/link', () => ({
   ),
 }));
 
-// Ten equal positions across 4 sectors: HHI = 0.1, N_eff = 10 → score 100.
+// Canonical concentration is equal across the book even though native
+// position values are deliberately uneven. The old native-value heuristic
+// would not produce 100% for this fixture.
+const nativeValues = [4000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 500, 500];
 const positions = Array.from({ length: 10 }, (_, i) => ({
   id: i + 1,
   ticker: `STK${i}.NS`,
@@ -25,7 +28,13 @@ const positions = Array.from({ length: 10 }, (_, i) => ({
   quantity: 10,
   buy_price: 90,
   last_price: 100,
-  market_value: 1000,
+  market_value: nativeValues[i],
+  current_value_base: 1000,
+  buy_price_base: 80,
+  last_price_base: 100,
+  total_cost_base: 800,
+  unrealized_gain_loss_base: 200,
+  unrealized_gain_loss_pct_base: 25,
   sector: ['Bank', 'IT', 'Energy', 'Pharma'][i % 4],
 }));
 
@@ -35,6 +44,10 @@ const sectors = [
   { name: 'Energy', value: 2000 },
   { name: 'Pharma', value: 2000 },
 ];
+
+let concentrationResponse: { diversification_score: number } | null = {
+  diversification_score: 100,
+};
 
 vi.mock('@/lib/store', () => ({
   usePortfolioStore: () => ({
@@ -61,6 +74,7 @@ vi.mock('@/hooks/useAnalytics', () => ({
       riskScore: null,
       realizedRisk: null,
       forecastRisk: null,
+      concentration: concentrationResponse,
     },
     loading: false,
     error: null,
@@ -112,8 +126,35 @@ describe('DashboardSummary — Phase 4 instrument vol + diversification decimals
     await waitFor(() => {
       expect(screen.getByText('Annual Volatility')).toBeDefined();
     });
-    // Perfect-10 book: score is exactly 100 → must render "100.0%".
+    // Canonical concentration is 100 even though native values are uneven.
     expect(screen.getAllByText('100.0%').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Diversification Score').length).toBeGreaterThan(0);
+  });
+
+  it('uses base-currency cost fields for the visible P&L', async () => {
+    render(<DashboardSummary />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Unrealized P&L')).toBeDefined();
+    });
+    expect(screen.getByText('+₹2,000.00')).toBeDefined();
+    expect(screen.getByText('+25.00%')).toBeDefined();
+    expect(screen.getAllByText('₹1,000.00').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('₹100.00').length).toBeGreaterThan(0);
+  });
+
+  it('renders N/A when canonical concentration is unavailable', async () => {
+    concentrationResponse = null;
+    try {
+      render(<DashboardSummary />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Annual Volatility')).toBeDefined();
+      });
+      expect(screen.getAllByText('N/A').length).toBeGreaterThan(0);
+      expect(screen.queryByText('100.0%')).toBeNull();
+    } finally {
+      concentrationResponse = { diversification_score: 100 };
+    }
   });
 });

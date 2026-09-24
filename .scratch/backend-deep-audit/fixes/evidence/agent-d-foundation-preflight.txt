@@ -1,0 +1,17 @@
+PASS D-01/dev: exact async URL must resolve to /app/backend/data/daisy.db
+PASS D-10/dev: only Settings-backed CORS/database keys may be injected
+PASS D-01/prod: exact async URL must resolve to /app/backend/data/daisy.db
+PASS D-10/prod: only Settings-backed CORS/database keys may be injected
+PASS D-07/dev: bind sources=['backend/data', 'frontend/src', 'frontend/public']; missing=[]
+PASS D-07/prod: bind sources=[]; missing=[]
+PASS D-02: runtime workdir/import/dependencies must agree
+PASS D-05: backend probe must use stdlib and test HTTP plus DB
+PASS D-11: COPY lines must be source allowlist only; forbidden=[]
+PASS D-03: deployment must not globally prune or auto-prune on exit
+PASS D-04: backup must copy a verified SQLite backup from the configured mounted DB
+PASS D-06: rollback must load and select recorded image identities
+PASS D-08: legacy DB converges to version=1, quick_check=ok
+PASS D-09: fresh/migrated tables must expose canonical uniqueness and integrity checks
+PASS D-12: CI targets existing integration tests and supplies backend/ as Docker context
+PASS D-13/migrations: failed cleanup must not exit zero
+SUMMARY: 16 passed; 0 failed

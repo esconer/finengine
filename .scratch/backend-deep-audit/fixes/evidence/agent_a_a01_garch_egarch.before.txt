@@ -1,0 +1,15 @@
+﻿2026-09-24 01:07:32 - app.services.analytics_engine - ERROR - EGARCH forecast error: Analytic forecasts not available for horizon > 1
+CHECK|garch_h1_volatility|backend=0.191976736853|reference=0.191976736853|abs_diff=0|rel_diff=0|tolerance=atol:0.001,rtol:0.005|PASS
+CHECK|garch_h1_var|backend=-0.0198936392096|reference=-0.0198918690621|abs_diff=1.77014748779e-06|rel_diff=8.89884948603e-05|tolerance=atol:0.0006,rtol:0.0001|PASS
+CHECK|garch_h5_volatility|backend=0.21265238802|reference=0.21265238802|abs_diff=0|rel_diff=0|tolerance=atol:0.001,rtol:0.005|PASS
+CHECK|garch_h5_var|backend=-0.0492743493324|reference=-0.0220341981407|abs_diff=0.0272401511917|rel_diff=1.23626696182|tolerance=atol:0.0006,rtol:0.0001|FAIL
+CHECK|garch_h5_cvar|backend=-0.0617052642096|reference=-0.0276317734073|abs_diff=0.0340734908023|rel_diff=1.23312717936|tolerance=atol:0.0006,rtol:0.0001|FAIL
+CHECK|egarch_h1_volatility|backend=0.195422141849|reference=0.195422141849|abs_diff=0|rel_diff=0|tolerance=atol:0.001,rtol:0.005|PASS
+CHECK|egarch_h1_var|backend=-0.020250670197|reference=-0.0202488682807|abs_diff=1.80191631093e-06|rel_diff=8.89884948605e-05|tolerance=atol:0.0006,rtol:0.0001|PASS
+CHECK|egarch_h5_volatility|backend=None|reference=0.2189663092017272|abs_diff=inf|rel_diff=inf|tolerance=atol:0.001,rtol:0.005|FAIL
+CHECK|egarch_h5_var|backend=None|reference=-0.02268842164444367|abs_diff=inf|rel_diff=inf|tolerance=atol:0.0006,rtol:0.0001|FAIL
+CHECK|egarch_h5_finite|backend=0|reference=1|abs_diff=1|rel_diff=1|tolerance=atol:0,rtol:0|FAIL
+OUTPUT|garch_h1|backend_var=-0.019893639209580483|reference_var=-0.019891869062092688
+OUTPUT|garch_h5|backend_var=-0.04927434933242286|reference_var=-0.02203419814074578
+OUTPUT|egarch_h5|backend=None|reference=0.2189663092017272
+

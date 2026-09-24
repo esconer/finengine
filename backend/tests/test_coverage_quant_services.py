@@ -86,7 +86,9 @@ class TestVolatilityService:
         # Empty input must not fabricate a forecast (was: hardcoded 0.20)
         with pytest.raises(ValueError, match="empty"):
             VolatilityService.calculate_ewma_volatility(pd.Series(dtype=float))
-        assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) > 0
+        # One observation has no sample dispersion; use the explicit
+        # insufficient/zero contract rather than abs(return).
+        assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) == 0.0
 
     def test_forecast_garch_volatility(self):
         s = pd.Series(np.random.normal(0, 0.015, 200))

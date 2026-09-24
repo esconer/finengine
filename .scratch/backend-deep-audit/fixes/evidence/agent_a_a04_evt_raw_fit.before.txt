@@ -1,0 +1,10 @@
+﻿CHECK|raw_fitted_xi|backend=-0.5|reference=-2.01301977674|abs_diff=1.51301977674|rel_diff=0.751616945955|tolerance=atol:1e-06,rtol:1e-6|FAIL
+CHECK|raw_evt_var|backend=-0.069798|reference=-0.0301336751272|abs_diff=0.0396643248728|rel_diff=1.31627903684|tolerance=atol:1e-06,rtol:1e-6|FAIL
+CHECK|raw_evt_es|backend=-0.08862|reference=-0.0309544261044|abs_diff=0.0576655738956|rel_diff=1.86291852742|tolerance=atol:1e-06,rtol:1e-6|FAIL
+CHECK|field_gpd_shape_xi_raw|backend='<missing>'|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+CHECK|field_gpd_shape_xi_constrained|backend='<missing>'|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+CHECK|field_metrics_constrained|backend='<missing>'|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+CHECK|field_metrics_valid|backend='<missing>'|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+OUTPUT|backend|{'confidence_level': 0.99, 'evt_pot_var_99': -0.069798, 'evt_pot_es_99': -0.08862, 'historical_var_99': -0.02839, 'historical_es_99': -0.030561, 'threshold_u': 0.0, 'gpd_shape_xi': -0.5, 'gpd_scale_beta': 0.063133, 'model_fitted': True, 'exceedances_count': 10, 'total_observations': 200, 'is_fat_tailed': True}
+OUTPUT|reference|xi=-2.01301977674,beta=0.0631326229031,var=-0.0301336751272,es=-0.0309544261044
+

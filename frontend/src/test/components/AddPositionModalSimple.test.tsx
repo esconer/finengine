@@ -87,6 +87,19 @@ describe('AddPositionModalSimple Component', () => {
     expect(onAdd.mock.calls[0][0].added_on).toBe('2024-06-15');
   });
 
+  it('keeps a bare US ticker in USD when the display currency is INR', async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    openModal(onAdd);
+    fireEvent.change(screen.getByPlaceholderText(/MOTHERSON\.NS/i), { target: { value: 'AAPL' } });
+    fireEvent.change(screen.getByPlaceholderText('100'), { target: { value: '1' } });
+    fireEvent.change(screen.getByPlaceholderText('100.00'), { target: { value: '150' } });
+    await screen.findByDisplayValue('100.00%');
+    fireEvent.click(screen.getByRole('button', { name: /Add Position/ }));
+    await waitFor(() => expect(onAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ ticker: 'AAPL', region: 'US' })
+    ));
+  });
+
   it('blocks submit and shows retry when portfolio total fails to load', async () => {
     vi.mocked(portfolioApi.getPortfolio).mockRejectedValueOnce(new Error('offline'));
     const onAdd = vi.fn();

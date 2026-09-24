@@ -30,6 +30,14 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+
+def _safe_not_found_detail(exc: Exception) -> str:
+    """Expose only the stable lookup phrase, never provider exception text."""
+    if "unknown ticker" in str(exc).lower():
+        return "Unknown ticker"
+    return "Resource not found"
+
+
 router = APIRouter()
 
 
@@ -44,12 +52,12 @@ async def get_company_full_profile(ticker: str):
         service = get_equity_research_service()
         data = await service.get_full_profile(ticker)
         return data
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching full profile for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -61,12 +69,12 @@ async def get_company_shareholding(ticker: str):
     try:
         service = get_equity_research_service()
         return await service.get_shareholding(ticker)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching shareholding for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -79,10 +87,10 @@ async def get_company_concalls(ticker: str):
         service = get_equity_research_service()
         concalls = await service.get_concalls(ticker)
         return {"ticker": ticker.upper(), "count": len(concalls), "concalls": concalls}
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching concalls for {ticker}: {e}")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -95,12 +103,12 @@ async def get_company_custom_ratios(ticker: str):
     try:
         service = get_equity_research_service()
         return await service.get_custom_ratios(ticker)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching custom ratios for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -121,12 +129,12 @@ async def export_company_excel_model(ticker: str):
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error exporting Excel for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -143,12 +151,12 @@ async def get_ai_investment_memo_prompt(
         service = get_ai_dossier_service()
         prompt = await service.get_investment_memo_prompt(ticker, custom_instructions=custom_instructions)
         return {"ticker": ticker.upper(), "prompt": prompt}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error generating memo prompt for {ticker}: {e}")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=_safe_not_found_detail(exc))
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -161,12 +169,12 @@ async def get_ai_forensic_prompt(ticker: str):
         service = get_ai_dossier_service()
         prompt = await service.get_forensic_audit_prompt(ticker)
         return {"ticker": ticker.upper(), "prompt": prompt}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error generating forensic prompt for {ticker}: {e}")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=_safe_not_found_detail(exc))
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -184,12 +192,12 @@ async def get_ai_dossier(
         if format == "json":
             return {"ticker": ticker.upper(), "format": format, "data": dossier}
         return {"ticker": ticker.upper(), "format": format, "content": dossier}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error generating AI dossier for {ticker}: {e}")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=_safe_not_found_detail(exc))
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -226,12 +234,12 @@ async def run_screener_strategy(
             cache_service=CacheService(db, ttl_minutes=SCREENER_DB_TTL_MINUTES),
         )
         return await service.run_screen(strategy, max_stocks=max_stocks)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error running screener {strategy}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid screener request")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -250,8 +258,8 @@ async def run_custom_screen(request: CustomScreenRequest):
             min_div_yield=request.min_div_yield,
             max_stocks=request.max_stocks or 50,
         )
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error running custom screener: {e}")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except Exception:
+        logger.error("Equity research request failed")
         raise HTTPException(status_code=500, detail="Internal server error")

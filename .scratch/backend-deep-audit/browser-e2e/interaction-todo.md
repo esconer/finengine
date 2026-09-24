@@ -1,0 +1,34 @@
+# Browser Interaction Todo
+
+- [x] Verify live stack is reachable without mutation.
+- [x] Build and start isolated 8001/3001 stack.
+- [x] Capture empty desktop/mobile route baseline.
+- [x] Add first holding and verify 100% weight.
+- [x] Verify single-holding 0% diversification.
+- [x] Seed multi-holding mixed-currency fixture.
+- [x] Test empty/malformed/negative form validation.
+- [x] Test duplicate ticker 409 handling.
+- [x] Test edit and restore values.
+- [x] Test delete confirmation and persistence.
+- [x] Test INR/USD view and capture P&L/row discrepancy.
+- [x] Capture seeded desktop/mobile route baseline.
+- [x] Finish settled internal-scroll desktop sections (13 captures per route).
+- [x] Finish settled internal-scroll mobile sections (13 captures per route).
+- [x] Test CSV import with synthetic INFY row, capture stale header state, and remove it.
+- [x] Test CSV invalid/unsupported input.
+- [x] Exercise forecast model and horizon controls (EGARCH, 10 days; both API requests captured).
+- [x] Exercise factor lookback control (252d → 504d; API request and updated analysis captured).
+- [x] Exercise stress presets and custom scenario (Run All + AuditShock -17%).
+- [x] Exercise volatility sizing simulation (dry-run only; database remained at five positions).
+- [x] Run all five optimizer strategies (HRP, Min Vol, Max Sharpe, Min CVaR, Black-Litterman).
+- [x] Run all three Monte Carlo methods (GBM, Student-t, Bootstrap).
+- [x] Exercise Pairs Scan, Regime refresh, and India refresh controls.
+- [x] Exercise Equity Research ticker search, audited-statements tab, and memo/forensic AI prompts.
+- [x] Exercise Screener built-in/custom/add flow; temporary BHARTIARTL.NS added then removed (duplicate conflict remains covered by Add Position 409 evidence).
+- [x] Exercise Settings source save/restore and isolated cache purge; portfolio preservation verified.
+- [x] Test controlled provider/loading/validation failures (forecast API abort, form validation, duplicate 409, unsupported CSV).
+- [x] Test isolated database-unavailable state (portfolio API aborted; explicit Network Error captured).
+- [x] Test WebSocket status, subscribe confirmation, ping/pong, disconnect, and reconnect.
+- [x] Run direct API capture (79/79) and independent core/advanced replays.
+- [x] Generate page reports and final summaries.
+- [x] Recompute protected-file hashes and close audit processes.

@@ -1,0 +1,7 @@
+﻿CHECK|memory_keys_differ|backend=False|reference='different'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+CHECK|durable_keys_differ|backend=False|reference='different'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+OUTPUT|memory_short|TypeError:_mem_cache_key() got an unexpected keyword argument 'lookback_days'
+OUTPUT|memory_long|TypeError:_mem_cache_key() got an unexpected keyword argument 'lookback_days'
+OUTPUT|durable_short|TypeError:_db_cache_keys() got an unexpected keyword argument 'lookback_days'
+OUTPUT|durable_long|TypeError:_db_cache_keys() got an unexpected keyword argument 'lookback_days'
+

@@ -2,18 +2,32 @@
 Data API endpoints for market data fetching and management
 """
 
-from datetime import datetime, timedelta
-from typing import List, Optional
+from datetime import date, datetime, timedelta
+from typing import Any, List, Optional
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.db.database import get_db_session
-from app.models.database import AppSetting, StockTimeseries
+from app.models.database import AnalyticsCache, AppSetting, StockTimeseries
 from app.services.data_service import GlobalDataService, DataService, canonical_ticker
-from app.services.cache_service import GlobalCacheService, CacheService, clear_market_data_cache
-from app.services.source_preference_service import get_primary_source, set_primary_source, source_order_for, get_setting
+from app.services.cache_service import (
+    GlobalCacheService,
+    CacheService,
+    clear_market_data_cache,
+    advance_cache_generation,
+    clear_service_memos,
+    ProviderError,
+)
+from app.services.source_preference_service import (
+    PREFERENCE_KEY,
+    get_primary_source,
+    get_setting,
+    source_order_for,
+    validate_source,
+)
 from app.services.indicators_service import IndicatorsService, SUPPORTED_INDICATORS, StaleMarketDataError
 from app.services.company_data_service import get_company_data_service
 from app.models.schemas import (
@@ -26,6 +40,127 @@ logger = setup_logger(__name__)
 
 # Create router
 router = APIRouter()
+
+_MAX_COLLECTION_SIZE = 50
+_MAX_INDICATORS = 20
+_MAX_DATE_RANGE_DAYS = 3650
+
+
+def _coerce_date(value: Any, field_name: str) -> Optional[date]:
+    if value is None:
+        return None
+    if not isinstance(value, (str, date, datetime)):
+        raise HTTPException(status_code=422, detail=f"{field_name} must be YYYY-MM-DD")
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be YYYY-MM-DD") from exc
+
+
+def _date_window(start: Any, end: Any, default_days: int) -> tuple[str, str]:
+    end_date = _coerce_date(end, "end") or datetime.now().date()
+    start_date = _coerce_date(start, "start") or (end_date - timedelta(days=default_days))
+    if start_date > end_date:
+        raise HTTPException(status_code=422, detail="start must be on or before end")
+    if (end_date - start_date).days > _MAX_DATE_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"date range must be at most {_MAX_DATE_RANGE_DAYS} days")
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _bounded_tickers(values: Any, *, field_name: str = "tickers", dedupe: bool = True) -> List[str]:
+    if not isinstance(values, list) or not values:
+        raise HTTPException(status_code=422, detail=f"{field_name} must contain at least one ticker")
+    if len(values) > _MAX_COLLECTION_SIZE:
+        raise HTTPException(status_code=422, detail=f"At most {_MAX_COLLECTION_SIZE} {field_name} are allowed")
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(status_code=422, detail=f"{field_name} entries must be non-empty strings")
+        ticker = value.strip().upper()
+        if dedupe and ticker in seen:
+            continue
+        seen.add(ticker)
+        output.append(ticker)
+    return output
+
+
+def _raise_provider_http_error(exc: ProviderError) -> None:
+    """Translate the shared provider taxonomy without leaking upstream text."""
+    status_code = int(getattr(exc, "status_code", 502) or 502)
+    if not 400 <= status_code <= 599:
+        status_code = 502
+    kind = str(getattr(exc, "kind", "provider_error"))
+    detail = {
+        "rate_limit": "Upstream data service rate limit",
+        "auth": "Upstream data service unavailable",
+        "unknown_ticker": "Requested ticker was not found",
+        "invalid_input": "Invalid market-data request",
+    }.get(kind, "Upstream data service unavailable")
+    raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+async def _frame_source_for_window(df: Any, canonical: str, db: AsyncSession) -> str:
+    """Derive provenance from rows actually returned, not a newer out-of-window row."""
+    attrs = getattr(df, "attrs", {}) or {}
+    if isinstance(attrs.get("source"), str) and attrs["source"].strip():
+        return attrs["source"].strip()
+    raw_source = getattr(df, "_source", None)
+    if isinstance(raw_source, str) and raw_source.strip():
+        return raw_source.strip()
+    try:
+        source_column = df.get("source_used") if hasattr(df, "get") else None
+        if source_column is not None:
+            sources = {
+                str(value).strip()
+                for value in source_column.dropna().tolist()
+                if str(value).strip()
+            }
+            if len(sources) == 1:
+                return next(iter(sources))
+            if len(sources) > 1:
+                return "mixed"
+    except Exception:
+        pass
+
+    # A normalized vendor frame may not carry source_used.  Restrict the
+    # fallback lookup to the returned date span, never the latest row globally.
+    try:
+        dates = None
+        if hasattr(df, "columns") and "date" in df.columns:
+            dates = pd.to_datetime(df["date"], errors="coerce")
+        elif isinstance(getattr(df, "index", None), pd.DatetimeIndex):
+            dates = pd.Series(pd.to_datetime(df.index, errors="coerce"), index=df.index)
+        if dates is not None:
+            valid_dates = dates.dropna()
+            if not valid_dates.empty:
+                start = valid_dates.min()
+                end = valid_dates.max()
+                result = await db.execute(
+                    select(StockTimeseries.source_used)
+                    .where(
+                        StockTimeseries.ticker == canonical,
+                        StockTimeseries.date >= start.to_pydatetime(),
+                        StockTimeseries.date <= end.to_pydatetime(),
+                    )
+                    .order_by(StockTimeseries.date)
+                )
+                sources = {
+                    str(value).strip()
+                    for value in result.scalars().all()
+                    if value is not None and str(value).strip()
+                }
+                if len(sources) == 1:
+                    return next(iter(sources))
+                if len(sources) > 1:
+                    return "mixed"
+    except Exception:
+        logger.debug("Stored source lookup unavailable")
+    return "yfinance"
 
 
 # Dependency injection
@@ -52,7 +187,7 @@ async def get_technical_indicators(
         description=f"Comma-separated indicator names. Supported: {', '.join(SUPPORTED_INDICATORS)}"
     ),
     lookback_days: int = Query(default=90, ge=5, le=750, description="Window of records to return"),
-    end_date: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD), defaults to today"),
+    end_date: Optional[date] = Query(default=None, description="End date (YYYY-MM-DD), defaults to today"),
     indicators_service: IndicatorsService = Depends(get_indicators_service)
 ):
     """
@@ -61,16 +196,25 @@ async def get_technical_indicators(
     Adapted from TauricResearch/TradingAgents dataflows (Apache-2.0).
     """
     try:
-        requested = [i.strip() for i in indicators.split(",")] if indicators else None
+        if indicators is not None:
+            requested = [i.strip() for i in indicators.split(",") if i.strip()]
+            if not requested or len(requested) > _MAX_INDICATORS:
+                raise HTTPException(status_code=422, detail="indicators must contain 1-20 names")
+        else:
+            requested = None
+        end_iso = _coerce_date(end_date, "end_date")
         return await indicators_service.compute_window(
-            ticker, requested, lookback_days=lookback_days, end_date=end_date
+            ticker, requested, lookback_days=lookback_days,
+            end_date=end_iso.isoformat() if end_iso else None,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except StaleMarketDataError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error computing indicators for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid data request")
+    except StaleMarketDataError:
+        raise HTTPException(status_code=409, detail="Market data is stale")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Indicator request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -87,15 +231,20 @@ async def get_verified_snapshot(
     Pattern adapted from TauricResearch/TradingAgents market_data_validator.
     """
     try:
+        end_iso = _coerce_date(end_date, "end_date")
         return await indicators_service.verified_snapshot(
-            ticker, end_date=end_date, look_back_days=look_back_days
+            ticker,
+            end_date=end_iso.isoformat() if end_iso else None,
+            look_back_days=look_back_days,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except StaleMarketDataError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error building verified snapshot for {ticker}: {e}")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except StaleMarketDataError:
+        raise HTTPException(status_code=409, detail="Market data is stale")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Verified snapshot request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -113,12 +262,16 @@ async def get_fundamentals(
     try:
         source_order = source_order_for(await get_primary_source(db))
         return await get_company_data_service().get_fundamentals(ticker, source_order=source_order)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching fundamentals for {ticker}: {e}")
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Upstream data service unavailable")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Fundamentals request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -127,19 +280,25 @@ async def get_financial_statements(
     ticker: str,
     statement: str = Query(default="income", description="income | balance | cashflow"),
     freq: str = Query(default="quarterly", description="quarterly | annual"),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     Structured financial statements (income / balance sheet / cash flow).
     Pattern adapted from TauricResearch/TradingAgents (Apache-2.0).
     """
     try:
+        source_order = source_order_for(await get_primary_source(db))
         return await get_company_data_service().get_financial_statements(
-            ticker, statement=statement, freq=freq
+            ticker, statement=statement, freq=freq, source_order=source_order
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error fetching financials for {ticker}: {e}")
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid data request")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Financial statements request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -149,8 +308,10 @@ async def get_insider_transactions(ticker: str):
     try:
         records = await get_company_data_service().get_insider_transactions(ticker)
         return {"ticker": ticker.upper(), "count": len(records), "transactions": records}
-    except Exception as e:
-        logger.error(f"Error fetching insider transactions for {ticker}: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Insider transactions request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -186,8 +347,8 @@ async def get_api_config(
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error getting API config: {e}")
+    except Exception:
+        logger.error("API config read failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -206,44 +367,101 @@ async def update_api_config(
         bfinance primary -> bfinance, yfinance, Alpha Vantage (always last)
         yfinance primary -> yfinance, bfinance, Alpha Vantage (always last)
     """
-    updated_settings = {}
+    # Direct unit calls may receive FastAPI's Query sentinel when a parameter
+    # is omitted; normalize that sentinel before deciding whether anything was
+    # requested.
+    if not isinstance(primary_source, (str, type(None))):
+        primary_source = None
+    if not isinstance(cache_ttl_minutes, (int, type(None))):
+        cache_ttl_minutes = None
+    if not isinstance(enable_cache, (bool, type(None))):
+        enable_cache = None
 
     if primary_source is None and cache_ttl_minutes is None and enable_cache is None:
         raise HTTPException(status_code=400, detail="No configuration parameters provided")
 
-    if primary_source is not None:
-        try:
-            saved = await set_primary_source(db, primary_source)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        updated_settings["primary_source"] = saved
+    committed = False
+    try:
+        validated_source = validate_source(primary_source) if primary_source is not None else None
+        previous_source = None
+        source_changed = False
+        if validated_source is not None:
+            previous_source = await get_setting(db, PREFERENCE_KEY)
+            previous_normalized = (previous_source or "bfinance").strip().lower()
+            source_changed = previous_normalized != validated_source
+        statements = []
+        if validated_source is not None:
+            stmt = sqlite_insert(AppSetting.__table__).values(
+                key=PREFERENCE_KEY, value=validated_source,
+            )
+            statements.append(stmt.on_conflict_do_update(
+                index_elements=[AppSetting.key],
+                set_={"value": stmt.excluded.value, "updated_on": stmt.excluded.updated_on},
+            ))
+        if cache_ttl_minutes is not None:
+            stmt = sqlite_insert(AppSetting.__table__).values(
+                key="cache_ttl_minutes", value=str(cache_ttl_minutes),
+            )
+            statements.append(stmt.on_conflict_do_update(
+                index_elements=[AppSetting.key],
+                set_={"value": stmt.excluded.value},
+            ))
+        if enable_cache is not None:
+            stmt = sqlite_insert(AppSetting.__table__).values(
+                key="enable_cache", value=str(bool(enable_cache)),
+            )
+            statements.append(stmt.on_conflict_do_update(
+                index_elements=[AppSetting.key],
+                set_={"value": stmt.excluded.value},
+            ))
 
-    if cache_ttl_minutes is not None:
-        stmt = sqlite_insert(AppSetting.__table__).values(key="cache_ttl_minutes", value=str(cache_ttl_minutes))
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[AppSetting.key],
-            set_={"value": stmt.excluded.value},
-        )
-        await db.execute(stmt)
-        updated_settings["cache_ttl_minutes"] = cache_ttl_minutes
-
-    if enable_cache is not None:
-        stmt = sqlite_insert(AppSetting.__table__).values(key="enable_cache", value=str(bool(enable_cache)))
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[AppSetting.key],
-            set_={"value": stmt.excluded.value},
-        )
-        await db.execute(stmt)
-        updated_settings["enable_cache"] = bool(enable_cache)
-
-    if "cache_ttl_minutes" in updated_settings or "enable_cache" in updated_settings:
+        for statement in statements:
+            await db.execute(statement)
+        if source_changed:
+            # Source identity is not part of StockTimeseries' natural key.
+            # Fence in-flight work and remove rows/derived analytics under the
+            # old cascade in this same transaction as the preference update.
+            await db.execute(delete(StockTimeseries))
+            await db.execute(delete(AnalyticsCache))
+            advance_cache_generation("primary source preference changed")
+            clear_service_memos()
+        # One API-owned commit covers every setting.  The B-owned helper still
+        # commits for standalone callers; it is intentionally not called here.
         await db.commit()
+        committed = True
+        if source_changed:
+            # Repeat the process-local reset after durability so a fetch that
+            # began during the settings transaction cannot leave a warm memo.
+            clear_service_memos()
+        expire_all = getattr(db, "expire_all", None)
+        if callable(expire_all):
+            try:
+                expire_all()
+            except Exception:
+                logger.warning("API configuration cache refresh failed")
 
-    return {
-        "updated": True,
-        "settings": updated_settings,
-        "message": "Configuration updated successfully"
-    }
+        settings = {}
+        if validated_source is not None:
+            settings["primary_source"] = validated_source
+        if cache_ttl_minutes is not None:
+            settings["cache_ttl_minutes"] = cache_ttl_minutes
+        if enable_cache is not None:
+            settings["enable_cache"] = bool(enable_cache)
+        return {
+            "updated": True,
+            "settings": settings,
+            "message": "Configuration updated successfully",
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unsupported primary data source") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if not committed:
+            await db.rollback()
+        logger.error("API configuration update failed")
+        detail = "Configuration committed, but the response could not be prepared" if committed else "Configuration update failed"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 @router.post("/cache/clear")
@@ -263,16 +481,18 @@ async def clear_cache(
         result = await clear_market_data_cache(db)
         clear_tails_cache()
         return result
-    except Exception as e:
-        logger.error(f"Error clearing market data cache: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Market data cache clear failed")
         raise HTTPException(status_code=500, detail="Failed to clear cache")
 
 
 @router.get("/{ticker}", response_model=StockTimeseriesResponse)
 async def get_stock_data(
     ticker: str,
-    start: Optional[str] = Query(default=None, description="Start date (YYYY-MM-DD)"),
-    end: Optional[str] = Query(default=None, description="End date (YYYY-MM-DD)"),
+    start: Optional[date] = Query(default=None, description="Start date (YYYY-MM-DD)"),
+    end: Optional[date] = Query(default=None, description="End date (YYYY-MM-DD)"),
     force_refresh: bool = Query(default=False, description="Force refresh from yfinance"),
     data_service: DataService = Depends(get_data_service),
     cache_service: CacheService = Depends(get_cache_service),
@@ -287,20 +507,18 @@ async def get_stock_data(
     - **force_refresh**: Force refresh from yfinance instead of using cache
     """
     try:
-        # Set default dates
-        if not end:
-            end = datetime.now().strftime('%Y-%m-%d')
-        if not start:
-            start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        # Validate dates before probing cache or calling a vendor.
+        start, end = _date_window(start, end, default_days=365)
+        canonical = canonical_ticker(ticker)
         
         # Probe cache BEFORE fetch: fetch_historical_data stores fresh rows on a
         # vendor miss, so a post-fetch probe would mislabel vendor data as cached.
         cached_before = (
-            None if force_refresh else await data_service._get_cached_data(ticker, start, end)
+            None if force_refresh else await data_service._get_cached_data(canonical, start, end)
         )
         
         # Fetch data
-        df = await data_service.fetch_historical_data(ticker, start, end, force_refresh)
+        df = await data_service.fetch_historical_data(canonical, start, end, force_refresh)
         
         if df is None or df.empty:
             raise HTTPException(
@@ -310,27 +528,22 @@ async def get_stock_data(
         
         from_cache = cached_before is not None and not cached_before.empty
         
-        # Source of truth: the vendor recorded on the just-stored timeseries row
-        canon = canonical_ticker(ticker)
-        source = None
-        try:
-            row = await db.execute(
-                select(StockTimeseries.source_used)
-                .where(StockTimeseries.ticker == canon)
-                .order_by(StockTimeseries.date.desc())
-                .limit(1)
-            )
-            source = row.scalar_one_or_none()
-        except Exception as se:
-            logger.debug(f"source_used lookup failed for {canon}: {se}")
-        if not source:
-            source = data_service._source_of_df(df)
+        # Source of truth: derive from the frame actually returned.  Looking up
+        # the latest row for the ticker can label an older requested window with
+        # a newer source after a preference switch.
+        source = await _frame_source_for_window(df, canonical, db)
+        if source == "yfinance":
+            frame_source = getattr(data_service, "_source_of_df", None)
+            if callable(frame_source):
+                candidate_source = frame_source(df)
+                if isinstance(candidate_source, str) and candidate_source.strip():
+                    source = candidate_source.strip()
         if not isinstance(source, str) or not source:
             source = "yfinance"
         
         # Get ticker metadata for response (skip None values - yfinance often
         # lacks sector/industry, and the schema forbids nulls here)
-        quote_data = await data_service.fetch_quote(ticker)
+        quote_data = await data_service.fetch_quote(canonical)
         metadata = {}
         if quote_data:
             for meta_key in ("sector", "industry"):
@@ -342,7 +555,7 @@ async def get_stock_data(
         stock_data = []
         for _, row in df.iterrows():
             stock_data.append(StockDataResponse(
-                ticker=ticker.upper(),
+                ticker=canonical,
                 date=row['date'].strftime('%Y-%m-%d'),
                 open=float(row['open']),
                 high=float(row['high']),
@@ -353,17 +566,19 @@ async def get_stock_data(
             ))
         
         return StockTimeseriesResponse(
-            ticker=ticker.upper(),
+            ticker=canonical,
             data=stock_data,
             source=source,
             from_cache=from_cache,
             metadata=metadata
         )
         
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error in get_stock_data for {ticker}: {e}")
+    except Exception:
+        logger.error("Stock data request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -386,10 +601,12 @@ async def get_stock_quote(
         
         return StockQuoteResponse(**quote_data)
         
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error in get_stock_quote for {ticker}: {e}")
+    except Exception:
+        logger.error("Stock quote request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -402,12 +619,9 @@ async def get_batch_stock_data(
     Get OHLCV data for multiple tickers efficiently
     """
     try:
-        # Set default dates
-        end = request.end or datetime.now().strftime('%Y-%m-%d')
-        start = request.start or (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')
-        
-        # Convert tickers to uppercase
-        tickers = [ticker.upper() for ticker in request.tickers]
+        # Validate the entire request before vendor fan-out.
+        start, end = _date_window(request.start, request.end, default_days=252)
+        tickers = _bounded_tickers(request.tickers)
         
         # Fetch batch data
         results = await data_service.fetch_ohlcv_batch(
@@ -440,9 +654,13 @@ async def get_batch_stock_data(
             failed_tickers=results["failed_tickers"]
         )
         
-    except Exception as e:
-        logger.error(f"Error in get_batch_stock_data: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Batch stock data request failed")
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
 
 @router.post("/validate", response_model=ValidateTickerResponse)
@@ -454,15 +672,19 @@ async def validate_ticker(
     Validate if a ticker exists and has data
     """
     try:
-        is_valid = await data_service.validate_ticker(request.ticker)
+        is_valid = await data_service.validate_ticker(request.ticker, strict_errors=True)
         
         return ValidateTickerResponse(
             valid=is_valid,
             message=f"Ticker {request.ticker} is valid" if is_valid else f"Ticker {request.ticker} not found"
         )
         
-    except Exception as e:
-        logger.error(f"Error validating ticker {request.ticker}: {e}")
+    except ProviderError as exc:
+        _raise_provider_http_error(exc)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Ticker validation request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -475,6 +697,7 @@ async def refresh_ticker_data(
     Force refresh data for specified tickers
     """
     try:
+        tickers = _bounded_tickers(tickers)
         refreshed_count = 0
         failed_count = 0
         
@@ -485,12 +708,12 @@ async def refresh_ticker_data(
         for ticker in tickers:
             try:
                 df = await data_service.fetch_historical_data(ticker, start, end, force_refresh=True)
-                if df is not None:
+                if df is not None and not getattr(df, "empty", False):
                     refreshed_count += 1
                 else:
                     failed_count += 1
-            except Exception as e:
-                logger.error(f"Error refreshing {ticker}: {e}")
+            except Exception:
+                logger.error("Ticker refresh failed")
                 failed_count += 1
         
         return {
@@ -499,8 +722,10 @@ async def refresh_ticker_data(
             "message": f"Refreshed {refreshed_count} tickers successfully"
         }
         
-    except Exception as e:
-        logger.error(f"Error in refresh_ticker_data: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Ticker refresh request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

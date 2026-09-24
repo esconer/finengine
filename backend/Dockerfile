@@ -1,71 +1,54 @@
-# Multi-stage build for production optimization
-FROM python:3.12-slim as base
+# Build context is ./backend in both Compose and CI.
+FROM python:3.12-slim-bookworm AS builder
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        gcc \
-        g++ \
-        libssl-dev \
-        libffi-dev \
-        curl \
-        && rm -rf /var/lib/apt/lists/*
-
-# Set work directory
 WORKDIR /app
+RUN pip install uv==0.12.17
 
-# Copy requirements first for better caching
-COPY pyproject.toml uv.lock* ./
-COPY backend/pyproject.toml backend/uv.lock* ./backend/
+# Only dependency metadata enters the dependency layer. No .env, database,
+# logs, tests, coverage output, or generated caches are in this allowlist.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# Install UV and dependencies
-RUN pip install uv
-RUN uv pip install --system --frozen-lockfile
+FROM python:3.12-slim-bookworm AS production
 
-# Copy application code
-COPY backend/ ./backend/
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app/backend"
 
-# Production stage
-FROM python:3.12-slim as production
-
-# Install runtime dependencies only
+WORKDIR /app/backend
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        libssl1.1 \
-        && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system appuser \
+    && useradd --system --gid appuser --home-dir /app appuser \
+    && mkdir -p /app/backend/data \
+    && chown -R appuser:appuser /app/backend/data
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+COPY --from=builder /app/.venv /app/.venv
 
-# Set work directory
-WORKDIR /app
+# Explicit source allowlist. Wildcards are limited to *.py, so __pycache__,
+# .env*, data/, logs/, backups/, coverage, and test artifacts cannot be copied.
+COPY --chown=appuser:appuser app/*.py ./app/
+COPY --chown=appuser:appuser app/api/*.py ./app/api/
+COPY --chown=appuser:appuser app/db/*.py ./app/db/
+COPY --chown=appuser:appuser app/models/*.py ./app/models/
+COPY --chown=appuser:appuser app/services/*.py ./app/services/
+COPY --chown=appuser:appuser app/utils/*.py ./app/utils/
+COPY --chown=appuser:appuser main.py ./main.py
+COPY --chown=appuser:appuser migrations/*.py ./migrations/
 
-# Install UV
-RUN pip install uv
-
-# Copy installed packages from base
-COPY --from=base /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/
-COPY --from=base /usr/local/bin/uv /usr/local/bin/uv
-
-# Copy application code
-COPY --chown=appuser:appuser backend/ ./backend/
-
-# Set ownership and permissions
-RUN chown -R appuser:appuser /app
 USER appuser
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Expose port
 EXPOSE 8000
 
-# Run application
-CMD ["uv", "run", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Readiness combines the published HTTP liveness endpoint with SQLite
+# quick_check. Python is already present, so no curl/wget runtime is required.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import os,sqlite3,urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).close(); p=os.environ['DATABASE_URL'].rsplit('///',1)[1]; c=sqlite3.connect(p,timeout=3); ok=c.execute('PRAGMA quick_check').fetchone()[0]; c.close(); assert ok == 'ok', ok"]
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

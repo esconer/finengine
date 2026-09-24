@@ -4,7 +4,7 @@ Alpha Vantage multi-key rotation + budget guard tests.
 All network I/O is mocked at the requests layer; scenarios mirror the
 behaviors verified during ticket 22 implementation:
 rotation on daily-limit, retire-until-midnight, frequency cooldown,
-local budget guard (no wasted calls), no-key no-op, symbol bridge.
+local budget guard (no wasted calls), no-key no-op, identity-safe symbols.
 """
 
 
@@ -25,7 +25,7 @@ TIMESERIES = {
         "2026-08-24": {"1. open": "10", "2. high": "11", "3. low": "9", "4. close": "10.5", "5. volume": "1000"}
     }
 }
-QUOTE = {"Global Quote": {"01. symbol": "X", "05. price": "2500.55", "06. volume": "12345", "08. previous close": "2490.00"}}
+QUOTE = {"Global Quote": {"01. symbol": "AAPL", "05. price": "2500.55", "06. volume": "12345", "08. previous close": "2490.00"}}
 
 
 class FakeResp:
@@ -58,9 +58,10 @@ def calls(monkeypatch):
     return holder
 
 
-def test_symbol_bridge():
-    assert to_av_symbol("RELIANCE.NS") == "RELIANCE.BSE"
-    assert to_av_symbol("TATASTEEL.BO") == "TATASTEEL.BSE"
+def test_symbol_identity_is_not_substituted():
+    assert to_av_symbol("RELIANCE.NS") is None
+    assert to_av_symbol("TATASTEEL.BO") is None
+    assert to_av_symbol("TATASTEEL.BSE") is None
     assert to_av_symbol("AAPL") == "AAPL"
 
 
@@ -70,7 +71,7 @@ async def test_rotation_on_daily_limit(calls):
     svc = AlphaVantageService()
     svc.pool = KeyPool(["KEY_A", "KEY_B"], daily_limit=25, minute_limit=5)
 
-    df = await svc.fetch_daily_ohlcv("RELIANCE.NS", "2026-08-20", "2026-08-25")
+    df = await svc.fetch_daily_ohlcv("AAPL", "2026-08-20", "2026-08-25")
 
     assert [k for _, k in calls["recorded"]] == ["KEY_A", "KEY_B"]
     assert len(df) == 1 and df.iloc[0]["close"] == 10.5

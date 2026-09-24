@@ -10,10 +10,10 @@ One permanent test per nontrivial fix in this pass:
 - B-09 _to_thread forwards *args
 - B-10 AV quote echoes the requested ticker
 - B-13 dividend-yield filter reads bfinance percent as percent
-- B-14 volume-only frame -> ADV defaults, no StopIteration
-- B-15 None OHLC record fields ingest as 0 instead of TypeError
+- B-14 missing price history -> liquidity metrics remain unavailable, no synthetic defaults
+- B-15 incomplete bhavcopy rows are quarantined instead of persisted as zeros
 - I-07 dead mutable participation_rates default removed
-- HANDOFF #1 (06-foundation): concurrent same-key NSE ingests do not raise
+- HANDOFF #1 (06-foundation): repeated/corrected NSE ingests remain deterministic
 """
 
 import inspect
@@ -28,7 +28,7 @@ from sqlalchemy import select
 
 import app.services.screener_service as ss
 from main import app
-from app.models.database import NSEBhavcopy
+from app.models.database import NSEBhavcopy, NSEInstitutionalFlow
 from app.services.ai_dossier_service import AIDossierService
 from app.services.alpha_vantage_service import AlphaVantageService
 from app.services.company_data_service import CompanyDataService, _to_thread
@@ -102,7 +102,7 @@ async def test_av_daily_ohlcv_requests_full_outputsize():
         }
     }
     with patch.object(svc, "_make_request", new=AsyncMock(return_value=payload)) as m:
-        await svc.fetch_daily_ohlcv("RELIANCE.NS", "2026-01-01", "2026-01-05")
+        await svc.fetch_daily_ohlcv("AAPL", "2026-01-01", "2026-01-05")
     assert m.call_args[0][0] == "TIME_SERIES_DAILY"
     assert m.call_args[0][1]["outputsize"] == "full"
 
@@ -116,10 +116,10 @@ async def test_av_quote_echoes_requested_ticker_not_bridged():
         "08. previous close": "2490.00",
     }}
     with patch.object(svc, "_make_request", new=AsyncMock(return_value=payload)):
-        q = await svc.fetch_global_quote("RELIANCE.NS")
-    assert q["ticker"] == "RELIANCE.NS"      # requested, not RELIANCE.BSE
-    assert q["currency"] == "INR"            # BSE context still reflected
-    assert q["exchange"] == "BSE"
+        q = await svc.fetch_global_quote("AAPL")
+    assert q["ticker"] == "AAPL"              # requested listing is preserved
+    assert q["currency"] == "USD"
+    assert q["exchange"] == "Other"
 
 
 # ---------------------------------------------------------------------- B-09
@@ -277,7 +277,7 @@ async def test_custom_screen_div_yield_filter_reads_bfinance_percent(monkeypatch
 
 # ---------------------------------------------------------------------- B-14
 
-async def test_liquidity_limits_volume_only_frame_falls_back_to_defaults(test_db):
+async def test_liquidity_limits_volume_only_frame_reports_unavailable(test_db):
     service = IndiaDataService(db=test_db)
     p = PortfolioPosition(
         ticker="X.NS", quantity=100.0, buy_price=10.0, last_price=12.0,
@@ -288,13 +288,16 @@ async def test_liquidity_limits_volume_only_frame_falls_back_to_defaults(test_db
         index=pd.date_range("2024-01-01", periods=40, freq="B"),
     )
     limits = await service.calculate_portfolio_liquidity_limits([p], {"X.NS": df})
-    assert limits["positions"][0]["adv_30d_shares"] == 50000.0  # default branch
-    assert limits["positions"][0]["liquidity_tier"]
+    row = limits["positions"][0]
+    assert row["adv_30d_shares"] is None
+    assert row["days_to_liquidate_10pct_adv"] is None
+    assert row["data_status"] == "unavailable"
+    assert row["liquidity_tier"] == "UNAVAILABLE"
 
 
 # ---------------------------------------------------------------------- B-15
 
-async def test_bhavcopy_none_ohlc_fields_ingest_without_typeerror(test_db):
+async def test_bhavcopy_incomplete_row_is_quarantined(test_db):
     service = IndiaDataService(db=test_db)
     rec = {
         "symbol": "NILTEST", "open": None, "high": None, "low": None,
@@ -302,7 +305,8 @@ async def test_bhavcopy_none_ohlc_fields_ingest_without_typeerror(test_db):
         "ttl_trd_qnty": None, "turnover_lacs": None, "no_of_trades": None,
     }
     count = await service.ingest_bhavcopy_records([rec], datetime.utcnow())
-    assert count == 1
+    assert count == 0
+    assert (await test_db.execute(select(NSEBhavcopy).where(NSEBhavcopy.symbol == "NILTEST"))).scalar_one_or_none() is None
 
 
 # ---------------------------------------------------------------------- I-07
@@ -316,41 +320,30 @@ def test_liquidity_limits_signature_has_no_mutable_default():
 
 # ------------------------------------------------------- HANDOFF #1 (foundation)
 
-async def test_concurrent_bhavcopy_ingest_does_not_raise(test_db):
+async def test_repeated_bhavcopy_ingest_is_idempotent(test_db):
     service = IndiaDataService(db=test_db)
     today = datetime.utcnow()
-    recs = [{"symbol": "RACER", "close": 100.0, "ttl_trd_qnty": 1000}]
-    assert await service.ingest_bhavcopy_records(list(recs), today) == 1
-
-    # Simulate the concurrent racer: its existence-select saw nothing, then
-    # its insert collides with uq_bhav_symbol_date.
-    empty = Mock()
-    empty.scalars.return_value.all.return_value = []
-    with patch.object(test_db, "execute", new=AsyncMock(return_value=empty)):
-        assert await service.ingest_bhavcopy_records(list(recs), today) == 0
-
+    rec = {
+        "symbol": "RACER", "open": 99.0, "high": 101.0, "low": 98.0,
+        "close": 100.0, "prev_close": 99.0, "avg_price": 99.5,
+        "ttl_trd_qnty": 1000, "turnover_lacs": 10.0, "no_of_trades": 5,
+    }
+    assert await service.ingest_bhavcopy_records([rec], today) == 1
+    assert await service.ingest_bhavcopy_records([rec], today) == 0
     res = await test_db.execute(select(NSEBhavcopy).where(NSEBhavcopy.symbol == "RACER"))
     assert len(res.scalars().all()) == 1  # deduped, no exception
 
 
-async def test_concurrent_institutional_flow_ingest_updates_winner(test_db):
+async def test_institutional_flow_correction_updates_existing_row(test_db):
     service = IndiaDataService(db=test_db)
     today = datetime.utcnow()
     assert await service.ingest_institutional_flow(today, "FII", 100.0, 50.0) is True
+    assert await service.ingest_institutional_flow(today, "FII", 999.0, 444.0) is True
 
-    # Racer: select lies (empty), insert collides with uq_flow_date_cat,
-    # handler reselects the winner row and updates it.
-    empty = Mock()
-    empty.scalar_one_or_none.return_value = None  # flow select saw no row
-    winner_res = Mock()
-    winner_row = Mock()
-    winner_res.scalar_one_or_none.return_value = winner_row
-    with patch.object(
-        test_db, "execute", new=AsyncMock(side_effect=[empty, winner_res])
-    ):
-        ok = await service.ingest_institutional_flow(today, "FII", 999.0, 444.0)
-
-    assert ok is True
-    assert winner_row.buy_value_crores == 999.0
-    assert winner_row.sell_value_crores == 444.0
-    assert winner_row.net_value_crores == 999.0 - 444.0
+    result = await test_db.execute(
+        select(NSEInstitutionalFlow).where(NSEInstitutionalFlow.category == "FII")
+    )
+    row = result.scalar_one()
+    assert row.buy_value_crores == 999.0
+    assert row.sell_value_crores == 444.0
+    assert row.net_value_crores == 555.0

@@ -22,6 +22,12 @@ interface PortfolioStatsProps {
   currency: Currency;
 }
 
+const monetaryValue = (base: number | null | undefined, native: number | null | undefined): number => {
+  if (typeof base === 'number' && Number.isFinite(base)) return base;
+  if (typeof native === 'number' && Number.isFinite(native)) return native;
+  return 0;
+};
+
 export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
   // Calculate comprehensive statistics
   const stats = React.useMemo(() => {
@@ -40,31 +46,50 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
       };
     }
 
-    const totalCost = positions.reduce((sum, pos) => sum + pos.total_cost, 0);
-    const totalCurrentValue = positions.reduce((sum, pos) => sum + pos.current_value, 0);
-    const totalGainLoss = totalCurrentValue - totalCost;
-    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
-
-    // Find best and worst performers
-    const bestPerformer = positions.reduce((best, pos) => 
-      pos.unrealized_gain_loss_pct > best.unrealized_gain_loss_pct ? pos : best
+    const totalCost = positions.reduce(
+      (sum, pos) => sum + monetaryValue(pos.total_cost_base, pos.total_cost),
+      0
     );
-    
-    const worstPerformer = positions.reduce((worst, pos) => 
-      pos.unrealized_gain_loss_pct < worst.unrealized_gain_loss_pct ? pos : worst
+    const totalCurrentValue = positions.reduce(
+      (sum, pos) => sum + monetaryValue(pos.current_value_base, pos.current_value),
+      0
+    );
+    const totalGainLoss = positions.reduce(
+      (sum, pos) => sum + monetaryValue(
+        pos.unrealized_gain_loss_base,
+        pos.unrealized_gain_loss
+      ),
+      0
+    );
+    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
+    const gainLossPct = (pos: PortfolioPosition) => monetaryValue(
+      pos.unrealized_gain_loss_pct_base,
+      pos.unrealized_gain_loss_pct
+    );
+    const gainLoss = (pos: PortfolioPosition) => monetaryValue(
+      pos.unrealized_gain_loss_base,
+      pos.unrealized_gain_loss
+    );
+
+    // Find best and worst performers in the selected base currency.
+    const bestPerformer = positions.reduce((best, pos) =>
+      gainLossPct(pos) > gainLossPct(best) ? pos : best
+    );
+    const worstPerformer = positions.reduce((worst, pos) =>
+      gainLossPct(pos) < gainLossPct(worst) ? pos : worst
     );
 
     // Portfolio concentration (largest position weight)
     const portfolioConcentration = Math.max(...positions.map(pos => pos.weight * 100));
 
     // Winners vs Losers
-    const winnersCount = positions.filter(pos => pos.unrealized_gain_loss > 0).length;
-    const losersCount = positions.filter(pos => pos.unrealized_gain_loss < 0).length;
+    const winnersCount = positions.filter(pos => gainLoss(pos) > 0).length;
+    const losersCount = positions.filter(pos => gainLoss(pos) < 0).length;
 
     return {
       bestPerformer,
       worstPerformer,
-      avgGainLoss: positions.reduce((sum, pos) => sum + pos.unrealized_gain_loss_pct, 0) / positions.length,
+      avgGainLoss: positions.reduce((sum, pos) => sum + gainLossPct(pos), 0) / positions.length,
       portfolioConcentration,
       totalGainLoss,
       totalGainLossPct,
@@ -115,7 +140,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
                 {stats.bestPerformer?.ticker}
               </p>
               <p className="text-sm text-green-700 dark:text-green-300">
-                {formatPercent(stats.bestPerformer?.unrealized_gain_loss_pct)}
+                {formatPercent(stats.bestPerformer ? monetaryValue(stats.bestPerformer.unrealized_gain_loss_pct_base, stats.bestPerformer.unrealized_gain_loss_pct) : null)}
               </p>
             </div>
             <TrendingUp className="h-8 w-8 text-green-600" />
@@ -133,7 +158,7 @@ export function PortfolioStats({ positions, currency }: PortfolioStatsProps) {
                 {stats.worstPerformer?.ticker}
               </p>
               <p className="text-sm text-red-700 dark:text-red-300">
-                {formatPercent(stats.worstPerformer?.unrealized_gain_loss_pct)}
+                {formatPercent(stats.worstPerformer ? monetaryValue(stats.worstPerformer.unrealized_gain_loss_pct_base, stats.worstPerformer.unrealized_gain_loss_pct) : null)}
               </p>
             </div>
             <TrendingDown className="h-8 w-8 text-red-600" />

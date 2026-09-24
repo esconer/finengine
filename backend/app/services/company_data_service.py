@@ -23,6 +23,14 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from app.services.cache_service import (
+    ProviderError,
+    ProviderUnavailableError,
+    UnknownTickerError,
+    cache_generation_is_current,
+    get_cache_generation,
+    get_runtime_cache_snapshot,
+)
 from app.services.data_service import canonical_ticker, DataService
 from app.utils.logger import setup_logger
 
@@ -64,10 +72,20 @@ YF_FUNDAMENTALS_TTL_SECONDS = 24 * 60 * 60
 class CompanyDataService:
     """Fundamentals / statements / insider feed on top of yfinance."""
 
-    def __init__(self):
-        # norm_ticker -> (fetched_at_epoch, payload); local to the instance
-        # (process-wide singleton in prod, fresh per test).
+    def __init__(self, db_session=None, cache_service=None):
+        # norm_ticker -> (generation, fetched_at_epoch, payload); local to the
+        # instance (process-wide singleton in prod, fresh per test).
         self._yf_fundamentals_cache: Dict[str, tuple] = {}
+        self.cache_service = cache_service
+        if self.cache_service is None and db_session is not None:
+            from app.services.cache_service import CacheService
+            self.cache_service = CacheService(db_session)
+
+    async def _fundamentals_cache_enabled(self) -> bool:
+        if self.cache_service is not None and hasattr(self.cache_service, "get_runtime_config"):
+            return (await self.cache_service.get_runtime_config()).enabled
+        snapshot = get_runtime_cache_snapshot()
+        return snapshot.enabled if snapshot is not None else True
 
     # ---------------------------------------------------------- fundamentals
 
@@ -119,10 +137,17 @@ class CompanyDataService:
                 (503 semantics - retry later).
         """
         norm_ticker = _normalize(ticker)
+        cache_enabled = await self._fundamentals_cache_enabled()
+        generation = get_cache_generation()
         import bfinance
         import yfinance as yf
 
-        order = source_order or ["bfinance", "yfinance"]
+        if source_order is None:
+            from app.services.source_preference_service import get_active_source_order
+            order = get_active_source_order()
+        else:
+            order = source_order
+        had_outage = False
         # Fail fast on typos/unknown tiers instead of silently serving
         # yfinance for anything that isn't exactly "bfinance" (I-02).
         unknown = [v for v in order if v not in ("bfinance", "yfinance")]
@@ -147,6 +172,7 @@ class CompanyDataService:
 
                 out = {
                     "ticker": norm_ticker.upper(),
+                    "source": "bfinance",
                     "name": profile.name or info.get("longName") or norm_ticker,
                     "sector": profile.sector or info.get("sector"),
                     "industry_group": profile.industry_group,
@@ -182,14 +208,25 @@ class CompanyDataService:
                 }
                 filtered = {k: v for k, v in out.items() if v is not None}
                 return filtered if len(filtered) > 2 else None
-            except Exception as e:
-                logger.debug(f"bfinance fundamentals fetch skipped for {norm_ticker}: {e}")
+            except Exception as exc:
+                nonlocal had_outage
+                had_outage = True
+                logger.debug("bfinance fundamentals unavailable for %s: %s", norm_ticker, type(exc).__name__)
                 return None
 
         async def _fetch_yf() -> Dict[str, Any]:
             cached = self._yf_fundamentals_cache.get(norm_ticker)
-            if cached and time.time() - cached[0] < YF_FUNDAMENTALS_TTL_SECONDS:
-                return cached[1]
+            if cached:
+                cached_generation = cached[0] if len(cached) == 3 else None
+                cached_ts = cached[1] if len(cached) == 3 else cached[0]
+                cached_payload = cached[2] if len(cached) == 3 else cached[1]
+                if (
+                    cache_enabled
+                    and cached_generation in (None, generation)
+                    and time.time() - cached_ts < YF_FUNDAMENTALS_TTL_SECONDS
+                    and cache_generation_is_current(generation)
+                ):
+                    return cached_payload
 
             def _fetch() -> Dict[str, Any]:
                 t = yf.Ticker(norm_ticker)
@@ -197,15 +234,15 @@ class CompanyDataService:
 
             try:
                 info = await _to_thread(_fetch)
-            except Exception as e:
+            except Exception as exc:
                 # Yahoo occasionally rejects .info with 401 Invalid-Crumb; treat
                 # as temporary upstream outage rather than missing ticker.
-                raise RuntimeError(f"Fundamentals upstream unavailable: {type(e).__name__}: {e}") from e
+                raise ProviderUnavailableError("Fundamentals upstream unavailable", provider="yfinance") from exc
 
             if not info:
-                raise ValueError(f"No fundamentals returned for {ticker}")
+                raise UnknownTickerError("No fundamentals returned", provider="yfinance")
 
-            out: Dict[str, Any] = {"ticker": norm_ticker.upper()}
+            out: Dict[str, Any] = {"ticker": norm_ticker.upper(), "source": "yfinance"}
             fallback_map = {
                 "longName": ["shortName", "companyName"],
                 "fiftyTwoWeekHigh": ["52WeekHigh", "fifty_two_week_high", "yearHigh"],
@@ -228,32 +265,38 @@ class CompanyDataService:
                         val = val * 100
                     out[our_key] = val
 
-            if len(out) <= 1:  # only ticker -> stub info dict
-                raise ValueError(f"No fundamental fields returned for {ticker}")
-            self._yf_fundamentals_cache[norm_ticker] = (time.time(), out)
+            if len(out) <= 2:  # only ticker/source -> stub info dict
+                raise UnknownTickerError("No fundamental fields returned", provider="yfinance")
+            if cache_enabled and cache_generation_is_current(generation):
+                self._yf_fundamentals_cache[norm_ticker] = (generation, time.time(), out)
             return out
 
-        # Cascade per the user's preferred vendor order. Vendor failures fall
-        # through to the next tier; the deepest error keeps its original 404
-        # (ValueError) / 503 (RuntimeError) semantics once all tiers are spent.
+        # Cascade per the user's preferred vendor order.  Preserve the deepest
+        # typed error after every tier has declined the request.
         last_error: Optional[Exception] = None
         for vendor in order:
             if vendor == "bfinance":
                 if is_yf_mocked and not is_bf_mocked:
-                    continue  # mocked-yf tests must not hit real network vendors
+                    continue
                 bf_res = await _to_thread(_fetch_bf)
                 if bf_res is not None:
                     return bf_res
-            else:
+            elif vendor == "yfinance":
                 try:
                     return await _fetch_yf()
-                except (RuntimeError, ValueError) as e:
-                    last_error = e
-                    logger.warning(f"yfinance fundamentals unavailable for {norm_ticker}: {e}")
+                except (ProviderUnavailableError, UnknownTickerError) as exc:
+                    if isinstance(exc, ProviderUnavailableError):
+                        had_outage = True
+                    last_error = exc
+                    logger.warning("yfinance fundamentals unavailable for %s: %s", norm_ticker, exc.safe_message)
+            else:
+                raise ValueError(f"Unknown data source(s) in source_order: {[vendor]}")
 
+        if had_outage:
+            raise ProviderUnavailableError("Fundamentals upstream unavailable", provider="company_data")
         if last_error is not None:
             raise last_error
-        raise ValueError(f"No fundamentals returned for {ticker}")
+        raise UnknownTickerError("No fundamentals returned", provider="company_data")
 
     # ----------------------------------------------------------- statements
 
@@ -269,81 +312,82 @@ class CompanyDataService:
         statement: str = "income",
         freq: str = "quarterly",
         curr_date: Optional[str] = None,
+        source_order: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Balance sheet / cash flow / income statement as structured JSON.
-        Pulls 10-13 years annual and 12-16 quarters via bfinance, falling back to yfinance.
-
-        Period columns after curr_date are dropped to prevent look-ahead
-        (TradingAgents filter_financials_by_date).
-        """
+        """Return statements with the actual vendor recorded in ``source``."""
         if statement not in self.STATEMENTS:
             raise ValueError(f"statement must be one of {list(self.STATEMENTS)}")
         if freq not in ("quarterly", "annual", "yearly"):
             raise ValueError("freq must be 'quarterly' or 'annual'")
+        if source_order is None:
+            from app.services.source_preference_service import get_active_source_order
+            order = get_active_source_order()
+        else:
+            order = source_order
+        unknown = [vendor for vendor in order if vendor not in ("bfinance", "yfinance")]
+        if unknown:
+            raise ValueError(f"Unknown data source(s) in source_order: {unknown}")
 
         av_symbol = _normalize(ticker)
         normalized_freq = "quarterly" if freq == "quarterly" else "yearly"
         import bfinance
         import yfinance as yf
-
         is_yf_mocked = yf.Ticker is not DataService._YF_TICKER_REAL
         is_bf_mocked = bfinance.Ticker is not DataService._BF_TICKER_REAL
         raw = None
+        source_used: Optional[str] = None
+        errors: List[ProviderError] = []
 
-        if not is_yf_mocked or is_bf_mocked:
-            # Tier 1: Try bfinance statements
-            def _fetch_bf():
-                try:
-                    import bfinance as bf
-                    t = bf.Ticker(av_symbol)
-                    if statement == "income":
-                        return t.get_income_stmt(freq=normalized_freq)
-                    elif statement == "balance":
-                        return t.get_balance_sheet(freq=normalized_freq)
-                    elif statement == "cashflow":
-                        return t.get_cash_flow(freq=normalized_freq)
-                    return None
-                except Exception as e:
-                    logger.debug(f"bfinance statement fetch skipped for {av_symbol}: {e}")
-                    return None
-
-            raw = await _to_thread(_fetch_bf)
-
-        # Tier 2: Fallback to yfinance statements
-        if raw is None or raw.empty:
-            attr = self.STATEMENTS[statement]["quarterly" if freq == "quarterly" else "annual"]
-
-            def _fetch_yf():
-                import yfinance as yf
-                t = yf.Ticker(av_symbol)
-                return _yf_retry(lambda: getattr(t, attr))
-
+        for vendor in order:
             try:
-                raw = await _to_thread(_fetch_yf)
-            except Exception as e:
-                logger.debug(f"yfinance statement fetch error for {av_symbol}: {e}")
+                if vendor == "bfinance":
+                    if is_yf_mocked and not is_bf_mocked:
+                        continue
+                    def _fetch_bf():
+                        ticker_obj = bfinance.Ticker(av_symbol)
+                        if statement == "income":
+                            return ticker_obj.get_income_stmt(freq=normalized_freq)
+                        if statement == "balance":
+                            return ticker_obj.get_balance_sheet(freq=normalized_freq)
+                        return ticker_obj.get_cash_flow(freq=normalized_freq)
+                    raw = await _to_thread(_fetch_bf)
+                else:
+                    attr = self.STATEMENTS[statement]["quarterly" if freq == "quarterly" else "annual"]
+                    def _fetch_yf():
+                        ticker_obj = yf.Ticker(av_symbol)
+                        return _yf_retry(lambda: getattr(ticker_obj, attr))
+                    raw = await _to_thread(_fetch_yf)
+                if raw is not None and not raw.empty:
+                    source_used = vendor
+                    break
+            except Exception as exc:
+                errors.append(ProviderUnavailableError("Statement provider unavailable", provider=vendor))
+                logger.debug("Statement fetch failed via %s: %s", vendor, type(exc).__name__)
 
         if raw is None or raw.empty:
-            raise ValueError(f"No {statement} statement data for {av_symbol} ({freq})")
+            if errors:
+                raise errors[-1]
+            raise UnknownTickerError(
+                f"No {statement} statement data for {av_symbol} ({freq})", provider="company_data"
+            )
 
-        df = raw.copy()
+        frame = raw.copy()
         if curr_date:
             cutoff = pd.Timestamp(curr_date)
-            cols = pd.to_datetime(df.columns, errors="coerce")
-            keep = [c for c, ts in zip(df.columns, cols) if pd.isna(ts) or ts <= cutoff]
-            df = df[keep]
-
-        periods = [str(c)[:10] for c in df.columns]
+            parsed = pd.to_datetime(frame.columns, errors="coerce")
+            keep = [column for column, stamp in zip(frame.columns, parsed) if pd.isna(stamp) or stamp <= cutoff]
+            frame = frame[keep]
+        periods = [str(column)[:10] for column in frame.columns]
         metrics: Dict[str, Dict[str, Any]] = {}
-        for label in df.index:
-            row = df.loc[label]
+        for label in frame.index:
+            row = frame.loc[label]
             metrics[str(label)] = {
-                period: (None if pd.isna(row[col]) else float(row[col]))
-                for period, col in zip(periods, df.columns)
+                period: (None if pd.isna(row[column]) else float(row[column]))
+                for period, column in zip(periods, frame.columns)
             }
-
         return {
             "ticker": av_symbol.upper(),
+            "source": source_used,
             "statement": statement,
             "freq": freq,
             "periods": periods,
@@ -382,8 +426,11 @@ class CompanyDataService:
 _service: Optional[CompanyDataService] = None
 
 
-def get_company_data_service() -> CompanyDataService:
+def get_company_data_service(db_session=None) -> CompanyDataService:
     global _service
     if _service is None:
-        _service = CompanyDataService()
+        _service = CompanyDataService(db_session=db_session)
+    elif db_session is not None and _service.cache_service is None:
+        from app.services.cache_service import CacheService
+        _service.cache_service = CacheService(db_session)
     return _service

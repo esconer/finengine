@@ -2,7 +2,19 @@
 SQLAlchemy database models for Daisy Risk Engine
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, JSON, Index, ForeignKey, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.db.database import Base
@@ -11,9 +23,12 @@ from app.db.database import Base
 class PortfolioPosition(Base):
     """Portfolio position model"""
     __tablename__ = "portfolio_positions"
-    
+
     id = Column(Integer, primary_key=True, index=True)
-    ticker = Column(String(20), nullable=False, index=True)
+    # NOCASE makes the database boundary enforce the same canonical identity as
+    # the API.  Existing case variants are blocked by the versioned migration
+    # rather than merged or deleted automatically.
+    ticker = Column(String(20, collation="NOCASE"), nullable=False)
     weight = Column(Float, nullable=False)
     quantity = Column(Float, default=0.0, nullable=False)
     buy_price = Column(Float, default=0.0, nullable=False)
@@ -23,15 +38,39 @@ class PortfolioPosition(Base):
     last_validated_source = Column(String(20), default="yfinance")
     last_price = Column(Float, default=0.0)
     market_value = Column(Float, default=0.0)
-    sector = Column(String(50), default="Unknown")
-    industry = Column(String(50), default="Unknown")
+    sector = Column(String(50), nullable=False, default="Unknown")
+    industry = Column(String(50), nullable=False, default="Unknown")
     custom_name = Column(String(100), nullable=True)
     added_on = Column(DateTime(timezone=True), server_default=func.now())
     updated_on = Column(DateTime(timezone=True), onupdate=func.now())
-    
+
+    __table_args__ = (
+        UniqueConstraint("ticker", name="uq_portfolio_positions_ticker"),
+        # Zero is a legacy persistence sentinel used during full-exit
+        # rebalance before the row is removed; request schemas still require
+        # newly submitted weights to be > 0.
+        CheckConstraint("weight >= 0 AND weight <= 1", name="ck_portfolio_positions_weight"),
+        CheckConstraint(
+            "quantity >= 0 AND quantity <= 1.7976931348623157e308",
+            name="ck_portfolio_positions_quantity",
+        ),
+        CheckConstraint(
+            "buy_price >= 0 AND buy_price <= 1.7976931348623157e308",
+            name="ck_portfolio_positions_buy_price",
+        ),
+        CheckConstraint(
+            "last_price IS NULL OR (last_price >= 0 AND last_price <= 1.7976931348623157e308)",
+            name="ck_portfolio_positions_last_price",
+        ),
+        CheckConstraint(
+            "market_value IS NULL OR (market_value >= 0 AND market_value <= 1.7976931348623157e308)",
+            name="ck_portfolio_positions_market_value",
+        ),
+    )
+
     # Relationships
     stock_data = relationship("StockTimeseries", back_populates="position")
-    
+
     def __repr__(self):
         return f"<PortfolioPosition(id={self.id}, ticker='{self.ticker}', weight={self.weight})>"
 
@@ -39,7 +78,7 @@ class PortfolioPosition(Base):
 class StockTimeseries(Base):
     """Stock timeseries data model"""
     __tablename__ = "stock_timeseries"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     ticker = Column(String(20), nullable=False, index=True)
     date = Column(DateTime, nullable=False, index=True)
@@ -52,17 +91,48 @@ class StockTimeseries(Base):
     source_used = Column(String(20), default="yfinance")
     fetch_status = Column(String(20), default="fresh")
     fetched_on = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     # Foreign key relationship
     position_id = Column(Integer, ForeignKey("portfolio_positions.id"), nullable=True)
     position = relationship("PortfolioPosition", back_populates="stock_data")
-    
-    # Composite index and unique constraint for performance and atomic upserts
+
+    # Persistence invariants reject invalid vendor rows even if an upstream
+    # normalization bug bypasses the service boundary.  Non-finite values are
+    # rejected by the SQLite IEEE-754 upper bound (and NOT NULL rejects NaN,
+    # which SQLite represents as NULL).
     __table_args__ = (
         UniqueConstraint("ticker", "date", name="uq_stock_timeseries_ticker_date"),
-        Index("ix_ticker_date", "ticker", "date"),
+        CheckConstraint(
+            "open >= 0 AND open <= 1.7976931348623157e308",
+            name="ck_stock_timeseries_open_finite",
+        ),
+        CheckConstraint(
+            "high >= 0 AND high <= 1.7976931348623157e308",
+            name="ck_stock_timeseries_high_finite",
+        ),
+        CheckConstraint(
+            "low >= 0 AND low <= 1.7976931348623157e308",
+            name="ck_stock_timeseries_low_finite",
+        ),
+        CheckConstraint(
+            "close >= 0 AND close <= 1.7976931348623157e308",
+            name="ck_stock_timeseries_close_finite",
+        ),
+        CheckConstraint(
+            "adj_close >= 0 AND adj_close <= 1.7976931348623157e308",
+            name="ck_stock_timeseries_adj_close_finite",
+        ),
+        CheckConstraint("volume >= 0", name="ck_stock_timeseries_volume_nonnegative"),
+        CheckConstraint(
+            "low <= open AND open <= high",
+            name="ck_stock_timeseries_ohlc_open",
+        ),
+        CheckConstraint(
+            "low <= close AND close <= high",
+            name="ck_stock_timeseries_ohlc_close",
+        ),
     )
-    
+
     def __repr__(self):
         return f"<StockTimeseries(ticker='{self.ticker}', date='{self.date}', close={self.close})>"
 
@@ -70,7 +140,7 @@ class StockTimeseries(Base):
 class AnalyticsCache(Base):
     """Analytics calculation cache model"""
     __tablename__ = "analytics_cache"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     ticker = Column(String(20), nullable=False, index=True)
     metric_name = Column(String(50), nullable=False)
@@ -79,13 +149,13 @@ class AnalyticsCache(Base):
     calculated_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
     model_params = Column(JSON, default=dict)
-    
+
     # Composite unique key + index for efficient lookups and atomic upserts
     __table_args__ = (
         UniqueConstraint("ticker", "metric_name", name="uq_analytics_cache_ticker_metric"),
         Index("ix_ticker_metric", "ticker", "metric_name"),
     )
-    
+
     def __repr__(self):
         return f"<AnalyticsCache(ticker='{self.ticker}', metric='{self.metric_name}', value={self.metric_value})>"
 
@@ -93,7 +163,7 @@ class AnalyticsCache(Base):
 class FetchLog(Base):
     """Data fetch attempt log model"""
     __tablename__ = "fetch_logs"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     ticker = Column(String(20), nullable=False, index=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
@@ -102,13 +172,13 @@ class FetchLog(Base):
     status = Column(String(20), nullable=False)  # "success", "failed"
     error_message = Column(String(500), nullable=True)
     source_used = Column(String(20), default="yfinance")
-    
+
     # Index for efficient queries
     __table_args__ = (
         Index("ix_ticker_timestamp", "ticker", "timestamp"),
         Index("ix_status_timestamp", "status", "timestamp"),
     )
-    
+
     def __repr__(self):
         return f"<FetchLog(ticker='{self.ticker}', status='{self.status}', timestamp='{self.timestamp}')>"
 
@@ -116,7 +186,7 @@ class FetchLog(Base):
 class NSEBhavcopy(Base):
     """Daily NSE equity bhavcopy with delivery metrics"""
     __tablename__ = "nse_bhavcopy"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
     date = Column(DateTime, nullable=False, index=True)
@@ -132,7 +202,7 @@ class NSEBhavcopy(Base):
     no_of_trades = Column(Integer, nullable=False, default=0)
     deliv_qty = Column(Integer, nullable=True)
     deliv_per = Column(Float, nullable=True)
-    
+
     # Natural key (symbol, date): the ingest path is select-then-insert, so
     # uniqueness must live in the schema or concurrent ingests create dupes
     # (later scalar_one_or_none -> MultipleResultsFound). SQLite renders a
@@ -148,14 +218,14 @@ class NSEBhavcopy(Base):
 class NSEInstitutionalFlow(Base):
     """Daily FII / DII equity cash market flows"""
     __tablename__ = "nse_institutional_flows"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     date = Column(DateTime, nullable=False, index=True)
     category = Column(String(20), nullable=False)  # "FII", "DII", etc.
     buy_value_crores = Column(Float, nullable=False)
     sell_value_crores = Column(Float, nullable=False)
     net_value_crores = Column(Float, nullable=False)
-    
+
     # Natural key (date, category): one FII/DII row per day per category —
     # the flow writer's scalar_one_or_none() would raise MultipleResultsFound
     # on a race without this.
@@ -170,7 +240,7 @@ class NSEInstitutionalFlow(Base):
 class NSEBulkBlockDeal(Base):
     """NSE bulk and block deal transactions"""
     __tablename__ = "nse_bulk_block_deals"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     deal_type = Column(String(10), nullable=False)  # "BULK" or "BLOCK"
     date = Column(DateTime, nullable=False, index=True)
@@ -180,14 +250,14 @@ class NSEBulkBlockDeal(Base):
     quantity = Column(Integer, nullable=False)
     trade_price = Column(Float, nullable=False)
     remarks = Column(String(200), nullable=True)
-    
+
     # NOTE deliberately NOT unique on (symbol, date): NSE bulk/block deal
     # pages list multiple client trades per symbol per day — that composite
     # is a query index, not a natural key (audit B10 partial refute).
     __table_args__ = (
         Index("ix_deal_symbol_date", "symbol", "date"),
     )
-    
+
     def __repr__(self):
         return f"<NSEBulkBlockDeal(deal_type='{self.deal_type}', symbol='{self.symbol}', client='{self.client_name}', buy_sell='{self.buy_sell}')>"
 
@@ -195,7 +265,7 @@ class NSEBulkBlockDeal(Base):
 class NSEShareholdingPattern(Base):
     """Quarterly shareholding patterns and promoter pledge deltas"""
     __tablename__ = "nse_shareholding_patterns"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
     period_ended = Column(String(20), nullable=False)  # e.g., "2024-12-31"
@@ -205,12 +275,12 @@ class NSEShareholdingPattern(Base):
     dii_pct = Column(Float, default=0.0)
     public_pct = Column(Float, default=0.0)
     updated_on = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     # One shareholding row per symbol per period report
     __table_args__ = (
         UniqueConstraint("symbol", "period_ended", name="uq_shp_symbol_period"),
     )
-    
+
     def __repr__(self):
         return f"<NSEShareholdingPattern(symbol='{self.symbol}', period='{self.period_ended}', promoter={self.promoter_pct}%, pledged={self.promoter_pledged_pct}%)>"
 

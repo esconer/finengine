@@ -21,6 +21,19 @@ export interface PortfolioPosition {
   unrealized_gain_loss: number;
   unrealized_gain_loss_pct: number;
   current_value: number;
+  // Explicit monetary-unit contract. Legacy calculated fields are native;
+  // *_base fields are converted into the response's requested base currency.
+  native_currency?: string;
+  value_currency?: string;
+  fx_rate?: number | null;
+  fx_provenance?: Record<string, unknown>;
+  market_value_base?: number | null;
+  buy_price_base?: number | null;
+  last_price_base?: number | null;
+  current_value_base?: number | null;
+  total_cost_base?: number | null;
+  unrealized_gain_loss_base?: number | null;
+  unrealized_gain_loss_pct_base?: number | null;
   // Risk metrics
   volatility_forecast?: number;
   var_forecast?: number;
@@ -46,6 +59,10 @@ export interface PortfolioSummary {
   total_positions: number;
   total_weight: number;
   sectors: Record<string, number>;
+  currency?: string;
+  base_currency?: string;
+  currency_provenance?: Record<string, unknown>;
+  position_currencies?: Record<string, string>;
 }
 
 // Realized Risk Metrics Type
@@ -108,9 +125,12 @@ export interface ConcentrationMetrics {
   herfindahl_index: number;
   effective_positions: number;
   diversification_ratio: number;
+  diversification_score?: number | null;
+  error?: string;
   by_weight: Record<string, number>;
   by_sector: Record<string, number>;
   methodology?: string;
+  zero_metrics?: boolean;
 }
 
 // Liquidity Metrics Type
@@ -131,6 +151,8 @@ export interface LiquidityMetrics {
     medium_volume_pct: number;
     low_volume_pct: number;
   };
+  zero_metrics?: boolean;
+  error?: string;
 }
 
 // Risk Score Type
@@ -167,7 +189,7 @@ export interface PortfolioCreateRequest {
   weight: number;
   quantity: number;
   buy_price: number;
-  region: string;
+  region?: string;
   custom_name?: string;
   added_on?: string;
 }
@@ -335,6 +357,8 @@ export interface LiquidityResponse {
     low_volume_pct: number;
   };
   methodology?: string;
+  zero_metrics?: boolean;
+  error?: string;
 }
 
 export interface OptimizationResponse {

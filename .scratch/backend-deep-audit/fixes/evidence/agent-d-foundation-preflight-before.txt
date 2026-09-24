@@ -1,0 +1,17 @@
+FAIL D-01/dev: exact async URL must resolve to /app/backend/data/daisy.db
+FAIL D-10/dev: only Settings-backed CORS/database keys may be injected
+FAIL D-01/prod: exact async URL must resolve to /app/backend/data/daisy.db
+FAIL D-10/prod: only Settings-backed CORS/database keys may be injected
+FAIL D-07/dev: bind sources=['backend/data', 'logs', 'frontend/src', 'frontend/public', 'backend/data', 'nginx/nginx.conf', 'nginx/conf.d', 'ssl']; missing=['logs', 'nginx/nginx.conf', 'nginx/conf.d', 'ssl']
+FAIL D-07/prod: bind sources=['monitoring/grafana/provisioning', 'monitoring/grafana/dashboards']; missing=['monitoring/grafana/provisioning', 'monitoring/grafana/dashboards']
+FAIL D-02: runtime workdir/import/dependencies must agree
+FAIL D-05: backend probe must use stdlib and test HTTP plus DB
+FAIL D-11: COPY lines must be source allowlist only; forbidden=['COPY backend/ ./backend/', 'COPY --chown=appuser:appuser backend/ ./backend/']
+FAIL D-03: deployment must not globally prune or auto-prune on exit
+FAIL D-04: backup must copy a verified SQLite backup from the configured mounted DB
+FAIL D-06: rollback must load and select recorded image identities
+FAIL D-08: versioned migration runner is absent
+FAIL D-09: versioned migration runner is absent
+FAIL D-12: CI targets existing integration tests and supplies backend/ as Docker context
+FAIL D-13/migrations: failed cleanup must not exit zero
+SUMMARY: 0 passed; 16 failed

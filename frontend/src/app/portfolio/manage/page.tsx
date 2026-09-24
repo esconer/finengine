@@ -5,7 +5,7 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
     Plus,
     DollarSign,
@@ -35,10 +35,17 @@ import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { PortfolioDropzone } from '@/components/portfolio/PortfolioDropzone';
 import { analyticsApi, portfolioApi } from '@/lib/api';
+import { usePortfolioStore } from '@/lib/store';
 import { cn, formatCurrency as sharedFormatCurrency } from '@/lib/utils';
 
 // Payload already carries snake_case calculated fields (PortfolioPosition)
 type SimplePortfolioPosition = PortfolioPosition;
+
+const monetaryValue = (base: number | null | undefined, native: number | null | undefined): number => {
+    if (typeof base === 'number' && Number.isFinite(base)) return base;
+    if (typeof native === 'number' && Number.isFinite(native)) return native;
+    return 0;
+};
 
 export default function PortfolioManagePage() {
     // State management
@@ -49,6 +56,8 @@ export default function PortfolioManagePage() {
     const [error, setError] = useState<string | null>(null);
     const [forecastNotice, setForecastNotice] = useState<string | null>(null);
     const [currency, setCurrency] = useState<Currency>('INR');
+    const { setPortfolioSnapshot, setPositionCount } = usePortfolioStore();
+    const fetchSequence = useRef(0);
 
     // Modal states
     const [showAddModal, setShowAddModal] = useState(false);
@@ -159,21 +168,40 @@ export default function PortfolioManagePage() {
 
     // Fetch portfolio data
     const fetchPortfolio = async () => {
+        const sequence = ++fetchSequence.current;
         try {
             setIsLoading(true);
             setError(null);
 
             const data = await portfolioApi.getPortfolio({ currency });
+            if (sequence !== fetchSequence.current) return;
 
-            // Transform data to include calculated fields
+            // Preserve native fields for editing while using the API's explicit
+            // base-currency fields for every displayed monetary value.
             const transformedPositions = data.positions.map((pos: any) => {
-                const cost = pos.quantity * pos.buy_price;
+                const nativeCost = pos.quantity * pos.buy_price;
+                const nativeCurrent = pos.current_value ?? pos.market_value ?? 0;
+                const baseCost = monetaryValue(pos.total_cost_base, nativeCost);
+                const baseCurrent = monetaryValue(pos.current_value_base, nativeCurrent);
                 return {
                     ...pos,
-                    total_cost: cost,
-                    unrealized_gain_loss: pos.current_value - cost,
-                    unrealized_gain_loss_pct: cost > 0 ? ((pos.current_value - cost) / cost) * 100 : NaN,
-                    current_value: pos.current_value
+                    total_cost: nativeCost,
+                    unrealized_gain_loss: nativeCurrent - nativeCost,
+                    unrealized_gain_loss_pct: nativeCost > 0 ? ((nativeCurrent - nativeCost) / nativeCost) * 100 : NaN,
+                    current_value: nativeCurrent,
+                    total_cost_base: baseCost,
+                    current_value_base: baseCurrent,
+                    market_value_base: monetaryValue(pos.market_value_base, baseCurrent),
+                    unrealized_gain_loss_base: monetaryValue(
+                        pos.unrealized_gain_loss_base,
+                        baseCurrent - baseCost
+                    ),
+                    unrealized_gain_loss_pct_base: monetaryValue(
+                        pos.unrealized_gain_loss_pct_base,
+                        baseCost > 0 ? ((baseCurrent - baseCost) / baseCost) * 100 : NaN
+                    ),
+                    buy_price_base: monetaryValue(pos.buy_price_base, pos.buy_price),
+                    last_price_base: monetaryValue(pos.last_price_base, pos.last_price),
                 };
             });
 
@@ -183,17 +211,30 @@ export default function PortfolioManagePage() {
                 total_value: data.total_value,
                 total_positions: data.total_positions,
                 total_weight: data.total_weight,
-                sectors: data.sectors
+                sectors: data.sectors,
+                currency: data.currency,
+                base_currency: data.base_currency,
+                currency_provenance: data.currency_provenance,
+                position_currencies: data.position_currencies
             });
+            setPositionCount?.(data.total_positions);
+            if (currency === 'INR') {
+                setPortfolioSnapshot?.({
+                    positions: transformedPositions,
+                    total_value: data.total_value,
+                    total_weight: data.total_weight,
+                });
+            }
 
             // Fire-and-forget: GARCH latency must not block first paint
             // (forecast columns have their own isLoadingForecast skeletons).
             void fetchForecastRisk(transformedPositions);
         } catch (err) {
+            if (sequence !== fetchSequence.current) return;
             console.error('Failed to fetch portfolio:', err);
             setError('Failed to load portfolio data. Please try again.');
         } finally {
-            setIsLoading(false);
+            if (sequence === fetchSequence.current) setIsLoading(false);
         }
     };
 
@@ -355,11 +396,19 @@ export default function PortfolioManagePage() {
             });
     }, [positions, searchQuery, sortBy, sortDirection]);
 
-    // Calculate total portfolio metrics
-    const totalGainLoss = positions.reduce((sum, pos) => sum + pos.unrealized_gain_loss, 0);
-    const totalGainLossPct = positions.length > 0
-        ? (totalGainLoss / positions.reduce((sum, pos) => sum + pos.total_cost, 0)) * 100
-        : 0;
+    // Calculate total portfolio metrics in the selected response currency.
+    const totalGainLoss = positions.reduce(
+        (sum, pos) => sum + monetaryValue(
+            pos.unrealized_gain_loss_base,
+            pos.unrealized_gain_loss
+        ),
+        0
+    );
+    const totalCost = positions.reduce(
+        (sum, pos) => sum + monetaryValue(pos.total_cost_base, pos.total_cost),
+        0
+    );
+    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
 
     const formatCurrency = (amount: number) =>
         sharedFormatCurrency(amount, currency);
@@ -385,6 +434,9 @@ export default function PortfolioManagePage() {
                         </h1>
                         <p className="text-gray-600 dark:text-gray-400 mt-1">
                             Manage your investment positions with real-time tracking
+                        </p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            Values are shown in {currency}; P&L uses current live FX.
                         </p>
                     </div>
 
@@ -683,7 +735,7 @@ export default function PortfolioManagePage() {
                                                         step="0.01"
                                                     />
                                                 ) : (
-                                                    formatCurrency(position.buy_price)
+                                                    formatCurrency(monetaryValue(position.buy_price_base, position.buy_price))
                                                 )}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
@@ -705,21 +757,21 @@ export default function PortfolioManagePage() {
                                                     : <span className="text-gray-500">N/A</span>}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                                                {formatCurrency(position.current_value)}
+                                                {formatCurrency(monetaryValue(position.current_value_base, position.current_value))}
                                             </td>
                                             <td className={cn(
                                                 "px-6 py-4 whitespace-nowrap text-sm font-medium",
-                                                position.unrealized_gain_loss >= 0 ? "text-green-600" : "text-red-600"
+                                                monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? "text-green-600" : "text-red-600"
                                             )}>
-                                                {position.unrealized_gain_loss >= 0 ? '+' : ''}
-                                                {formatCurrency(position.unrealized_gain_loss)}
+                                                {monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? '+' : ''}
+                                                {formatCurrency(monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss))}
                                             </td>
                                             <td className={cn(
                                                 "px-6 py-4 whitespace-nowrap text-sm font-medium",
-                                                position.unrealized_gain_loss >= 0 ? "text-green-600" : "text-red-600"
+                                                monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? "text-green-600" : "text-red-600"
                                             )}>
-                                                {Number.isFinite(position.unrealized_gain_loss_pct)
-                                                    ? `${position.unrealized_gain_loss >= 0 ? '+' : ''}${position.unrealized_gain_loss_pct.toFixed(2)}%`
+                                                {Number.isFinite(monetaryValue(position.unrealized_gain_loss_pct_base, position.unrealized_gain_loss_pct))
+                                                    ? `${monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? '+' : ''}${monetaryValue(position.unrealized_gain_loss_pct_base, position.unrealized_gain_loss_pct).toFixed(2)}%`
                                                     : <span className="text-gray-500">N/A</span>}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">

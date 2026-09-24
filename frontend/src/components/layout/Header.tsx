@@ -33,15 +33,18 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
   const liveDataMode = useUIStore((s) => s.liveDataMode);
   const toggleLiveDataMode = useUIStore((s) => s.toggleLiveDataMode);
   const lastUpdated = useUIStore((s) => s.lastUpdated);
-  const positions = usePortfolioStore((s) => s.positions);
-  const fetchPortfolio = usePortfolioStore((s) => s.fetchPortfolio);
-  const isLoading = usePortfolioStore((s) => s.isLoading);
+  const portfolioState = usePortfolioStore((state) => state);
+  const { positions, positionCount, fetchPortfolio, isLoading } = portfolioState;
   const { addNotification } = useNotifications();
+  const portfolioCount = positionCount || positions.length;
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
   const handleRefresh = async () => {
     try {
-      await fetchPortfolio();
+      const refreshed = await fetchPortfolio();
+      if (!refreshed) {
+        throw new Error('Portfolio refresh failed');
+      }
     } catch (error) {
       console.error('Failed to refresh portfolio:', error);
       addNotification('error', 'Refresh Failed', "Couldn't fetch portfolio data. Try again.");
@@ -51,7 +54,10 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
   const handleExportPdf = async () => {
     setIsExportingPdf(true);
     try {
-      const totalVal = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+      const totalVal = positions.reduce(
+        (sum, p) => sum + (p.market_value_base ?? p.market_value ?? 0),
+        0
+      );
       await ExportService.exportInstitutionalReviewPDF({
         positions,
         totalValue: totalVal,
@@ -104,7 +110,7 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
           <div className="hidden sm:flex items-center space-x-4 text-sm text-gray-600 dark:text-gray-400">
             <div className="flex items-center space-x-1">
               <Activity className="w-4 h-4" />
-              <span>{positions.length} positions</span>
+              <span>{portfolioCount} positions</span>
             </div>
             <div className="flex items-center space-x-1">
               <span>Last updated: {formatRelativeTime(lastUpdated)}</span>
@@ -133,7 +139,7 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
           {/* Export PDF Tear-Sheet */}
           <button
             onClick={handleExportPdf}
-            disabled={positions.length === 0 || isExportingPdf}
+            disabled={portfolioCount === 0 || isExportingPdf}
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 transition disabled:opacity-50"
             title="Download Institutional PDF Review"
           >

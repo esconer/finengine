@@ -1,0 +1,3 @@
+YAML_OK exact async DB URLs rendered
+Docker runtime build: NOT RUN — `docker`, `docker compose`, and `docker-compose` are not installed/on PATH on this host.
+`bash -n scripts/deploy.sh`: exit 0.

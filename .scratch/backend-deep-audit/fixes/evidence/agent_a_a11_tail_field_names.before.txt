@@ -1,0 +1,7 @@
+﻿CHECK|evt_pot_var|backend=nan|reference=-0.027248|abs_diff=nan|rel_diff=nan|tolerance=atol:1e-6,rtol:1e-6|FAIL
+CHECK|evt_pot_es|backend=nan|reference=-0.041628|abs_diff=nan|rel_diff=nan|tolerance=atol:1e-6,rtol:1e-6|FAIL
+CHECK|historical_var|backend=nan|reference=-0.026989|abs_diff=nan|rel_diff=nan|tolerance=atol:1e-6,rtol:1e-6|FAIL
+CHECK|historical_es|backend=nan|reference=-0.041308|abs_diff=nan|rel_diff=nan|tolerance=atol:1e-6,rtol:1e-6|FAIL
+CHECK|no_hardcoded_99_fields_for_95|backend=['evt_pot_var_99', 'evt_pot_es_99', 'historical_var_99', 'historical_es_99']|reference=[]|abs_diff=4|rel_diff=0|tolerance=atol:0,rtol:0|FAIL
+OUTPUT|confidence|requested=0.95|returned=0.95
+

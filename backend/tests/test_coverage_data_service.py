@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from app.models.database import StockTimeseries
+from app.services.alpha_vantage_service import AlphaVantageIdentityError
 from app.services.data_service import DataService, GlobalDataService
 
 
@@ -270,20 +271,29 @@ class TestDataServiceBatchAndTimeout:
 
     async def test_download_with_timeout_branches(self, test_db: AsyncSession):
         service = DataService(test_db)
-        
+        # ``run_in_executor`` is submitted before ``wait_for``; block both
+        # provider seams so a mocked timeout test cannot leak a live request.
+        blocked_download = Mock(side_effect=RuntimeError("network blocked by test"))
+
         # Success
         sample_df = _sample_df("INFY.NS", 2)
-        with patch("asyncio.wait_for", new=AsyncMock(return_value=sample_df)):
+        with patch("app.services.data_service.bfinance.download", blocked_download), \
+             patch("app.services.data_service.yf.download", blocked_download), \
+             patch("asyncio.wait_for", new=AsyncMock(return_value=sample_df)):
             df = await service._download_with_timeout("INFY.NS", "2025-01-01", "2025-01-02")
             assert df is not None
             assert len(df) == 2
 
         # TimeoutError
-        with patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError())):
+        with patch("app.services.data_service.bfinance.download", blocked_download), \
+             patch("app.services.data_service.yf.download", blocked_download), \
+             patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError())):
             assert await service._download_with_timeout("TIMEOUT.NS", "2025-01-01", "2025-01-02") is None
 
         # General Exception
-        with patch("asyncio.wait_for", new=AsyncMock(side_effect=Exception("Failed"))):
+        with patch("app.services.data_service.bfinance.download", blocked_download), \
+             patch("app.services.data_service.yf.download", blocked_download), \
+             patch("asyncio.wait_for", new=AsyncMock(side_effect=Exception("Failed"))):
             assert await service._download_with_timeout("ERROR.NS", "2025-01-01", "2025-01-02") is None
 
 
@@ -335,13 +345,19 @@ class TestDataServiceAlphaVantageFallbacks:
         with patch("app.services.data_service.get_alpha_vantage_service", return_value=mock_av_empty):
             assert await service._fallback_quote("AAPL", "AAPL") is None
             
-        # Success
-        mock_av_ok = Mock(enabled=True, fetch_global_quote=AsyncMock(return_value={"ticker": "RELIANCE.BSE", "current_price": 2500.0}))
+        # Success preserves the requested listing identity.
+        mock_av_ok = Mock(enabled=True, fetch_global_quote=AsyncMock(return_value={"ticker": "RELIANCE.NS", "current_price": 2500.0}))
         with patch("app.services.data_service.get_alpha_vantage_service", return_value=mock_av_ok):
             q = await service._fallback_quote("RELIANCE.NS", "RELIANCE.NS")
             assert q is not None
             assert q["current_price"] == 2500.0
             assert q["is_indian"] is True
+
+        # A provider payload for a different exchange is not relabeled.
+        mock_av_wrong_identity = Mock(enabled=True, fetch_global_quote=AsyncMock(return_value={"ticker": "RELIANCE.BSE", "current_price": 2500.0}))
+        with patch("app.services.data_service.get_alpha_vantage_service", return_value=mock_av_wrong_identity):
+            with pytest.raises(AlphaVantageIdentityError):
+                await service._fallback_quote("RELIANCE.NS", "RELIANCE.NS", strict_errors=True)
 
 
 @pytest.mark.asyncio

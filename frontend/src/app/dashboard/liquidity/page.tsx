@@ -235,6 +235,7 @@ interface LiquidityData {
   liquidation_time_days: string;
   risk_level: string;
   error?: string;
+  zero_metrics?: boolean;
   by_position: Record<string, {
     score: number;
     category: string;
@@ -274,44 +275,69 @@ export default function LiquidityPage() {
 
   const { positions, fetchPortfolio } = usePortfolioStore();
   const fetchSeq = useRef(0);
+  const positionKey = positions.map(p => `${p.ticker}:${p.weight}:${p.last_price}`).join(',');
+  const inFlightRef = useRef<{ key: string; promise: Promise<void> } | null>(null);
 
   const fetchLiquidityData = async () => {
-    const seq = ++fetchSeq.current;
-    setLoading(true);
-    setError(null);
+    if (inFlightRef.current?.key === positionKey) {
+      return inFlightRef.current.promise;
+    }
 
-    try {
-      const data = await analyticsApi.getLiquidityMetrics();
-      if (seq !== fetchSeq.current) return;
-      setLiquidityData(data);
+    const request = (async () => {
+      const seq = ++fetchSeq.current;
+      setLoading(true);
+      setError(null);
 
-      // Convert by_position data for table
-      const positionsList: PositionLiquidity[] = [];
+      try {
+        const data = await analyticsApi.getLiquidityMetrics() as LiquidityData;
+        if (seq !== fetchSeq.current) return;
 
-      if (data.by_position && Object.keys(data.by_position).length > 0) {
-        Object.entries(data.by_position).forEach(([ticker, posData]: [string, any]) => {
-          positionsList.push({
-            ticker,
-            score: posData.score ?? null,
-            category: posData.category ?? null,
-            liquidation_days: posData.liquidation_days ?? null,
-            volume_30d: posData.avg_volume ?? null,
-            avg_turnover: posData.avg_turnover ?? (posData.avg_volume && positions.find(p => p.ticker === ticker)?.last_price ? posData.avg_volume * positions.find(p => p.ticker === ticker)!.last_price : null),
-            market_cap: posData.market_cap && posData.market_cap > 0 ? posData.market_cap : null,
-            bid_ask_spread: posData.spread && posData.spread > 0 ? posData.spread : null,
+        if (data.zero_metrics) {
+          setError(data.error || 'Liquidity metrics unavailable');
+          setLiquidityData(null);
+          setPositionData([]);
+          return;
+        }
+
+        setLiquidityData(data);
+
+        // Convert by_position data for table
+        const positionsList: PositionLiquidity[] = [];
+
+        if (data.by_position && Object.keys(data.by_position).length > 0) {
+          Object.entries(data.by_position).forEach(([ticker, posData]: [string, any]) => {
+            positionsList.push({
+              ticker,
+              score: posData.score ?? null,
+              category: posData.category ?? null,
+              liquidation_days: posData.liquidation_days ?? null,
+              volume_30d: posData.avg_volume ?? null,
+              avg_turnover: posData.avg_turnover ?? (posData.avg_volume && positions.find(p => p.ticker === ticker)?.last_price ? posData.avg_volume * positions.find(p => p.ticker === ticker)!.last_price : null),
+              market_cap: posData.market_cap && posData.market_cap > 0 ? posData.market_cap : null,
+              bid_ask_spread: posData.spread && posData.spread > 0 ? posData.spread : null,
+            });
           });
-        });
-      }
+        }
 
-      setPositionData(positionsList.sort((a, b) => (b.score ?? -1) - (a.score ?? -1)));
-    } catch (err) {
-      if (seq !== fetchSeq.current) return;
-      console.error('Failed to fetch liquidity data:', err);
-      setError(err instanceof Error ? err.message : 'Failed to load liquidity data');
-      setLiquidityData(null);
-      setPositionData([]);
+        setPositionData(positionsList.sort((a, b) => (b.score ?? -1) - (a.score ?? -1)));
+      } catch (err) {
+        if (seq !== fetchSeq.current) return;
+        console.error('Failed to fetch liquidity data:', err);
+        setError(err instanceof Error ? err.message : 'Failed to load liquidity data');
+        setLiquidityData(null);
+        setPositionData([]);
+      } finally {
+        if (seq === fetchSeq.current) setLoading(false);
+      }
+    })();
+
+    inFlightRef.current = { key: positionKey, promise: request };
+    try {
+      await request;
     } finally {
-      if (seq === fetchSeq.current) setLoading(false);
+      if (inFlightRef.current?.promise === request) {
+        inFlightRef.current = null;
+      }
     }
   };
 
@@ -659,7 +685,9 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="High Liquidity Positions"
-              value={`${highVolumeCount} (${positionData.length > 0 ? formatPercentage(highVolumeCount / positionData.length, 1) : '0.0%'})`}
+              value={liquidityData == null
+                ? 'N/A'
+                : `${highVolumeCount} (${positionData.length > 0 ? formatPercentage(highVolumeCount / positionData.length, 1) : '0.0%'})`}
               icon={TrendingDown}
               loading={loading}
             />

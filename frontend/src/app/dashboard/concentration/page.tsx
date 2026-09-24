@@ -48,7 +48,9 @@ interface ConcentrationData {
   top_10: number;
   herfindahl_index: number;
   effective_positions: number;
-  diversification_score?: number;
+  diversification_score?: number | null;
+  error?: string;
+  zero_metrics?: boolean;
   diversification_ratio: number;
   gini_coefficient?: number;
   by_weight: Record<string, number>;
@@ -353,6 +355,8 @@ export default function ConcentrationPage() {
 
   const { positions, fetchPortfolio } = usePortfolioStore();
   const fetchSeq = useRef(0);
+  const positionKey = positions.map(p => `${p.ticker}:${p.weight}:${p.last_price}`).join(',');
+  const inFlightRef = useRef<{ key: string; promise: Promise<void> } | null>(null);
 
   // Compute Lorenz Inequality Curve
   const lorenzCurveData = useMemo(() => {
@@ -401,37 +405,60 @@ export default function ConcentrationPage() {
   };
 
   const fetchConcentrationData = async () => {
-    const seq = ++fetchSeq.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await analyticsApi.getConcentrationMetrics();
-      if (seq !== fetchSeq.current) return;
-      setConcentrationData(data);
-      useUIStore.getState().updateLastUpdated();
+    if (inFlightRef.current?.key === positionKey) {
+      return inFlightRef.current.promise;
+    }
 
-      // Convert by_weight data for table with real sector and pre-calculated cumulative weights
-      let cumWeight = 0;
-      const sortedEntries = Object.entries(data.by_weight || {}).sort(([, a], [, b]) => (b as number) - (a as number));
-      const positionsList = sortedEntries.map(([ticker, weight]) => {
-        cumWeight += (weight as number);
-        const pos = positions.find(p => p.ticker === ticker);
-        return {
-          ticker,
-          weight: weight as number,
-          cumulative_weight: cumWeight,
-          sector: pos?.sector || null
-        };
-      });
-      setPositionData(positionsList);
-    } catch (error) {
-      if (seq !== fetchSeq.current) return;
-      console.error('Failed to fetch concentration data:', error);
-      setError(error instanceof Error ? error.message : 'Failed to load concentration data');
-      setConcentrationData(null);
-      setPositionData([]);
+    const request = (async () => {
+      const seq = ++fetchSeq.current;
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await analyticsApi.getConcentrationMetrics() as ConcentrationData;
+        if (seq !== fetchSeq.current) return;
+
+        if (data.zero_metrics) {
+          setError(data.error || 'Concentration metrics unavailable');
+          setConcentrationData(null);
+          setPositionData([]);
+          return;
+        }
+
+        setConcentrationData(data);
+        useUIStore.getState().updateLastUpdated();
+
+        // Convert by_weight data for table with real sector and pre-calculated cumulative weights
+        let cumWeight = 0;
+        const sortedEntries = Object.entries(data.by_weight || {}).sort(([, a], [, b]) => (b as number) - (a as number));
+        const positionsList = sortedEntries.map(([ticker, weight]) => {
+          cumWeight += (weight as number);
+          const pos = positions.find(p => p.ticker === ticker);
+          return {
+            ticker,
+            weight: weight as number,
+            cumulative_weight: cumWeight,
+            sector: pos?.sector || null
+          };
+        });
+        setPositionData(positionsList);
+      } catch (error) {
+        if (seq !== fetchSeq.current) return;
+        console.error('Failed to fetch concentration data:', error);
+        setError(error instanceof Error ? error.message : 'Failed to load concentration data');
+        setConcentrationData(null);
+        setPositionData([]);
+      } finally {
+        if (seq === fetchSeq.current) setLoading(false);
+      }
+    })();
+
+    inFlightRef.current = { key: positionKey, promise: request };
+    try {
+      await request;
     } finally {
-      if (seq === fetchSeq.current) setLoading(false);
+      if (inFlightRef.current?.promise === request) {
+        inFlightRef.current = null;
+      }
     }
   };
 
@@ -596,7 +623,7 @@ export default function ConcentrationPage() {
     .filter(s => s.weight > 0.01)
     .sort((a, b) => b.weight - a.weight) : [];
 
-  const divScore: number | null = positions.length <= 1 ? 0.0 : (concentrationData?.diversification_score ??
+  const divScore: number | null = positions.length === 0 ? null : positions.length === 1 ? 0.0 : (concentrationData?.diversification_score ??
     (concentrationData?.herfindahl_index != null ?
       Number((((1 - concentrationData.herfindahl_index) / (1 - 1 / positions.length)) * 100).toFixed(1)) : null));
 
@@ -878,7 +905,9 @@ export default function ConcentrationPage() {
             <div className="w-14 h-14 bg-yellow-100 dark:bg-yellow-900/30 rounded-full flex items-center justify-center mx-auto mb-3 text-yellow-600 dark:text-yellow-400">
               <BarChart3 className="w-7 h-7" />
             </div>
-            <h4 className="font-bold text-gray-900 dark:text-white">Monitor Closely</h4>
+            <h4 className="font-bold text-gray-900 dark:text-white">
+              {concentrationData == null ? 'N/A' : 'Monitor Closely'}
+            </h4>
             <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
               {concentrationData == null
                 ? 'N/A'

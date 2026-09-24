@@ -1,0 +1,36 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.9, pytest-8.3.4, pluggy-1.6.0
+rootdir: C:\es\coding\finengine\backend
+configfile: pyproject.toml
+plugins: anyio-4.15.1, Faker-33.1.0, asyncio-0.24.0, cov-5.0.0, mock-3.12.0, xdist-3.8.0
+asyncio: mode=Mode.AUTO, default_loop_scope=function
+collected 201 items
+
+backend\tests\test_agent_a_quant_fixes.py ...................            [  9%]
+backend\tests\test_agent_b_data_audit.py .................               [ 17%]
+backend\tests\test_agent_c_api_contracts.py ............................ [ 31%]
+                                                                         [ 31%]
+backend\tests\test_agent_d_migrations.py .........                       [ 36%]
+backend\tests\test_agent_d_deployment_contract.py ........               [ 40%]
+backend\tests\test_api_endpoints.py .................................... [ 58%]
+..                                                                       [ 59%]
+backend\tests\test_websocket.py ..................                       [ 68%]
+backend\tests\test_coverage_portfolio_api.py ...................         [ 77%]
+backend\tests\test_coverage_data_service.py .........................    [ 90%]
+backend\tests\test_source_preference_and_cache.py ....................   [100%]
+
+============================== warnings summary ===============================
+tests/test_websocket.py::TestWebSocketEndpoint::test_invalid_type_then_connection_still_alive
+  C:\es\coding\finengine\backend\.venv\Lib\site-packages\aiosqlite\context.py:18: SAWarning: The garbage collector is trying to clean up non-checked-in connection <AdaptedConnection <aiosqlite.core.Connection object at 0x000002CB2097E240>>, which will be terminated.  Please ensure that SQLAlchemy pooled connections are returned to the pool explicitly, either by calling ``close()`` or by using appropriate context managers to manage their lifecycle.
+    def __init__(self, coro: Coroutine[Any, Any, _T]):
+
+tests/test_websocket.py::TestWebSocketEndpoint::test_multiple_clients_topic_isolation
+  sys:1: SAWarning: The garbage collector is trying to clean up non-checked-in connection <AdaptedConnection <aiosqlite.core.Connection object at 0x000002CB26E75BB0>>, which will be terminated.  Please ensure that SQLAlchemy pooled connections are returned to the pool explicitly, either by calling ``close()`` or by using appropriate context managers to manage their lifecycle.
+
+tests/test_websocket.py::TestBackgroundWorker::test_send_portfolio_update_real
+  C:\Users\Sayanti\AppData\Roaming\uv\python\cpython-3.12.9-windows-x86_64-none\Lib\unittest\mock.py:2217: SAWarning: The garbage collector is trying to clean up non-checked-in connection <AdaptedConnection <aiosqlite.core.Connection object at 0x000002CB26E307A0>>, which will be terminated.  Please ensure that SQLAlchemy pooled connections are returned to the pool explicitly, either by calling ``close()`` or by using appropriate context managers to manage their lifecycle.
+    def __init__(self, name, parent):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+====================== 201 passed, 3 warnings in 26.22s =======================
+

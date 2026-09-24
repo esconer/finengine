@@ -57,9 +57,8 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
         if (t.includes(':')) {
             t = t.split(':')[1];
         }
-        if (!t.endsWith('.NS') && !t.endsWith('.BO') && !t.startsWith('^') && !t.endsWith('=X')) {
-            t = `${t}.NS`;
-        }
+        // Preserve bare symbols; the backend canonicalizes known Indian scrips
+        // and can infer the native region without fabricating an .NS suffix.
         return t;
     };
 
@@ -172,7 +171,7 @@ export function PortfolioDropzone({ isOpen, onClose, onSuccess }: PortfolioDropz
                     buy_price: r.buy_price,
                     weight: denom > 0 ? (r.quantity * r.buy_price) / denom : 1 / parsedRows.length,
                     custom_name: r.custom_name,
-                    region: 'IN',
+                    region: r.ticker.endsWith('.NS') || r.ticker.endsWith('.BO') ? 'IN' : undefined,
                     ...(r.added_on ? { added_on: r.added_on } : {})
                 })),
                 auto_normalize: true

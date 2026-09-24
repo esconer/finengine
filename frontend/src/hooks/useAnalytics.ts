@@ -16,6 +16,18 @@ interface AnalyticsData {
   riskScore: any;
 }
 
+const isZeroMetricsPayload = (value: unknown): boolean => {
+  return value !== null
+    && typeof value === 'object'
+    && (value as { zero_metrics?: unknown }).zero_metrics === true;
+};
+
+const fulfilledValueOrNull = (result: PromiseSettledResult<any>): any => {
+  return result.status === 'fulfilled' && !isZeroMetricsPayload(result.value)
+    ? result.value
+    : null;
+};
+
 export const usePortfolioAnalytics = () => {
   const [data, setData] = useState<AnalyticsData>({
     summary: null,
@@ -30,78 +42,106 @@ export const usePortfolioAnalytics = () => {
   const [error, setError] = useState<string | null>(null);
   const { positions } = usePortfolioStore();
   const requestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  const inFlightRef = useRef<{ key: string; requestId: number; promise: Promise<void> } | null>(null);
+  const tickerKey = positions.map(p => `${p.ticker}:${p.weight}:${p.last_price}`).join(',');
 
   const fetchAnalyticsData = async () => {
+    if (inFlightRef.current?.key === tickerKey && inFlightRef.current.requestId === requestIdRef.current) {
+      return inFlightRef.current.promise;
+    }
+
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
 
-    try {
-      // Get tickers from current portfolio
-      const tickers = positions.map(p => p.ticker).join(',');
-      
-      // Fetch all analytics data in parallel
-      const [
-        summary,
-        realizedRisk,
-        forecastRisk,
-        factorExposure,
-        concentration,
-        liquidity,
-        riskScore,
-      ] = await Promise.allSettled([
-        analyticsApi.getSummary(),
-        analyticsApi.getRealizedRisk({ tickers }),
-        analyticsApi.getForecastRisk({ tickers }),
-        analyticsApi.getFactorExposure({ tickers }),
-        analyticsApi.getConcentrationMetrics(),
-        analyticsApi.getLiquidityMetrics(),
-        analyticsApi.getRiskScore(),
-      ]);
+    const request = (async () => {
+      try {
+        // Get tickers from current portfolio
+        const tickers = positions.map(p => p.ticker).join(',');
 
-      // Discard stale responses — a newer fetch (or unmount) superseded this one (B11)
-      if (requestId !== requestIdRef.current) return;
+        // Fetch all analytics data in parallel
+        const [
+          summary,
+          realizedRisk,
+          forecastRisk,
+          factorExposure,
+          concentration,
+          liquidity,
+          riskScore,
+        ] = await Promise.allSettled([
+          analyticsApi.getSummary(),
+          analyticsApi.getRealizedRisk({ tickers }),
+          analyticsApi.getForecastRisk({ tickers }),
+          analyticsApi.getFactorExposure({ tickers }),
+          analyticsApi.getConcentrationMetrics(),
+          analyticsApi.getLiquidityMetrics(),
+          analyticsApi.getRiskScore(),
+        ]);
 
-      const results = [summary, realizedRisk, forecastRisk, factorExposure, concentration, liquidity, riskScore];
-      const rejectedCount = results.filter(r => r.status === 'rejected').length;
+        // Discard stale responses — a newer portfolio snapshot superseded this one (B11)
+        if (!mountedRef.current || requestId !== requestIdRef.current) return;
 
-      if (rejectedCount === results.length) {
-        setError('Failed to fetch analytics data');
-      } else if (rejectedCount > 0) {
-        console.warn(`Partial analytics failure: ${rejectedCount} metrics endpoints were unreachable.`);
+        const results = [summary, realizedRisk, forecastRisk, factorExposure, concentration, liquidity, riskScore];
+        const rejectedCount = results.filter(r => r.status === 'rejected').length;
+
+        if (rejectedCount === results.length) {
+          setError('Failed to fetch analytics data');
+        } else if (rejectedCount > 0) {
+          console.warn(`Partial analytics failure: ${rejectedCount} metrics endpoints were unreachable.`);
+        }
+
+        setData({
+          summary: fulfilledValueOrNull(summary),
+          realizedRisk: fulfilledValueOrNull(realizedRisk),
+          forecastRisk: fulfilledValueOrNull(forecastRisk),
+          factorExposure: fulfilledValueOrNull(factorExposure),
+          concentration: fulfilledValueOrNull(concentration),
+          liquidity: fulfilledValueOrNull(liquidity),
+          riskScore: fulfilledValueOrNull(riskScore),
+        });
+
+      } catch (err: any) {
+        if (!mountedRef.current || requestId !== requestIdRef.current) return;
+        setError(err.message || 'Failed to fetch analytics data');
+      } finally {
+        if (mountedRef.current && requestId === requestIdRef.current) {
+          setLoading(false);
+        }
       }
+    })();
 
-      setData({
-        summary: summary.status === 'fulfilled' ? summary.value : null,
-        realizedRisk: realizedRisk.status === 'fulfilled' ? realizedRisk.value : null,
-        forecastRisk: forecastRisk.status === 'fulfilled' ? forecastRisk.value : null,
-        factorExposure: factorExposure.status === 'fulfilled' ? factorExposure.value : null,
-        concentration: concentration.status === 'fulfilled' ? concentration.value : null,
-        liquidity: liquidity.status === 'fulfilled' ? liquidity.value : null,
-        riskScore: riskScore.status === 'fulfilled' ? riskScore.value : null,
-      });
-
-    } catch (err: any) {
-      if (requestId !== requestIdRef.current) return;
-      setError(err.message || 'Failed to fetch analytics data');
+    inFlightRef.current = { key: tickerKey, requestId, promise: request };
+    try {
+      await request;
     } finally {
-      if (requestId === requestIdRef.current) {
-        setLoading(false);
+      if (inFlightRef.current?.promise === request) {
+        inFlightRef.current = null;
       }
     }
   };
 
-  const tickerKey = positions.map(p => `${p.ticker}:${p.weight}:${p.last_price}`).join(',');
-
   useEffect(() => {
+    mountedRef.current = true;
     if (positions.length > 0) {
-      fetchAnalyticsData();
+      void fetchAnalyticsData();
     } else {
+      requestIdRef.current++;
+      setData({
+        summary: null,
+        realizedRisk: null,
+        forecastRisk: null,
+        factorExposure: null,
+        concentration: null,
+        liquidity: null,
+        riskScore: null,
+      });
+      setError(null);
       setLoading(false);
     }
-    // Invalidate in-flight fetches when tickers change or on unmount (B11)
+
     return () => {
-      requestIdRef.current++;
+      mountedRef.current = false;
     };
   }, [tickerKey]);
 

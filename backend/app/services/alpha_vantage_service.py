@@ -1,29 +1,7 @@
-"""
-Alpha Vantage fallback vendor for Daisy Risk Engine.
-
-Error-classification and request patterns adapted from
-TauricResearch/TradingAgents, tradingagents/dataflows/alpha_vantage_common.py
-(Apache License 2.0, Copyright Tauric Research).
-
-Modifications from the original:
-- async surface (requests offloaded via asyncio.to_thread)
-- MULTI-KEY POOL: several free API keys are rotated automatically when one
-  hits a rate limit (daily or per-minute), multiplying effective free quota
-  to N x 25 req/day. Per-key budgets are tracked in-process so exhausted
-  keys are skipped WITHOUT burning a network call.
-- error taxonomy distinguishes daily-limit vs call-frequency vs invalid-key
-  notices (TradingAgents issue #991): daily phrases retire the key until
-  midnight, frequency phrases impose a 60s cooldown, invalid keys are
-  dropped from the pool.
-- symbol bridge for Indian listings: yfinance's NSE suffix (.NS) and BSE
-  suffix (.BO) both map to Alpha Vantage's .BSE feed; plain symbols pass
-  through unchanged. Caveat: a minority of companies use different ticker
-  letters per exchange; failures here simply leave yfinance as sole source.
-
-Licensed under the Apache License, Version 2.0.
-"""
+"""Alpha Vantage fallback client with identity-safe symbols and typed errors."""
 
 import asyncio
+import math
 import re
 import time
 from collections import deque
@@ -35,60 +13,114 @@ import pandas as pd
 import requests
 
 from app.config import settings
+from app.services.cache_service import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderInvalidInputError,
+    ProviderRateLimitError,
+    ProviderServerError,
+    ProviderUnavailableError,
+    UnknownTickerError,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 API_BASE_URL = "https://www.alphavantage.co/query"
+FREQUENCY_COOLDOWN_SECONDS = 60
+
+# No exchange substitution is implicit.  An operator may add a verified,
+# identity-specific mapping here after checking the issuer/security identity.
+AV_SYMBOL_MAP: Dict[str, str] = {}
 
 
-def to_av_symbol(ticker: str) -> str:
-    """Map our tickers to Alpha Vantage convention.
+class AlphaVantageRateLimitError(ProviderRateLimitError):
+    """All pooled keys are exhausted for today or right now."""
 
-    .NS (NSE, yfinance style) and .BO (BSE) both map to .BSE — Alpha
-    Vantage has no NSE feed and does not accept Yahoo's .BO suffix; the
-    BSE lists the same companies. Plain symbols (US etc.) pass through.
+    def __init__(self, message: str) -> None:
+        super().__init__(message, provider="alphavantage")
+
+
+class AlphaVantageNotConfiguredError(ProviderAuthError):
+    """No usable API keys are configured."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, provider="alphavantage")
+
+
+class AlphaVantageInvalidInputError(ProviderInvalidInputError):
+    """The request or returned payload is structurally invalid."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, provider="alphavantage")
+
+
+class AlphaVantageUnknownTickerError(UnknownTickerError):
+    """The provider explicitly reported that the symbol is unknown."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, provider="alphavantage")
+
+
+class AlphaVantageIdentityError(ProviderUnavailableError):
+    """A requested exchange/listing cannot be proven equivalent to AV's feed."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, provider="alphavantage", status_code=503, retryable=False)
+
+
+def to_av_symbol(ticker: str, *, allow_exchange_mapping: bool = False) -> Optional[str]:
+    """Resolve a ticker without silently changing its exchange identity.
+
+    Alpha Vantage has no general NSE feed and a ``.BO``/``.BSE`` spelling is
+    not enough proof that the security is the same listing.  Exchange-suffixed
+    Indian tickers therefore return ``None`` unless an operator has added a
+    verified entry to ``AV_SYMBOL_MAP``.  Plain/global symbols pass through unchanged.
     """
-    t = ticker.upper().strip()
-    if t.endswith(".NS") or t.endswith(".BO"):
-        return t[:-3] + ".BSE"
-    return t
+    raw = str(ticker or "").upper().strip()
+    if not raw:
+        return None
+    if raw in AV_SYMBOL_MAP:
+        return AV_SYMBOL_MAP[raw]
+    if raw.endswith((".NS", ".BO", ".BSE")):
+        # Even an opt-in flag is not identity verification.  Only entries in
+        # AV_SYMBOL_MAP (checked above) may cross an exchange boundary.
+        return None
+    if any(ch.isspace() for ch in raw):
+        return None
+    return raw
 
 
 def _quota_day() -> _date:
-    """Alpha Vantage free-tier quota resets at US Eastern midnight, not local."""
+    """Alpha Vantage free-tier quota resets at US Eastern midnight."""
     try:
         return datetime.now(ZoneInfo("America/New_York")).date()
     except Exception:
         return _date.today()
 
-# Cooldown applied to a key after a per-minute ("call frequency") rejection.
-FREQUENCY_COOLDOWN_SECONDS = 60
-
-
-class AlphaVantageRateLimitError(Exception):
-    """All pooled keys are exhausted for today / right now."""
-
-
-class AlphaVantageNotConfiguredError(Exception):
-    """No usable API keys configured."""
-
 
 def _classify_notice(notice: str) -> Optional[str]:
-    """Classify an Information/Note payload.
-
-    Returns 'daily' | 'frequency' | 'invalid_key' | 'other'.
-    Rate-limit phrasing is checked BEFORE api-key phrasing because both
-    mention "API key" (TradingAgents issue #991).
-    """
-    low = notice.lower()
-    if "requests per day" in low or "rate limit" in low:
+    """Classify an Information/Note/Error payload without exposing it."""
+    low = str(notice).lower()
+    if "requests per day" in low or "rate limit" in low or "daily limit" in low:
         return "daily"
-    if "call frequency" in low or "per minute" in low:
+    if "call frequency" in low or "per minute" in low or "frequency" in low:
         return "frequency"
-    if "api key" in low or "apikey" in low:
+    if "api key" in low or "apikey" in low or "invalid key" in low:
         return "invalid_key"
+    if any(token in low for token in ("invalid api call", "unknown symbol", "symbol not found", "ticker not found", "not found")):
+        return "unknown_ticker"
     return "other"
+
+
+def _safe_notice(notice: Any, secrets: Optional[List[str]] = None) -> str:
+    """Return a bounded notice with query/key material removed."""
+    text = str(notice or "")
+    text = re.sub(r"(?i)(apikey|api_key|key)=([^&\s]+)", r"\1=<REDACTED>", text)
+    for secret in secrets or []:
+        if secret:
+            text = text.replace(secret, "<REDACTED>")
+    return text[:240]
 
 
 class _KeyBudget:
@@ -101,8 +133,8 @@ class _KeyBudget:
         self._day: Optional[_date] = None
         self.used_today = 0
         self._minute_stamps: deque = deque()
-        self.cooldown_until = 0.0          # monotonic ts, for frequency hits
-        self.retired_on: Optional[_date] = None  # day the key was marked daily-exhausted
+        self.cooldown_until = 0.0
+        self.retired_on: Optional[_date] = None
 
     def _roll_day(self) -> None:
         today = _quota_day()
@@ -138,7 +170,6 @@ class KeyPool:
 
     def __init__(self, keys: List[str], daily_limit: int, minute_limit: int):
         self.budgets = [_KeyBudget(k.strip(), daily_limit, minute_limit) for k in keys if k.strip()]
-        # Positional cursor spreads load round-robin across healthy keys.
         self._cursor = 0
 
     @property
@@ -146,25 +177,24 @@ class KeyPool:
         return bool(self.budgets)
 
     def acquire(self) -> Optional[_KeyBudget]:
-        """Return the next available key budget, scanning once from the cursor."""
         n = len(self.budgets)
         for i in range(n):
-            b = self.budgets[(self._cursor + i) % n]
-            if b.available():
+            budget = self.budgets[(self._cursor + i) % n]
+            if budget.available():
                 self._cursor = (self._cursor + i + 1) % n
-                return b
+                return budget
         return None
 
     def mark_daily_exhausted(self, budget: _KeyBudget) -> None:
         budget.retired_on = _quota_day()
-        logger.warning(f"Alpha Vantage key ...{budget.key[-4:]} retired until midnight (daily limit)")
+        logger.warning("Alpha Vantage key retired until midnight (daily limit)")
 
     def mark_frequency_limited(self, budget: _KeyBudget) -> None:
         budget.cooldown_until = time.monotonic() + FREQUENCY_COOLDOWN_SECONDS
-        logger.warning(f"Alpha Vantage key ...{budget.key[-4:]} cooling down {FREQUENCY_COOLDOWN_SECONDS}s (frequency limit)")
+        logger.warning("Alpha Vantage key cooling down for frequency limit")
 
     def drop_invalid(self, budget: _KeyBudget) -> None:
-        logger.error(f"Alpha Vantage key ...{budget.key[-4:]} rejected - removing from pool")
+        logger.error("Alpha Vantage key rejected; removing it from the pool")
         if budget in self.budgets:
             self.budgets.remove(budget)
 
@@ -178,10 +208,29 @@ def _configured_keys() -> List[str]:
         keys.append(settings.alpha_vantage_api_key)
     raw = settings.alpha_vantage_api_keys or ""
     for part in re.split(r"[,;\s]+", raw):
-        k = part.strip()
-        if k and k not in keys:
-            keys.append(k)
+        key = part.strip()
+        if key and key not in keys:
+            keys.append(key)
     return keys
+
+
+def _parse_bounds(start: str, end: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    try:
+        start_dt = pd.Timestamp(start).normalize()
+        end_dt = pd.Timestamp(end).normalize()
+    except (TypeError, ValueError) as exc:
+        raise AlphaVantageInvalidInputError("Invalid historical date bounds") from exc
+    if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+        raise AlphaVantageInvalidInputError("Historical date bounds are invalid")
+    return start_dt, end_dt
+
+
+def _finite_positive(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
 
 
 class AlphaVantageService:
@@ -199,159 +248,192 @@ class AlphaVantageService:
     def enabled(self) -> bool:
         return self.pool.enabled
 
-    # ------------------------------------------------------------------ core
-
     async def _make_request(self, function_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Issue an API call, rotating through keys on rate limits.
-
-        Tries at most len(pool) keys per logical request; each rate-limited
-        key is demoted (cooldown / retired / dropped) before the next try.
-
-        Raises:
-            AlphaVantageNotConfiguredError: no keys configured.
-            AlphaVantageRateLimitError: every key exhausted.
-            ValueError: non-rate-limit vendor error or malformed payload.
-        """
+        """Issue a request and classify failures without logging request URLs."""
         if not self.pool.enabled:
-            raise AlphaVantageNotConfiguredError("No ALPHA_VANTAGE_API_KEY(S) configured")
+            raise AlphaVantageNotConfiguredError("No Alpha Vantage keys configured")
 
-        # Default error: local budgets ran dry without any server rejection.
-        last_error: Exception = AlphaVantageRateLimitError(
-            f"All {len(self.pool.budgets)} Alpha Vantage key(s) are exhausted"
-        )
+        last_error: ProviderError = AlphaVantageRateLimitError("All Alpha Vantage keys are exhausted")
         for _ in range(max(1, len(self.pool.budgets))):
             budget = self.pool.acquire()
             if budget is None:
                 break
-
             query = {"function": function_name, "apikey": budget.key, **params}
 
             def _get() -> requests.Response:
                 return requests.get(API_BASE_URL, params=query, timeout=self.timeout)
 
-            response = await asyncio.to_thread(_get)
+            try:
+                response = await asyncio.to_thread(_get)
+            except requests.Timeout:
+                last_error = ProviderUnavailableError("Alpha Vantage request timed out", provider="alphavantage")
+                # A transport timeout is not evidence of a per-minute quota
+                # violation; do not retire/cool down a key for the wrong cause.
+                logger.warning("AV timeout on %s", function_name)
+                continue
+            except requests.RequestException as exc:
+                last_error = ProviderUnavailableError("Alpha Vantage network failure", provider="alphavantage")
+                logger.warning("AV network error on %s: %s", function_name, type(exc).__name__)
+                continue
+
             try:
                 response.raise_for_status()
-            except requests.HTTPError as e:
-                self.pool.mark_frequency_limited(budget)
-                last_error = ValueError(
-                    f"Alpha Vantage HTTP {response.status_code} for {function_name}"
-                )
-                logger.warning(f"AV HTTP error on {function_name}: {e}")
+            except requests.HTTPError:
+                status = int(getattr(response, "status_code", 0) or 0)
+                if status == 429:
+                    self.pool.mark_frequency_limited(budget)
+                    last_error = AlphaVantageRateLimitError("Alpha Vantage rate limit")
+                elif status in (401, 403):
+                    self.pool.drop_invalid(budget)
+                    last_error = AlphaVantageNotConfiguredError("Alpha Vantage authentication rejected")
+                elif status >= 500:
+                    # Server failures are retryable outages, not frequency
+                    # notices; preserve the key for the next bounded attempt.
+                    last_error = ProviderServerError("Alpha Vantage server unavailable", provider="alphavantage")
+                elif status == 400:
+                    last_error = AlphaVantageInvalidInputError("Alpha Vantage rejected the request")
+                elif status == 404:
+                    last_error = AlphaVantageUnknownTickerError("Alpha Vantage symbol is unknown")
+                else:
+                    last_error = ProviderUnavailableError("Alpha Vantage HTTP failure", provider="alphavantage")
+                # Never interpolate HTTPError: requests embeds the query URL/key.
+                logger.warning("AV HTTP error on %s: status=%s", function_name, status)
                 continue
 
             try:
                 data = response.json()
-            except ValueError:
-                raise ValueError(f"Alpha Vantage returned non-JSON payload for {function_name}")
+            except (TypeError, ValueError) as exc:
+                raise ProviderServerError("Alpha Vantage returned a non-JSON response", provider="alphavantage") from exc
 
+            if not isinstance(data, dict):
+                raise AlphaVantageInvalidInputError("Alpha Vantage returned an invalid payload")
             notice = data.get("Information") or data.get("Note") or data.get("Error Message")
             if not notice:
                 budget.spend()
                 return data
 
-            kind = _classify_notice(str(notice))
+            safe_notice = _safe_notice(notice, [budget.key])
+            kind = _classify_notice(safe_notice)
             if kind == "daily":
                 self.pool.mark_daily_exhausted(budget)
-                last_error = AlphaVantageRateLimitError(str(notice))
+                last_error = AlphaVantageRateLimitError("Alpha Vantage daily limit")
             elif kind == "frequency":
                 self.pool.mark_frequency_limited(budget)
-                last_error = AlphaVantageRateLimitError(str(notice))
+                last_error = AlphaVantageRateLimitError("Alpha Vantage call frequency limit")
             elif kind == "invalid_key":
                 self.pool.drop_invalid(budget)
-                last_error = AlphaVantageNotConfiguredError(str(notice))
+                last_error = AlphaVantageNotConfiguredError("Alpha Vantage key rejected")
+            elif kind == "unknown_ticker":
+                last_error = AlphaVantageUnknownTickerError("Alpha Vantage symbol is unknown")
             else:
-                raise ValueError(f"Alpha Vantage notice: {notice}")
+                last_error = AlphaVantageInvalidInputError("Alpha Vantage notice: request rejected")
+            logger.warning("AV notice on %s: %s", function_name, safe_notice)
 
         raise last_error
 
-    # --------------------------------------------------------------- series
-
     async def fetch_daily_ohlcv(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        """TIME_SERIES_DAILY -> DataFrame in our lowercase cache schema.
-
-        adj_close mirrors close: TIME_SERIES_DAILY serves unadjusted prices
-        (the adjusted variant is premium-only), recorded here for transparency.
-        Returns None when the vendor yields no rows in range.
-        """
-        av_symbol = to_av_symbol(ticker)
+        """Fetch inclusive historical OHLCV, returning only structurally valid rows."""
+        requested_ticker = str(ticker or "").upper().strip()
+        av_symbol = to_av_symbol(requested_ticker)
+        if not av_symbol:
+            raise AlphaVantageIdentityError("Alpha Vantage listing identity is unavailable for this exchange")
+        start_dt, end_dt = _parse_bounds(start, end)
         data = await self._make_request(
             "TIME_SERIES_DAILY", {"symbol": av_symbol, "outputsize": "full"}
         )
+        if not isinstance(data, dict):
+            raise AlphaVantageInvalidInputError("Alpha Vantage returned an invalid series payload")
+        metadata = data.get("Meta Data") or data.get("MetaData") or {}
+        returned_symbol = metadata.get("2. Symbol") or metadata.get("Symbol")
+        if returned_symbol and str(returned_symbol).upper() != av_symbol.upper():
+            raise AlphaVantageIdentityError("Alpha Vantage returned a different security identity")
 
         series = data.get("Time Series (Daily)") or {}
         rows: List[Dict[str, Any]] = []
-        start_dt, end_dt = pd.to_datetime(start), pd.to_datetime(end)
         for day, values in sorted(series.items()):
-            day_dt = pd.to_datetime(day)
+            try:
+                day_dt = pd.Timestamp(day).normalize()
+            except (TypeError, ValueError):
+                continue
             if not (start_dt <= day_dt <= end_dt):
                 continue
             try:
+                open_price = float(values["1. open"])
+                high = float(values["2. high"])
+                low = float(values["3. low"])
+                close = float(values["4. close"])
+                volume = float(values.get("5. volume", 0))
+                valid = all(math.isfinite(v) and v > 0 for v in (open_price, high, low, close))
+                valid = valid and high >= max(open_price, close, low) and low <= min(open_price, close, high) and volume >= 0
+                if not valid:
+                    continue
                 rows.append({
                     "date": day_dt,
-                    "open": float(values["1. open"]),
-                    "high": float(values["2. high"]),
-                    "low": float(values["3. low"]),
-                    "close": float(values["4. close"]),
-                    "adj_close": float(values["4. close"]),  # unadjusted source
-                    "volume": int(float(values.get("5. volume", 0))),
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "adj_close": close,
+                    "volume": int(volume),
+                    "ticker": requested_ticker,
                 })
-            except (KeyError, TypeError, ValueError) as e:
-                logger.warning(f"Skipping malformed AV row {av_symbol} {day}: {e}")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                logger.warning("Skipping malformed AV historical row for %s", requested_ticker)
 
         if not rows:
-            logger.info(f"Alpha Vantage returned no rows for {av_symbol} in range")
             return None
-        df = pd.DataFrame(rows)
-        df.insert(0, "ticker", av_symbol.upper())
-        logger.info(f"Alpha Vantage supplied {len(df)} rows for {av_symbol}")
-        return df
-
-    # ---------------------------------------------------------------- quote
+        return pd.DataFrame(rows)
 
     async def fetch_global_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """GLOBAL_QUOTE -> partial quote dict matching our quote schema.
-
-        Fills price/volume/day-range only; fundamentals fields (sector,
-        industry, PE...) are absent from this endpoint and left None so
-        callers using .get() degrade gracefully.
-        """
-        av_symbol = to_av_symbol(ticker)
+        """Fetch a quote while preserving the requested listing identity."""
+        requested_ticker = str(ticker or "").upper().strip()
+        av_symbol = to_av_symbol(requested_ticker)
+        if not av_symbol:
+            raise AlphaVantageIdentityError("Alpha Vantage listing identity is unavailable for this exchange")
         data = await self._make_request("GLOBAL_QUOTE", {"symbol": av_symbol})
-        q = data.get("Global Quote") or {}
-        price_raw = q.get("05. price")
-        if not price_raw:
+        quote = data.get("Global Quote") or {}
+        returned_symbol = quote.get("01. symbol")
+        if returned_symbol and str(returned_symbol).upper() != av_symbol.upper():
+            raise AlphaVantageIdentityError("Alpha Vantage returned a different security identity")
+        price_raw = quote.get("05. price")
+        if not _finite_positive(price_raw):
             return None
         try:
-            chg = q.get("10. change percent")
+            change = quote.get("10. change percent")
+            previous = quote.get("08. previous close")
             return {
-                "ticker": ticker.upper().strip(),
+                "ticker": requested_ticker,
                 "current_price": float(price_raw),
-                "volume": int(float(q.get("06. volume") or 0)),
+                "volume": int(float(quote.get("06. volume") or 0)),
                 "market_cap": None,
                 "sector": None,
                 "industry": None,
                 "52_week_high": None,
                 "52_week_low": None,
+                "week_52_high": None,
+                "week_52_low": None,
                 "pe_ratio": None,
                 "dividend_yield": None,
-                "previous_close": float(q["08. previous close"]) if q.get("08. previous close") else None,
-                "change_percent": float(str(chg).rstrip("%")) if chg else None,
-                "currency": "INR" if ".BSE" in av_symbol else "USD",
-                "exchange": "BSE" if ".BSE" in av_symbol else "Other",
+                "previous_close": float(previous) if previous else None,
+                "change_percent": float(str(change).rstrip("%")) if change else None,
+                "currency": "INR" if _is_indian(requested_ticker) else "USD",
+                "exchange": "BSE" if av_symbol.endswith(".BSE") else "Other",
                 "source": "alphavantage",
+                "is_indian": _is_indian(requested_ticker),
                 "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
             }
-        except (KeyError, TypeError, ValueError) as e:
-            logger.warning(f"Malformed AV quote for {av_symbol}: {e}")
-            return None
+        except (KeyError, TypeError, ValueError):
+            raise AlphaVantageInvalidInputError("Alpha Vantage returned a malformed quote")
+
+
+def _is_indian(ticker: str) -> bool:
+    return str(ticker).upper().endswith((".NS", ".BO", ".BSE"))
 
 
 _service: Optional[AlphaVantageService] = None
 
 
 def get_alpha_vantage_service() -> AlphaVantageService:
-    """Process-wide service instance (keys read once from settings)."""
     global _service
     if _service is None:
         _service = AlphaVantageService()

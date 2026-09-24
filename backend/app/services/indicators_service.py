@@ -18,6 +18,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from app.services.data_service import DataService
@@ -82,15 +83,16 @@ def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
-    """Parse dates, coerce numerics, drop invalid rows, fill price gaps."""
+    """Parse dates and coerce numerics while preserving the price time axis."""
     data = _ensure_date_column(data)
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
     data = data.dropna(subset=["Date"])
 
     price_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
     data[price_cols] = data[price_cols].apply(pd.to_numeric, errors="coerce")
-    data = data.dropna(subset=["Close"])
-    data[price_cols] = data[price_cols].ffill().bfill()
+    # Preserve genuine missing observations.  Dropping a missing Close row
+    # would compress the time axis and make the next observation look adjacent
+    # to the prior one; filling it would invent a price instead.
     return data
 
 
@@ -133,7 +135,44 @@ def _compute_sync(df: pd.DataFrame, indicators: List[str]) -> pd.DataFrame:
     out = df[base_cols].reset_index(drop=True).copy()
     if len(stock_df) != len(out):
         raise ValueError("stockstats returned a different number of rows than input")
+    required_inputs = {
+        "close_10_ema": ("Close",),
+        "close_50_sma": ("Close",),
+        "close_200_sma": ("Close",),
+        "rsi": ("Close",),
+        "boll": ("Close",),
+        "boll_ub": ("Close",),
+        "boll_lb": ("Close",),
+        "macd": ("Close",),
+        "macds": ("Close",),
+        "macdh": ("Close",),
+        "atr": ("High", "Low", "Close"),
+        "vwma": ("Close", "Volume"),
+        "mfi": ("High", "Low", "Close", "Volume"),
+    }
     for ind, values in computed.items():
+        # The installed stockstats implementation exposes MFI as a
+        # positive/(positive+negative) fraction, while this service's public
+        # contract documents the conventional 0–100 oscillator (>80/<20).
+        # Convert at the adapter boundary rather than exposing two scales.
+        if ind == "mfi":
+            values = values * 100.0
+        values = np.asarray(values, dtype=float).copy()
+        needed = [column for column in required_inputs.get(ind, ()) if column in df.columns]
+        if needed:
+            invalid_inputs = df[needed].isna().any(axis=1).to_numpy(copy=True)
+            if ind == "mfi":
+                price_columns = [
+                    column for column in ("Open", "High", "Low", "Close")
+                    if column in df.columns
+                ]
+                prices = df[price_columns].to_numpy(dtype=float)
+                invalid_prices = (
+                    ~np.isfinite(prices).all(axis=1)
+                    | (prices <= 0).any(axis=1)
+                )
+                invalid_inputs |= invalid_prices
+            values[invalid_inputs] = np.nan
         out[ind] = values
     return out
 
@@ -184,9 +223,10 @@ class IndicatorsService:
 
         records = []
         for _, row in out_df.iterrows():
+            close_value = row.get("Close")
             entry: Dict[str, Any] = {
                 "date": row["Date"].strftime("%Y-%m-%d"),
-                "close": round(float(row["Close"]), 2),
+                "close": None if pd.isna(close_value) else round(float(close_value), 2),
             }
             for ind in requested:
                 val = row.get(ind)

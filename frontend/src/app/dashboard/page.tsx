@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { MetricCard } from '@/components/ui/MetricCard';
@@ -65,27 +65,50 @@ export default function DashboardSummary() {
   const sectorData = useSectorAllocation();
   const [regimeInfo, setRegimeInfo] = useState<{ current_regime: string; stability_pct: number } | null>(null);
   const [riskDrivers, setRiskDrivers] = useState<[string, number][] | null>(null);
+  const supplementaryRequestRef = useRef<Promise<{
+    regime: { current_regime: string; stability_pct: number } | null;
+    risk: Record<string, any> | null;
+  }> | null>(null);
 
   useEffect(() => {
     fetchPortfolio();
   }, [fetchPortfolio]);
 
-  // Supplementary widgets: regime + risk drivers load quietly and never block the page
+  // Supplementary widgets: regime + risk drivers load quietly and never block
+  // the page. Coalesce the pair so StrictMode/route refreshes do not duplicate
+  // the same in-flight requests.
   useEffect(() => {
     let mounted = true;
-    analyticsApi
-      .getRegime({ with_portfolio: false })
-      .then((r) => { if (mounted) setRegimeInfo({ current_regime: r.current_regime, stability_pct: r.stability_pct }); })
-      .catch(() => { if (mounted) setRegimeInfo(null); });
-    analyticsApi
-      .getRiskContribution()
-      .then((r) => {
-        if (!mounted) return;
-        const entries = Object.entries(r.positions?.volatility ?? {}) as [string, number][];
+    if (!supplementaryRequestRef.current) {
+      supplementaryRequestRef.current = Promise.allSettled([
+        analyticsApi.getRegime({ with_portfolio: false }),
+        analyticsApi.getRiskContribution(),
+      ])
+        .then(([regimeResult, riskResult]) => ({
+          regime: regimeResult.status === 'fulfilled' ? regimeResult.value : null,
+          risk: riskResult.status === 'fulfilled' ? riskResult.value : null,
+        }))
+        .finally(() => {
+          supplementaryRequestRef.current = null;
+        });
+    }
+
+    void supplementaryRequestRef.current.then(({ regime, risk }) => {
+      if (!mounted) return;
+      if (regime?.current_regime) {
+        setRegimeInfo(regime);
+      } else {
+        setRegimeInfo(null);
+      }
+      if (risk) {
+        const entries = Object.entries(risk.positions?.volatility ?? {}) as [string, number][];
         entries.sort(([, a], [, b]) => b - a);
         setRiskDrivers(entries.slice(0, 3));
-      })
-      .catch(() => { if (mounted) setRiskDrivers(null); });
+      } else {
+        setRiskDrivers(null);
+      }
+    });
+
     return () => { mounted = false; };
   }, []);
 
@@ -103,28 +126,30 @@ export default function DashboardSummary() {
     }
   }, [analyticsData.summary, updateLastUpdated]);
 
-  // Quantitative Diversification Score based on Herfindahl Concentration & Sector Breadth
-  const diversificationScore = useMemo(() => {
-    if (positions.length <= 1) return 0;
-    const weights = positions.map(p => {
-      const mv = p.market_value || ((p as any).quantity ? (p as any).quantity * (p.last_price || 0) : 0);
-      return (totalValue && totalValue > 0) ? (mv / totalValue) : p.weight;
-    });
-    const totalW = weights.reduce((a, b) => a + b, 0) || 1;
-    const normW = weights.map(w => w / totalW);
-    const hhi = normW.reduce((sum, w) => sum + w * w, 0); // 1.0 for 1 stock, 0.5 for 2 equal stocks, 0.1 for 10 stocks
-    const effectiveN = 1 / Math.max(hhi, 0.01);
-    // Score scaled from 0% (1 stock) to 100% (10+ effective stocks across 4+ sectors)
-    const positionScore = Math.min(100, Math.max(0, ((effectiveN - 1) / 9) * 100));
-    const sectorMultiplier = Math.min(1, Math.max(0.25, (sectorData.length / 4)));
-    return Math.round(positionScore * sectorMultiplier * 10) / 10;
-  }, [positions, totalValue, sectorData]);
+  // The concentration endpoint owns the canonical base-currency score. Do not
+  // recompute it from native position values mixed with a converted total.
+  const diversificationScore = useMemo<number | null>(() => {
+    if (positions.length === 0) return null;
+    if (positions.length === 1) return 0;
+    const canonical = analyticsData.concentration?.diversification_score;
+    return typeof canonical === 'number' && Number.isFinite(canonical)
+      ? canonical
+      : null;
+  }, [positions.length, analyticsData.concentration]);
 
   const totalCost = useMemo(() => {
     return positions.reduce((sum, p) => {
-      const q = (p as any).quantity || 0;
-      const bp = (p as any).buy_price || 0;
-      return sum + (q > 0 && bp > 0 ? q * bp : (p.market_value || 0));
+      const baseCost = p.total_cost_base;
+      if (typeof baseCost === 'number' && Number.isFinite(baseCost)) {
+        return sum + baseCost;
+      }
+      const q = p.quantity || 0;
+      const baseBuyPrice = p.buy_price_base;
+      if (q > 0 && typeof baseBuyPrice === 'number' && Number.isFinite(baseBuyPrice)) {
+        return sum + q * baseBuyPrice;
+      }
+      // Never mix a legacy native cost into a base-currency total.
+      return sum;
     }, 0);
   }, [positions]);
 
@@ -175,8 +200,11 @@ export default function DashboardSummary() {
       accessorKey: 'weight' as keyof PortfolioPosition,
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const liveWeight = (totalValue && totalValue > 0 && data.market_value)
-          ? (data.market_value / totalValue)
+        const baseValue = typeof data.market_value_base === 'number'
+          ? data.market_value_base
+          : (typeof data.current_value_base === 'number' ? data.current_value_base : null);
+        const liveWeight = (totalValue && totalValue > 0 && typeof baseValue === 'number')
+          ? (baseValue / totalValue)
           : data.weight;
         if (liveWeight == null || !Number.isFinite(liveWeight)) {
           return <div className="text-gray-500">N/A</div>;
@@ -193,9 +221,12 @@ export default function DashboardSummary() {
       accessorKey: 'market_value' as keyof PortfolioPosition,
       cell: ({ row }: any) => {
         const data = row.original || row;
+        const baseValue = typeof data.market_value_base === 'number'
+          ? data.market_value_base
+          : (typeof data.current_value_base === 'number' ? data.current_value_base : null);
         return (
           <div className="text-gray-900 dark:text-white">
-            {data.market_value ? `₹${data.market_value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '₹0.00'}
+            {baseValue !== null ? `₹${baseValue.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'N/A'}
           </div>
         );
       },
@@ -205,9 +236,12 @@ export default function DashboardSummary() {
       accessorKey: 'last_price' as keyof PortfolioPosition,
       cell: ({ row }: any) => {
         const data = row.original || row;
+        const basePrice = typeof data.last_price_base === 'number'
+          ? data.last_price_base
+          : null;
         return (
           <div className="text-gray-900 dark:text-white">
-            {data.last_price ? `₹${data.last_price.toFixed(2)}` : '₹0.00'}
+            {basePrice !== null ? `₹${basePrice.toFixed(2)}` : 'N/A'}
           </div>
         );
       },
@@ -327,14 +361,19 @@ export default function DashboardSummary() {
           icon={TrendingUp}
           loading={isOverallLoading}
         />
-        <MetricCard
-          title="Unrealized P&L"
-          value={`${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-          change={totalCost > 0 ? portfolioMetrics.totalGainLossPct : undefined}
-          changeType={portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
-          icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
-          loading={isOverallLoading}
-        />
+        <div>
+          <MetricCard
+            title="Unrealized P&L"
+            value={`${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            change={totalCost > 0 ? portfolioMetrics.totalGainLossPct : undefined}
+            changeType={portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
+            icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
+            loading={isOverallLoading}
+          />
+          {!isOverallLoading && positions.length > 0 && (
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Uses current live FX for mixed-currency positions.</p>
+          )}
+        </div>
         <div>
           <MetricCard
             title="Annual Volatility"
@@ -355,7 +394,9 @@ export default function DashboardSummary() {
         </div>
         <MetricCard
           title="Diversification Score"
-          value={`${portfolioMetrics.diversificationScore.toFixed(1)}%`}
+          value={portfolioMetrics.diversificationScore === null
+            ? 'N/A'
+            : `${portfolioMetrics.diversificationScore.toFixed(1)}%`}
           icon={Shield}
           loading={analyticsLoading}
         />
@@ -579,13 +620,15 @@ export default function DashboardSummary() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="text-center">
               <div className={`text-2xl font-bold ${
-                diversificationScore <= 20
+                diversificationScore === null
+                  ? 'text-gray-500 dark:text-gray-400'
+                  : diversificationScore <= 20
                   ? 'text-red-500 dark:text-red-400'
                   : diversificationScore <= 60
                   ? 'text-amber-500 dark:text-amber-400'
                   : 'text-green-600 dark:text-green-400'
               }`}>
-                {diversificationScore.toFixed(1)}%
+                {diversificationScore === null ? 'N/A' : `${diversificationScore.toFixed(1)}%`}
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 Diversification Score

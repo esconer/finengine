@@ -11,9 +11,11 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+import asyncio
 import time
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Receive, Scope, Send
 from typing import Callable, Any
 
 from app.config import settings
@@ -24,6 +26,22 @@ from app.utils.logger import setup_logger
 
 # Setup logging
 logger = setup_logger(__name__)
+
+
+class _HealthExemptHTTPSRedirectMiddleware(HTTPSRedirectMiddleware):
+    """Keep internal container health probes on the loopback HTTP listener.
+
+    Production currently terminates no TLS inside Uvicorn; redirecting the
+    health endpoint would make the Docker/Compose probe follow an unusable
+    HTTPS URL.  Public application routes still receive the production
+    redirect posture.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("path") in {"/health", "/api/v1/health"}:
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -62,8 +80,11 @@ async def lifespan(app: FastAPI):
     
     # Cleanup on shutdown
     logger.info("Shutting down Daisy Risk Engine Backend")
-    if websocket.update_task and not websocket.update_task.done():
-        websocket.update_task.cancel()
+    task = websocket.update_task
+    if task and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
     await close_db_connections()
 
 
@@ -80,7 +101,7 @@ app = FastAPI(
 # Add production middleware
 if settings.environment == "production":
     # Security middleware for production
-    app.add_middleware(HTTPSRedirectMiddleware)
+    app.add_middleware(_HealthExemptHTTPSRedirectMiddleware)
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["daisy-risk-engine.com", "*.daisy-risk-engine.com", "localhost", "127.0.0.1"]
@@ -106,7 +127,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler. Must return a Response (never a plain dict),
     otherwise Starlette raises a secondary failure while handling the error."""
-    logger.error(f"Global exception: {exc}", exc_info=True)
+    logger.error("Unhandled application error")
     return JSONResponse(
         status_code=500,
         content={
@@ -158,6 +179,18 @@ async def health_check():
         "version": "0.1.0",
         "environment": settings.environment
     }
+
+@app.get("/v1/models")
+async def list_models():
+    """Expose an honest OpenAI-compatible discovery response.
+
+    FinEngine currently provides analytics and LLM-ready prompt/dossier APIs;
+    it does not host an LLM or proxy chat completions.  Returning an empty
+    standards-shaped list prevents generic clients from treating a missing
+    route as a server error without inventing model IDs.
+    """
+    return {"object": "list", "data": []}
+
 
 # Root endpoint
 @app.get("/")

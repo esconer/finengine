@@ -1,0 +1,5 @@
+﻿CHECK|total_turnover|backend=0.3|reference=0.588372093023|abs_diff=0.288372093023|rel_diff=0.490118577075|tolerance=atol:1e-12,rtol:1e-12|FAIL
+CHECK|second_rebalance_turnover|backend=0|reference=0.288372093023|abs_diff=0.288372093023|rel_diff=1|tolerance=atol:1e-12,rtol:1e-12|FAIL
+OUTPUT|backend_events|[{'date': '2024-01-29', 'turnover': 0.3, 'cost_penalty': 0.0, 'weights': {'A': 0.8, 'B': 0.2}}, {'date': '2024-02-26', 'turnover': 0.0, 'cost_penalty': 0.0, 'weights': {'A': 0.8, 'B': 0.2}}]
+OUTPUT|reference_events|[0.30000000000000004, 0.28837209302325584]
+

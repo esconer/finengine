@@ -1,0 +1,5 @@
+﻿CHECK|analytics_initial_loss|backend=0|reference=-0.1|abs_diff=0.1|rel_diff=1|tolerance=atol:1e-12,rtol:1e-12|FAIL
+CHECK|backtest_initial_loss|backend=0|reference=-0.1|abs_diff=0.1|rel_diff=1|tolerance=atol:5e-05,rtol:1e-12|FAIL
+OUTPUT|analytics|backend=0.0|reference=-0.09999999999999998
+OUTPUT|backtest|backend=0.0|reference=-0.09999999999999998
+

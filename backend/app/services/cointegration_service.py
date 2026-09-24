@@ -16,7 +16,11 @@ from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.schemas import CointPairResult, CointScannerResponse
-from app.services.cache_service import CacheService
+from app.services.cache_service import (
+    CacheService,
+    cache_generation_is_current,
+    get_cache_generation,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -47,13 +51,20 @@ def _db_cache_keys(
     last_date: str,
     p_value_threshold: float = 0.05,
     include_spread_series: bool = False,
+    lookback_days: Optional[int] = None,
+    history_coverage: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Collision-free (ticker, metric_name) for a pair-day-params within column sizes.
+    """Build a durable key including effective history coverage.
 
-    Result-affecting query params (p threshold, spread inclusion) are digested
-    into the metric name: a p=0.05 scan must not be served for p=0.10 after restarts.
+    Pair/date/threshold/spread flags alone are insufficient: the same pair
+    requested over 60 versus 2,520 observations has different p-values,
+    spread points, and OU diagnostics.
     """
-    raw = f"{ticker_a}|{ticker_b}|{p_value_threshold}|{int(include_spread_series)}"
+    coverage = history_coverage or ("lookback:unknown" if lookback_days is None else f"lookback:{int(lookback_days)}")
+    raw = (
+        f"{ticker_a}|{ticker_b}|{p_value_threshold}|"
+        f"{int(include_spread_series)}|lookback:{lookback_days}|coverage:{coverage}"
+    )
     digest = sha1(raw.encode("utf-8")).hexdigest()[:8]
     return COINT_DB_TICKER, f"coint_{digest}_{last_date}"
 
@@ -64,12 +75,28 @@ def _mem_cache_key(
     last_date: str,
     p_value_threshold: float = 0.05,
     include_spread_series: bool = False,
+    lookback_days: Optional[int] = None,
+    history_coverage: Optional[str] = None,
 ) -> str:
-    """Single source of truth for the in-memory key; mirrors _db_cache_keys' param set."""
+    """Single source of truth for the in-memory key."""
+    coverage = history_coverage or ("lookback:unknown" if lookback_days is None else f"lookback:{int(lookback_days)}")
     return (
         f"coint_{ticker_a}_{ticker_b}_{last_date}"
         f"_{p_value_threshold}_{int(include_spread_series)}"
+        f"_{lookback_days}_{coverage}"
     )
+
+
+def _history_coverage(series_a: pd.Series, series_b: pd.Series) -> str:
+    """Return a deterministic effective-overlap identity for cache keys."""
+    frame = pd.DataFrame({"a": series_a, "b": series_b}).replace([np.inf, -np.inf], np.nan).dropna()
+    if frame.empty:
+        return "empty:0"
+    start = frame.index[0]
+    end = frame.index[-1]
+    start_text = start.strftime("%Y-%m-%d") if hasattr(start, "strftime") else str(start)[:32]
+    end_text = end.strftime("%Y-%m-%d") if hasattr(end, "strftime") else str(end)[:32]
+    return f"{len(frame)}:{start_text}:{end_text}"
 
 
 def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
@@ -288,12 +315,27 @@ class CointegrationService:
         last_date: str,
         p_value_threshold: float = 0.05,
         include_spread_series: bool = False,
+        lookback_days: Optional[int] = None,
+        history_coverage: Optional[str] = None,
+        cache_generation: Optional[int] = None,
     ) -> Optional[CointPairResult]:
         """Check in-memory cache and DB cache for computed pair result"""
-        cache_key = _mem_cache_key(ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series)
+        if cache_generation is not None and not cache_generation_is_current(cache_generation):
+            return None
+        cache_key = _mem_cache_key(
+            ticker_a,
+            ticker_b,
+            last_date,
+            p_value_threshold,
+            include_spread_series,
+            lookback_days=lookback_days,
+            history_coverage=history_coverage,
+        )
 
         # 1. In-memory check
         if cache_key in _IN_MEMORY_COINT_CACHE:
+            if cache_generation is not None and not cache_generation_is_current(cache_generation):
+                return None
             ts, data = _IN_MEMORY_COINT_CACHE[cache_key]
             if _utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS):
                 try:
@@ -305,7 +347,13 @@ class CointegrationService:
         if self.cache_service is not None:
             try:
                 db_ticker, metric_name = _db_cache_keys(
-                    ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series
+                    ticker_a,
+                    ticker_b,
+                    last_date,
+                    p_value_threshold,
+                    include_spread_series,
+                    lookback_days=lookback_days,
+                    history_coverage=history_coverage,
                 )
                 cached = await self.cache_service.get_cached_analytics(
                     ticker=db_ticker,
@@ -315,6 +363,8 @@ class CointegrationService:
                     pair_data = cached["model_params"]
                     if pair_data.get("ticker_a") == ticker_a and pair_data.get("ticker_b") == ticker_b:
                         res = CointPairResult(**pair_data)
+                        if cache_generation is not None and not cache_generation_is_current(cache_generation):
+                            return None
                         _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_data)
                         return res
             except Exception as e:
@@ -330,12 +380,32 @@ class CointegrationService:
         result: CointPairResult,
         p_value_threshold: float = 0.05,
         include_spread_series: bool = False,
+        lookback_days: Optional[int] = None,
+        history_coverage: Optional[str] = None,
+        cache_generation: Optional[int] = None,
     ) -> None:
-        """Store pair result in memory and DB cache"""
-        cache_key = _mem_cache_key(ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series)
+        """Store pair result in memory and DB cache.
+
+        ``cache_generation`` is captured before the expensive pair analysis;
+        a purge/source switch that advances the token makes this late write
+        stale instead of repopulating a cleared memo.
+        """
+        if cache_generation is not None and not cache_generation_is_current(cache_generation):
+            return
+        cache_key = _mem_cache_key(
+            ticker_a,
+            ticker_b,
+            last_date,
+            p_value_threshold,
+            include_spread_series,
+            lookback_days=lookback_days,
+            history_coverage=history_coverage,
+        )
         pair_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
 
         # 1. In-memory store
+        if cache_generation is not None and not cache_generation_is_current(cache_generation):
+            return
         _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_dict)
         # Bounded memory: drop expired entries on every write (cache is
         # per-key-per-day-per-params, so long-running scanners grow it otherwise)
@@ -346,10 +416,18 @@ class CointegrationService:
             _IN_MEMORY_COINT_CACHE.pop(k, None)
 
         # 2. Database store
+        if cache_generation is not None and not cache_generation_is_current(cache_generation):
+            return
         if self.cache_service is not None:
             try:
                 db_ticker, metric_name = _db_cache_keys(
-                    ticker_a, ticker_b, last_date, p_value_threshold, include_spread_series
+                    ticker_a,
+                    ticker_b,
+                    last_date,
+                    p_value_threshold,
+                    include_spread_series,
+                    lookback_days=lookback_days,
+                    history_coverage=history_coverage,
                 )
                 await self.cache_service.set_cached_analytics(
                     ticker=db_ticker,
@@ -367,6 +445,7 @@ class CointegrationService:
         p_value_threshold: float = 0.05,
         max_half_life: Optional[int] = 60,
         include_spread_series: bool = False,
+        lookback_days: Optional[int] = None,
     ) -> CointScannerResponse:
         """
         Scan all pairwise combinations in the universe for cointegration.
@@ -376,6 +455,8 @@ class CointegrationService:
             p_value_threshold: Maximum Engle-Granger p-value for cointegration
             max_half_life: Optional maximum OU half-life filter in trading days
             include_spread_series: Whether to include historical spread data
+            lookback_days: Optional requested lookback; actual pair coverage is
+                also fingerprinted so sliced histories cannot share results.
 
         Returns:
             CointScannerResponse with scanned & cointegrated pair metrics
@@ -402,6 +483,9 @@ class CointegrationService:
         as_of_date = max(all_dates) if all_dates else _utcnow().strftime("%Y-%m-%d")
 
         pair_combinations = list(combinations(tickers, 2))
+        # Fence late cache writes if a purge/source switch happens while the
+        # pair's statsmodels analysis is running.
+        cache_generation = get_cache_generation()
         scanned_count = 0
         all_results: List[CointPairResult] = []
 
@@ -409,10 +493,18 @@ class CointegrationService:
             scanned_count += 1
             s1 = price_data[t1]
             s2 = price_data[t2]
+            coverage = _history_coverage(s1, s2)
 
             # Check cache first
             cached_result = await self._get_cached_pair(
-                t1, t2, as_of_date, p_value_threshold, include_spread_series
+                t1,
+                t2,
+                as_of_date,
+                p_value_threshold,
+                include_spread_series,
+                lookback_days=lookback_days,
+                history_coverage=coverage,
+                cache_generation=cache_generation,
             )
             if cached_result is not None:
                 all_results.append(cached_result)
@@ -432,7 +524,15 @@ class CointegrationService:
 
             if pair_res is not None:
                 await self._set_cached_pair(
-                    t1, t2, as_of_date, pair_res, p_value_threshold, include_spread_series
+                    t1,
+                    t2,
+                    as_of_date,
+                    pair_res,
+                    p_value_threshold,
+                    include_spread_series,
+                    lookback_days=lookback_days,
+                    history_coverage=coverage,
+                    cache_generation=cache_generation,
                 )
                 all_results.append(pair_res)
 

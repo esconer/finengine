@@ -3,7 +3,7 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-import { useUIStore } from './store';
+import * as store from './store';
 
 interface WebSocketMessage {
     type: string;
@@ -229,7 +229,7 @@ export class WebSocketClient {
         }
 
         // Update last updated time for UI
-        const { updateLastUpdated } = useUIStore.getState();
+        const { updateLastUpdated } = store.useUIStore.getState();
         updateLastUpdated();
 
         // Call custom message handler
@@ -279,7 +279,10 @@ export class WebSocketClient {
 export function useWebSocket(options: WebSocketOptions = {}) {
   const wsClientRef = useRef<WebSocketClient | null>(null);
   const optionsRef = useRef<WebSocketOptions>(options);
-  const { liveDataMode } = useUIStore();
+  const uiState = typeof store.useUIStore === 'function'
+    ? store.useUIStore((state: any) => state)
+    : undefined;
+  const liveDataMode = Boolean(uiState?.liveDataMode);
   const [isConnected, setIsConnected] = useState(false);
   const [readyState, setReadyState] = useState<number>(WebSocket.CLOSED);
   const [clientId, setClientId] = useState<string>('');

@@ -318,7 +318,7 @@ async def test_indicator_warmup_yields_200sma_at_default_lookback():
 # P1: Monte Carlo (num_paths x steps) element budget
 # ---------------------------------------------------------------------------
 
-def test_mc_caps_paths_by_element_budget(monkeypatch):
+def test_mc_caps_paths_by_element_budget_and_chunks(monkeypatch):
     from app.services import monte_carlo_service as mc
 
     captured = []
@@ -326,7 +326,11 @@ def test_mc_caps_paths_by_element_budget(monkeypatch):
     def fake_gbm(mu_annual, sigma_annual, initial_value, horizon_years, num_paths, rng):
         captured.append(num_paths)
         steps = int(round(float(horizon_years) * mc.TRADING_DAYS))
-        return np.full((1, steps + 1), float(initial_value))
+        # Broadcast a one-row view so the regression never allocates the full
+        # requested path matrix merely to spy on chunk sizes.
+        return np.broadcast_to(
+            np.array([[float(initial_value)]]), (num_paths, steps + 1)
+        )
 
     monkeypatch.setattr(mc, "_simulate_gbm", fake_gbm)
     r = pd.Series(np.random.default_rng(10).normal(0.0004, 0.01, 300))
@@ -334,11 +338,13 @@ def test_mc_caps_paths_by_element_budget(monkeypatch):
     out = simulate_goal(r, 100_000, 150_000, 40, method="gbm", num_paths=20_000, seed=1)
     steps = int(round(40 * 252))
     expected = max(100, min(20_000, mc.MAX_PATH_ELEMENTS // steps))
-    assert captured[0] == expected
-    assert captured[0] * steps <= mc.MAX_PATH_ELEMENTS
     assert out["num_paths"] == expected
+    assert len(captured) > 1
+    assert max(captured) == out["chunk_size_paths"]
+    assert all(count * steps <= mc.MAX_CHUNK_ELEMENTS for count in captured)
+    assert out["memory_budget_elements"] == mc.MAX_AGGREGATE_ELEMENTS
 
-    # Requests within the budget pass through unchanged
+    # Requests within the chunk budget pass through as one bounded call.
     simulate_goal(r, 100_000, 150_000, 1, method="gbm", num_paths=500, seed=1)
     assert captured[-1] == 500
 

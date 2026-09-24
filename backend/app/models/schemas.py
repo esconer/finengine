@@ -4,6 +4,7 @@ Pydantic schemas for Daisy Risk Engine
 
 from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any
+import math
 from pydantic import BaseModel, Field, validator
 
 
@@ -14,7 +15,7 @@ class PortfolioPositionBase(BaseModel):
     weight: float = Field(..., gt=0, le=1, description="Portfolio weight (0-1)")
     quantity: float = Field(..., gt=0, description="Number of shares/units held - must be > 0")
     buy_price: float = Field(..., gt=0, description="Price per share at time of purchase - must be > 0")
-    region: str = Field(default="US", description="Region code")
+    region: Optional[str] = Field(default=None, description="Region code; inferred from ticker when omitted")
     custom_name: Optional[str] = Field(default=None, max_length=100, description="Custom position name")
     added_on: Optional[date] = Field(default=None, description="Purchase date (YYYY-MM-DD); defaults to today. Must not be in the future.")
 
@@ -27,23 +28,23 @@ class PortfolioPositionBase(BaseModel):
         if not v.strip():
             raise ValueError('Ticker cannot be empty')
         return v.upper().strip()
-    
+
     @validator('weight')
     def weight_must_be_valid(cls, v):
         if not (0 < v <= 1):
             raise ValueError('Weight must be between 0 and 1 (exclusive of 0, inclusive of 1)')
         return v
-    
+
     @validator('quantity')
     def quantity_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError('Quantity must be greater than 0')
+        if not math.isfinite(float(v)) or v <= 0:
+            raise ValueError('Quantity must be finite and greater than 0')
         return v
-    
+
     @validator('buy_price')
     def buy_price_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError('Buy price must be greater than 0')
+        if not math.isfinite(float(v)) or v <= 0:
+            raise ValueError('Buy price must be finite and greater than 0')
         return v
 
     @validator('added_on')
@@ -72,6 +73,12 @@ class PortfolioPositionUpdate(BaseModel):
             raise ValueError('added_on cannot be in the future')
         return v
 
+    @validator('weight', 'quantity', 'buy_price')
+    def finite_positive_values(cls, v):
+        if v is not None and not math.isfinite(float(v)):
+            raise ValueError('numeric portfolio values must be finite')
+        return v
+
 
 class PortfolioPositionResponse(BaseModel):
     """Schema for portfolio position response"""
@@ -84,6 +91,7 @@ class PortfolioPositionResponse(BaseModel):
     market_value: float
     sector: str
     industry: str
+    region: Optional[str] = None
     custom_name: Optional[str]
     added_on: datetime
     updated_on: Optional[datetime] = None
@@ -92,7 +100,21 @@ class PortfolioPositionResponse(BaseModel):
     unrealized_gain_loss: float
     unrealized_gain_loss_pct: float
     current_value: float
-    
+    # Explicit monetary-unit contract. Legacy calculated fields above remain
+    # native-unit values for backward compatibility; *_base fields are the
+    # values converted into the envelope's requested base currency.
+    native_currency: Optional[str] = None
+    value_currency: Optional[str] = None
+    fx_rate: Optional[float] = None
+    fx_provenance: Optional[Dict[str, Any]] = None
+    market_value_base: Optional[float] = None
+    buy_price_base: Optional[float] = None
+    last_price_base: Optional[float] = None
+    current_value_base: Optional[float] = None
+    total_cost_base: Optional[float] = None
+    unrealized_gain_loss_base: Optional[float] = None
+    unrealized_gain_loss_pct_base: Optional[float] = None
+
     class Config:
         from_attributes = True
 
@@ -131,13 +153,13 @@ class StockTimeseriesResponse(BaseModel):
     source: str
     from_cache: bool
     metadata: Dict[str, str] = {}
-    
+
     class Config:
         from_attributes = True
 
 
 class StockQuoteResponse(BaseModel):
-    """Schema for stock quote response"""
+    """Schema for stock quote response, including provider provenance."""
     ticker: str
     current_price: float
     volume: int
@@ -148,6 +170,13 @@ class StockQuoteResponse(BaseModel):
     week_52_low: Optional[float] = None
     pe_ratio: Optional[float] = None
     dividend_yield: Optional[float] = None
+    previous_close: Optional[float] = None
+    change_percent: Optional[float] = None
+    currency: Optional[str] = None
+    exchange: Optional[str] = None
+    is_indian: Optional[bool] = None
+    source: Optional[str] = None
+    timestamp: Optional[datetime] = None
 
 
 class BatchStockDataRequest(BaseModel):
@@ -326,12 +355,16 @@ class CorrelationDataPoint(BaseModel):
 
 
 class CorrelationStabilityResponse(BaseModel):
-    """Schema for rolling 60-day correlation stability and regime break response"""
+    """Schema for rolling 60-day correlation stability and regime break response.
+
+    Pairwise correlation is undefined for a single holding; the nullable
+    fields preserve that fact instead of publishing a fabricated 1.0.
+    """
     as_of: str
-    current_avg_correlation: float
-    historical_threshold_90th: float
-    historical_threshold_75th: float
-    historical_median: float
+    current_avg_correlation: Optional[float] = None
+    historical_threshold_90th: Optional[float] = None
+    historical_threshold_75th: Optional[float] = None
+    historical_median: Optional[float] = None
     is_regime_break: bool
     alert_level: str  # "CRITICAL", "ELEVATED", "NORMAL"
     message: str
@@ -403,15 +436,37 @@ class VolConeResponse(BaseModel):
 
 # Tail Risk & EVT / Copula Schemas
 class EVTPOTVarMetrics(BaseModel):
-    """EVT Peaks-Over-Threshold 99% VaR and Expected Shortfall metrics"""
+    """EVT POT metrics with confidence-neutral primary fields.
+
+    ``evt_pot_var``/``evt_pot_es`` and the historical counterparts describe the
+    requested ``confidence_level``.  The legacy ``*_99`` names remain optional
+    compatibility aliases and are only populated by the service for an actual
+    99% request; arbitrary confidence values must not be mislabelled as 99%.
+    """
     confidence_level: float = 0.99
-    evt_pot_var_99: float
-    evt_pot_es_99: float
-    historical_var_99: float
-    historical_es_99: float
+    evt_pot_var: Optional[float] = None
+    evt_pot_es: Optional[float] = None
+    historical_var: Optional[float] = None
+    historical_es: Optional[float] = None
+    evt_pot_var_99: Optional[float] = None
+    evt_pot_es_99: Optional[float] = None
+    historical_var_99: Optional[float] = None
+    historical_es_99: Optional[float] = None
     threshold_u: float
     gpd_shape_xi: Optional[float] = None
     gpd_scale_beta: Optional[float] = None
+    gpd_shape_xi_raw: Optional[float] = None
+    gpd_shape_xi_constrained: Optional[float] = None
+    gpd_scale_beta_raw: Optional[float] = None
+    gpd_scale_beta_constrained: Optional[float] = None
+    evt_pot_var_unconstrained: Optional[float] = None
+    evt_pot_es_unconstrained: Optional[float] = None
+    constraint_applied: Optional[bool] = None
+    metrics_constrained: Optional[bool] = None
+    metrics_valid: Optional[bool] = None
+    raw_fit_valid: Optional[bool] = None
+    constrained_metrics_valid: Optional[bool] = None
+    constraint_reason: Optional[str] = None
     model_fitted: bool = True
     exceedances_count: int
     total_observations: int
@@ -578,4 +633,4 @@ class CustomScreenRequest(BaseModel):
     min_div_yield: Optional[float] = Field(default=None, ge=0, le=100)
     max_stocks: Optional[int] = Field(default=50, ge=5, le=100)
 
-
+

@@ -1,0 +1,1 @@
+{'/health': (200, None), '/api/v1/health': (200, None), '/': (307, 'https://127.0.0.1/')}

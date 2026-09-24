@@ -1,0 +1,14 @@
+Agent D final focused verification (2026-09-24)
+
+- Foundation/deployment/migration/cache pytest: 37 passed in 3.41s
+- Portfolio API integration pytest: 19 passed in 3.88s
+- B persistence integration pytest: 14 passed in 1.55s
+- Health/B-06/duplicate seam pytest: 3 passed in 0.76s
+- Ruff --no-cache on all Agent D changed Python: All checks passed
+- bash -n scripts/deploy.sh: exit 0
+- Docker-free rollback dry run: PASS
+- Agent D static preflight: 16 passed, 0 failed
+- YAML parse/exact URL render: PASS
+- Host import/constraint smoke: PASS
+- Docker build/runtime: NOT RUN; Docker/Compose executables unavailable
+- Live portfolio DB: NOT OPENED OR MUTATED

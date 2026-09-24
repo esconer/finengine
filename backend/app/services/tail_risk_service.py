@@ -17,7 +17,7 @@ logger = setup_logger(__name__)
 class TailRiskService:
     """
     Institutional tail-risk suite implementing:
-    1. EVT-POT (Peaks-Over-Threshold) 99% VaR and Expected Shortfall via Generalized Pareto Distribution (GPD).
+    1. EVT-POT (Peaks-Over-Threshold) confidence-level VaR and Expected Shortfall via Generalized Pareto Distribution (GPD).
     2. Bivariate Student-t Copula Lower-Tail Dependence Coefficient matrix (lambda_L).
     """
 
@@ -27,132 +27,227 @@ class TailRiskService:
         confidence_level: float = 0.99,
         threshold_quantile: float = 0.95,
     ) -> Dict[str, Any]:
-        """
-        Calculate 99% EVT-POT Value-at-Risk and Expected Shortfall using scipy.stats.genpareto.
+        """Calculate configurable EVT-POT VaR/ES with fit disclosure.
 
-        Parameters
-        ----------
-        returns : pd.Series or np.ndarray
-            Daily portfolio returns series.
-        confidence_level : float
-            Confidence level for VaR/ES (default 0.99).
-        threshold_quantile : float
-            Quantile for POT threshold selection (default 0.95).
-
-        Returns
-        -------
-        Dict[str, Any]
-            EVT POT VaR/ES, historical VaR/ES, GPD parameters (xi, beta), and diagnostics.
+        The raw fitted GPD shape and scale are retained.  Numerical guards are
+        applied only to a separately named constrained estimate used for the
+        reported risk metrics, so a clipped value is never mislabeled as the
+        raw MLE fit.
         """
         if isinstance(returns, pd.Series):
-            r = returns.dropna().values
+            r = returns.to_numpy(dtype=float)
         else:
-            r = np.asarray(returns)[~np.isnan(returns)]
+            r = np.asarray(returns, dtype=float)
+        r = r[np.isfinite(r)]
+
+        try:
+            confidence_level = float(confidence_level)
+            threshold_quantile = float(threshold_quantile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence_level and threshold_quantile must be finite") from exc
+        if not np.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
+            raise ValueError("confidence_level must be finite and between 0 and 1")
+        if not np.isfinite(threshold_quantile) or not 0.0 < threshold_quantile < 1.0:
+            raise ValueError("threshold_quantile must be finite and between 0 and 1")
 
         n_total = len(r)
         if n_total < 20:
-            # Never fabricate tail numbers: EVT-POT needs enough data to
-            # clear the 95% threshold with fittable exceedances. Callers map
-            # this to 400/insufficient-data (the /tails route already guards
-            # len(port_ret) < 30 and translates ValueError to 400).
+            # Never fabricate tail numbers: EVT-POT needs enough data to clear
+            # the threshold with fittable exceedances.
             raise ValueError(
                 f"Insufficient observations for EVT-POT (need >= 20, got {n_total})"
             )
 
         if threshold_quantile >= confidence_level:
-            # Fitting GPD above the reported confidence level would make the
-            # threshold clamp systematically overstate VaR/ES for that level.
             raise ValueError(
                 f"threshold_quantile ({threshold_quantile}) must be < "
                 f"confidence_level ({confidence_level})"
             )
 
-        # Daily loss series: positive values are losses
+        # Daily loss series: positive values are losses.
         losses = -r
-        alpha = 1.0 - confidence_level  # 0.01 for 99%
+        alpha = 1.0 - confidence_level
 
-        # 1. Historical empirical VaR and ES
         hist_var_loss = float(np.percentile(losses, confidence_level * 100.0))
         tail_losses = losses[losses >= hist_var_loss]
         hist_es_loss = float(np.mean(tail_losses)) if len(tail_losses) > 0 else hist_var_loss
 
-        # 2. EVT Peaks-Over-Threshold (POT)
         threshold_u = float(np.percentile(losses, threshold_quantile * 100.0))
         exceedances = losses[losses > threshold_u] - threshold_u
         n_u = len(exceedances)
 
+        def pot_moments(shape: float, scale: float) -> Tuple[float, float]:
+            """Return finite POT first/second moments, or NaN when undefined."""
+            try:
+                if not np.isfinite(shape) or not np.isfinite(scale) or scale <= 0.0 or shape >= 1.0:
+                    return float("nan"), float("nan")
+                ratio = (n_total / n_u) * alpha
+                if abs(shape) > 1e-6:
+                    var_loss = threshold_u + (scale / shape) * (ratio ** (-shape) - 1.0)
+                else:
+                    var_loss = threshold_u - scale * np.log(ratio)
+                es_loss = (var_loss + scale - shape * threshold_u) / (1.0 - shape)
+                if not np.isfinite(var_loss) or not np.isfinite(es_loss):
+                    return float("nan"), float("nan")
+                return float(var_loss), float(es_loss)
+            except (ArithmeticError, FloatingPointError, ValueError):
+                return float("nan"), float("nan")
+
+        xi_raw: Optional[float] = None
+        beta_raw: Optional[float] = None
+        xi_constrained: Optional[float] = None
+        beta_constrained: Optional[float] = None
+        raw_var_loss: Optional[float] = None
+        raw_es_loss: Optional[float] = None
+        var_evt_loss = hist_var_loss
+        es_evt_loss = hist_es_loss
+        model_fitted = False
+        metrics_valid = False
+        constraint_reasons: list[str] = []
+
         if n_u < 5:
-            # Not enough exceedances to fit GPD reliably: report honest
-            # historical-only VaR/ES with model_fitted=False and no GPD
-            # parameters — never invent xi/beta or scale history by
-            # arbitrary factors (fabrication class as the fixed P0-6).
-            xi = None
-            beta = None
-            model_fitted = False
-            var_evt_loss = hist_var_loss
-            es_evt_loss = hist_es_loss
+            constraint_reasons.append("insufficient_exceedances")
         else:
             try:
-                # Fit GPD with location fixed at 0: y ~ GPD(xi, beta)
-                # scipy.stats.genpareto: c is shape parameter (xi), scale is beta
-                c_est, loc_est, scale_est = stats.genpareto.fit(exceedances, floc=0.0)
-                xi = float(c_est)
-                beta = float(max(scale_est, 1e-6))
+                # scipy.stats.genpareto: c is the raw shape (xi), scale is beta.
+                c_est, _loc_est, scale_est = stats.genpareto.fit(exceedances, floc=0.0)
+                xi_raw = float(c_est)
+                beta_raw = float(scale_est)
                 model_fitted = True
+                metrics_valid = bool(np.isfinite(xi_raw) and np.isfinite(beta_raw) and beta_raw > 0.0)
 
-                # Numerical stability constraint: clip xi in [-0.5, 0.95]
-                # If xi >= 1.0, theoretical mean (ES) does not exist
-                xi = float(np.clip(xi, -0.5, 0.95))
+                # A finite ES requires xi < 1.  The lower bound is a
+                # stability guard for extreme heavy-tail extrapolation; it is
+                # deliberately separate from the raw fit and is disclosed.
+                xi_constrained = float(np.clip(xi_raw, -0.5, 0.95))
+                beta_constrained = float(max(beta_raw, 1e-6))
+                if not np.isclose(xi_constrained, xi_raw):
+                    constraint_reasons.append("gpd_shape_clipped")
+                if beta_constrained != beta_raw:
+                    constraint_reasons.append("gpd_scale_floor")
 
-                # Analytical EVT VaR formula
-                ratio = (n_total / n_u) * alpha
-                if abs(xi) > 1e-6:
-                    var_evt_loss = threshold_u + (beta / xi) * ((ratio ** (-xi)) - 1.0)
-                else:
-                    var_evt_loss = threshold_u - beta * np.log(ratio)
+                raw_var_loss, raw_es_loss = pot_moments(xi_raw, beta_raw)
+                constrained_var_loss, constrained_es_loss = pot_moments(
+                    xi_constrained, beta_constrained
+                )
+                if not np.isfinite(constrained_var_loss) or not np.isfinite(constrained_es_loss):
+                    raise ValueError("constrained GPD moments are not finite")
 
-                # Analytical EVT Expected Shortfall formula: ES = (VaR + beta - xi * u) / (1 - xi)
-                es_evt_loss = (var_evt_loss + beta - xi * threshold_u) / (1.0 - xi)
-
-                # Monotonicity & conservative sanity check: ES >= VaR >= threshold_u.
-                # No cosmetic VaR->ES gap: a thin tail with ES ~ VaR stays honest.
-                var_evt_loss = max(var_evt_loss, threshold_u, hist_var_loss * 0.9)
+                # Preserve the existing conservative monotonicity/floor
+                # behavior, but expose the unconstrained moments alongside it.
+                var_evt_loss = max(
+                    constrained_var_loss,
+                    threshold_u,
+                    hist_var_loss * 0.9,
+                )
+                es_evt_loss = constrained_es_loss
+                if var_evt_loss > constrained_var_loss + 1e-15:
+                    constraint_reasons.append("var_floor")
+                # Keep this exact guard visible in the source: no cosmetic
+                # five-percent ES gap is introduced here.
                 es_evt_loss = max(es_evt_loss, var_evt_loss)
-
-            except Exception as e:
+                if es_evt_loss > constrained_es_loss + 1e-15:
+                    constraint_reasons.append("es_monotonicity")
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"GPD fit failed ({e}); reporting historical-only tail metrics "
                     f"(model_fitted=False)"
                 )
-                xi = None
-                beta = None
+                xi_raw = None
+                beta_raw = None
+                xi_constrained = None
+                beta_constrained = None
                 model_fitted = False
+                metrics_valid = False
                 var_evt_loss = hist_var_loss
                 es_evt_loss = hist_es_loss
+                constraint_reasons = ["fit_failed"]
 
-        # Check kurtosis for fat tails
+        # A fitted raw shape is still not a valid first-moment EVT estimate when
+        # xi >= 1.  Keep the constrained metrics available, but disclose that
+        # validity rather than silently calling the extrapolation valid.
+        if xi_raw is not None and xi_raw >= 1.0:
+            metrics_valid = False
+            constraint_reasons.append("raw_first_moment_undefined")
+
         excess_kurt = float(stats.kurtosis(r)) if n_total > 4 else 0.0
         if model_fitted:
-            is_fat_tailed = bool(xi > 0.05 or excess_kurt > 0.5 or (var_evt_loss > hist_var_loss))
+            is_fat_tailed = bool(
+                (xi_raw is not None and xi_raw > 0.05)
+                or excess_kurt > 0.5
+                or var_evt_loss > hist_var_loss
+            )
         else:
-            # No GPD fit: fatness comes from the empirical tail only —
-            # never forced True by a fabricated inflation factor.
             is_fat_tailed = bool(excess_kurt > 0.5)
 
-        return {
-            "confidence_level": round(confidence_level, 2),
-            "evt_pot_var_99": round(-float(var_evt_loss), 6),
-            "evt_pot_es_99": round(-float(es_evt_loss), 6),
-            "historical_var_99": round(-float(hist_var_loss), 6),
-            "historical_es_99": round(-float(hist_es_loss), 6),
+        neutral = {
+            "evt_pot_var": round(-float(var_evt_loss), 6),
+            "evt_pot_es": round(-float(es_evt_loss), 6),
+            "historical_var": round(-float(hist_var_loss), 6),
+            "historical_es": round(-float(hist_es_loss), 6),
+        }
+        constraint_applied = any(
+            reason in {
+                "gpd_shape_clipped",
+                "gpd_scale_floor",
+                "var_floor",
+                "es_monotonicity",
+                "raw_first_moment_undefined",
+            }
+            for reason in constraint_reasons
+        )
+        result: Dict[str, Any] = {
+            "confidence_level": round(confidence_level, 4),
+            **neutral,
+            "evt_pot_var_unconstrained": (
+                round(-float(raw_var_loss), 6) if raw_var_loss is not None else None
+            ),
+            "evt_pot_es_unconstrained": (
+                round(-float(raw_es_loss), 6) if raw_es_loss is not None else None
+            ),
             "threshold_u": round(float(threshold_u), 6),
-            "gpd_shape_xi": round(float(xi), 4) if xi is not None else None,
-            "gpd_scale_beta": round(float(beta), 6) if beta is not None else None,
+            # This field is intentionally the raw MLE fit, never the clipped
+            # stability estimate.
+            "gpd_shape_xi": round(float(xi_raw), 4) if xi_raw is not None else None,
+            "gpd_shape_xi_raw": round(float(xi_raw), 8) if xi_raw is not None else None,
+            "gpd_shape_xi_constrained": (
+                round(float(xi_constrained), 8) if xi_constrained is not None else None
+            ),
+            "gpd_scale_beta": round(float(beta_constrained), 6) if beta_constrained is not None else None,
+            "gpd_scale_beta_raw": round(float(beta_raw), 6) if beta_raw is not None else None,
+            "gpd_scale_beta_constrained": (
+                round(float(beta_constrained), 6) if beta_constrained is not None else None
+            ),
+            "gpd_shape_constrained": bool(
+                xi_raw is not None and xi_constrained is not None
+                and not np.isclose(xi_raw, xi_constrained)
+            ),
+            "constraint_applied": constraint_applied,
+            "metrics_constrained": constraint_applied,
+            "metrics_valid": bool(metrics_valid),
+            "raw_fit_valid": bool(metrics_valid),
+            "constrained_metrics_valid": bool(
+                np.isfinite(var_evt_loss) and np.isfinite(es_evt_loss)
+            ),
+            "constraint_reason": ",".join(constraint_reasons) if constraint_reasons else None,
             "model_fitted": model_fitted,
             "exceedances_count": int(n_u),
             "total_observations": int(n_total),
             "is_fat_tailed": is_fat_tailed,
         }
+
+        # Preserve the established 99%-named contract only for the actual 99%
+        # default.  Arbitrary configurable levels use neutral names exclusively.
+        if confidence_level == 0.99:
+            result.update(
+                {
+                    "evt_pot_var_99": neutral["evt_pot_var"],
+                    "evt_pot_es_99": neutral["evt_pot_es"],
+                    "historical_var_99": neutral["historical_var"],
+                    "historical_es_99": neutral["historical_es"],
+                }
+            )
+        return result
 
     @staticmethod
     def calculate_bivariate_tail_dependence(
@@ -363,18 +458,25 @@ class TailRiskService:
             else:
                 as_of = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-        # Compute weighted portfolio returns
-        if weights is not None and len(weights) > 0:
-            norm_weights = pd.Series(weights)
-            matched_cols = [c for c in norm_weights.index if c in returns_df.columns]
-            if matched_cols:
-                w_subset = norm_weights[matched_cols]
-                w_subset = w_subset / w_subset.sum()
-                portfolio_returns = (returns_df[matched_cols].fillna(0.0) * w_subset).sum(axis=1)
-            else:
-                portfolio_returns = returns_df.mean(axis=1)
+        # Compute weighted portfolio returns with the same active-mask rule as
+        # AnalyticsEngine.  Missing/pre-listing observations are not economic
+        # zeroes; available positive weights are renormalised per date.
+        clean_returns = returns_df.replace([np.inf, -np.inf], np.nan)
+        if weights is None or len(weights) == 0:
+            candidate_weights = pd.Series(1.0, index=clean_returns.columns)
         else:
-            portfolio_returns = returns_df.mean(axis=1)
+            candidate_weights = pd.Series(weights, dtype=float)
+            candidate_weights = candidate_weights[
+                [c for c in candidate_weights.index if c in clean_returns.columns]
+            ]
+            candidate_weights = candidate_weights[
+                np.isfinite(candidate_weights) & (candidate_weights > 0.0)
+            ]
+        weight_frame = candidate_weights.reindex(clean_returns.columns, fill_value=0.0)
+        active = clean_returns.notna() & (weight_frame > 0.0)
+        active_weight = active.mul(weight_frame, axis=1).sum(axis=1)
+        numerator = clean_returns.where(active, 0.0).mul(weight_frame, axis=1).sum(axis=1)
+        portfolio_returns = numerator.loc[active_weight > 0.0] / active_weight.loc[active_weight > 0.0]
 
         # 1. EVT POT VaR/ES
         evt_var_metrics = cls.calculate_evt_pot_var_es(portfolio_returns, confidence_level=0.99, threshold_quantile=0.95)

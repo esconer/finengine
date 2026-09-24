@@ -5,8 +5,10 @@ Unit tests for Analytics Engine
 import pytest
 import pandas as pd
 import numpy as np
-from unittest.mock import patch, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch, Mock
 
+from app.api.analytics import get_forecast_risk
 from app.config import settings
 from app.services.analytics_engine import AnalyticsEngine, GlobalAnalyticsEngine
 
@@ -107,6 +109,68 @@ class TestAnalyticsEngine:
         assert result["error"] == "Insufficient data for forecast"
         assert result["volatility_forecast"] is None
     
+    @pytest.mark.asyncio
+    async def test_egarch_low_variance_forecast_is_not_floored(self):
+        """A finite, low-variance EGARCH fit must not become a fallback value."""
+        engine = AnalyticsEngine()
+        returns = pd.Series(np.linspace(-1e-5, 1e-5, 30))
+
+        model = Mock()
+        fitted = Mock()
+        forecast = Mock()
+        forecast.variance.values = np.array([[1e-8]])
+        fitted.forecast.return_value = forecast
+        model.fit.return_value = fitted
+
+        with patch("app.services.analytics_engine.arch_model", return_value=model):
+            result = await engine.forecast_volatility(
+                returns, model="EGARCH", horizon=1
+            )
+
+        expected_volatility = np.sqrt(1e-8 * 252.0) / 100.0
+        expected_var = -np.sqrt(1e-8) / 100.0 * 1.645
+        expected_cvar = -np.sqrt(1e-8) / 100.0 * 2.06
+        assert result["volatility_forecast"] == pytest.approx(expected_volatility)
+        assert result["var_forecast"] == pytest.approx(expected_var)
+        assert result["cvar_forecast"] == pytest.approx(expected_cvar)
+        assert result["term_structure"] == [pytest.approx(expected_volatility)]
+        assert result["volatility_forecast"] < 0.05
+        assert result["var_forecast"] > -0.001
+
+    @pytest.mark.asyncio
+    async def test_forecast_route_propagates_unavailable_error(self):
+        dates = pd.bdate_range("2025-01-01", periods=31)
+        prices = pd.Series(np.linspace(100.0, 101.0, len(dates)), index=dates)
+
+        async def allocation(_tickers, _db):
+            return ["A"], {"A": 1.0}
+
+        engine = SimpleNamespace(
+            forecast_volatility=AsyncMock(return_value={
+                "volatility_forecast": None,
+                "var_forecast": None,
+                "cvar_forecast": None,
+                "confidence_interval": None,
+                "term_structure": None,
+                "model_params": None,
+                "error": "EGARCH forecast failed",
+            })
+        )
+        with patch("app.api.analytics.resolve_allocation", side_effect=allocation), \
+             patch(
+                 "app.api.analytics._fetch_price_series_dict",
+                 new=AsyncMock(return_value={"A": prices}),
+             ):
+            result = await get_forecast_risk(
+                model="EGARCH", horizon=1, tickers="A",
+                start=str(dates[0].date()), end=str(dates[-1].date()),
+                db=Mock(), data_service=Mock(), analytics_engine=engine,
+            )
+
+        assert result["portfolio"]["volatility_forecast"] is None
+        assert result["positions"]["A"]["volatility_forecast"] is None
+        assert result["error"] == "EGARCH forecast failed"
+
     @pytest.mark.asyncio
     async def test_concentration_analysis(self, sample_portfolio_weights):
         """Test portfolio concentration analysis"""

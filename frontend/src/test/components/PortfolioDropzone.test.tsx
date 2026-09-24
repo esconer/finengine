@@ -63,6 +63,20 @@ describe('PortfolioDropzone', () => {
     expect(screen.queryByText(/Detected/)).toBeNull();
   });
 
+  it('infers import regions from ticker identity', async () => {
+    const onClose = vi.fn();
+    const onSuccess = vi.fn();
+    render(<PortfolioDropzone isOpen={true} onClose={onClose} onSuccess={onSuccess} />);
+    dropFile(makeFile('mixed.csv', 'ticker,quantity,buy_price\nAAPL,1,100\nTCS.NS,1,200\n'));
+    await screen.findByText(/Detected 2 valid positions/);
+    fireEvent.click(screen.getByLabelText(/I understand each imported position/));
+    fireEvent.click(screen.getByRole('button', { name: /Import 2 Positions/ }));
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(apiClient.post).mock.calls[0][1] as any;
+    expect(payload.positions[0].region).toBeUndefined();
+    expect(payload.positions[1].region).toBe('IN');
+  });
+
   it('computes value-share weights and requires acknowledge before import', async () => {
     const onClose = vi.fn();
     const onSuccess = vi.fn();

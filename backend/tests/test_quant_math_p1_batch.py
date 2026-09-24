@@ -130,18 +130,31 @@ class TestBacktestOneWayTurnover:
         res = bt.run_walk_forward_backtest(
             rets, strategy="hrp", rebalance_freq_days=50, lookback_days=60,
             transaction_cost_bps=100.0, risk_free_rate=0.02)
-        # 50/50 -> 80/20: sum|dW| = 0.6, one-way = 0.3 (old code reported 0.6)
+        # Independent self-financing replay: weights drift after every day,
+        # while turnover and the multiplicative cost are charged only at the
+        # scheduled boundaries.
+        values = rets.to_numpy(dtype=float)
+        boundaries = [60, 110, 160, 200]
+        weights = np.array([0.5, 0.5])
+        target = np.array([0.8, 0.2])
+        exp_daily = []
+        exp_events = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            turnover = 0.5 * np.abs(target - weights).sum()
+            exp_events.append(round(float(turnover), 4))
+            cost = turnover * 0.01
+            weights = target.copy()
+            for offset, row in enumerate(values[start:end]):
+                gross = float(weights @ row)
+                exp_daily.append((1.0 - cost) * (1.0 + gross) - 1.0 if offset == 0 else gross)
+                weights = weights * (1.0 + row) / (1.0 + gross)
+
         assert res["rebalance_events"][0]["turnover"] == pytest.approx(0.3)
-        assert res["total_turnover"] == pytest.approx(
-            sum(e["turnover"] for e in res["rebalance_events"]))
-        # OOS rows 60..199 (final day of the 200-row frame included) at fixed
-        # 80/20; only the first day pays friction, multiplicatively:
-        # (1-c)(1+r)-1 with c = 0.3 * 0.01
-        base = rets.iloc[60:200].to_numpy() @ np.array([0.8, 0.2])
-        exp_daily = base.copy()
-        exp_daily[0] = (1.0 - 0.003) * (1.0 + base[0]) - 1.0
-        exp_sharpe = (exp_daily.mean() * 252 - 0.02) / (exp_daily.std(ddof=1) * np.sqrt(252))
+        assert [event["turnover"] for event in res["rebalance_events"]] == pytest.approx(exp_events)
+        assert res["total_turnover"] == pytest.approx(round(sum(exp_events), 2), abs=1e-4)
+        exp_sharpe = (np.mean(exp_daily) * 252 - 0.02) / (np.std(exp_daily, ddof=1) * np.sqrt(252))
         assert res["sharpe_ratio"] == pytest.approx(round(float(exp_sharpe), 4), abs=1e-4)
+        assert res["drawdowns"][0]["strategy"] <= 0.0
 
 
 class TestMaxSharpeGuardAndBeta:

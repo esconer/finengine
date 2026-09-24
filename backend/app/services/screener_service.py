@@ -12,7 +12,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 import bfinance as bf
-from app.services.cache_service import CacheService
+from app.services.cache_service import (
+    CacheService,
+    cache_generation_is_current,
+    get_cache_generation,
+    get_runtime_cache_snapshot,
+    ProviderUnavailableError,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -141,8 +147,8 @@ class ScreenerService:
                 return None
             stocks = stored.get("stocks", [])[:want]
             return {**stored, "stocks": stocks, "count": len(stocks)}
-        except Exception as e:
-            logger.debug(f"Screener L2 cache read error: {e}")
+        except Exception as exc:
+            logger.debug("Screener L2 cache read error: %s", type(exc).__name__)
             return None
 
     async def _set_cached_screen(
@@ -170,8 +176,8 @@ class ScreenerService:
                     "response": response_data,
                 },
             )
-        except Exception as e:
-            logger.debug(f"Screener L2 cache write error: {e}")
+        except Exception as exc:
+            logger.debug("Screener L2 cache write error: %s", type(exc).__name__)
 
     async def run_screen(
         self,
@@ -193,16 +199,31 @@ class ScreenerService:
         universe_token = _universe_cache_token(universe)
         cache_key = f"{strat_key}_{max_stocks}_{universe_token}"
         now_ts = time.time()
-        if cache_key in self._cache:
-            ts, cached_res = self._cache[cache_key]
-            if now_ts - ts < self.CACHE_TTL_SECONDS:
+        runtime_config = get_runtime_cache_snapshot()
+        if self.cache_service is not None and hasattr(self.cache_service, "get_runtime_config"):
+            try:
+                runtime_config = await self.cache_service.get_runtime_config()
+            except Exception as exc:
+                logger.debug("Screener runtime cache config unavailable: %s", type(exc).__name__)
+        cache_enabled = runtime_config.enabled if runtime_config is not None else True
+        generation = get_cache_generation()
+        if cache_key in self._cache and cache_enabled:
+            entry = self._cache[cache_key]
+            ts, cached_res = entry[0], entry[1]
+            cached_generation = entry[2] if len(entry) > 2 else None
+            if (
+                now_ts - ts < self.CACHE_TTL_SECONDS
+                and cached_generation in (None, generation)
+                and cache_generation_is_current(generation)
+            ):
                 return cached_res
 
         # L2 DB cache on L1 miss (survives restarts; ~24h TTL).
         asof_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        l2_hit = await self._get_cached_screen(strat_key, universe_token, asof_day, max_stocks)
+        l2_hit = await self._get_cached_screen(strat_key, universe_token, asof_day, max_stocks) if cache_enabled else None
         if l2_hit is not None:
-            self._cache[cache_key] = (now_ts, l2_hit)
+            if cache_generation_is_current(generation):
+                self._cache[cache_key] = (now_ts, l2_hit, generation)
             return l2_hit
 
         def _execute():
@@ -241,17 +262,20 @@ class ScreenerService:
                 "strategy": strat_key,
                 "name": strategy_meta["name"],
                 "description": strategy_meta["description"],
+                "source": "bfinance",
                 "count": len(results),
                 "stocks": results,
             }
-            self._cache[cache_key] = (now_ts, response_data)
-            await self._set_cached_screen(strat_key, universe_token, asof_day, max_stocks, response_data)
+            if not cache_generation_is_current(generation):
+                return {"strategy": strat_key, "name": strategy_meta["name"], "description": strategy_meta["description"], "count": 0, "stocks": [], "data_status": "unavailable"}
+            if cache_enabled:
+                self._cache[cache_key] = (now_ts, response_data, generation)
+                await self._set_cached_screen(strat_key, universe_token, asof_day, max_stocks, response_data)
             return response_data
-        except Exception as e:
-            logger.error(f"Error running screener {strategy}: {e}")
-            # Upstream/vendor failure is not the client's fault (B-06):
-            # ValueError here mapped to 400; RuntimeError maps to 5xx.
-            raise RuntimeError(f"Screen execution failed: {e}") from e
+        except Exception as exc:
+            logger.error("Error running screener %s: %s", strategy, type(exc).__name__)
+            # Upstream/vendor failure is not the client's fault (B-06).
+            raise ProviderUnavailableError("Screen execution failed", provider="bfinance") from exc
 
     async def _enforce_debt_free(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Keep only matches with D/E <= ceiling (fail-closed on unknown)."""
@@ -269,9 +293,9 @@ class ScreenerService:
 
         try:
             return await _to_thread(_check)
-        except Exception as e:
-            logger.error(f"Debt-free enforcement failed: {e}")
-            return []
+        except Exception as exc:
+            logger.error("Debt-free enforcement failed: %s", type(exc).__name__)
+            raise ProviderUnavailableError("Debt-free provider unavailable", provider="bfinance") from exc
 
     async def run_custom_screen(
         self,
@@ -343,12 +367,13 @@ class ScreenerService:
                 "strategy": "custom",
                 "name": "Custom Filter",
                 "description": f"Custom filter: ROCE>={min_roce}, ROE>={min_roe}, PE<={max_pe}, Mcap>={min_mcap_cr}Cr",
+                "source": "bfinance",
                 "count": len(results),
                 "stocks": results,
             }
-        except Exception as e:
-            logger.error(f"Error running custom screener: {e}")
-            raise ValueError(f"Custom screen execution failed: {e}")
+        except Exception as exc:
+            logger.error("Error running custom screener: %s", type(exc).__name__)
+            raise ProviderUnavailableError("Custom screen execution failed", provider="bfinance") from exc
 
 
 _screener_service: Optional[ScreenerService] = None

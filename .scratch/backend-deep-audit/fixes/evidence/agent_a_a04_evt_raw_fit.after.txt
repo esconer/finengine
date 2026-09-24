@@ -1,0 +1,9 @@
+﻿CHECK|raw_fitted_xi|backend=-2.01301978|reference=-2.01301977674|abs_diff=3.26023963382e-09|rel_diff=1.61957655433e-09|tolerance=atol:1e-06,rtol:1e-6|PASS
+CHECK|raw_evt_var|backend=-0.030134|reference=-0.0301336751272|abs_diff=3.2487281244e-07|rel_diff=1.07810551175e-05|tolerance=atol:1e-06,rtol:1e-6|PASS
+CHECK|raw_evt_es|backend=-0.030954|reference=-0.0309544261044|abs_diff=4.26104431732e-07|rel_diff=1.3765541325e-05|tolerance=atol:1e-06,rtol:1e-6|PASS
+CHECK|field_gpd_shape_xi_raw|backend=-2.01301978|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+CHECK|field_gpd_shape_xi_constrained|backend=-0.5|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+CHECK|field_metrics_constrained|backend=True|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+CHECK|field_metrics_valid|backend=True|reference='present'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+OUTPUT|backend|{'confidence_level': 0.99, 'evt_pot_var': -0.069798, 'evt_pot_es': -0.08862, 'historical_var': -0.02839, 'historical_es': -0.030561, 'evt_pot_var_unconstrained': -0.030134, 'evt_pot_es_unconstrained': -0.030954, 'threshold_u': 0.0, 'gpd_shape_xi': -2.013, 'gpd_shape_xi_raw': -2.01301978, 'gpd_shape_xi_constrained': -0.5, 'gpd_scale_beta': 0.063133, 'gpd_scale_beta_raw': 0.063133, 'gpd_scale_beta_constrained': 0.063133, 'gpd_shape_constrained': True, 'constraint_applied': True, 'metrics_constrained': True, 'metrics_valid': True, 'raw_fit_valid': True, 'constrained_metrics_valid': True, 'constraint_reason': 'gpd_shape_clipped', 'model_fitted': True, 'exceedances_count': 10, 'total_observations': 200, 'is_fat_tailed': True, 'evt_pot_var_99': -0.069798, 'evt_pot_es_99': -0.08862, 'historical_var_99': -0.02839, 'historical_es_99': -0.030561}
+OUTPUT|reference|xi=-2.01301977674,beta=0.0631326229031,var=-0.0301336751272,es=-0.0309544261044

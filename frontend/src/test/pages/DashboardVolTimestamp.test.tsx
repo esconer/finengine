@@ -82,7 +82,7 @@ describe('DashboardSummary — vol N/A caption + store timestamp', () => {
     await waitFor(() => {
       expect(screen.getByText('Annual Volatility')).toBeDefined();
     });
-    expect(screen.getByText('N/A')).toBeDefined();
+    expect(screen.getAllByText('N/A').length).toBeGreaterThan(0);
     expect(screen.getByText(/Holding-window realized vol/)).toBeDefined();
     expect(screen.getByText(/30 trading days/)).toBeDefined();
   });

@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import StockTimeseries
+from app.services.cache_service import ProviderUnavailableError
 from app.services.data_service import DataService
 
 
@@ -165,17 +166,16 @@ class TestL1TickerKeyed:
         vendor = _VendorMax(full)
 
         with patch.object(service, "_download_with_timeout", new=vendor):
-            # NOTE: window end sits past the last trading day on purpose: the
-            # SQLite `date <= end` string comparison is end-exclusive at
-            # midnight (pre-existing _get_cached_data behavior, untouched).
+            # The first request has valid January coverage even though its end
+            # date is later than the last available trading row.
             a = await service.fetch_historical_data("DEEPOUT.NS", "2024-01-01", "2024-02-02")
-            # Window entirely outside cached depth: vendor seam would need a hit,
-            # but the mock only knows January -> falls back to empty slice, never
-            # January rows mislabeled as February.
-            b = await service.fetch_historical_data("DEEPOUT.NS", "2024-02-01", "2024-02-29")
+            # The second request is entirely outside the available vendor
+            # window.  The service must report unavailable rather than label
+            # January rows as February data.
+            with pytest.raises(ProviderUnavailableError, match="cover"):
+                await service.fetch_historical_data("DEEPOUT.NS", "2024-02-01", "2024-02-29")
 
         assert len(a) == len(full)
-        assert b.empty or pd.to_datetime(b["date"]).min() >= pd.to_datetime("2024-02-01")
 
 
 @pytest.mark.asyncio

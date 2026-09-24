@@ -14,6 +14,17 @@ export interface PortfolioPosition {
     buy_price?: number;
     last_price: number;
     market_value: number;
+    native_currency?: string;
+    value_currency?: string;
+    fx_rate?: number | null;
+    fx_provenance?: Record<string, unknown>;
+    market_value_base?: number | null;
+    buy_price_base?: number | null;
+    last_price_base?: number | null;
+    current_value_base?: number | null;
+    total_cost_base?: number | null;
+    unrealized_gain_loss_base?: number | null;
+    unrealized_gain_loss_pct_base?: number | null;
     sector: string;
     industry: string;
     custom_name?: string;
@@ -28,9 +39,16 @@ export interface PortfolioStore {
     error: string | null;
     totalValue: number;
     totalWeight: number;
+    positionCount: number;
 
     // Actions
     fetchPortfolio: () => Promise<boolean>;
+    setPositionCount: (count: number) => void;
+    setPortfolioSnapshot: (snapshot: {
+        positions: PortfolioPosition[];
+        total_value: number;
+        total_weight: number;
+    }) => void;
     addPosition: (position: {
         ticker: string;
         weight: number;
@@ -92,6 +110,14 @@ export interface AnalyticsStore {
     setWebSocketConnection: (connected: boolean) => void;
 }
 
+// Coalesce StrictMode/route refreshes for the same shared portfolio snapshot.
+let portfolioFetchInFlight: Promise<boolean> | null = null;
+
+async function waitForPortfolioFetch(): Promise<void> {
+    const pending = portfolioFetchInFlight;
+    if (pending) await pending;
+}
+
 // Portfolio Store
 export const usePortfolioStore = create<PortfolioStore>()(
     persist(
@@ -102,25 +128,56 @@ export const usePortfolioStore = create<PortfolioStore>()(
             error: null,
             totalValue: 0,
             totalWeight: 0,
+            positionCount: 0,
 
             fetchPortfolio: async () => {
-                set({ isLoading: true, error: null });
+                if (portfolioFetchInFlight) return portfolioFetchInFlight;
+
+                const request = (async () => {
+                    set({ isLoading: true, error: null });
+                    try {
+                        const data = await portfolioApi.getPortfolio();
+                        set({
+                            positions: data.positions || [],
+                            totalValue: data.total_value || 0,
+                            totalWeight: data.total_weight || 0,
+                            positionCount: data.total_positions ?? data.positions?.length ?? 0,
+                            isLoading: false,
+                        });
+                        useUIStore.getState().updateLastUpdated();
+                        return true;
+                    } catch (error: any) {
+                        set({
+                            error: error?.message || 'Failed to fetch portfolio',
+                            isLoading: false,
+                        });
+                        return false;
+                    }
+                })();
+
+                portfolioFetchInFlight = request;
                 try {
-                    const data = await portfolioApi.getPortfolio();
-                    set({
-                        positions: data.positions || [],
-                        totalValue: data.total_value || 0,
-                        totalWeight: data.total_weight || 0,
-                        isLoading: false,
-                    });
-                    return true;
-                } catch (error: any) {
-                    set({
-                        error: error?.message || 'Failed to fetch portfolio',
-                        isLoading: false,
-                    });
-                    return false;
+                    return await request;
+                } finally {
+                    if (portfolioFetchInFlight === request) {
+                        portfolioFetchInFlight = null;
+                    }
                 }
+            },
+
+            setPositionCount: (count) => {
+                set({ positionCount: Math.max(0, Math.floor(count || 0)) });
+            },
+
+            setPortfolioSnapshot: (snapshot) => {
+                set({
+                    positions: snapshot.positions || [],
+                    totalValue: snapshot.total_value || 0,
+                    totalWeight: snapshot.total_weight || 0,
+                    positionCount: snapshot.positions.length,
+                    error: null,
+                });
+                useUIStore.getState().updateLastUpdated();
             },
 
             addPosition: async (positionData) => {
@@ -129,7 +186,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     // Ensure region has a default value if not provided (INR/NSE-first product)
                     const completePositionData = {
                         ...positionData,
-                        region: positionData.region || 'IN'
+                        region: positionData.region
                     };
                     const newPosition = await portfolioApi.addPosition(completePositionData);
                     const currentPositions = get().positions;
@@ -138,6 +195,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                         isLoading: false,
                     });
                     // Refresh portfolio to get updated totals
+                    await waitForPortfolioFetch();
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
@@ -153,7 +211,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     // Ensure all positions have required region field
                     const completePositions = positions.map(position => ({
                         ...position,
-                        region: position.region || 'IN'
+                        region: position.region
                     }));
                     const result = await portfolioApi.bulkAddPositions({
                         positions: completePositions,
@@ -161,6 +219,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     });
                     set({ isLoading: false });
                     // Refresh portfolio to get updated data
+                    await waitForPortfolioFetch();
                     await get().fetchPortfolio();
                     // Surface partial import failures (fetchPortfolio clears error first)
                     if (result.failed > 0) {
@@ -181,6 +240,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                 try {
                     await portfolioApi.updatePosition(ticker, updates);
                     // Refresh portfolio to get updated data
+                    await waitForPortfolioFetch();
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
@@ -200,6 +260,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                         isLoading: false,
                     });
                     // Refresh portfolio to get updated totals
+                    await waitForPortfolioFetch();
                     await get().fetchPortfolio();
                 } catch (error: any) {
                     set({
@@ -223,6 +284,7 @@ export const usePortfolioStore = create<PortfolioStore>()(
                     selectedTickers: [],
                     totalValue: 0,
                     totalWeight: 0,
+                    positionCount: 0,
                     error: null,
                 });
             },

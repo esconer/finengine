@@ -26,6 +26,40 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def aggregate_active_returns(
+    returns: pd.DataFrame, weights: Dict[str, float]
+) -> pd.Series:
+    """Aggregate returns using the shared active positive-weight contract.
+
+    A date is usable only when at least one positive-weight constituent has a
+    finite return.  On that date, the available positive weights are
+    renormalised; dates with no active exposure are omitted rather than
+    converted into synthetic zero returns.  Keeping this helper at module
+    scope lets API orchestration use exactly the same rule as the service.
+    """
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
+        return pd.Series(dtype=float)
+
+    clean = returns.replace([np.inf, -np.inf], np.nan)
+    usable_weights: Dict[str, float] = {}
+    for column in clean.columns:
+        try:
+            weight = float(weights.get(column, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(weight) and weight > 0.0:
+            usable_weights[column] = weight
+    if not usable_weights:
+        return pd.Series(dtype=float)
+
+    weight_frame = pd.Series(usable_weights).reindex(clean.columns, fill_value=0.0)
+    active = clean.notna() & (weight_frame > 0.0)
+    active_weight = active.mul(weight_frame, axis=1).sum(axis=1)
+    numerator = clean.where(active, 0.0).mul(weight_frame, axis=1).sum(axis=1)
+    portfolio = numerator.loc[active_weight > 0.0] / active_weight.loc[active_weight > 0.0]
+    return portfolio.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+
+
 class AnalyticsEngine:
     """
     Comprehensive analytics engine for portfolio risk calculations
@@ -54,36 +88,51 @@ class AnalyticsEngine:
                 logger.warning("Empty price data provided")
                 return self._empty_metrics()
             
-            # Calculate returns with defensive forward/back filling for mixed inception dates
-            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            # Preserve the active-price mask.  Back-filling a newly listed
+            # instrument with its first future price creates a flat synthetic
+            # history; zero-filling the resulting gaps creates a different
+            # synthetic history.  Returns remain NaN until both endpoints of a
+            # price observation are available.
+            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index()
+            returns = cleaned_prices.pct_change(fill_method=None)
             if returns.empty or len(returns) < 2:
                 return self._empty_metrics()
             returns = returns.iloc[1:]
-            
-            # Handle weights
+
+            # Handle only finite, strictly positive weights.  The active-mask
+            # aggregation below renormalises the positive weights on each date
+            # for which at least one constituent has a real return.
             if weights is None:
-                weights = {col: 1.0/len(cols) for col in cols} if (cols := returns.columns) else {}
+                weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
             else:
-                # Normalize weights to sum to 1
+                weights = {
+                    key: float(value)
+                    for key, value in weights.items()
+                    if key in returns.columns
+                    and np.isfinite(float(value))
+                    and float(value) > 0.0
+                }
                 weight_sum = sum(weights.values())
                 if weight_sum <= 0:
                     return self._empty_metrics()
-                weights = {k: v/weight_sum for k, v in weights.items()}
-            
-            # Calculate portfolio returns
+                weights = {key: value / weight_sum for key, value in weights.items()}
+
             portfolio_returns = self._calculate_portfolio_returns(returns, weights)
-            
-            # Basic metrics
-            metrics = {}
+            if portfolio_returns.empty:
+                return self._empty_metrics()
+
+            metrics = {
+                "observations": int(len(portfolio_returns)),
+                "active_observations": int(len(portfolio_returns)),
+            }
             metrics.update(self._calculate_basic_metrics(portfolio_returns))
             metrics.update(self._calculate_risk_metrics(portfolio_returns))
             metrics.update(self._calculate_drawdown_metrics(portfolio_returns))
             metrics.update(self._calculate_return_distribution(portfolio_returns))
-            
+
             # Position-level metrics using active price series
             metrics['positions'] = self._calculate_position_metrics(returns, weights, raw_prices=price_data)
-            
+
             return metrics
             
         except Exception as e:
@@ -203,6 +252,16 @@ class AnalyticsEngine:
             Dictionary with concentration metrics
         """
         try:
+            if not weights:
+                return self._empty_concentration()
+
+            # Zero/negative/non-finite rows are not active holdings and must
+            # not dilute the HHI denominator or diversification baseline.
+            weights = {
+                key: float(value)
+                for key, value in weights.items()
+                if np.isfinite(float(value)) and float(value) > 0.0
+            }
             if not weights:
                 return self._empty_concentration()
             
@@ -504,9 +563,10 @@ class AnalyticsEngine:
             description = sc_cfg["description"]
             sector_table = sc_cfg.get("sectors", {})
 
-            # Clean and calculate asset returns
-            cleaned_prices = price_data.sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            # Keep the active observation mask; missing prices are not economic
+            # zero returns and must not influence the volatility adjustment.
+            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index()
+            returns = cleaned_prices.pct_change(fill_method=None)
             if returns.empty or len(returns) < 2:
                 return self._empty_stress_test()
             returns = returns.iloc[1:]
@@ -584,76 +644,146 @@ class AnalyticsEngine:
             if price_data.empty or not weights:
                 return self._empty_volatility_sizing()
             
-            cleaned_prices = price_data.sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            # Missing observations remain missing.  The inverse-volatility
+            # calculation uses each asset's active history and pairwise
+            # correlation rather than manufacturing pre-listing zeroes.
+            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index()
+            returns = cleaned_prices.pct_change(fill_method=None)
             if returns.empty or len(returns) < 2:
                 return self._empty_volatility_sizing()
             returns = returns.iloc[1:]
             
-            # Calculate volatilities using the selected model (EWMA, GARCH, EGARCH)
+            # Calculate volatilities using the selected model (EWMA, GARCH, EGARCH).
+            # Keep the source of each estimate visible: a model that cannot fit a
+            # short sample may use a measured sample-volatility fallback, but
+            # never an invented constant.
             annualized_vols = {}
             daily_vols = {}
+            volatility_sources = {}
             model_type = (model or "EWMA").upper()
-            
+
             for ticker in returns.columns:
-                series = returns[ticker]
-                vol_ann = 0.20
+                series = returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
+                if model_type == "EWMA" and len(series) < 2:
+                    # A single return has no sample dispersion; do not turn the
+                    # model's zero convention into a fabricated allocation.
+                    continue
+                sample_vol = (
+                    float(series.std(ddof=1) * np.sqrt(252))
+                    if len(series) > 1 else None
+                )
+                if sample_vol is not None and (not np.isfinite(sample_vol) or sample_vol < 0):
+                    sample_vol = None
+                vol_ann = None
+                source = model_type
                 try:
                     if model_type == "GARCH":
                         res = await self._garch_forecast(series, 1)
-                        vol_ann = float(res.get("volatility_forecast", 0.20))
                     elif model_type == "EGARCH":
                         res = await self._egarch_forecast(series, 1)
-                        vol_ann = float(res.get("volatility_forecast", 0.20))
                     else:
                         res = self._ewma_forecast(series, 1)
-                        vol_ann = float(res.get("volatility_forecast", 0.20))
+                    # Use the un-floored model estimate for inverse-volatility
+                    # parity.  The public forecast remains clipped for stable
+                    # UI bounds, but a 1% asset must not become a 5% peer.
+                    raw_value = res.get("raw_volatility_forecast")
+                    if raw_value is None:
+                        raw_value = res.get("volatility_forecast")
+                    if raw_value is not None:
+                        candidate = float(raw_value)
+                        if np.isfinite(candidate) and candidate >= 0.0:
+                            vol_ann = candidate
                 except Exception:
-                    vol_ann = float(series.std() * np.sqrt(252)) if len(series) > 1 else 0.20
-                
-                vol_ann = max(0.05, min(1.20, vol_ann))
-                annualized_vols[ticker] = vol_ann
-                daily_vols[ticker] = vol_ann / np.sqrt(252)
-            
-            # Calculate correlation matrix
-            correlation_matrix = returns.corr()
-            
-            # Calculate portfolio volatility under current weights
-            current_weights = np.array([weights.get(ticker, 0.0) for ticker in returns.columns])
-            current_vol_arr = np.array([daily_vols.get(ticker, 0.02 / np.sqrt(252)) for ticker in returns.columns])
-            
-            if len(correlation_matrix) > 0 and current_weights.sum() > 0:
-                cov_matrix = correlation_matrix.values * np.outer(
-                    current_vol_arr, current_vol_arr
-                )
-                portfolio_variance = float(current_weights @ cov_matrix @ current_weights)
-                portfolio_volatility = np.sqrt(max(0.0, portfolio_variance)) * np.sqrt(252)  # Annualized
-            else:
-                portfolio_volatility = 0.165
-            
-            # Calculate true inverse-volatility risk parity weights: w_i \propto 1 / \sigma_i
-            inv_vols = {ticker: (1.0 / max(v, 1e-4)) for ticker, v in annualized_vols.items() if ticker in weights}
-            sum_inv_vol = sum(inv_vols.values())
-            
-            if sum_inv_vol > 0:
-                recommended_weights = {k: v / sum_inv_vol for k, v in inv_vols.items()}
-            else:
-                recommended_weights = weights.copy()
+                    vol_ann = None
+                if vol_ann is None and sample_vol is not None:
+                    vol_ann = sample_vol
+                    source = "sample_fallback"
+                if vol_ann is None:
+                    # No finite estimate means no inverse-volatility allocation;
+                    # retaining a made-up floor would distort relative sizing.
+                    continue
+                annualized_vols[ticker] = float(vol_ann)
+                daily_vols[ticker] = float(vol_ann) / np.sqrt(252)
+                volatility_sources[ticker] = source
 
-            # Scale-to-target: size the inverse-volatility basket so its
-            # ex-ante volatility equals target_volatility; the remainder is
-            # cash (unlevered long-only). scale > 1 implies leverage required.
-            rec_vec = np.array([recommended_weights.get(ticker, 0.0) for ticker in returns.columns])
-            if len(correlation_matrix) > 0 and rec_vec.sum() > 0:
-                rec_cov = correlation_matrix.values * np.outer(current_vol_arr, current_vol_arr)
-                rec_vol_ann = float(np.sqrt(max(0.0, rec_vec @ rec_cov @ rec_vec)) * np.sqrt(252))
+            available_tickers = list(returns.columns)
+            current_tickers = []
+            current_weight_values = []
+            current_vol_values = []
+            for ticker in available_tickers:
+                try:
+                    weight = float(weights.get(ticker, 0.0))
+                    vol = float(annualized_vols.get(ticker, np.nan))
+                except (TypeError, ValueError):
+                    continue
+                if weight > 0.0 and np.isfinite(weight) and np.isfinite(vol) and vol >= 0.0:
+                    current_tickers.append(ticker)
+                    current_weight_values.append(weight)
+                    current_vol_values.append(vol / np.sqrt(252))
+            current_volatility = None
+            if current_tickers:
+                current_corr = returns[current_tickers].corr()
+                current_corr = current_corr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                current_corr_values = current_corr.to_numpy(dtype=float).copy()
+                np.fill_diagonal(current_corr_values, 1.0)
+                current_cov = current_corr_values * np.outer(current_vol_values, current_vol_values)
+                current_vec = np.asarray(current_weight_values, dtype=float)
+                variance = float(current_vec @ current_cov @ current_vec)
+                if np.isfinite(variance):
+                    current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
+
+            # Calculate true inverse-volatility risk parity weights for
+            # positive, finite target holdings: w_i \propto 1 / \sigma_i.
+            # Zero-weight positions must not receive a synthetic allocation.
+            inv_vols = {}
+            for ticker, weight in weights.items():
+                sigma = annualized_vols.get(ticker)
+                try:
+                    weight = float(weight)
+                    sigma = float(sigma)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    ticker in returns.columns
+                    and weight > 0.0
+                    and np.isfinite(weight)
+                    and np.isfinite(sigma)
+                    and sigma > 0.0
+                ):
+                    inv_vols[ticker] = 1.0 / sigma
+            sum_inv_vol = sum(inv_vols.values())
+
+            if sum_inv_vol <= 0:
+                return self._empty_volatility_sizing()
+            recommended_weights = {k: v / sum_inv_vol for k, v in inv_vols.items()}
+
+            # Scale-to-target using only the recommended, positive-volatility
+            # legs.  Excluding a zero-variance leg is not enough if its NaN
+            # correlation remains in the matrix: 0 * NaN would still poison the
+            # quadratic form.
+            rec_tickers = list(recommended_weights)
+            rec_vec = np.asarray([recommended_weights[ticker] for ticker in rec_tickers], dtype=float)
+            rec_vol_vec = np.asarray([annualized_vols[ticker] / np.sqrt(252) for ticker in rec_tickers], dtype=float)
+            if len(rec_tickers) == 1:
+                rec_vol_ann = float(rec_vol_vec[0] * np.sqrt(252))
             else:
-                rec_vol_ann = 0.0
-            scale = float(target_volatility / rec_vol_ann) if rec_vol_ann > 0 else 1.0
+                rec_corr = returns[rec_tickers].corr()
+                rec_corr = rec_corr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                rec_corr_values = rec_corr.to_numpy(dtype=float).copy()
+                np.fill_diagonal(rec_corr_values, 1.0)
+                rec_cov = rec_corr_values * np.outer(rec_vol_vec, rec_vol_vec)
+                rec_variance = float(rec_vec @ rec_cov @ rec_vec)
+                rec_vol_ann = (
+                    float(np.sqrt(max(0.0, rec_variance)) * np.sqrt(252))
+                    if np.isfinite(rec_variance) else 0.0
+                )
+            if not np.isfinite(rec_vol_ann) or rec_vol_ann <= 0.0:
+                return self._empty_volatility_sizing()
+            scale = float(target_volatility / rec_vol_ann)
             scaled_weights = {k: round(v * scale, 6) for k, v in recommended_weights.items()}
             cash_weight = round(max(0.0, 1.0 - scale), 6)
             leveraged = bool(scale > 1.0)
-            achieved_vol = float(rec_vol_ann * scale) if rec_vol_ann > 0 else rec_vol_ann
+            achieved_vol = float(rec_vol_ann * scale)
 
             # Calculate trade recommendations
             trades = {}
@@ -687,8 +817,9 @@ class AnalyticsEngine:
                 "recommended_weights": scaled_weights,
                 "trades": trades,
                 "target_volatility": target_volatility,
-                "current_volatility": portfolio_volatility,
+                "current_volatility": current_volatility,
                 "volatilities": annualized_vols,
+                "volatility_sources": volatility_sources,
                 "scale_factor": round(scale, 6),
                 "cash_weight": cash_weight,
                 "leveraged": leveraged,
@@ -723,8 +854,8 @@ class AnalyticsEngine:
             if price_data.empty or not weights:
                 return self._empty_risk_score()
             
-            cleaned_prices = price_data.sort_index().ffill().bfill()
-            returns = cleaned_prices.pct_change(fill_method=None).fillna(0.0)
+            cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index()
+            returns = cleaned_prices.pct_change(fill_method=None)
             if returns.empty or len(returns) < 2:
                 return self._empty_risk_score()
             returns = returns.iloc[1:]
@@ -759,7 +890,9 @@ class AnalyticsEngine:
             # would pin this leg at max risk, so exclude + renormalize instead.
             excluded: list[str] = []
             if benchmark_data is not None and not benchmark_data.empty:
-                factor_result = await self.factor_exposure_analysis(price_data, benchmark_data=benchmark_data)
+                factor_result = await self.factor_exposure_analysis(
+                    price_data, benchmark_data=benchmark_data, weights=weights
+                )
                 r_squared = factor_result.get('r_squared')
                 if r_squared is None:
                     factor_score = None
@@ -835,11 +968,9 @@ class AnalyticsEngine:
     # Helper methods for calculations
     
     def _calculate_portfolio_returns(self, returns: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
-        """Calculate weighted portfolio returns"""
+        """Delegate to the shared active positive-weight aggregation contract."""
         try:
-            weight_vector = np.array([weights.get(col, 0) for col in returns.columns])
-            portfolio_returns = (returns * weight_vector).sum(axis=1)
-            return portfolio_returns
+            return aggregate_active_returns(returns, weights)
         except Exception:
             return pd.Series(dtype=float)
     
@@ -904,19 +1035,25 @@ class AnalyticsEngine:
             return {}
     
     def _calculate_drawdown_metrics(self, returns: pd.Series) -> Dict[str, float]:
-        """Calculate drawdown metrics"""
+        """Calculate baseline-aware drawdown metrics.
+
+        Initial wealth of 1.0 is a valid peak before the first return.  Without
+        that baseline, a first-day loss appears to have no drawdown.
+        """
         try:
-            if returns.empty:
+            clean = pd.Series(returns).replace([np.inf, -np.inf], np.nan).dropna()
+            if clean.empty:
                 return {}
-            
-            cumulative_returns = (1 + returns).cumprod()
-            running_max = cumulative_returns.expanding().max()
-            drawdown = (cumulative_returns - running_max) / running_max
-            
-            max_drawdown = drawdown.min()
-            
+
+            wealth = (1.0 + clean).cumprod()
+            wealth_with_baseline = pd.concat(
+                [pd.Series([1.0]), wealth], ignore_index=True
+            )
+            running_max = wealth_with_baseline.cummax()
+            drawdown = (wealth_with_baseline - running_max) / running_max
+
             return {
-                "max_drawdown": max_drawdown
+                "max_drawdown": float(drawdown.min())
             }
         except Exception:
             return {}
@@ -949,8 +1086,11 @@ class AnalyticsEngine:
             for ticker in returns.columns:
                 # Use raw active price series if available to avoid artificial zero-dilution on newly listed assets
                 if raw_prices is not None and ticker in raw_prices.columns:
-                    raw_s = raw_prices[ticker].replace([np.inf, -np.inf], np.nan).dropna()
-                    if len(raw_s) >= 2:
+                    raw_s = raw_prices[ticker].replace([np.inf, -np.inf], np.nan)
+                    if raw_s.notna().sum() >= 2:
+                        # Keep missing dates in the index while calculating
+                        # returns; dropping them first would create a return
+                        # spanning an unobserved interval.
                         ticker_returns = raw_s.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
                     else:
                         ticker_returns = returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
@@ -975,89 +1115,194 @@ class AnalyticsEngine:
         except Exception:
             return {}
             
+    @staticmethod
+    def _forecast_variance_path(forecast: Any, horizon: int, simulated: bool = False) -> np.ndarray:
+        """Return the per-period variance path from an arch forecast.
+
+        ``arch`` reports analytic GARCH variance as ``(1, horizon)`` and
+        EGARCH simulation variance as ``(1, horizon, simulations)``.  The
+        simulation axis is an ensemble dimension, not a time dimension, so it
+        must be averaged before the caller cumulatively sums the periods.
+        """
+        values = np.asarray(forecast.variance.values, dtype=float)
+        if values.ndim == 0:
+            values = values.reshape(1)
+        if simulated and values.ndim >= 3:
+            values = values.mean(axis=tuple(range(2, values.ndim)))
+        elif simulated and values.ndim == 2:
+            # A few arch-compatible adapters drop the leading origin axis and
+            # return ``(horizon, simulations)`` instead.  Distinguish that
+            # from the ordinary analytic ``(1, horizon)`` shape.
+            if values.shape[0] != 1 and values.shape[-1] >= values.shape[0]:
+                values = values.mean(axis=-1)
+        values = np.squeeze(values)
+        if values.ndim == 0:
+            path = values.reshape(1)
+        elif values.ndim == 1:
+            path = values
+        else:
+            # Analytic forecasts have one origin row; retain the last origin
+            # row if a test double supplies more than one.
+            path = values[-1]
+        return np.asarray(path, dtype=float).reshape(-1)[: max(1, int(horizon))]
+
+    @staticmethod
+    def _cumulative_forecast_volatility(
+        variance_path: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Convert per-period arch variances to cumulative horizon units.
+
+        ``arch`` returns one conditional variance for each future period, not
+        a cumulative terminal variance.  The public volatility field remains
+        annualized (the h-day cumulative variance divided by h and scaled by
+        252), while the return-space path is the unscaled h-day sigma used for
+        VaR/ES.
+        """
+        values = np.maximum(np.asarray(variance_path, dtype=float), 0.0)
+        cumulative = np.cumsum(values)
+        steps = np.arange(1, len(cumulative) + 1, dtype=float)
+        annualized = np.sqrt(cumulative * 252.0 / steps) / 100.0
+        return_space = np.sqrt(cumulative) / 100.0
+        return annualized, return_space
+
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
-        """GARCH volatility forecast"""
+        """GARCH volatility forecast with cumulative-horizon tail units.
+
+        ``arch`` returns one conditional variance per future period.  The
+        adapter sums that path before converting to return-space VaR/CVaR;
+        applying a second ``sqrt(horizon / 252)`` would double-count time.
+        """
+        h = int(max(1, horizon))
         try:
-            h = max(1, horizon)
             clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
             clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             if len(clean_returns) < 20:
                 return self._empty_forecast(h, "GARCH")
 
-            # Scale returns by 100 for arch optimizer numerical convergence stability
+            # Scale returns by 100 for arch optimizer numerical convergence stability.
             scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
             fitted_model = await asyncio.to_thread(
                 lambda: model.fit(disp='off', show_warning=False, options={'maxiter': 100})
             )
-            
-            # Generate analytical forecast (fast O(1) computation instead of 1000 simulation paths)
-            forecast = fitted_model.forecast(horizon=h, method='analytic')
-            
-            # Extract volatility forecast and unscale
-            variance_forecast = forecast.variance.values[-1, :]
-            volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
-            vol_final = float(np.clip(volatility_forecast[-1], 0.05, 1.20)) if len(volatility_forecast) > 0 else 0.22
-            h_factor = np.sqrt(h / 252.0)
-            
+
+            forecast = await asyncio.to_thread(
+                lambda: fitted_model.forecast(horizon=h, method='analytic')
+            )
+            variance_path = self._forecast_variance_path(forecast, h)
+            if variance_path.size == 0 or not np.isfinite(variance_path).all():
+                raise ValueError("arch returned no finite GARCH variance path")
+            variance_path = np.maximum(variance_path, 0.0)
+
+            # arch supplies per-period conditional variances.  Aggregate
+            # them before converting to the h-day return-space tail units.
+            volatility_path, return_space_path = self._cumulative_forecast_volatility(
+                variance_path
+            )
+            raw_vol_final = float(volatility_path[-1])
+            vol_final = float(np.clip(raw_vol_final, 0.05, 1.20))
+            return_space_vol = float(return_space_path[-1])
+            var_forecast = float(np.clip(-return_space_vol * 1.645, -0.99, -0.001))
+            cvar_forecast = float(np.clip(-return_space_vol * 2.06, -0.99, -0.001))
+
             return {
                 "model": "GARCH",
                 "horizon": h,
                 "volatility_forecast": vol_final,
-                "var_forecast": float(np.clip(-vol_final * 1.645 * h_factor, -0.99, -0.001)),
-                "cvar_forecast": float(np.clip(-vol_final * 2.06 * h_factor, -0.99, -0.001)),
+                "raw_volatility_forecast": raw_vol_final,
+                "var_forecast": var_forecast,
+                "cvar_forecast": cvar_forecast,
                 "confidence_interval": [
                     max(0.0, float(vol_final * 0.8)),
                     float(vol_final * 1.2)
                 ],
-                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_forecast],
-                "model_params": {"p": 1, "q": 1, "type": "GARCH"}
+                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_path],
+                "model_params": {
+                    "p": 1,
+                    "q": 1,
+                    "type": "GARCH",
+                    "forecast_method": "analytic",
+                },
             }
         except Exception as e:
             logger.error(f"GARCH forecast error: {e}")
-            return self._empty_forecast(h, "GARCH")
-    
+            return self._empty_forecast(
+                h, "GARCH", error="GARCH forecast failed"
+            )
+
     async def _egarch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
-        """EGARCH volatility forecast"""
+        """EGARCH forecast using analytic h=1 and seeded simulation for h>1."""
+        h = int(max(1, horizon))
         try:
-            h = max(1, horizon)
             clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
             clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
             if len(clean_returns) < 20:
                 return self._empty_forecast(h, "EGARCH")
 
-            # Scale returns by 100 for arch optimizer numerical convergence stability
             scaled_returns = clean_returns * 100.0
             model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
             fitted_model = await asyncio.to_thread(
                 lambda: model.fit(disp='off', show_warning=False)
             )
-            
-            # Generate forecast
-            forecast = fitted_model.forecast(horizon=h)
-            
-            # Extract volatility forecast and unscale
-            variance_forecast = forecast.variance.values[-1, :]
-            volatility_forecast = np.sqrt(variance_forecast * 252) / 100.0  # Annualized
-            vol_final = float(np.clip(volatility_forecast[-1], 0.05, 1.20)) if len(volatility_forecast) > 0 else 0.24
-            h_factor = np.sqrt(h / 252.0)
-            
+
+            if h == 1:
+                forecast = await asyncio.to_thread(
+                    lambda: fitted_model.forecast(horizon=1, method='analytic')
+                )
+                simulated = False
+                method = "analytic"
+            else:
+                # arch 8.x does not provide analytic multi-step EGARCH
+                # forecasts.  Simulation is a supported path; fixing the seed
+                # makes the returned path deterministic for tests and clients.
+                forecast = await asyncio.to_thread(
+                    lambda: fitted_model.forecast(
+                        horizon=h,
+                        method="simulation",
+                        simulations=2000,
+                        random_state=100,
+                    )
+                )
+                simulated = True
+                method = "simulation"
+
+            variance_path = self._forecast_variance_path(forecast, h, simulated=simulated)
+            if variance_path.size == 0 or not np.isfinite(variance_path).all():
+                raise ValueError("arch returned no finite EGARCH variance path")
+            variance_path = np.maximum(variance_path, 0.0)
+            volatility_path, return_space_path = self._cumulative_forecast_volatility(
+                variance_path
+            )
+            raw_vol_final = float(volatility_path[-1])
+            vol_final = float(np.clip(raw_vol_final, 0.0, 1.20))
+            return_space_vol = float(return_space_path[-1])
+
             return {
                 "model": "EGARCH",
                 "horizon": h,
                 "volatility_forecast": vol_final,
-                "var_forecast": float(np.clip(-vol_final * 1.645 * h_factor, -0.99, -0.001)),
-                "cvar_forecast": float(np.clip(-vol_final * 2.06 * h_factor, -0.99, -0.001)),
+                "raw_volatility_forecast": raw_vol_final,
+                "var_forecast": float(np.clip(-return_space_vol * 1.645, -0.99, 0.0)),
+                "cvar_forecast": float(np.clip(-return_space_vol * 2.06, -0.99, 0.0)),
                 "confidence_interval": [
                     max(0.0, float(vol_final * 0.8)),
                     float(vol_final * 1.2)
                 ],
-                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_forecast],
-                "model_params": {"p": 1, "q": 1, "type": "EGARCH"}
+                "term_structure": [float(np.clip(v, 0.0, 1.20)) for v in volatility_path],
+                "model_params": {
+                    "p": 1,
+                    "q": 1,
+                    "type": "EGARCH",
+                    "forecast_method": method,
+                    "simulations": 2000 if simulated else None,
+                    "random_state": 100 if simulated else None,
+                },
             }
         except Exception as e:
             logger.error(f"EGARCH forecast error: {e}")
-            return self._empty_forecast(h, "EGARCH")
+            return self._empty_forecast(
+                h, "EGARCH", error="EGARCH forecast failed"
+            )
     
     def _ewma_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """EWMA volatility forecast (RiskMetrics 1996 single-pass recursion)."""
@@ -1073,7 +1318,8 @@ class AnalyticsEngine:
             for x in r[-min(len(r), 60):]:
                 var = lambda_val * var + (1.0 - lambda_val) * x * x
 
-            forecast_volatility = float(np.clip(np.sqrt(var * 252), 0.05, 1.20))
+            raw_forecast_volatility = float(np.sqrt(max(0.0, var) * 252))
+            forecast_volatility = float(np.clip(raw_forecast_volatility, 0.05, 1.20))
             # RiskMetrics has no mean reversion: flat h-step term structure
             term_structure = [forecast_volatility] * h
             h_factor = np.sqrt(h / 252.0)
@@ -1082,6 +1328,7 @@ class AnalyticsEngine:
                 "model": "EWMA",
                 "horizon": h,
                 "volatility_forecast": forecast_volatility,
+                "raw_volatility_forecast": raw_forecast_volatility,
                 "var_forecast": float(np.clip(-forecast_volatility * 1.645 * h_factor, -0.99, -0.001)),
                 "cvar_forecast": float(np.clip(-forecast_volatility * 2.06 * h_factor, -0.99, -0.001)),
                 "confidence_interval": [
@@ -1236,11 +1483,18 @@ class AnalyticsEngine:
             "var_95": None,
             "cvar_95": None,
             "hit_ratio": None,
+            "observations": 0,
+            "active_observations": 0,
             "positions": {},
             "error": "Insufficient data for calculations"
         }
     
-    def _empty_forecast(self, horizon: int = 1, model: str = "GARCH") -> Dict[str, Any]:
+    def _empty_forecast(
+        self,
+        horizon: int = 1,
+        model: str = "GARCH",
+        error: str = "Insufficient data for forecast",
+    ) -> Dict[str, Any]:
         h = max(1, horizon)
         return {
             "model": model,
@@ -1251,7 +1505,7 @@ class AnalyticsEngine:
             "confidence_interval": None,
             "term_structure": None,
             "model_params": None,
-            "error": "Insufficient data for forecast"
+            "error": error
         }
     
     def _empty_factor_exposure(self) -> Dict[str, Any]:

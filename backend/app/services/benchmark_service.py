@@ -7,6 +7,7 @@ tear-sheet comparisons. Data flows through the existing DataService cache
 """
 
 from datetime import datetime, timedelta
+import inspect
 from typing import Optional
 
 import pandas as pd
@@ -48,12 +49,28 @@ class BenchmarkService:
     def __init__(self, db_session):
         self.data_service = DataService(db_session)
 
-    async def ensure_history(self, days: int = 756):
-        """Pull ~`days` calendar days of ^NSEI through the shared cache."""
-        end = datetime.now()
-        start = end - timedelta(days=days)
+    async def ensure_history(
+        self,
+        days: int = 756,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ):
+        """Fetch ^NSEI through the shared cache for an explicit date window.
+
+        ``start``/``end`` are part of the service contract so historical
+        callers are not silently anchored to the server's current date.
+        ``days`` remains the default-window convenience for existing callers.
+        """
+        end_dt = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+        start_dt = (
+            datetime.strptime(start, "%Y-%m-%d")
+            if start
+            else end_dt - timedelta(days=int(days))
+        )
         return await self.data_service.fetch_historical_data(
-            BENCHMARK_SYMBOL, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            BENCHMARK_SYMBOL,
+            start_dt.strftime("%Y-%m-%d"),
+            end_dt.strftime("%Y-%m-%d"),
         )
 
     async def get_benchmark_df(self, days: int = 1100) -> Optional[pd.DataFrame]:
@@ -75,22 +92,53 @@ class BenchmarkService:
         end: Optional[str] = None,
         days: int = 756,
     ) -> Optional[pd.Series]:
-        """Daily simple returns of the benchmark, indexed by date."""
-        if not end:
-            end = datetime.now().strftime("%Y-%m-%d")
-        if not start:
-            start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        """Daily simple returns of the benchmark, indexed by date.
 
-        # Fetch must cover the requested window: derive the calendar span
-        # from start when it reaches further back than the days default.
-        span_days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
-        df = await self.ensure_history(days=max(days, span_days))
+        The fetch window is anchored to the requested ``end`` date, not to
+        ``datetime.now()``.  This is essential for historical tear sheets and
+        factor windows.
+        """
+        end_dt = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+        start_dt = (
+            datetime.strptime(start, "%Y-%m-%d")
+            if start
+            else end_dt - timedelta(days=int(days))
+        )
+        start_text = start_dt.strftime("%Y-%m-%d")
+        end_text = end_dt.strftime("%Y-%m-%d")
+        span_days = max(0, (end_dt - start_dt).days)
+        fetch_days = max(int(days), span_days)
+
+        # Keep compatibility with lightweight test doubles/older subclasses
+        # that expose the historical ``ensure_history(days=...)`` signature.
+        try:
+            parameters = inspect.signature(self.ensure_history).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_explicit_window = (
+            "start" in parameters
+            or "end" in parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
+        if accepts_explicit_window:
+            df = await self.ensure_history(
+                days=fetch_days, start=start_text, end=end_text
+            )
+        else:
+            df = await self.ensure_history(days=fetch_days)
+
         series = _close_series(df)
         if series is None:
             logger.warning("No benchmark data available for %s", BENCHMARK_SYMBOL)
             return None
 
-        series = series.loc[(series.index >= start) & (series.index <= end)]
-        returns = series.pct_change().dropna()
+        series = series.loc[
+            (series.index >= pd.Timestamp(start_text))
+            & (series.index <= pd.Timestamp(end_text))
+        ]
+        returns = series.pct_change(fill_method=None).dropna()
         returns.name = "benchmark"
         return returns if not returns.empty else None

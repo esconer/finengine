@@ -30,8 +30,9 @@ from app.services.company_data_service import (
 
 class TestAlphaVantageServiceComprehensive:
     def test_to_av_symbol_conversions(self):
-        assert to_av_symbol("RELIANCE.NS") == "RELIANCE.BSE"
-        assert to_av_symbol("TCS.BO") == "TCS.BSE"
+        assert to_av_symbol("RELIANCE.NS") is None
+        assert to_av_symbol("TCS.BO") is None
+        assert to_av_symbol("TCS.BSE") is None
         assert to_av_symbol("AAPL") == "AAPL"
         assert to_av_symbol("  msft  ") == "MSFT"
 
@@ -164,14 +165,14 @@ class TestAlphaVantageServiceComprehensive:
                 }
             }
             with patch.object(service, "_make_request", new=AsyncMock(return_value=mock_ts)):
-                df = await service.fetch_daily_ohlcv("TCS.NS", "2025-01-01", "2025-01-02")
+                df = await service.fetch_daily_ohlcv("AAPL", "2025-01-01", "2025-01-02")
                 assert df is not None
                 assert len(df) == 2
                 assert "close" in df.columns
 
             # fetch_daily_ohlcv empty
             with patch.object(service, "_make_request", new=AsyncMock(return_value={})):
-                df_empty = await service.fetch_daily_ohlcv("TCS.NS", "2025-01-01", "2025-01-02")
+                df_empty = await service.fetch_daily_ohlcv("AAPL", "2025-01-01", "2025-01-02")
                 assert df_empty is None
 
             # fetch_global_quote success

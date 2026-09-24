@@ -1,19 +1,14 @@
-"""P1: init_db self-heals legacy analytics_cache unique index.
+"""Safe versioned convergence for legacy analytics_cache schemas.
 
-Legacy DBs created before the AnalyticsCache UniqueConstraint lack
-UNIQUE(ticker, metric_name) (create_all never alters existing tables), so
-CacheService's ON CONFLICT (ticker, metric_name) upsert fails at runtime.
-The real daisy.db only carried a 3-col unique index (ticker, metric_name,
-calculation_date), which does not satisfy that ON CONFLICT.
-
-Gates the init_db heal: dedupe keeping MAX(id) per (ticker, metric_name),
-then CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_cache_ticker_metric.
-Hermetic — temp sqlite file, never backend/data/daisy.db.
+Duplicate-free legacy databases gain the current unique key.  Databases with
+conflicting cache rows are blocked with a backup and retain every row; cache
+repair must never silently discard user-visible data.
 """
 
 import sqlite3
 from datetime import datetime
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -21,10 +16,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import app.db.database as db_mod
 from app.db.database import init_db
 from app.services.cache_service import CacheService
+from migrations.schema_version import MigrationBlocked
 
-# Legacy table exactly as pre-constraint DBs have it: PK id, non-unique
-# (ticker, metric_name) index, and the old 3-col unique index that does NOT
-# match the upsert's ON CONFLICT columns.
 LEGACY_DDL = [
     "CREATE TABLE analytics_cache ("
     "id INTEGER NOT NULL, "
@@ -39,29 +32,33 @@ LEGACY_DDL = [
     "CREATE INDEX ix_ticker_metric ON analytics_cache (ticker, metric_name)",
     "CREATE UNIQUE INDEX idx_analytics_cache_unique "
     "ON analytics_cache(ticker, metric_name, calculation_date)",
-    # duplicate (ticker, metric_name): legal under the 3-col index
     "INSERT INTO analytics_cache (id, ticker, metric_name, metric_value,"
     " calculation_date, expires_at, model_params)"
     " VALUES (1, 'AAPL', 'sharpe', 1.0, '2026-01-01', '2030-01-01', '{}')",
-    "INSERT INTO analytics_cache (id, ticker, metric_name, metric_value,"
-    " calculation_date, expires_at, model_params)"
-    " VALUES (2, 'AAPL', 'sharpe', 2.0, '2026-02-01', '2030-01-01', '{}')",
     "INSERT INTO analytics_cache (id, ticker, metric_name, metric_value,"
     " calculation_date, expires_at, model_params)"
     " VALUES (3, 'MSFT', 'beta', 3.0, '2026-01-01', '2030-01-01', '{}')",
 ]
 
 
-@pytest_asyncio.fixture
-async def healed_legacy_engine(tmp_path, monkeypatch):
-    """Legacy-simulated temp DB run through the real init_db path."""
-    db_file = tmp_path / "legacy.db"
-    conn = sqlite3.connect(db_file)
-    for stmt in LEGACY_DDL:
-        conn.execute(stmt)
+def _legacy_db(path, *, duplicate: bool = False) -> None:
+    conn = sqlite3.connect(path)
+    for statement in LEGACY_DDL:
+        conn.execute(statement)
+    if duplicate:
+        conn.execute(
+            "INSERT INTO analytics_cache (id, ticker, metric_name, metric_value,"
+            " calculation_date, expires_at, model_params)"
+            " VALUES (2, 'AAPL', 'sharpe', 2.0, '2026-02-01', '2030-01-01', '{}')"
+        )
     conn.commit()
     conn.close()
 
+
+@pytest_asyncio.fixture
+async def healed_legacy_engine(tmp_path, monkeypatch):
+    db_file = tmp_path / "legacy.db"
+    _legacy_db(db_file)
     url = f"sqlite+aiosqlite:///{db_file.as_posix()}"
     engine = create_async_engine(url, echo=False)
     monkeypatch.setattr(db_mod, "engine", engine)
@@ -73,78 +70,63 @@ async def healed_legacy_engine(tmp_path, monkeypatch):
 
 async def test_unique_index_exists_after_init(healed_legacy_engine):
     async with healed_legacy_engine.connect() as conn:
-        row = (
+        indexes = (
             await conn.execute(
-                text(
-                    "SELECT sql FROM sqlite_master"
-                    " WHERE type='index' AND name='uq_analytics_cache_ticker_metric'"
-                )
+                text("PRAGMA index_list('analytics_cache')")
             )
-        ).fetchone()
-        assert row is not None, "uq_analytics_cache_ticker_metric not created by init_db"
-        assert "UNIQUE" in row[0].upper()
-        cols = [
-            r[2]
-            for r in await conn.execute(
-                text("PRAGMA index_info(uq_analytics_cache_ticker_metric)")
-            )
-        ]
-        assert cols == ["ticker", "metric_name"]
+        ).all()
+        matching = []
+        for index in indexes:
+            name = index[1]
+            if not index[2]:
+                continue
+            cols = [row[2] for row in (await conn.execute(text(f'PRAGMA index_info("{name}")'))).all()]
+            if cols == ["ticker", "metric_name"]:
+                matching.append(name)
+        assert matching, "no UNIQUE(ticker, metric_name) index after migration"
 
 
-async def test_duplicates_deduped_keeping_max_id(healed_legacy_engine):
+async def test_existing_rows_are_preserved(healed_legacy_engine):
     async with healed_legacy_engine.connect() as conn:
-        dupes = (
-            await conn.execute(
-                text(
-                    "SELECT ticker, metric_name, COUNT(*) FROM analytics_cache"
-                    " GROUP BY ticker, metric_name HAVING COUNT(*) > 1"
-                )
-            )
-        ).fetchall()
-        assert dupes == [], f"duplicate cache keys survived: {dupes}"
-        # MAX(id) kept: row 2 (value 2.0) wins over row 1 (value 1.0)
-        value = (
-            await conn.execute(
-                text(
-                    "SELECT metric_value FROM analytics_cache"
-                    " WHERE ticker='AAPL' AND metric_name='sharpe'"
-                )
-            )
-        ).scalar()
-        assert value == 2.0, f"expected MAX(id) row kept, got value {value}"
-        msft = (
-            await conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM analytics_cache"
-                    " WHERE ticker='MSFT' AND metric_name='beta'"
-                )
-            )
-        ).scalar()
-        assert msft == 1
+        assert (await conn.execute(text("SELECT COUNT(*) FROM analytics_cache"))).scalar() == 2
+        assert (await conn.execute(text("PRAGMA user_version"))).scalar() == 1
 
 
-async def test_upsert_succeeds_after_selfheal(healed_legacy_engine):
-    session_factory = async_sessionmaker(
-        healed_legacy_engine, expire_on_commit=False
-    )
+async def test_upsert_succeeds_after_migration(healed_legacy_engine):
+    session_factory = async_sessionmaker(healed_legacy_engine, expire_on_commit=False)
     async with session_factory() as session:
-        svc = CacheService(session)
-        # set_cached_analytics swallows exceptions (logs + rolls back), so
-        # success is asserted by the row actually taking the new value.
-        await svc.set_cached_analytics(
+        service = CacheService(session)
+        await service.set_cached_analytics(
             "AAPL", "sharpe", 9.0, datetime(2026, 3, 1), {"v": 9}
         )
         rows = (
             await session.execute(
                 text(
-                    "SELECT metric_value FROM analytics_cache"
-                    " WHERE ticker='AAPL' AND metric_name='sharpe'"
+                    "SELECT metric_value FROM analytics_cache "
+                    "WHERE ticker='AAPL' AND metric_name='sharpe'"
                 )
             )
-        ).fetchall()
-        assert len(rows) == 1, f"upsert created {len(rows)} rows"
-        assert rows[0][0] == 9.0, (
-            "upsert did not update the row — ON CONFLICT likely failed "
-            "(unique index missing?)"
-        )
+        ).all()
+        assert rows == [(9.0,)]
+
+
+async def test_duplicate_cache_rows_block_safely_and_keep_backup(tmp_path, monkeypatch):
+    db_file = tmp_path / "duplicates.db"
+    _legacy_db(db_file, duplicate=True)
+    before = db_file.read_bytes()
+    url = f"sqlite+aiosqlite:///{db_file.as_posix()}"
+    engine = create_async_engine(url, echo=False)
+    monkeypatch.setattr(db_mod, "engine", engine)
+    monkeypatch.setattr(db_mod.settings, "database_url", url)
+    try:
+        with pytest.raises(MigrationBlocked):
+            await init_db()
+    finally:
+        await engine.dispose()
+
+    conn = sqlite3.connect(db_file)
+    assert conn.execute("SELECT COUNT(*) FROM analytics_cache").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    conn.close()
+    assert db_file.read_bytes() == before
+    assert len(list((tmp_path / "backups").glob("daisy_backup_*.db"))) == 1

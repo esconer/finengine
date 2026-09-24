@@ -133,6 +133,21 @@ describe('fetchPortfolio success contract (04-B10)', () => {
     expect(usePortfolioStore.getState().error).toBeNull();
   });
 
+  it('coalesces concurrent refreshes for the shared snapshot', async () => {
+    let resolve!: (value: typeof emptySummary) => void;
+    vi.mocked(portfolioApi.getPortfolio).mockReturnValueOnce(new Promise((res) => {
+      resolve = res;
+    }));
+
+    const first = usePortfolioStore.getState().fetchPortfolio();
+    const second = usePortfolioStore.getState().fetchPortfolio();
+    expect(portfolioApi.getPortfolio).toHaveBeenCalledTimes(1);
+
+    resolve(emptySummary);
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+  });
+
   it('returns false and surfaces the message on failure — callers must not stamp freshness', async () => {
     vi.mocked(portfolioApi.getPortfolio).mockRejectedValueOnce(new Error('service down'));
     const ok = await usePortfolioStore.getState().fetchPortfolio();
@@ -166,7 +181,7 @@ describe('bulkAddPositions partial failure surfacing (04-B13)', () => {
     expect(usePortfolioStore.getState().error).toMatch(/2 of 10 positions failed/);
   });
 
-  it('defaults region to IN for an INR/NSE-first product (04-B16)', async () => {
+  it('leaves omitted region for backend ticker inference (04-B16)', async () => {
     vi.mocked(portfolioApi.bulkAddPositions).mockResolvedValueOnce({
       success: true,
       added: 1,
@@ -180,7 +195,7 @@ describe('bulkAddPositions partial failure surfacing (04-B13)', () => {
     ]);
 
     const sent = vi.mocked(portfolioApi.bulkAddPositions).mock.calls[0][0];
-    expect(sent.positions[0].region).toBe('IN');
+    expect(sent.positions[0].region).toBeUndefined();
     expect(usePortfolioStore.getState().error).toBeNull();
   });
 

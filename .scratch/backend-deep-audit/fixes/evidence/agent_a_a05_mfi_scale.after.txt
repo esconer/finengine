@@ -1,0 +1,2 @@
+﻿CHECK|mfi_scale|backend=52.4678528716|reference=52.4678528716|abs_diff=1.13686837722e-13|rel_diff=2.16679035828e-15|tolerance=atol:1e-10,rtol:1e-10|PASS
+OUTPUT|mfi|backend=52.4678528716|reference=52.4678528716|stockstats_contract=fraction_times_100

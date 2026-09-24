@@ -1,0 +1,6 @@
+﻿CHECK|evt_pot_var|backend=-0.027248|reference=-0.0272480031955199|abs_diff=3.1955198973032672e-09|rel_diff=1.1727537883688567e-07|tolerance=atol:1e-6,rtol:1e-6|PASS
+CHECK|evt_pot_es|backend=-0.041628|reference=-0.04162801961103262|abs_diff=1.96110326242116e-08|rel_diff=4.7110174366820253e-07|tolerance=atol:1e-6,rtol:1e-6|PASS
+CHECK|historical_var|backend=-0.026989|reference=-0.026988750647063724|abs_diff=2.4935293627473265e-07|rel_diff=9.23914335774788e-06|tolerance=atol:1e-6,rtol:1e-6|PASS
+CHECK|historical_es|backend=-0.041308|reference=-0.041308275313226374|abs_diff=2.7531322637636135e-07|rel_diff=6.664844375340203e-06|tolerance=atol:1e-6,rtol:1e-6|PASS
+CHECK|no_hardcoded_99_fields_for_95|backend=[]|reference=[]|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+OUTPUT|confidence|requested=0.95|returned=0.95

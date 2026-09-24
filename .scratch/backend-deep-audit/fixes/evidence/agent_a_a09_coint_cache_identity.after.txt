@@ -1,0 +1,6 @@
+﻿CHECK|memory_keys_differ|backend=True|reference='different'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+CHECK|durable_keys_differ|backend=True|reference='different'|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+OUTPUT|memory_short|coint_A_B_2026-09-24_0.05_0_60_lookback:60
+OUTPUT|memory_long|coint_A_B_2026-09-24_0.05_0_2520_lookback:2520
+OUTPUT|durable_short|('COINT', 'coint_5ff4cda4_2026-09-24')
+OUTPUT|durable_long|('COINT', 'coint_0bd635bf_2026-09-24')

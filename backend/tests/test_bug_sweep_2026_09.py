@@ -307,8 +307,8 @@ async def test_websocket_analytics_mixed_inception(test_db: AsyncSession):
     assert broadcast_mock.call_args_list, "expected an analytics_update broadcast"
     payload = broadcast_mock.call_args_list[0].args[0]["data"]
     assert payload["positions_count"] == 2
-    # With the old dropna() the shared frame collapsed to 4 rows (< 6),
-    # leaving realized volatility at exactly 0. The ffill fix keeps all 30 days.
+    # The active-mask aggregation keeps the measured observations rather than
+    # collapsing a shared frame with dropna().
     assert payload["realized_volatility"] > 0.0
 
     await test_db.execute(delete(PortfolioPosition))

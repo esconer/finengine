@@ -51,12 +51,13 @@ class VolatilityService:
         if not isinstance(returns, pd.Series):
             returns = pd.Series(returns)
 
-        clean_returns = returns.dropna()
-        if len(clean_returns) == 0:
+        clean_returns = returns.replace([np.inf, -np.inf], np.nan)
+        finite_count = int(clean_returns.notna().sum())
+        if finite_count == 0:
             return pd.Series(dtype=float)
 
         if min_periods is None:
-            min_periods = max(5, min(window, len(clean_returns)))
+            min_periods = max(5, min(window, finite_count))
 
         rolling_std = clean_returns.rolling(window=window, min_periods=min_periods).std(ddof=1)
         rolling_vol = rolling_std * annualization_factor
@@ -83,12 +84,14 @@ class VolatilityService:
         Returns
         -------
         float
-            Annualized EWMA volatility.
+            Annualized EWMA volatility.  Empty input raises; a single
+            observation returns 0.0 because sample dispersion is undefined.
         """
         if isinstance(returns, pd.Series):
-            r = returns.dropna().values
+            r = returns.replace([np.inf, -np.inf], np.nan).dropna().values
         else:
-            r = np.asarray(returns)[~np.isnan(returns)]
+            values = np.asarray(returns)
+            r = values[np.isfinite(values)]
 
         n = len(r)
         if n == 0:
@@ -96,7 +99,11 @@ class VolatilityService:
             # nothing (route/garch callers guard non-empty inputs).
             raise ValueError("Cannot compute EWMA volatility on empty returns")
         if n == 1:
-            return float(abs(r[0]) * annualization_factor)
+            # A single return contains no dispersion estimate.  Returning its
+            # absolute value conflates return level with volatility; use the
+            # explicit zero-assumption contract until a second observation is
+            # available.
+            return 0.0
 
         # Vectorized exponential weights: (1 - lambda) * lambda^(N-1-t)
         weights = (1.0 - decay) * (decay ** np.arange(n)[::-1])
@@ -133,9 +140,10 @@ class VolatilityService:
             Dictionary with annualized volatility forecast and fitted model parameters.
         """
         if isinstance(returns, pd.Series):
-            r = returns.dropna().values
+            r = returns.replace([np.inf, -np.inf], np.nan).dropna().values
         else:
-            r = np.asarray(returns)[~np.isnan(returns)]
+            values = np.asarray(returns)
+            r = values[np.isfinite(values)]
 
         if len(r) < 30:
             # Insufficient observations for stable GARCH convergence -> fallback to EWMA
@@ -226,11 +234,11 @@ class VolatilityService:
         if not isinstance(returns, pd.Series):
             returns = pd.Series(returns)
 
-        clean_returns = returns.dropna()
+        clean_returns = returns.replace([np.inf, -np.inf], np.nan)
 
         if as_of is None:
-            if isinstance(clean_returns.index, pd.DatetimeIndex) and len(clean_returns.index) > 0:
-                as_of = str(clean_returns.index[-1])[:10]
+            if isinstance(clean_returns.index, pd.DatetimeIndex) and clean_returns.notna().any():
+                as_of = str(clean_returns.last_valid_index())[:10]
             else:
                 as_of = pd.Timestamp.now().strftime("%Y-%m-%d")
 

@@ -10,6 +10,7 @@ import { usePathname } from 'next/navigation';
 import { Sidebar, navigation } from './Sidebar';
 import { Header } from './Header';
 import { NotificationContainer } from '@/components/ui/NotificationSystem';
+import { RealtimeStatus } from './RealtimeStatus';
 import { useUIStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
 
@@ -112,6 +113,7 @@ export function DashboardLayout({
         </main>
       </div>
 
+      <RealtimeStatus />
       <NotificationContainer />
     </div>
   );

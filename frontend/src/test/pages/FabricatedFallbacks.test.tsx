@@ -5,6 +5,8 @@ import React from 'react';
 const mocks = vi.hoisted(() => ({
   positions: [] as any[],
   fetchPortfolio: vi.fn().mockResolvedValue(undefined),
+  setPortfolioSnapshot: vi.fn(),
+  setPositionCount: vi.fn(),
   updateLastUpdated: vi.fn(),
   getFactorExposure: vi.fn(),
   getForecastRisk: vi.fn(),
@@ -27,6 +29,8 @@ vi.mock('@/lib/store', () => ({
   usePortfolioStore: () => ({
     positions: mocks.positions,
     fetchPortfolio: mocks.fetchPortfolio,
+    setPortfolioSnapshot: mocks.setPortfolioSnapshot,
+    setPositionCount: mocks.setPositionCount,
     isLoading: false,
     error: null,
     totalValue: 0,
@@ -457,6 +461,57 @@ describe('fabricated fallbacks — portfolio manage null forecast', () => {
     expect(screen.queryByText('High')).toBeNull();
     // Weight column renders the real weight.
     expect(screen.getByText('50.00%')).toBeDefined();
+  });
+});
+
+describe('portfolio manage — base-currency values', () => {
+  it('uses converted row values when the USD view is selected', async () => {
+    mocks.getPortfolio.mockImplementation(async ({ currency }: { currency: 'INR' | 'USD' }) => ({
+      positions: [{
+        id: 1,
+        ticker: 'AAPL',
+        quantity: 1,
+        buy_price: 90,
+        last_price: 100,
+        market_value: 100,
+        current_value: 100,
+        total_cost: 90,
+        unrealized_gain_loss: 10,
+        unrealized_gain_loss_pct: 11.111,
+        weight: 1,
+        sector: 'Technology',
+        native_currency: 'USD',
+        value_currency: currency,
+        buy_price_base: currency === 'USD' ? 90 : 7200,
+        last_price_base: currency === 'USD' ? 100 : 8000,
+        market_value_base: currency === 'USD' ? 100 : 8000,
+        current_value_base: currency === 'USD' ? 100 : 8000,
+        total_cost_base: currency === 'USD' ? 90 : 7200,
+        unrealized_gain_loss_base: currency === 'USD' ? 10 : 800,
+        unrealized_gain_loss_pct_base: 11.111,
+      }],
+      total_value: currency === 'USD' ? 100 : 8000,
+      total_positions: 1,
+      total_weight: 1,
+      sectors: { Technology: 1 },
+      currency,
+      base_currency: currency,
+    }));
+    mocks.getForecastRisk.mockResolvedValue({ positions: {} });
+
+    render(<PortfolioManagePage />);
+    await waitFor(() => expect(screen.getAllByText('AAPL').length).toBeGreaterThan(0));
+
+    fireEvent.click(screen.getByRole('button', { name: /USD/ }));
+    await waitFor(() => expect(mocks.getPortfolio).toHaveBeenCalledWith({ currency: 'USD' }));
+    await waitFor(() => expect(screen.getAllByText('$100.00').length).toBeGreaterThan(0));
+    expect(screen.getAllByText('$90.00').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('+$10.00').length).toBeGreaterThan(0);
+    expect(screen.queryByText('₹8,000.00')).toBeNull();
+    expect(mocks.setPositionCount).toHaveBeenLastCalledWith(1);
+    expect(mocks.setPortfolioSnapshot).not.toHaveBeenCalledWith(
+      expect.objectContaining({ total_value: 100 })
+    );
   });
 });
 

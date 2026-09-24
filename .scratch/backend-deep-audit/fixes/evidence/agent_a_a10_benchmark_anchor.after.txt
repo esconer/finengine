@@ -1,0 +1,2 @@
+﻿CHECK|fetch_end_anchor|backend=2020-02-01|reference=2020-02-01|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|PASS
+OUTPUT|fetch_call|('^NSEI', '2020-01-01', '2020-02-01')

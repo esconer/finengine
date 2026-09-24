@@ -1,0 +1,237 @@
+VERIFY_RISK_TIMESERIES_V1
+READ_ONLY_EVIDENCE|No production files modified; no DB/network fixture; deterministic seeds declared per check
+BACKEND_ROOT=C:\es\coding\finengine\backend
+OUTPUT_FILE=C:\es\coding\finengine\.scratch\backend-deep-audit\quant\outputs\verify-risk-timeseries.txt
+INVENTORY_START
+LIB|numpy|pyproject=numpy|uv.lock=2.5.3|installed=2.5.3
+LIB|pandas|pyproject=pandas|uv.lock=3.0.6|installed=3.0.6
+LIB|scipy|pyproject=scipy|uv.lock=1.18.1|installed=1.18.1
+LIB|arch|pyproject=arch|uv.lock=8.0.0|installed=8.0.0
+LIB|statsmodels|pyproject=statsmodels|uv.lock=0.15.0|installed=0.15.0
+LIB|quantstats|pyproject=quantstats|uv.lock=0.0.81|installed=0.0.81
+LIB|hmmlearn|pyproject=hmmlearn>=0.3.3|uv.lock=0.3.3|installed=0.3.3
+LIB|stockstats|pyproject=stockstats>=0.6.8|uv.lock=0.6.8|installed=0.6.8
+LIB|scikit-learn|pyproject=scikit-learn>=1.7.2|uv.lock=1.9.1|installed=1.9.1
+LIB|cvxpy|pyproject=cvxpy>=1.6.0|uv.lock=1.9.3|installed=1.9.3
+LIB|quantlib|pyproject=quantlib>=1.40|uv.lock=1.43|installed=1.43
+LIB|ta-lib|pyproject=NOT_DECLARED|uv.lock=NOT_LOCKED|installed=NOT_INSTALLED
+LIB|pandas-ta|pyproject=NOT_DECLARED|uv.lock=NOT_LOCKED|installed=NOT_INSTALLED
+LIB|vectorbt|pyproject=NOT_DECLARED|uv.lock=NOT_LOCKED|installed=NOT_INSTALLED
+LIB|empyrical|pyproject=NOT_DECLARED|uv.lock=NOT_LOCKED|installed=NOT_INSTALLED
+LIB|pyfolio|pyproject=NOT_DECLARED|uv.lock=NOT_LOCKED|installed=NOT_INSTALLED
+INVENTORY_END
+FIXTURE|returns_n=600|start=2022-01-03|end=2024-04-19|seed=20260923
+MODEL_START|Realized annual return, volatility, Sharpe, Sortino, hit ratio|final_verdict=MATCHES|severity=None|reference=NumPy/Pandas closed forms
+CHECK|Realized annual return, volatility, Sharpe, Sortino, hit ratio|metric_vector|backend=array(n=5,first=0.11443820467,last=0.511666666667,max_abs=0)|reference=array(n=5,first=0.11443820467,last=0.511666666667,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Realized annual return, volatility, Sharpe, Sortino, hit ratio|backend={'annual_return': 0.11443820466986843, 'annual_volatility': 0.23355365768674657, 'sharpe_ratio': 0.40435335333747374, 'sortino_ratio': 0.5920009755778347, 'hit_ratio': 0.5116666666666667}
+OUTPUT|Realized annual return, volatility, Sharpe, Sortino, hit ratio|reference={'annual_return': 0.11443820466986843, 'annual_volatility': 0.23355365768674657, 'sharpe_ratio': 0.40435335333747374, 'sortino_ratio': 0.5920009755778347, 'hit_ratio': 0.5116666666666667}
+MODEL_END|Realized annual return, volatility, Sharpe, Sortino, hit ratio|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Historical 95% VaR and CVaR|final_verdict=MATCHES|severity=None|reference=NumPy 5th percentile and conditional tail mean
+CHECK|Historical 95% VaR and CVaR|var_95|backend=-0.021381693265|reference=-0.021381693265|abs_diff=0|rel_diff=0|tolerance=atol:1e-15,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Historical 95% VaR and CVaR|cvar_95|backend=-0.0321308711441|reference=-0.0321308711441|abs_diff=0|rel_diff=0|tolerance=atol:1e-15,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Historical 95% VaR and CVaR|backend={'var_95': -0.021381693265, 'cvar_95': -0.0321308711441}
+OUTPUT|Historical 95% VaR and CVaR|reference={'var_95': -0.021381693265, 'cvar_95': -0.0321308711441}
+MODEL_END|Historical 95% VaR and CVaR|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Maximum drawdown, skewness, and excess kurtosis|final_verdict=MATCHES|severity=None|reference=Pandas wealth drawdown and SciPy unbiased shape statistics
+CHECK|Maximum drawdown, skewness, and excess kurtosis|max_drawdown|backend=-0.314742563071|reference=-0.314742563071|abs_diff=0|rel_diff=0|tolerance=atol:1e-15,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Maximum drawdown, skewness, and excess kurtosis|shape_vector|backend=array(n=2,first=0.227271332667,last=5.5679614247,max_abs=5.55111512313e-17)|reference=array(n=2,first=0.227271332667,last=5.5679614247,max_abs=5.55111512313e-17)|abs_diff=5.55111512313e-17|rel_diff=2.44250564204e-16|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Maximum drawdown, skewness, and excess kurtosis|backend={'max_drawdown': np.float64(-0.31474256307082676), 'skewness': np.float64(0.2272713326668863), 'kurtosis': np.float64(5.567961424696676)}
+OUTPUT|Maximum drawdown, skewness, and excess kurtosis|reference={'max_drawdown': -0.314742563071, 'skewness': 0.227271332667, 'kurtosis': 5.5679614247}
+MODEL_END|Maximum drawdown, skewness, and excess kurtosis|verdict=MATCHES|severity=None|max_abs=5.55111512313e-17|max_rel=2.44250564204e-16
+MODEL_START|Static normalized EWMA volatility|final_verdict=DIVERGES|severity=None|reference=Independent RiskMetrics exponential-weight identity
+CHECK|Static normalized EWMA volatility|finite_sample_normalized|backend=0.184095753073|reference=0.184095753073|abs_diff=2.77555756156e-17|rel_diff=1.50767060904e-16|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Static normalized EWMA volatility|riskmetrics_unnormalized_weights|backend=0.184095753073|reference=0.155110232506|abs_diff=0.0289855205662|rel_diff=0.186870460432|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=FAIL|check_verdict=DIVERGES
+OUTPUT|Static normalized EWMA volatility|backend=0.184095753073
+OUTPUT|Static normalized EWMA volatility|reference_normalized=0.184095753073|reference_unnormalized=0.155110232506
+NOTE|Static normalized EWMA volatility|Finite-sample normalization is a convention difference, not wrong arithmetic; relative magnitude is reported above.
+MODEL_END|Static normalized EWMA volatility|verdict=DIVERGES|severity=None|max_abs=0.0289855205662|max_rel=0.186870460432
+MODEL_START|Recursive RiskMetrics-style EWMA forecast|final_verdict=MATCHES|severity=None|reference=Independent initialized recursion plus SciPy normal tails
+CHECK|Recursive RiskMetrics-style EWMA forecast|one_day_forecast|backend=0.174139772184|reference=0.174139772184|abs_diff=8.32667268469e-17|rel_diff=4.78160306531e-16|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Recursive RiskMetrics-style EWMA forecast|flat_term_structure|backend=array(n=5,first=0.174139772184,last=0.174139772184,max_abs=8.32667268469e-17)|reference=array(n=5,first=0.174139772184,last=0.174139772184,max_abs=8.32667268469e-17)|abs_diff=8.32667268469e-17|rel_diff=4.78160306531e-16|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Recursive RiskMetrics-style EWMA forecast|h5_var_95|backend=-0.0403504707714|reference=-0.0403468803633|abs_diff=3.59040815585e-06|rel_diff=8.89884948607e-05|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Recursive RiskMetrics-style EWMA forecast|h5_cvar_95|backend=-0.0505300728202|reference=-0.0505966157138|abs_diff=6.65428936395e-05|rel_diff=0.00131516491174|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Recursive RiskMetrics-style EWMA forecast|backend={'volatility_forecast': 0.174139772184, 'var_forecast': -0.0403504707714, 'cvar_forecast': -0.0505300728202}
+OUTPUT|Recursive RiskMetrics-style EWMA forecast|reference={'volatility_forecast': 0.174139772184}
+NOTE|Recursive RiskMetrics-style EWMA forecast|Initialization uses full-sample variance and only the last 60 returns are recursively updated; this is an explicit model assumption.
+MODEL_END|Recursive RiskMetrics-style EWMA forecast|verdict=MATCHES|severity=None|max_abs=6.65428936395e-05|max_rel=0.00131516491174
+MODEL_START|Rolling realized volatility and volatility-cone quantiles|final_verdict=MATCHES|severity=None|reference=Pandas rolling ddof=1 and NumPy quantiles
+CHECK|Rolling realized volatility and volatility-cone quantiles|rolling_21d|backend=array(n=580,first=0.193553740968,last=0.175927877546,max_abs=0)|reference=array(n=580,first=0.193553740968,last=0.175927877546,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Rolling realized volatility and volatility-cone quantiles|cone_rounded_vector|backend=array(n=14,first=0.073,last=39.3,max_abs=0)|reference=array(n=14,first=0.073,last=39.3,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Rolling realized volatility and volatility-cone quantiles|backend_windows=[{'window_days': 10, 'min': 0.073, 'p25': 0.1486, 'median': 0.1793, 'p75': 0.2169, 'max': 0.7732, 'current_realized': 0.1324, 'percentile_rank': 15.2, 'insufficient_data': False}, {'window_days': 21, 'min': 0.101, 'p25': 0.1619, 'median': 0.1909, 'p75': 0.2206, 'max': 0.6079, 'current_realized': 0.1759, 'percentile_rank': 39.3, 'insufficient_data': False}]
+OUTPUT|Rolling realized volatility and volatility-cone quantiles|backend_forecast={'model': 'EWMA', 'annualized_vol': 0.1716, 'horizon_days': 21, 'percentile_rank': 36.4, 'valuation': 'normal'}
+MODEL_END|Rolling realized volatility and volatility-cone quantiles|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|AnalyticsEngine GARCH(1,1) forecast and parametric tail|final_verdict=BUG|severity=High|reference=arch 8.0.0 forecast plus SciPy normal tail quantiles
+CHECK|AnalyticsEngine GARCH(1,1) forecast and parametric tail|terminal_annualized_volatility|backend=0.21265238802|reference=0.212980545081|abs_diff=0.000328157060599|rel_diff=0.0015407842086|tolerance=atol:0.001,rtol:0.005|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|AnalyticsEngine GARCH(1,1) forecast and parametric tail|term_structure|backend=array(n=5,first=0.191976736853,last=0.21265238802,max_abs=0.00065310089086)|reference=array(n=5,first=0.192629837744,last=0.212980545081,max_abs=0.00065310089086)|abs_diff=0.00065310089086|rel_diff=0.0033904451071|tolerance=atol:0.001,rtol:0.005|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|AnalyticsEngine GARCH(1,1) forecast and parametric tail|h5_var_95|backend=-0.0492743493324|reference=-0.0220682004756|abs_diff=0.0272061488569|rel_diff=1.232821357|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=FAIL|check_verdict=BUG
+CHECK|AnalyticsEngine GARCH(1,1) forecast and parametric tail|h5_cvar_95|backend=-0.0617052642096|reference=-0.0276744137069|abs_diff=0.0340308505027|rel_diff=1.22968641226|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=FAIL|check_verdict=BUG
+OUTPUT|AnalyticsEngine GARCH(1,1) forecast and parametric tail|backend={'volatility_forecast': 0.21265238802, 'var_forecast': -0.0492743493324, 'cvar_forecast': -0.0617052642096}
+OUTPUT|AnalyticsEngine GARCH(1,1) forecast and parametric tail|reference={'volatility_forecast': 0.212980545081, 'var_forecast': -0.0220682004756, 'cvar_forecast': -0.0276744137069}
+NOTE|AnalyticsEngine GARCH(1,1) forecast and parametric tail|Backend scales an already h-step annualized terminal volatility by sqrt(h/252), double-counting horizon.
+MODEL_END|AnalyticsEngine GARCH(1,1) forecast and parametric tail|verdict=BUG|severity=High|max_abs=0.0340308505027|max_rel=1.232821357
+MODEL_START|VolatilityService horizon-average GARCH(1,1)|final_verdict=MATCHES|severity=None|reference=arch 8.0.0 root-mean-square horizon variance
+CHECK|VolatilityService horizon-average GARCH(1,1)|annualized_rms_forecast|backend=0.217171400193|reference=0.217171400193|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|VolatilityService horizon-average GARCH(1,1)|backend={'annualized_vol': 0.2171714001930881, 'model': 'GARCH(1,1)', 'horizon': 21, 'params': {'omega': 0.45940556793552595, 'alpha': 0.21692606854922775, 'beta': 0.550312404168509, 'persistence': 0.7672384727177368}}
+OUTPUT|VolatilityService horizon-average GARCH(1,1)|reference_annualized_vol=0.217171400193
+NOTE|VolatilityService horizon-average GARCH(1,1)|This is a separate GARCH interface and does not use the AnalyticsEngine h-step VaR scaling path.
+MODEL_END|VolatilityService horizon-average GARCH(1,1)|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|final_verdict=BUG|severity=High|reference=arch 8.0.0 analytic h=1 and simulation h=5 plus SciPy normal tails
+CHECK|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|h1_volatility|backend=0.195422141849|reference=0.196166891955|abs_diff=0.000744750105423|rel_diff=0.00379651274484|tolerance=atol:0.001,rtol:0.005|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|h1_var_95|backend=-0.020250670197|reference=-0.0203260363367|abs_diff=7.53661396935e-05|rel_diff=0.00370786209594|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|h1_cvar_95|backend=-0.0253595018881|reference=-0.0254896695916|abs_diff=0.000130167703576|rel_diff=0.00510668461623|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|h5_volatility|backend=nan|reference=0.220720188989|abs_diff=inf|rel_diff=inf|tolerance=atol:0.001,rtol:0.005|tolerance_verdict=FAIL|check_verdict=BUG
+CHECK|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|h5_var_95|backend=nan|reference=-0.0228701517209|abs_diff=inf|rel_diff=inf|tolerance=atol:0.0006,rtol:0.0001|tolerance_verdict=FAIL|check_verdict=BUG
+OUTPUT|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|backend_h1={'volatility_forecast': 0.1954221418493867, 'var_forecast': -0.020250670197021724, 'cvar_forecast': -0.025359501888063678}
+OUTPUT|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|reference_h1={'volatility_forecast': 0.196166891955, 'var_forecast': -0.0203260363367, 'cvar_forecast': -0.0254896695916}
+OUTPUT|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|backend_h5={'model': 'EGARCH', 'horizon': 5, 'volatility_forecast': None, 'var_forecast': None, 'cvar_forecast': None, 'confidence_interval': None, 'term_structure': None, 'model_params': None, 'error': 'Insufficient data for forecast'}
+OUTPUT|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|reference_h5={'volatility_forecast': 0.220720188989, 'var_forecast': -0.0228701517209}
+NOTE|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|arch rejects analytic EGARCH forecasts for horizon > 1; the backend catches that error and returns nulls without using arch simulation forecasts.
+MODEL_END|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|verdict=BUG|severity=High|max_abs=inf|max_rel=inf
+MODEL_START|EVT peaks-over-threshold GPD VaR and expected shortfall|final_verdict=BUG|severity=Medium|reference=SciPy genpareto fit and untruncated POT moments
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|typical_shape|backend=0.3054|reference=0.3054|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|typical_var|backend=-0.048268|reference=-0.048268|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|typical_es|backend=-0.072361|reference=-0.072361|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|stress_shape|backend=-0.5|reference=-2.01301977674|abs_diff=1.51301977674|rel_diff=0.751616945955|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=FAIL|check_verdict=BUG
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|stress_var|backend=-0.069798|reference=-0.0301336751272|abs_diff=0.0396643248728|rel_diff=1.31627903684|tolerance=atol:1e-06,rtol:1e-06|tolerance_verdict=FAIL|check_verdict=BUG
+CHECK|EVT peaks-over-threshold GPD VaR and expected shortfall|stress_es|backend=-0.08862|reference=-0.0309544261044|abs_diff=0.0576655738956|rel_diff=1.86291852742|tolerance=atol:1e-06,rtol:1e-06|tolerance_verdict=FAIL|check_verdict=BUG
+OUTPUT|EVT peaks-over-threshold GPD VaR and expected shortfall|typical_backend={'confidence_level': 0.99, 'evt_pot_var_99': -0.048268, 'evt_pot_es_99': -0.072361, 'historical_var_99': -0.052413, 'historical_es_99': -0.07144, 'threshold_u': 0.026989, 'gpd_shape_xi': 0.3054, 'gpd_scale_beta': 0.010238, 'model_fitted': True, 'exceedances_count': 25, 'total_observations': 500, 'is_fat_tailed': True}
+OUTPUT|EVT peaks-over-threshold GPD VaR and expected shortfall|typical_reference={'xi': 0.3053687679876133, 'beta': 0.010237614407962897, 'var_return': -0.04826803091001024, 'es_return': -0.0723608750469459, 'u': 0.026988750647063724, 'n_u': 25}
+OUTPUT|EVT peaks-over-threshold GPD VaR and expected shortfall|stress_backend={'confidence_level': 0.99, 'evt_pot_var_99': -0.069798, 'evt_pot_es_99': -0.08862, 'historical_var_99': -0.02839, 'historical_es_99': -0.030561, 'threshold_u': 0.0, 'gpd_shape_xi': -0.5, 'gpd_scale_beta': 0.063133, 'model_fitted': True, 'exceedances_count': 10, 'total_observations': 200, 'is_fat_tailed': True}
+OUTPUT|EVT peaks-over-threshold GPD VaR and expected shortfall|stress_reference={'xi': -2.0130197767397604, 'beta': 0.06313262290309474, 'var_return': -0.030133675127187558, 'es_return': -0.03095442610443173, 'u': 0.0, 'n_u': 10}
+NOTE|EVT peaks-over-threshold GPD VaR and expected shortfall|The backend reports clipped xi as the fitted GPD shape and uses that clipped value in both tail moments.
+MODEL_END|EVT peaks-over-threshold GPD VaR and expected shortfall|verdict=BUG|severity=Medium|max_abs=1.51301977674|max_rel=1.86291852742
+MODEL_START|Student-t lower-tail dependence|final_verdict=MATCHES|severity=None|reference=SciPy Student-t CDF closed form
+CHECK|Student-t lower-tail dependence|lambda_lower|backend=0.221765394253|reference=0.221765394253|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Student-t lower-tail dependence|correlation_rho|backend=0.591167024508|reference=0.591167024508|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Student-t lower-tail dependence|backend={'lambda_L': 0.221765394253, 'rho': 0.591167024508, 'nu': 6}
+OUTPUT|Student-t lower-tail dependence|reference={'lambda_L': 0.221765394253}
+NOTE|Student-t lower-tail dependence|The implementation uses the average of independently fitted marginal t degrees of freedom, not a fitted joint t-copula.
+MODEL_END|Student-t lower-tail dependence|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Three-state Gaussian HMM regime detection, labels, and crash veto|final_verdict=MATCHES|severity=None|reference=Independent feature construction plus direct hmmlearn 0.3.3 fit
+OUTPUT|Three-state Gaussian HMM regime detection, labels, and crash veto|backend_current=bull|reference_current=bull
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|current_probabilities|backend=array(n=3,first=0,last=99.9818,max_abs=0)|reference=array(n=3,first=0,last=99.9818,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|transition_matrix|backend=array(n=9,first=96,last=96,max_abs=0)|reference=array(n=9,first=96,last=96,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|state_labels|tolerance_verdict=PASS|check_verdict=MATCHES|backend=['crisis', 'bull', 'calm']|reference=['crisis', 'bull', 'calm']
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|state_statistics|backend=array(n=9,first=-0.9224,last=20.6,max_abs=0)|reference=array(n=9,first=-0.9224,last=20.6,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|stability_and_diagnostics|backend=array(n=5,first=96.8,last=379,max_abs=2.10338342134e-05)|reference=array(n=5,first=96.8,last=379,max_abs=2.10338342134e-05)|abs_diff=2.10338342134e-05|rel_diff=0.000176046335924|tolerance=atol:0.0001,rtol:0.001|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|crash_veto_hand_fixture|backend=array(n=7,first=2,last=2,max_abs=0)|reference=array(n=7,first=2,last=2,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:0,rtol:0|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Three-state Gaussian HMM regime detection, labels, and crash veto|regime_conditioned_summary|backend=array(n=4,first=80,last=0.0895,max_abs=0)|reference=array(n=4,first=80,last=0.0895,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Three-state Gaussian HMM regime detection, labels, and crash veto|backend={'observations': 379, 'stability_pct': 96.8, 'veto_days': 44, 'transition': [96.0, 1.0, 3.0, 1.0, 96.0, 3.0, 2.0, 2.0, 96.0]}
+OUTPUT|Three-state Gaussian HMM regime detection, labels, and crash veto|reference={'observations': 379, 'stability_pct': 96.8, 'veto_days': 44, 'transition': [96.0, 1.0, 3.0, 1.0, 96.0, 3.0, 2.0, 2.0, 96.0]}
+NOTE|Three-state Gaussian HMM regime detection, labels, and crash veto|The reference repeats the configured hmmlearn estimator independently; the feature, labeling, and veto formulas are reconstructed separately.
+MODEL_END|Three-state Gaussian HMM regime detection, labels, and crash veto|verdict=MATCHES|severity=None|max_abs=2.10338342134e-05|max_rel=0.000176046335924
+MODEL_START|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|final_verdict=MATCHES|severity=None|reference=Independent NumPy/SciPy/arch streams with identical seeds
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|gbm_full_path|backend=array(n=101200,first=100000,last=131383.46001,max_abs=0)|reference=array(n=101200,first=100000,last=131383.46001,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-09,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|gbm_goal_output|backend=array(n=22,first=0.4225,last=160591.67,max_abs=0)|reference=array(n=22,first=0.4225,last=160591.67,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=gbm|backend={'prob_success': 0.4225, 'terminal_percentiles': {'p5': 72725.74, 'p25': 93750.04, 'p50': 110982.54, 'p75': 128030.78, 'p95': 160591.67}, 'expected_shortfall_vs_target': -20339.71}
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=gbm|reference={'prob_success': 0.4225, 'terminal_percentiles': [72725.74, 93750.04, 110982.54, 128030.78, 160591.67], 'expected_shortfall_vs_target': -20339.71}
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|student_t_full_path|backend=array(n=101200,first=100000,last=142185.321552,max_abs=0)|reference=array(n=101200,first=100000,last=142185.321552,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-09,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|student_t_goal_output|backend=array(n=22,first=0.3725,last=153222.99,max_abs=0)|reference=array(n=22,first=0.3725,last=153222.99,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=student_t|backend={'prob_success': 0.3725, 'terminal_percentiles': {'p5': 73785.88, 'p25': 92859.72, 'p50': 107013.26, 'p75': 124119.06, 'p95': 153222.99}, 'expected_shortfall_vs_target': -20165.4}
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=student_t|reference={'prob_success': 0.3725, 'terminal_percentiles': [73785.88, 92859.72, 107013.26, 124119.06, 153222.99], 'expected_shortfall_vs_target': -20165.4}
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|bootstrap_full_path|backend=array(n=101200,first=100000,last=111378.025211,max_abs=0)|reference=array(n=101200,first=100000,last=111378.025211,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-09,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|bootstrap_goal_output|backend=array(n=22,first=0.425,last=170174.21,max_abs=0)|reference=array(n=22,first=0.425,last=170174.21,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=bootstrap|backend={'prob_success': 0.425, 'terminal_percentiles': {'p5': 65319.61, 'p25': 88691.09, 'p50': 108746.18, 'p75': 131028.34, 'p95': 170174.21}, 'expected_shortfall_vs_target': -25641.35}
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|method=bootstrap|reference={'prob_success': 0.425, 'terminal_percentiles': [65319.61, 88691.09, 108746.18, 131028.34, 170174.21], 'expected_shortfall_vs_target': -25641.35}
+OUTPUT|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|all_backend_results=[{'method': 'gbm', 'initial_value': 100000.0, 'target_value': 115000.0, 'horizon_years': 1.0, 'num_paths': 400, 'prob_success': 0.4225, 'terminal_percentiles': {'p5': 72725.74, 'p25': 93750.04, 'p50': 110982.54, 'p75': 128030.78, 'p95': 160591.67}, 'fan': [{'year': 0.0, 'p5': 100000.0, 'p25': 100000.0, 'p50': 100000.0, 'p75': 100000.0, 'p95': 100000.0}, {'year': 0.5, 'p5': 80078.67, 'p25': 93135.37, 'p50': 105189.95, 'p75': 117717.39, 'p95': 138677.51}, {'year': 1.0, 'p5': 72725.74, 'p25': 93750.04, 'p50': 110982.54, 'p75': 128030.78, 'p95': 160591.67}], 'expected_shortfall_vs_target': -20339.71, 'historical_mu_annual': 0.1144, 'historical_sigma_annual': 0.2336, 'student_t_df': None, 'disclaimer': 'Probabilities are model estimates from historical data; not investment advice.'}, {'method': 'student_t', 'initial_value': 100000.0, 'target_value': 115000.0, 'horizon_years': 1.0, 'num_paths': 400, 'prob_success': 0.3725, 'terminal_percentiles': {'p5': 73785.88, 'p25': 92859.72, 'p50': 107013.26, 'p75': 124119.06, 'p95': 153222.99}, 'fan': [{'year': 0.0, 'p5': 100000.0, 'p25': 100000.0, 'p50': 100000.0, 'p75': 100000.0, 'p95': 100000.0}, {'year': 0.5, 'p5': 79258.89, 'p25': 93794.41, 'p50': 103959.49, 'p75': 116249.19, 'p95': 136213.11}, {'year': 1.0, 'p5': 73785.88, 'p25': 92859.72, 'p50': 107013.26, 'p75': 124119.06, 'p95': 153222.99}], 'expected_shortfall_vs_target': -20165.4, 'historical_mu_annual': 0.1144, 'historical_sigma_annual': 0.2336, 'student_t_df': 4.04, 'disclaimer': 'Probabilities are model estimates from historical data; not investment advice.'}, {'method': 'bootstrap', 'initial_value': 100000.0, 'target_value': 115000.0, 'horizon_years': 1.0, 'num_paths': 400, 'prob_success': 0.425, 'terminal_percentiles': {'p5': 65319.61, 'p25': 88691.09, 'p50': 108746.18, 'p75': 131028.34, 'p95': 170174.21}, 'fan': [{'year': 0.0, 'p5': 100000.0, 'p25': 100000.0, 'p50': 100000.0, 'p75': 100000.0, 'p95': 100000.0}, {'year': 0.5, 'p5': 70189.56, 'p25': 89155.19, 'p50': 104809.87, 'p75': 120607.36, 'p95': 144224.97}, {'year': 1.0, 'p5': 65319.61, 'p25': 88691.09, 'p50': 108746.18, 'p75': 131028.34, 'p95': 170174.21}], 'expected_shortfall_vs_target': -25641.35, 'historical_mu_annual': 0.1144, 'historical_sigma_annual': 0.2336, 'student_t_df': None, 'disclaimer': 'Probabilities are model estimates from historical data; not investment advice.'}]
+NOTE|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|Student-t draws are winsorized at eight analytic standard deviations and simple returns are floored at -95%; bootstrap is stationary with block length 21.
+MODEL_END|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Walk-forward backtest mechanics and transaction friction|final_verdict=MATCHES|severity=None|reference=Independent schedule/P&L loop using assigned min-vol dependency as a fixed oracle
+CHECK|Walk-forward backtest mechanics and transaction friction|reported_metrics|backend=array(n=10,first=0.1211,last=-0.0418,max_abs=0)|reference=array(n=10,first=0.1211,last=-0.0418,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Walk-forward backtest mechanics and transaction friction|rounded_equity_curve|backend=array(n=120,first=1.0035,last=1.0559,max_abs=0)|reference=array(n=120,first=1.0035,last=1.0559,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Walk-forward backtest mechanics and transaction friction|backend={'cagr': 0.1211, 'annualized_volatility': 0.1251, 'sharpe_ratio': 0.8159, 'max_drawdown': -0.0568, 'calmar_ratio': 2.1303, 'total_turnover': 0.74, 'n_oos_days': 120}
+OUTPUT|Walk-forward backtest mechanics and transaction friction|reference={'cagr': 0.1211, 'annualized_volatility': 0.1251, 'sharpe_ratio': 0.8159, 'max_drawdown': -0.0568, 'calmar_ratio': 2.1303, 'total_turnover': 0.74, 'benchmark_cagr': 0.261, 'benchmark_volatility': 0.1296, 'benchmark_sharpe': 1.7, 'benchmark_max_drawdown': -0.0418, 'first_oos': '2022-03-28', 'n_days': 120}
+NOTE|Walk-forward backtest mechanics and transaction friction|The assigned min-vol optimizer is used only as a fixed weight oracle; its allocation math is outside this partition.
+NOTE|Walk-forward backtest mechanics and transaction friction|Transaction cost is interpreted as a round-trip rate applied to one-way half-L1 turnover; this convention is not independently estimable from code.
+MODEL_END|Walk-forward backtest mechanics and transaction friction|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|final_verdict=BUG|severity=Medium|reference=Canonical independent formulas; optional TA-Lib oracle is not installed
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_10_ema|backend=103.712213192|reference=103.712213192|abs_diff=2.84217094304e-14|rel_diff=2.740439969e-16|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_10_ema|backend=103.712213192|reference=103.712213192
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_50_sma|backend=101.873530227|reference=101.873530227|abs_diff=2.84217094304e-14|rel_diff=2.78990129891e-16|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_50_sma|backend=101.873530227|reference=101.873530227
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_200_sma|backend=102.478455996|reference=102.478455996|abs_diff=2.84217094304e-14|rel_diff=2.77343263558e-16|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_200_sma|backend=102.478455996|reference=102.478455996
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|rsi|backend=52.3443054097|reference=52.3443054172|abs_diff=7.50798534455e-09|rel_diff=1.43434615947e-10|tolerance=atol:1e-07,rtol:1e-07|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|rsi|backend=52.3443054097|reference=52.3443054172
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll|backend=102.747014144|reference=102.747014144|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll|backend=102.747014144|reference=102.747014144
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll_ub|backend=106.029686557|reference=105.946567435|abs_diff=0.0831191218954|rel_diff=0.000784538130002|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=FAIL|check_verdict=DIVERGES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll_ub|backend=106.029686557|reference=105.946567435
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll_lb|backend=99.4643417319|reference=99.5474608538|abs_diff=0.0831191218954|rel_diff=0.000834969784086|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=FAIL|check_verdict=DIVERGES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|boll_lb|backend=99.4643417319|reference=99.5474608538
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macd|backend=0.730446809068|reference=0.730446816235|abs_diff=7.16747194929e-09|rel_diff=9.81244875052e-09|tolerance=atol:1e-07,rtol:1e-07|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macd|backend=0.730446809068|reference=0.730446816235
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macds|backend=0.51057570513|reference=0.51057571379|abs_diff=8.6597531368e-09|rel_diff=1.69607619456e-08|tolerance=atol:1e-07,rtol:1e-07|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macds|backend=0.51057570513|reference=0.51057571379
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macdh|backend=0.219871103938|reference=0.219871102446|abs_diff=1.49228118751e-09|rel_diff=6.78707283909e-09|tolerance=atol:1e-07,rtol:1e-07|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|macdh|backend=0.219871103938|reference=0.219871102446
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|atr|backend=2.62363804672|reference=2.6236380447|abs_diff=2.01744088102e-09|rel_diff=7.68947868055e-10|tolerance=atol:1e-07,rtol:1e-07|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|atr|backend=2.62363804672|reference=2.6236380447
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|vwma|backend=102.77678903|reference=102.77678903|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|vwma|backend=102.77678903|reference=102.77678903
+CHECK|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|mfi|backend=0.524678528716|reference=52.4678528716|abs_diff=51.9431743428|rel_diff=0.99|tolerance=atol:1e-10,rtol:1e-10|tolerance_verdict=FAIL|check_verdict=BUG
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|mfi|backend=0.524678528716|reference=52.4678528716
+NOTE|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_50_sma finite warmup values backend=260, full-window reference=211, extra_partial_rows=49
+NOTE|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|close_200_sma finite warmup values backend=260, full-window reference=61, extra_partial_rows=199
+OUTPUT|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|threshold_contract=backend MFI is fraction-like; SUPPORTED_INDICATORS documents >80/<20
+NOTE|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|Adjusted EWM seed, Wilder seed, sample-vs-population rolling sigma, and min_periods=1 are convention differences.
+NOTE|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|MFI omits the standard factor of 100, contradicting the backend's own >80/<20 description.
+MODEL_END|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|verdict=BUG|severity=Medium|max_abs=51.9431743428|max_rel=0.99
+MODEL_START|Benchmark-relative OLS beta, alpha, and R-squared|final_verdict=MATCHES|severity=None|reference=statsmodels 0.15.0 OLS with HAC covariance
+CHECK|Benchmark-relative OLS beta, alpha, and R-squared|portfolio_factor_vector|backend=array(n=5,first=0.000181,last=0.93,max_abs=0)|reference=array(n=5,first=0.000181,last=0.93,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Benchmark-relative OLS beta, alpha, and R-squared|backend={'alpha': 0.000181, 'annualized_alpha': 0.0457, 'market': 1.0243, 'r_squared': 0.9303, 'adjusted_r_squared': 0.93}
+OUTPUT|Benchmark-relative OLS beta, alpha, and R-squared|reference={'alpha': 0.000181, 'annualized_alpha': 0.0457, 'market': 1.0243, 'r_squared': 0.9303, 'adjusted_r_squared': 0.93}
+NOTE|Benchmark-relative OLS beta, alpha, and R-squared|Alpha is the daily regression intercept multiplied by 252; it is not risk-free-adjusted and HAC affects standard errors, not the reported coefficients.
+MODEL_END|Benchmark-relative OLS beta, alpha, and R-squared|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|final_verdict=MATCHES|severity=None|reference=Direct quantstats 0.0.81 plus NumPy/Pandas identities
+CHECK|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|tear_sheet_metrics|backend=array(n=11,first=-0.007671,last=-0.192154,max_abs=0)|reference=array(n=11,first=-0.007671,last=-0.192154,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|relative_beta_alpha|backend=array(n=2,first=-0.0099,last=0.0012,max_abs=0)|reference=array(n=2,first=-0.0099,last=0.0012,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|monthly_compounded_returns|backend=array(n=9,first=0.033676,last=0.037829,max_abs=0)|reference=array(n=9,first=0.033676,last=0.037829,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|underwater_curve|backend=array(n=179,first=-0.009408,last=-0.09584,max_abs=0)|reference=array(n=179,first=-0.009408,last=-0.09584,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|performance_history_and_rebased_benchmark|backend=array(n=540,first=19972.51,last=23396.08,max_abs=0)|reference=array(n=540,first=19972.51,last=23396.08,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|backend_metrics={'total_return': -0.007671, 'cagr': -0.010783, 'sharpe': -0.149955, 'sortino': -0.204763, 'calmar': -0.077453, 'omega': 0.998713, 'tail_ratio': 0.966698, 'volatility': 0.139628, 'max_drawdown': -0.139214, 'skew': -0.210802, 'kurtosis': -0.192154, 'annualized': True}
+OUTPUT|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|reference_metrics={'total_return': -0.007671, 'cagr': -0.010783, 'sharpe': -0.149955, 'sortino': -0.204763, 'calmar': -0.077453, 'omega': 0.998713, 'tail_ratio': 0.966698, 'volatility': 0.139628, 'max_drawdown': -0.139214, 'skew': -0.210802, 'kurtosis': -0.192154}
+OUTPUT|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|backend_relative={'beta_vs_nifty': -0.0099, 'alpha_annualized': 0.0012, 'benchmark_sharpe': 1.463481, 'benchmark_volatility': 0.150055, 'benchmark_max_drawdown': -0.116412, 'benchmark_total_return': 0.176969, 'overlap_days': 179}
+OUTPUT|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|reference_relative={'beta_vs_nifty': -0.0099, 'alpha_annualized': 0.0012}
+NOTE|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|This endpoint is library-delegated rather than a hand-rolled estimator; direct calls establish wrapper parity.
+MODEL_END|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+MODEL_START|Delivery-percentage rolling z-score anomaly|final_verdict=DIVERGES|severity=None|reference=SciPy z-score with sample standard deviation
+CHECK|Delivery-percentage rolling z-score anomaly|rounded_z_score|backend=3.53|reference=1.68|abs_diff=1.85|rel_diff=1.10119047619|tolerance=atol:0.0051,rtol:0|tolerance_verdict=FAIL|check_verdict=DIVERGES
+OUTPUT|Delivery-percentage rolling z-score anomaly|backend={'z_score': 3.53, 'is_anomaly': True}
+OUTPUT|Delivery-percentage rolling z-score anomaly|reference_sample_std={'z_score': 1.68, 'is_anomaly': False}
+NOTE|Delivery-percentage rolling z-score anomaly|Backend uses population ddof=0 and replaces zero standard deviation with 1.0; this is a convention difference.
+MODEL_END|Delivery-percentage rolling z-score anomaly|verdict=DIVERGES|severity=None|max_abs=1.85|max_rel=1.10119047619
+MODEL_START|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|final_verdict=MATCHES|severity=None|reference=NumPy closed forms
+CHECK|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|amihud|backend=9.3879369435e-05|reference=9.3879369435e-05|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|days_to_liquidate|backend=0.01|reference=0.01|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+CHECK|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|displayed_adv_days|backend=array(n=3,first=104760,last=0,max_abs=0)|reference=array(n=3,first=104760,last=0,max_abs=0)|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|tolerance_verdict=PASS|check_verdict=MATCHES
+OUTPUT|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|backend={'amihud': 9.3879369435e-05, 'days_10': 0.01, 'position': {'ticker': 'TEST.NS', 'position_value': 100000.0, 'weight': 1.0, 'adv_30d_shares': 104760.0, 'adv_30d_rupees': 105372544.47, 'days_to_liquidate_10pct_adv': 0.01, 'days_to_liquidate_20pct_adv': 0.0, 'amihud_illiquidity': 9.4e-05, 'max_sane_position_value': 5268627.22, 'liquidity_tier': 'HIGHLY_LIQUID', 'is_oversized_vs_adv': False}}
+OUTPUT|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|reference={'amihud': 9.3879369435e-05, 'days_10': 0.01, 'adv_30d_shares': 104760, 'adv_30d_rupees': 105372544.47, 'days_20': 0.0}
+NOTE|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|The metric assumes rupee-volume scaling and a 30-session simple mean ADV for cash-equity liquidity analysis.
+MODEL_END|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|verdict=MATCHES|severity=None|max_abs=0|max_rel=0
+SUMMARY_START
+SUMMARY|Realized annual return, volatility, Sharpe, Sortino, hit ratio|MATCHES|None|NumPy/Pandas closed forms|0|0
+SUMMARY|Historical 95% VaR and CVaR|MATCHES|None|NumPy 5th percentile and conditional tail mean|0|0
+SUMMARY|Maximum drawdown, skewness, and excess kurtosis|MATCHES|None|Pandas wealth drawdown and SciPy unbiased shape statistics|5.55111512313e-17|2.44250564204e-16
+SUMMARY|Static normalized EWMA volatility|DIVERGES|None|Independent RiskMetrics exponential-weight identity|0.0289855205662|0.186870460432
+SUMMARY|Recursive RiskMetrics-style EWMA forecast|MATCHES|None|Independent initialized recursion plus SciPy normal tails|6.65428936395e-05|0.00131516491174
+SUMMARY|Rolling realized volatility and volatility-cone quantiles|MATCHES|None|Pandas rolling ddof=1 and NumPy quantiles|0|0
+SUMMARY|AnalyticsEngine GARCH(1,1) forecast and parametric tail|BUG|High|arch 8.0.0 forecast plus SciPy normal tail quantiles|0.0340308505027|1.232821357
+SUMMARY|VolatilityService horizon-average GARCH(1,1)|MATCHES|None|arch 8.0.0 root-mean-square horizon variance|0|0
+SUMMARY|AnalyticsEngine EGARCH(1,1) forecast and parametric tail|BUG|High|arch 8.0.0 analytic h=1 and simulation h=5 plus SciPy normal tails|inf|inf
+SUMMARY|EVT peaks-over-threshold GPD VaR and expected shortfall|BUG|Medium|SciPy genpareto fit and untruncated POT moments|1.51301977674|1.86291852742
+SUMMARY|Student-t lower-tail dependence|MATCHES|None|SciPy Student-t CDF closed form|0|0
+SUMMARY|Three-state Gaussian HMM regime detection, labels, and crash veto|MATCHES|None|Independent feature construction plus direct hmmlearn 0.3.3 fit|2.10338342134e-05|0.000176046335924
+SUMMARY|Monte Carlo goal probability: GBM, Student-t, stationary bootstrap|MATCHES|None|Independent NumPy/SciPy/arch streams with identical seeds|0|0
+SUMMARY|Walk-forward backtest mechanics and transaction friction|MATCHES|None|Independent schedule/P&L loop using assigned min-vol dependency as a fixed oracle|0|0
+SUMMARY|Technical indicators: SMA, EMA, RSI, MACD, Bollinger, ATR, VWMA, MFI|BUG|Medium|Canonical independent formulas; optional TA-Lib oracle is not installed|51.9431743428|0.99
+SUMMARY|Benchmark-relative OLS beta, alpha, and R-squared|MATCHES|None|statsmodels 0.15.0 OLS with HAC covariance|0|0
+SUMMARY|Quantstats tear-sheet, performance history, monthly compounding, underwater curve, and relative beta/alpha|MATCHES|None|Direct quantstats 0.0.81 plus NumPy/Pandas identities|0|0
+SUMMARY|Delivery-percentage rolling z-score anomaly|DIVERGES|None|SciPy z-score with sample standard deviation|1.85|1.10119047619
+SUMMARY|Cash-equity Amihud illiquidity and ADV liquidation diagnostics|MATCHES|None|NumPy closed forms|0|0
+VERDICT_COUNT|MATCHES|13
+VERDICT_COUNT|DIVERGES|2
+VERDICT_COUNT|BUG|4
+VERDICT_COUNT|REPLACE-WITH-LIBRARY|0
+SUMMARY_END
+SCRIPT_STATUS|SUCCESS

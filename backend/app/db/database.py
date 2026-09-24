@@ -2,9 +2,11 @@
 Database configuration and initialization for Daisy Risk Engine
 """
 
+import asyncio
+
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import event, text
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from pathlib import Path
 from typing import AsyncGenerator
@@ -48,27 +50,29 @@ def ensure_sqlite_dir(database_url: str) -> None:
 
 
 async def init_db() -> None:
-    """
-    Initialize database tables
-    """
+    """Apply versioned migrations, then create any missing current tables."""
     # Register all models on Base.metadata so init_db works even when called
-    # without the routers having been imported (main.py imports routers first,
-    # but init_db must not depend on that ordering).
+    # without routers having been imported. create_all remains useful for new
+    # tables, but is no longer treated as an existing-schema migration.
     from app.models import database as _models  # noqa: F401
+    from migrations.schema_version import (
+        apply_migrations,
+        resolve_sqlite_database_path,
+    )
 
     ensure_sqlite_dir(settings.database_url)
+    url = make_url(settings.database_url)
+    if url.get_backend_name() == "sqlite":
+        database = url.database or ""
+        is_memory = database == ":memory:" or "mode=memory" in (url.query.get("uri", "") or "")
+        if not is_memory:
+            db_path = resolve_sqlite_database_path(settings.database_url)
+            # SQLite backup/table rebuilds are synchronous. Keep startup async
+            # without blocking the event loop and fail closed on blocked data.
+            await asyncio.to_thread(apply_migrations, db_path)
+
     async with engine.begin() as conn:
-        # Create all tables
         await conn.run_sync(Base.metadata.create_all)
-        if conn.dialect.name == "sqlite":
-            await conn.execute(text(
-                "DELETE FROM analytics_cache WHERE id NOT IN "
-                "(SELECT MAX(id) FROM analytics_cache GROUP BY ticker, metric_name)"
-            ))
-            await conn.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_cache_ticker_metric "
-                "ON analytics_cache (ticker, metric_name)"
-            ))
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

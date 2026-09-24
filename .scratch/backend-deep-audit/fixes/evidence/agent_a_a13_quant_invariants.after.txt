@@ -1,0 +1,14 @@
+﻿CHECK|hhi|backend=0.66|reference=0.66|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|PASS
+CHECK|effective_positions|backend=1.52|reference=1.52|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|PASS
+CHECK|diversification_score|backend=51|reference=51|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|PASS
+CHECK|single_holding_diversification|backend=0|reference=0|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|PASS
+CHECK|inverse_volatility_ratio|backend=0.500000054389|reference=0.5|abs_diff=5.43885529392e-08|rel_diff=1.08777105878e-07|tolerance=atol:1e-06,rtol:1e-06|PASS
+CHECK|zero_variance_achieved_target|backend=0.1|reference=0.1|abs_diff=0|rel_diff=0|tolerance=atol:1e-06,rtol:1e-06|PASS
+CHECK|zero_variance_leg_excluded|PASS|recommended={'A': 0.459656, 'B': 0.919311}|current_volatility=0.07769650394635268
+CHECK|short_history_recommendation_count|backend=0|reference=0|abs_diff=0|rel_diff=0|tolerance=atol:1e-10,rtol:1e-10|PASS
+CHECK|indicator_gap_time_axis|PASS|input_rows=60|clean_rows=60|missing_preserved=True
+CHECK|geometric_monthly_compounding|backend=0.244715859751|reference=0.244715859751|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|PASS
+OUTPUT|concentration|{'largest_position': 0.8, 'top_3': 1.0, 'top_5': 1.0, 'top_10': 1.0, 'herfindahl_index': 0.66, 'effective_positions': 1.52, 'diversification_score': 51.0, 'diversification_ratio': 0.51, 'gini_coefficient': 0.467, 'by_weight': {'A': 0.8, 'B': 0.1, 'C': 0.1}}
+OUTPUT|inverse_vol|backend_ratio=0.500000054389|reference_ratio=0.5
+OUTPUT|monthly|backend=0.244715859751|reference=0.244715859751
+

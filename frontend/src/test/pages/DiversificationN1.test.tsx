@@ -80,17 +80,18 @@ async function renderAndSettle() {
   });
 }
 
-describe('Diversification Score — N ≤ 1 renders 0%, never 100%', () => {
+describe('Diversification Score — empty unavailable, single holding 0%', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('N = 0 (empty portfolio) → Diversification Score is 0.0%', async () => {
+  it('N = 0 (empty portfolio) → Diversification Score is N/A', async () => {
     mocks.positions = [];
     mocks.totalValue = 0;
     await renderAndSettle();
     expect(screen.getAllByText('Diversification Score').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('0.0%').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('N/A').length).toBeGreaterThan(0);
+    expect(screen.queryByText('0.0%')).toBeNull();
     expect(screen.queryByText('100.0%')).toBeNull();
   });
 

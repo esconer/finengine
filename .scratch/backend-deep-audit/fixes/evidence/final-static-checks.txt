@@ -1,0 +1,3 @@
+scoped diff check: PASS
+bash -n scripts/deploy.sh: PASS
+ruff: PASS (see final-ruff.txt)

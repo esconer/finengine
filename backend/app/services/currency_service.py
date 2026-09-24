@@ -1,260 +1,398 @@
 """
-Currency conversion service for portfolio management
-Supports conversion between USD and Indian Rupees (INR) with real-time exchange rates
-Configured with INR as the default currency for Indian market focus
+Currency conversion service for portfolio management.
+
+The service supports the currencies it can actually quote: INR and USD (plus
+their inverse).  A hard-coded emergency rate is never represented as a live
+quote: it is returned as a float-compatible ``FXRate`` carrying explicit
+provenance and age, and it is not written to the live-rate cache.
 """
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
+from app.services.cache_service import (
+    CacheService,
+    ProviderUnavailableError,
+    cache_generation_is_current,
+    get_cache_generation,
+    get_runtime_cache_snapshot,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-# Served (never cached) when the live FX vendor is unreachable.
+# Served (never cached as live) when the live FX vendor is unreachable.
 FALLBACK_USD_INR = 83.0
+SUPPORTED_CURRENCIES = ("INR", "USD")
+
+
+class CurrencyUnavailableError(ProviderUnavailableError):
+    """A portfolio FX conversion could not be completed from a live quote."""
+
+    def __init__(self, message: str = "Live FX unavailable") -> None:
+        super().__init__(message, provider="currency")
+
+
+class FXRate(float):
+    """Float-compatible rate with honest provenance metadata.
+
+    Existing numeric callers remain source-compatible, while new callers can
+    inspect ``provenance``/``fetched_at`` instead of treating 83.0 as live.
+    """
+
+    def __new__(
+        cls,
+        value: float,
+        *,
+        provenance: str = "live",
+        source: str = "yfinance",
+        fetched_at: Optional[datetime] = None,
+    ) -> "FXRate":
+        obj = float.__new__(cls, value)
+        obj.provenance = provenance
+        obj.source = source
+        obj.fetched_at = fetched_at or datetime.now(timezone.utc)
+        obj.is_fallback = provenance == "fallback"
+        return obj
+
+    @property
+    def age_seconds(self) -> float:
+        age = datetime.now(timezone.utc) - self.fetched_at
+        return max(0.0, age.total_seconds())
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "rate": float(self),
+            "provenance": self.provenance,
+            "source": self.source,
+            "is_fallback": self.is_fallback,
+            "fetched_at": self.fetched_at.isoformat(),
+            "age_seconds": round(self.age_seconds, 3),
+        }
+
+
+def coerce_live_fx_rate(candidate: Any) -> tuple[float, Dict[str, Any]]:
+    """Validate an FX quote as live, returning its rate and safe metadata.
+
+    API conversion seams must not infer that an unlabelled number is live.  The
+    only accepted non-identity quote therefore carries ``provenance="live"``;
+    emergency constants and metadata-free adapters fail closed as a typed FX
+    outage instead of entering portfolio arithmetic.
+    """
+    if isinstance(candidate, dict):
+        rate_value = candidate.get("rate")
+        metadata = {
+            key: candidate.get(key)
+            for key in ("provenance", "source", "is_fallback", "fetched_at", "age_seconds")
+            if key in candidate
+        }
+    else:
+        rate_value = candidate
+        metadata = {
+            key: getattr(candidate, key)
+            for key in ("provenance", "source", "is_fallback", "fetched_at", "age_seconds")
+            if hasattr(candidate, key)
+        }
+
+    fallback_flag = metadata.get("is_fallback")
+    is_fallback = (
+        fallback_flag is True
+        or str(fallback_flag).strip().lower() in {"1", "true", "yes"}
+        or str(metadata.get("provenance", "")).strip().lower() == "fallback"
+        or str(metadata.get("source", "")).strip().lower() == "fallback_constant"
+    )
+    provenance = str(metadata.get("provenance", "")).strip().lower()
+    if is_fallback or provenance != "live":
+        raise CurrencyUnavailableError()
+
+    try:
+        numeric_rate = float(rate_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CurrencyUnavailableError() from exc
+    if not math.isfinite(numeric_rate) or numeric_rate <= 0:
+        raise CurrencyUnavailableError()
+
+    if isinstance(metadata.get("fetched_at"), datetime):
+        metadata["fetched_at"] = metadata["fetched_at"].isoformat()
+    if "age_seconds" in metadata:
+        try:
+            metadata["age_seconds"] = round(float(metadata["age_seconds"]), 3)
+        except (TypeError, ValueError, OverflowError):
+            metadata.pop("age_seconds", None)
+    return numeric_rate, metadata
 
 
 class CurrencyConversionService:
-    """Service for handling currency conversions between USD and INR"""
+    """USD/INR conversion with explicit live-versus-fallback provenance."""
 
-    def __init__(self):
+    def __init__(self, db_session=None):
         self._exchange_rates: Dict[str, float] = {}
+        self._rate_metadata: Dict[str, Dict[str, Any]] = {}
+        self._last_rate_metadata: Optional[Dict[str, Any]] = None
+        self._last_rate_value: Optional[float] = None
         self._last_updated: Optional[datetime] = None
-        self._cache_duration = timedelta(minutes=30)  # Cache for 30 minutes
+        self._cache_duration = timedelta(minutes=30)
         self._refresh_lock = asyncio.Lock()
+        self.cache_service = CacheService(db_session) if db_session is not None else None
 
-    async def get_exchange_rate(self, from_currency: str, to_currency: str) -> float:
+    @staticmethod
+    def _currency(value: str) -> str:
+        code = str(value or "").strip().upper()
+        if code not in SUPPORTED_CURRENCIES:
+            raise ValueError(
+                f"No exchange rate configured for {value!r}; supported currencies: {', '.join(SUPPORTED_CURRENCIES)}"
+            )
+        return code
+
+    async def _cache_enabled(self) -> bool:
+        if self.cache_service is not None:
+            return (await self.cache_service.get_runtime_config()).enabled
+        snapshot = get_runtime_cache_snapshot()
+        return snapshot.enabled if snapshot is not None else True
+
+    async def get_exchange_rate(self, from_currency: str, to_currency: str) -> FXRate:
+        """Return a float-compatible rate with provenance metadata.
+
+        ``FXRate`` behaves exactly like a float for existing arithmetic callers.
+        Consumers that need to distinguish a fallback should inspect
+        ``is_fallback``/``provenance`` or use ``get_exchange_rate_info``.
         """
-        Get exchange rate between two currencies
+        source = self._currency(from_currency)
+        target = self._currency(to_currency)
+        if source == target:
+            return FXRate(1.0, provenance="identity", source="identity")
 
-        Args:
-            from_currency: Source currency code (e.g., 'USD')
-            to_currency: Target currency code (e.g., 'INR')
+        cache_key = f"{source}_{target}"
+        use_cache = await self._cache_enabled()
 
-        Returns:
-            Exchange rate from source to target currency
-        """
-        if from_currency == to_currency:
-            return 1.0
+        if use_cache and self._is_cache_valid() and cache_key in self._exchange_rates:
+            metadata = self._rate_metadata.get(cache_key, {})
+            cached_rate = FXRate(
+                self._exchange_rates[cache_key],
+                provenance=metadata.get("provenance", "live"),
+                source=metadata.get("source", "yfinance"),
+                fetched_at=metadata.get("fetched_at"),
+            )
+            self._last_rate_value = float(cached_rate)
+            return cached_rate
 
-        cache_key = f"{from_currency}_{to_currency}"
-
-        # Check cache first (fast path)
-        if self._is_cache_valid() and cache_key in self._exchange_rates:
-            return self._exchange_rates[cache_key]
-
-        # Lock to prevent cache stampede under concurrent requests
         async with self._refresh_lock:
-            # Double check after acquiring lock
-            if self._is_cache_valid() and cache_key in self._exchange_rates:
-                return self._exchange_rates[cache_key]
-
-            # Fetch fresh exchange rate
-            rate, is_fallback = await self._fetch_exchange_rate(from_currency, to_currency)
-
-            # B-07: never cache the hardcoded fallback — only live rates enter
-            # the cache / _last_updated, so info can't report 83.0 as fetched.
-            if not is_fallback:
-                self._exchange_rates[cache_key] = rate
-                self._exchange_rates[f"{to_currency}_{from_currency}"] = 1.0 / rate if rate > 0 else 1.0
-                self._last_updated = datetime.now(timezone.utc)
-            else:
-                logger.warning(
-                    f"FX fallback served for {cache_key} (not cached): live vendor unavailable"
+            if use_cache and self._is_cache_valid() and cache_key in self._exchange_rates:
+                metadata = self._rate_metadata.get(cache_key, {})
+                return FXRate(
+                    self._exchange_rates[cache_key],
+                    provenance=metadata.get("provenance", "live"),
+                    source=metadata.get("source", "yfinance"),
+                    fetched_at=metadata.get("fetched_at"),
                 )
 
-            return rate
-    
-    async def convert_amount(self, amount: float, from_currency: str, to_currency: str) -> float:
-        """
-        Convert amount from one currency to another
-        
-        Args:
-            amount: Amount to convert
-            from_currency: Source currency code
-            to_currency: Target currency code
-            
-        Returns:
-            Converted amount in target currency
-        """
-        if amount == 0:
-            return 0.0
-            
-        rate = await self.get_exchange_rate(from_currency, to_currency)
-        return amount * rate
-    
-    def format_currency(self, amount: float, currency: str) -> str:
-        """
-        Format currency amount with proper symbols
-        
-        Args:
-            amount: Amount to format
-            currency: Currency code ('USD' or 'INR')
-            
-        Returns:
-            Formatted currency string
-        """
-        if currency == 'INR':
-            symbol = '₹'
-            # Indian number formatting (lakhs, crores)
-            if amount >= 10000000:  # 1 crore or more
-                return f"{symbol}{amount/10000000:.2f} Cr"
-            elif amount >= 100000:  # 1 lakh or more
-                return f"{symbol}{amount/100000:.2f} L"
+            generation = get_cache_generation()
+            rate_value, is_fallback = await self._fetch_exchange_rate(source, target)
+            rate = FXRate(
+                float(rate_value),
+                provenance="fallback" if is_fallback else "live",
+                source="fallback_constant" if is_fallback else "yfinance",
+            )
+            self._last_rate_value = float(rate)
+            if not cache_generation_is_current(generation):
+                raise CurrencyUnavailableError("FX result superseded by cache purge")
+            if not is_fallback:
+                self._exchange_rates[cache_key] = float(rate)
+                inverse = 1.0 / float(rate) if float(rate) > 0 else None
+                if inverse is not None:
+                    inverse_key = f"{target}_{source}"
+                    self._exchange_rates[inverse_key] = inverse
+                    self._rate_metadata[inverse_key] = {
+                        "provenance": "live",
+                        "source": "yfinance",
+                        "fetched_at": rate.fetched_at,
+                    }
+                self._rate_metadata[cache_key] = {
+                    "provenance": "live",
+                    "source": "yfinance",
+                    "fetched_at": rate.fetched_at,
+                }
+                self._last_rate_metadata = self._rate_metadata[cache_key]
+                self._last_updated = rate.fetched_at
             else:
-                return f"{symbol}{amount:,.2f}"
-        else:  # USD
-            symbol = '$'
-            return f"{symbol}{amount:,.2f}"
-    
-    def format_currency_indian(self, amount: float, currency: str = 'INR') -> str:
-        """
-        Format currency using Indian numbering system with a K tier.
+                self._last_rate_metadata = {
+                    "provenance": "fallback",
+                    "source": "fallback_constant",
+                    "fetched_at": rate.fetched_at,
+                }
+                logger.warning(
+                    "FX fallback served for %s (not cached): live vendor unavailable", cache_key
+                )
+            return rate
 
-        Thin wrapper over format_currency with an extra thousands tier.
-        """
-        if currency == 'INR' and 1000 <= amount < 100000:
+    async def convert_amount(
+        self,
+        amount: float,
+        from_currency: str,
+        to_currency: str,
+        *,
+        allow_fallback: bool = False,
+    ) -> float:
+        """Convert an amount; live FX is required unless fallback is explicit."""
+        value = float(amount)
+        if not math.isfinite(value):
+            raise ValueError("amount must be finite")
+        if value == 0:
+            return 0.0
+        rate = await self.get_exchange_rate(from_currency, to_currency)
+        if bool(getattr(rate, "is_fallback", False)) and not allow_fallback:
+            raise CurrencyUnavailableError("Live FX unavailable; fallback conversion refused")
+        return value * float(rate)
+
+    async def convert_amount_with_provenance(
+        self,
+        amount: float,
+        from_currency: str,
+        to_currency: str,
+        *,
+        allow_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        """Return converted value plus rate provenance; fallback is opt-in."""
+        rate = await self.get_exchange_rate(from_currency, to_currency)
+        value = float(amount)
+        if not math.isfinite(value):
+            raise ValueError("amount must be finite")
+        if bool(getattr(rate, "is_fallback", False)) and not allow_fallback:
+            raise CurrencyUnavailableError("Live FX unavailable; fallback conversion refused")
+        return {
+            "amount": value * float(rate),
+            "rate": rate.as_dict(),
+            "from_currency": self._currency(from_currency),
+            "to_currency": self._currency(to_currency),
+        }
+
+    def format_currency(self, amount: float, currency: str) -> str:
+        """Format a supported currency without silently labelling others as USD."""
+        code = self._currency(currency)
+        if code == 'INR':
+            if amount >= 10000000:
+                return f"₹{amount/10000000:.2f} Cr"
+            if amount >= 100000:
+                return f"₹{amount/100000:.2f} L"
+            return f"₹{amount:,.2f}"
+        return f"${amount:,.2f}"
+
+    def format_currency_indian(self, amount: float, currency: str = 'INR') -> str:
+        if self._currency(currency) == 'INR' and 1000 <= amount < 100000:
             return f"₹{amount/1000:.2f} K"
         return self.format_currency(amount, currency)
-    
+
     def get_currency_symbol(self, currency: str) -> str:
-        """Get currency symbol"""
-        return '₹' if currency == 'INR' else '$'
-    
+        code = self._currency(currency)
+        return '₹' if code == 'INR' else '$'
+
     def get_exchange_rate_info(self) -> Dict[str, Any]:
-        """
-        Get information about cached exchange rates
-        
-        Returns:
-            Dictionary with rate info and last update time
-        """
+        """Describe cached live rates and the most recent fallback provenance."""
+        usd_meta = self._rate_metadata.get("USD_INR")
+        latest_meta = usd_meta or self._last_rate_metadata
+        if latest_meta:
+            fetched_at = latest_meta.get("fetched_at")
+            age = (
+                max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds())
+                if isinstance(fetched_at, datetime)
+                else None
+            )
+        else:
+            fetched_at = None
+            age = None
         return {
             'last_updated': self._last_updated.isoformat() if self._last_updated else None,
             'cache_duration_minutes': self._cache_duration.total_seconds() / 60,
-            'cached_rates': len(self._exchange_rates),
-            'usd_to_inr': self._exchange_rates.get('USD_INR', None)
+            'cached_rates': len([k for k in self._exchange_rates if not k.endswith("_meta")]),
+            'usd_to_inr': self._exchange_rates.get('USD_INR'),
+            'last_served_rate': self._last_rate_value,
+            'supported_currencies': list(SUPPORTED_CURRENCIES),
+            'provenance': latest_meta.get('provenance') if latest_meta else None,
+            'source': latest_meta.get('source') if latest_meta else None,
+            'is_fallback': bool(latest_meta and latest_meta.get('provenance') == 'fallback'),
+            'fetched_at': fetched_at.isoformat() if isinstance(fetched_at, datetime) else None,
+            'age_seconds': round(age, 3) if age is not None else None,
         }
-    
+
     def _is_cache_valid(self) -> bool:
-        """Check if cached exchange rates are still valid"""
         if not self._last_updated:
             return False
-        
         age = datetime.now(timezone.utc) - self._last_updated
         return age < self._cache_duration
-    
-    async def _fetch_exchange_rate(self, from_currency: str, to_currency: str) -> tuple:
-        """
-        Fetch exchange rate from yfinance (USDINR=X) or return the fallback.
 
-        Returns:
-            (rate, is_fallback) — is_fallback is True when the hardcoded
-            constant is served so the caller can skip caching it.
-        """
-        if (from_currency == 'USD' and to_currency == 'INR') or (from_currency == 'INR' and to_currency == 'USD'):
-            def _get_live_rate() -> Optional[float]:
-                try:
-                    import yfinance as yf
-                    t = yf.Ticker("USDINR=X")
-                    if hasattr(t, "fast_info") and t.fast_info:
-                        price = getattr(t.fast_info, "last_price", None) or getattr(t.fast_info, "regular_market_price", None)
-                        if price and price > 0:
-                            return float(price)
-                    hist = t.history(period="5d")
-                    if not hist.empty and "Close" in hist.columns:
-                        closes = hist["Close"].dropna()
-                        if not closes.empty and closes.iloc[-1] > 0:
-                            return float(closes.iloc[-1])
-                except Exception as e:
-                    logger.warning(f"Failed to fetch live USDINR=X from yfinance: {e}")
-                return None
+    async def _fetch_exchange_rate(self, from_currency: str, to_currency: str) -> tuple[float, bool]:
+        """Fetch USDINR=X, or return the marked emergency fallback."""
+        source = self._currency(from_currency)
+        target = self._currency(to_currency)
+        if {source, target} != {"USD", "INR"}:
+            raise ValueError(f"No exchange rate configured for {source} to {target}")
 
+        def _get_live_rate() -> Optional[float]:
             try:
-                live_usd_inr = await asyncio.to_thread(_get_live_rate)
-            except Exception as e:
-                logger.warning(f"Error in async thread for USDINR rate: {e}")
-                live_usd_inr = None
+                import yfinance as yf
+                ticker = yf.Ticker("USDINR=X")
+                fast_info = getattr(ticker, "fast_info", None)
+                if fast_info:
+                    price = getattr(fast_info, "last_price", None) or getattr(
+                        fast_info, "regular_market_price", None
+                    )
+                    if price and float(price) > 0 and math.isfinite(float(price)):
+                        return float(price)
+                hist = ticker.history(period="5d")
+                if not hist.empty and "Close" in hist.columns:
+                    closes = pd_numeric(hist["Close"])
+                    if not closes.empty and float(closes.iloc[-1]) > 0:
+                        return float(closes.iloc[-1])
+            except Exception as exc:
+                # Never log the upstream text: it can contain a request URL/query.
+                logger.warning("Live USDINR=X fetch failed: %s", type(exc).__name__)
+            return None
 
-            if live_usd_inr and live_usd_inr > 0:
-                rate = live_usd_inr
-                is_fallback = False
-            else:
-                rate = FALLBACK_USD_INR
-                is_fallback = True
+        try:
+            live_usd_inr = await asyncio.to_thread(_get_live_rate)
+        except Exception as exc:
+            logger.warning("Async USDINR=X fetch failed: %s", type(exc).__name__)
+            live_usd_inr = None
 
-            if from_currency == 'USD' and to_currency == 'INR':
-                return rate, is_fallback
-            else:
-                return 1.0 / rate, is_fallback
-        else:
-            # Unknown pairs have no configured rate — fail loudly instead of
-            # silently treating the currencies as 1:1.
-            raise ValueError(f"No exchange rate configured for {from_currency} to {to_currency}")
+        if live_usd_inr is not None and live_usd_inr > 0 and math.isfinite(live_usd_inr):
+            rate = live_usd_inr if source == "USD" else 1.0 / live_usd_inr
+            return rate, False
+        fallback = FALLBACK_USD_INR if source == "USD" else 1.0 / FALLBACK_USD_INR
+        return fallback, True
 
 
-# Global currency service instance
+def pd_numeric(values):
+    """Small local coercion helper; avoids importing pandas for one FX series."""
+    import pandas as pd
+
+    return pd.to_numeric(values, errors="coerce").dropna()
+
+
 _currency_service: Optional[CurrencyConversionService] = None
 
 
-def get_currency_service() -> CurrencyConversionService:
-    """Get global currency service instance"""
+def get_currency_service(db_session=None) -> CurrencyConversionService:
     global _currency_service
     if _currency_service is None:
-        _currency_service = CurrencyConversionService()
+        _currency_service = CurrencyConversionService(db_session=db_session)
+    elif db_session is not None and _currency_service.cache_service is None:
+        _currency_service.cache_service = CacheService(db_session)
     return _currency_service
 
 
-# Convenience functions - NOW DEFAULT TO INR FOR INDIAN MARKET
 async def convert_portfolio_value(amount: float, target_currency: str = 'INR') -> float:
-    """
-    Convert portfolio value to target currency
-
-    Args:
-        amount: Amount to convert
-        target_currency: Target currency ('USD' or 'INR')
-
-    Returns:
-        Converted amount
-    """
-    # Default to INR - assume amounts are in INR by default for Indian market
     return await get_currency_service().convert_amount(amount, 'INR', target_currency)
 
 
 async def format_portfolio_value(amount: float, currency: str = 'INR') -> str:
-    """
-    Format portfolio value with currency symbol
-
-    Args:
-        amount: Amount to format
-        currency: Currency code
-
-    Returns:
-        Formatted currency string
-    """
     return get_currency_service().format_currency(amount, currency)
 
 
 async def format_portfolio_value_indian(amount: float, currency: str = 'INR') -> str:
-    """
-    Format portfolio value with Indian numbering system
-
-    Args:
-        amount: Amount to format
-        currency: Currency code
-
-    Returns:
-        Formatted currency string with Indian formatting
-    """
     return get_currency_service().format_currency_indian(amount, currency)
 
 
-async def get_exchange_rate_usd_inr() -> float:
-    """
-    Get current USD to INR exchange rate
-
-    Returns:
-        Exchange rate
-    """
+async def get_exchange_rate_usd_inr() -> FXRate:
     return await get_currency_service().get_exchange_rate('USD', 'INR')

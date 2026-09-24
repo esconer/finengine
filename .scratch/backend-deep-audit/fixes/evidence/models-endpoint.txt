@@ -1,0 +1,8 @@
+GET /v1/models compatibility probe (no lifespan, isolated in-memory SQLite):
+status=200
+body={"object":"list","data":[]}
+
+Focused API test file: 39 passed.
+Independent endpoint verifier: PASS.
+Ruff: All checks passed.
+Contract decision: FinEngine exposes prompts/dossiers and analytics, not hosted LLMs; no model IDs are fabricated.

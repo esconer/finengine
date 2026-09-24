@@ -1,0 +1,6 @@
+﻿CHECK|annual_return|backend=-0.187572607579|reference=-0.221933686444|abs_diff=0.0343610788649|rel_diff=0.154825882521|tolerance=atol:1e-12,rtol:1e-12|FAIL
+CHECK|annual_volatility|backend=0.106793127354|reference=0.141871962473|abs_diff=0.0350788351191|rel_diff=0.247256995023|tolerance=atol:1e-12,rtol:1e-12|FAIL
+CHECK|active_return_count|backend=239|reference=239|abs_diff=0|rel_diff=0|tolerance=atol:1e-12,rtol:1e-12|PASS
+OUTPUT|prelisting_backend_return|backend=nan|reference=nan
+OUTPUT|reference_active_window|start=2024-01-03|end=2024-12-02|n=239
+

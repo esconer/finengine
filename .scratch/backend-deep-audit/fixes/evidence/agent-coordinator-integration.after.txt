@@ -1,0 +1,14 @@
+﻿PASS A-02 API active returns: active_dates=3 values=[0.1, 0.09090909, 0.05416667]
+PASS A-09 coint lookback identity: threaded=60
+PASS B-13 returned-window source: source=yfinance
+PASS B-09/B-14 provider redaction: status=503
+PASS A-11 neutral tail schema: fields={'confidence_level': 0.95, 'evt_pot_var': -0.02, 'evt_pot_es': -0.03, 'historical_var': -0.015, 'historical_es': -0.02, 'evt_pot_var_99': None, 'evt_pot_es_99': None, 'historical_var_99': None, 'historical_es_99': None, 'threshold_u': -0.01, 'gpd_shape_xi': None, 'gpd_scale_beta': None, 'gpd_shape_xi_raw': None, 'gpd_shape_xi_constrained': None, 'gpd_scale_beta_raw': None, 'gpd_scale_beta_constrained': None, 'evt_pot_var_unconstrained': None, 'evt_pot_es_unconstrained': None, 'constraint_applied': None, 'metrics_constrained': None, 'metrics_valid': None, 'raw_fit_valid': None, 'constrained_metrics_valid': None, 'constraint_reason': None, 'model_fitted': True, 'exceedances_count': 5, 'total_observations': 100, 'is_fat_tailed': True}
+2026-09-24 04:16:55 - app.services.currency_service - WARNING - Live USDINR=X fetch failed: ConnectionError
+2026-09-24 04:16:55 - app.services.currency_service - WARNING - FX fallback served for USD_INR (not cached): live vendor unavailable
+PASS B-12 FX provenance: rate=83.0 provenance=fallback age=0.0
+PASS B-11 missing liquidity is unavailable: status=unavailable days=None
+PASS B-11 measured day formula: 100/(0.1*1000)=1
+PASS C-04 websocket origin: evil origin rejected before accept
+PASS B source seam present: DataService imported without network/DB setup
+SUMMARY passed=10 failed=0
+

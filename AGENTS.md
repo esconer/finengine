@@ -1,5 +1,12 @@
 ## Agent skills
-
+### Core Philosophy 
+1. Does this need to exist?   → no: skip it (YAGNI)
+2. Already in this codebase?  → reuse it, don't rewrite
+3. Stdlib does it?            → use it
+4. Native platform feature?   → use it
+5. Installed dependency?      → use it
+6. One line?                  → one line
+7. Only then: the minimum that works
 ### Issue tracker
 
 Local markdown: issues live as files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
@@ -32,5 +39,3 @@ Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
 - **NSE/BSE Ticker Formats**: Ticker validation regexes must support alphanumeric scrip codes, numbers, hyphens, and exchange suffixes (e.g., `3MINDIA.NS`, `MOTHERSON.NS`, `BAJAJ-AUTO.NS`, `500112.BO`).
 - **Currency & Market Microstructure**: Indian equities (`.NS`, `.BO`) must format prices and market caps in Indian Rupee notation (`₹`, `Cr`, `L`) using `en-IN` localization.
 - **Metric Card Hygiene**: Keep metric cards deduplicated and strictly driven by live API responses without placeholder mock deltas.
-
-

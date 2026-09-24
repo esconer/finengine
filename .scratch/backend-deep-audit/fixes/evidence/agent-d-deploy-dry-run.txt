@@ -1,0 +1,3 @@
+[ERROR] Deployment failed; selecting the last recorded known image identities.
+[INFO] Rollback selected recorded image IDs and passed readiness checks.
+PASS rollback selected recorded image IDs and forced recreation without Docker

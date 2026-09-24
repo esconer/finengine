@@ -12,6 +12,7 @@ import json
 from typing import Annotated, Optional
 from pydantic_settings import BaseSettings, NoDecode
 from pydantic import Field, field_validator
+from sqlalchemy.engine import make_url
 
 
 class Settings(BaseSettings):
@@ -19,6 +20,26 @@ class Settings(BaseSettings):
     
     # Database
     database_url: str = Field(default="sqlite+aiosqlite:///./data/daisy.db")
+
+    @field_validator("database_url")
+    @classmethod
+    def database_url_must_be_async_sqlite(cls, value: str) -> str:
+        """Reject the sync URL that create_async_engine cannot load.
+
+        SQLite is the only database driver installed by this project.  Keeping
+        the check at Settings construction makes Compose/operator mistakes fail
+        before any table or user file is touched.
+        """
+
+        try:
+            url = make_url(value)
+        except Exception as exc:  # pydantic reports a normal validation error
+            raise ValueError(f"invalid DATABASE_URL: {exc}") from exc
+        if url.get_backend_name() == "sqlite" and url.get_driver_name() != "aiosqlite":
+            raise ValueError(
+                "SQLite DATABASE_URL must use sqlite+aiosqlite for the async engine"
+            )
+        return value
     
     # API Settings
     api_host: str = Field(default="127.0.0.1")

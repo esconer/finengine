@@ -1,0 +1,8 @@
+﻿CHECK|negative_cost|backend_accepted=False|reference_accepted=False|abs_diff=0|rel_diff=inf|tolerance=atol:0,rtol:0|PASS
+OUTPUT|negative_cost|backend_value=None|reference_value='ValueError'
+CHECK|nan_cost|backend_accepted=False|reference_accepted=False|abs_diff=0|rel_diff=inf|tolerance=atol:0,rtol:0|PASS
+OUTPUT|nan_cost|backend_value=None|reference_value='ValueError'
+CHECK|inf_cost|backend_accepted=False|reference_accepted=False|abs_diff=0|rel_diff=inf|tolerance=atol:0,rtol:0|PASS
+OUTPUT|inf_cost|backend_value=None|reference_value='ValueError'
+CHECK|nan_risk_free|backend_accepted=False|reference_accepted=False|abs_diff=0|rel_diff=inf|tolerance=atol:0,rtol:0|PASS
+OUTPUT|nan_risk_free|backend_value=None|reference_value='ValueError'

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 import bfinance as bf
+from app.services.cache_service import ProviderUnavailableError, UnknownTickerError
 from app.services.data_service import canonical_ticker
 from app.utils.logger import setup_logger
 
@@ -43,7 +44,7 @@ class EquityResearchService:
             t = bf.Ticker(norm_ticker)
             profile = t._ensure_profile()
             if not profile or not profile.name:
-                raise ValueError(f"No equity profile found for {ticker}")
+                raise UnknownTickerError(f"No equity profile found for {ticker}", provider="bfinance")
 
             r = profile.ratios
             info = getattr(t, "info", {}) or {}
@@ -71,6 +72,7 @@ class EquityResearchService:
             return {
                 "symbol": profile.symbol,
                 "ticker": norm_ticker.upper(),
+                "source": "bfinance",
                 "name": profile.name,
                 "about": profile.about,
                 "website": profile.website,
@@ -119,8 +121,8 @@ class EquityResearchService:
         except ValueError:
             raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
-            logger.error(f"Error getting full profile for {ticker}: {e}")
-            raise RuntimeError(f"Failed to load research profile for {ticker}: {e}") from e
+            logger.error("Error getting full profile for %s: %s", ticker, type(e).__name__)
+            raise ProviderUnavailableError("Failed to load research profile", provider="bfinance") from e
 
     async def get_shareholding(self, ticker: str) -> Dict[str, Any]:
         """
@@ -133,7 +135,7 @@ class EquityResearchService:
             t = bf.Ticker(norm_ticker)
             profile = t._ensure_profile()
             if not profile:
-                raise ValueError(f"No shareholding data for {ticker}")
+                raise UnknownTickerError(f"No shareholding data for {ticker}", provider="bfinance")
 
             # Quarterly
             q_df = profile.shareholding.to_dataframe(orient="columns")
@@ -169,6 +171,7 @@ class EquityResearchService:
 
             return {
                 "ticker": norm_ticker.upper(),
+                "source": "bfinance",
                 "quarterly": {
                     "periods": [str(c)[:10] for c in q_df.columns] if not q_df.empty else [],
                     "rows": profile.shareholding.rows,
@@ -186,8 +189,8 @@ class EquityResearchService:
         except ValueError:
             raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
-            logger.error(f"Error fetching shareholding for {ticker}: {e}")
-            raise RuntimeError(f"Failed to load shareholding for {ticker}: {e}") from e
+            logger.error("Error fetching shareholding for %s: %s", ticker, type(e).__name__)
+            raise ProviderUnavailableError("Failed to load shareholding", provider="bfinance") from e
 
     async def get_concalls(self, ticker: str) -> List[Dict[str, Any]]:
         """
@@ -206,8 +209,8 @@ class EquityResearchService:
             return await _to_thread(_fetch)
         except Exception as e:
             # Upstream outage must not masquerade as "no concalls" (B-11).
-            logger.error(f"Error fetching concalls for {ticker}: {e}")
-            raise RuntimeError(f"Failed to load concalls for {ticker}: {e}") from e
+            logger.error("Error fetching concalls for %s: %s", ticker, type(e).__name__)
+            raise ProviderUnavailableError("Failed to load concalls", provider="bfinance") from e
 
     async def get_custom_ratios(self, ticker: str) -> Dict[str, Any]:
         """
@@ -220,7 +223,7 @@ class EquityResearchService:
             t = bf.Ticker(norm_ticker)
             profile = t._ensure_profile()
             if not profile:
-                raise ValueError(f"No profile for {ticker}")
+                raise UnknownTickerError(f"No profile for {ticker}", provider="bfinance")
 
             custom = getattr(t, "custom_ratios", {}) or {}
             rh_df = profile.ratios_history.to_dataframe(orient="columns")
@@ -233,6 +236,7 @@ class EquityResearchService:
 
             return {
                 "ticker": norm_ticker.upper(),
+                "source": "bfinance",
                 "piotroski_score": custom.get("piotroski_score") or getattr(t, "piotroski_score", 0),
                 "graham_number": graham,
                 "graham_upside_pct": graham_upside,
@@ -252,8 +256,8 @@ class EquityResearchService:
         except ValueError:
             raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
-            logger.error(f"Error fetching custom ratios for {ticker}: {e}")
-            raise RuntimeError(f"Failed to compute custom ratios for {ticker}: {e}") from e
+            logger.error("Error fetching custom ratios for %s: %s", ticker, type(e).__name__)
+            raise ProviderUnavailableError("Failed to compute custom ratios", provider="bfinance") from e
 
     async def export_excel_model(self, ticker: str) -> bytes:
         """
@@ -265,7 +269,7 @@ class EquityResearchService:
             t = bf.Ticker(norm_ticker)
             profile = t._ensure_profile()
             if not profile or not profile.name:
-                raise ValueError(f"Cannot generate financial model for {ticker}")
+                raise UnknownTickerError(f"Cannot generate financial model for {ticker}", provider="bfinance")
 
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
                 tmp_path = tmp.name
@@ -288,8 +292,8 @@ class EquityResearchService:
         except ValueError:
             raise  # genuine not-found keeps 404 semantics (B-05)
         except Exception as e:
-            logger.error(f"Error generating Excel model for {ticker}: {e}")
-            raise RuntimeError(f"Failed to export Excel model: {e}") from e
+            logger.error("Error generating Excel model for %s: %s", ticker, type(e).__name__)
+            raise ProviderUnavailableError("Failed to export Excel model", provider="bfinance") from e
 
 
 _equity_research_service: Optional[EquityResearchService] = None

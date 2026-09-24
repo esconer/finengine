@@ -66,7 +66,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
         weight: 0,
         quantity: 0,
         buy_price: 0,
-        region: currency === 'INR' ? 'IN' : 'US',
+        region: 'US',
         custom_name: '',
         added_on: new Date().toISOString().split('T')[0]
       });
@@ -158,7 +158,8 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       if (trimmed.endsWith('.NS') || trimmed.endsWith('.BO')) {
         updatedFormData.region = 'IN';
       } else if (trimmed) {
-        updatedFormData.region = currency === 'INR' ? 'IN' : 'US';
+        // Listing identity, not the display currency, determines native region.
+        updatedFormData.region = 'US';
       }
     }
     setFormData(updatedFormData);
@@ -167,7 +168,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
     }
   };
 
-  const isIndianTicker = formData.ticker.endsWith('.NS') || formData.ticker.endsWith('.BO') || formData.region === 'IN' || currency === 'INR';
+  const isIndianTicker = formData.ticker.endsWith('.NS') || formData.ticker.endsWith('.BO') || formData.region === 'IN';
   const effectiveCurrency = isIndianTicker ? 'INR' : currency;
 
   if (!isOpen) {
