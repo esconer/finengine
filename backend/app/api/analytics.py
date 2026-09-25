@@ -58,11 +58,16 @@ from app.utils.allocations import (
 )
 from app.utils.holdings import (
     MIN_ANNUALIZE_DAYS,
+    analytics_start_claim,
+    annualizable,
     apply_annualization_gate,
     coerce_holding_date,
-    effective_starts,
+    effective_start_detail,
     holding_coverage,
     holding_window,
+    holding_window_detail,
+    position_history_note,
+    position_limited_history,
 )
 from app.utils.logger import setup_logger
 
@@ -675,6 +680,465 @@ def _history_window(
     }
 
 
+# --- Per-position own-sample measurement (V3-06) -----------------------------
+# A position's annualization gate, its limited-history flag and every number in
+# its disclosure line are read from THIS function's output: the non-null returns
+# that ticker itself produced. Portfolio-wide and global counts are never
+# consulted, because a 176-observation book does not make a 20-observation leg
+# "full history" - that mislabelling is exactly what the gate exists to stop.
+def _own_return_observations(frame: Any) -> Dict[str, int]:
+    """Non-null return observations per ticker, measured from `frame` itself.
+
+    Mirrors the engine's own per-position sample (union index kept, so an
+    interior gap stays a gap rather than becoming a synthetic multi-day
+    return). A frame that is not a dated `DataFrame` measures nothing and
+    returns an empty map rather than an invented count.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {}
+    cleaned = frame.replace([np.inf, -np.inf], np.nan).sort_index()
+    returns = cleaned.pct_change(fill_method=None)
+    if len(returns) < 2:
+        return {}
+    returns = returns.iloc[1:]
+    return {str(ticker): int(returns[ticker].notna().sum()) for ticker in returns.columns}
+
+
+def _own_finite_observations(frame: Any) -> Dict[str, int]:
+    """Per-ticker FINITE return count: the legs a model can actually regress."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {}
+    cleaned = frame.replace([np.inf, -np.inf], np.nan).sort_index()
+    returns = cleaned.pct_change(fill_method=None)
+    if len(returns) < 2:
+        return {}
+    returns = returns.iloc[1:].replace([np.inf, -np.inf], np.nan)
+    return {
+        str(ticker): int(np.isfinite(returns[ticker].to_numpy(dtype=float)).sum())
+        for ticker in returns.columns
+    }
+
+
+def _position_provenance(detail: Optional[Mapping[str, Any]], ticker: str) -> Dict[str, Any]:
+    """One ticker's holding-window start with the source that produced it."""
+    entry = detail.get(ticker) if isinstance(detail, Mapping) else None
+    entry = entry if isinstance(entry, Mapping) else {}
+    return {
+        "analytics_start": entry.get("analytics_start"),
+        "analytics_start_source": entry.get("analytics_start_source"),
+        "stored_added_on": entry.get("stored_added_on"),
+        "buy_price_inferred": entry.get("buy_price_inferred"),
+    }
+
+
+# --- Full-history model evidence (V3-05) -------------------------------------
+# Factor Exposure and Risk Contribution are hypothetical current-weight
+# questions answered over FULL exchange history. They must never publish a
+# holding `effective_start`/`truncated` flag: doing so claims a model window was
+# cut to a holding window it never used. So the model's own evidence lives in a
+# SEPARATE object and the holding window stays explicitly ancillary.
+FULL_HISTORY_BASIS = "full_exchange_history_current_weights"
+HOLDING_CONTEXT_SCOPE = "holding_context_ancillary"
+FULL_HISTORY_RELATION = (
+    "Holding context is ancillary: it never shortens, lengthens or "
+    "annualizes this model window."
+)
+
+
+def _full_history_evidence(
+    price_frame: Any,
+    *,
+    requested_start: Optional[str],
+    requested_end: Optional[str],
+    declared_limited: Optional[Mapping[str, bool]] = None,
+    coverage_reasons: Optional[Mapping[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """Self-describing evidence for a model measured on full exchange history.
+
+    Own window, own observation count, own latest observation and own
+    annualization flag. Sparse or late-listed legs are published with their own
+    usable observation count and limited-history flag instead of being averaged
+    away by the rest of the book.
+    """
+    counts = _own_return_observations(price_frame)
+    finite = _own_finite_observations(price_frame)
+    first, last = _observation_bounds(price_frame)
+    price_rows = int(len(price_frame)) if isinstance(price_frame, pd.DataFrame) else 0
+    return_rows = max(0, price_rows - 1) if price_rows else 0
+    flags = declared_limited or {}
+    reasons = coverage_reasons or {}
+    tickers: Dict[str, Any] = {}
+    for ticker in sorted(set(counts) | set(finite)):
+        usable = finite.get(ticker, counts.get(ticker, 0))
+        column = price_frame[ticker] if isinstance(price_frame, pd.DataFrame) and ticker in price_frame else None
+        tickers[ticker] = {
+            "price_observations": int(len(column)) if column is not None else None,
+            "return_observations": int(counts.get(ticker, 0)),
+            "usable_observations": int(usable),
+            "limited_history": position_limited_history(
+                int(counts.get(ticker, 0)), bool(flags.get(ticker, False))
+            ),
+            "coverage_reason": reasons.get(ticker),
+        }
+    meets = bool(
+        return_rows >= MIN_ANNUALIZE_DAYS
+        and counts
+        and min(counts.values()) >= MIN_ANNUALIZE_DAYS
+    )
+    return {
+        "basis": FULL_HISTORY_BASIS,
+        "scope": "full_exchange_history",
+        "truncated_to_holding_window": False,
+        "requested_window": {"start": requested_start, "end": requested_end},
+        "window": {"start": first, "end": last, "days": return_rows},
+        "first_observation": first,
+        "last_observation": last,
+        "latest_observation_date": _latest_observation_date(price_frame),
+        "observation_count": return_rows,
+        "price_observation_count": price_rows,
+        "per_ticker_return_observations": counts,
+        "annualized": meets,
+        "minimum_observations_required": MIN_ANNUALIZE_DAYS,
+        "model_used_tickers": list(price_frame.columns) if isinstance(price_frame, pd.DataFrame) else [],
+        "tickers": tickers,
+        "holding_context_note": FULL_HISTORY_RELATION,
+    }
+
+
+def _model_history_coverage(
+    holding_context: Mapping[str, Any],
+    full_history: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """`history_coverage` for a full-history model: model evidence + ancillary holdings.
+
+    `truncated` is `False` and `effective_start` is `None` at the top level
+    because neither describes this model; the holding window is reachable only
+    under `holding_context`, where its own `covered_days`/`annualized` describe
+    the holding tenure rather than the model sample.
+    """
+    return {
+        "scope": HOLDING_CONTEXT_SCOPE,
+        "calculation_basis": full_history.get("basis", FULL_HISTORY_BASIS),
+        "full_history": dict(full_history),
+        "holding_context": dict(holding_context),
+        "holding_window_days": holding_context.get("covered_days"),
+        # Model-scoped mirrors. The holding window never writes these.
+        "annualized": bool(full_history.get("annualized")),
+        "truncated": False,
+        "covered_days": full_history.get("observation_count"),
+        "covered_days_scope": "model_return_observations",
+        "model_observation_count": full_history.get("observation_count"),
+        "model_window": full_history.get("window"),
+        "effective_start": None,
+        "intersection_start": holding_context.get("intersection_start"),
+        "oldest_holding": holding_context.get("oldest_holding"),
+        "requested_start": holding_context.get("requested_start"),
+        "requested_end": holding_context.get("requested_end"),
+        "tickers": holding_context.get("tickers", {}),
+    }
+
+
+def _conditional_regime_coverage(
+    regime_summary: Mapping[str, Any],
+    holding_context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Coverage for the CURRENT-REGIME conditional sample (V3-05).
+
+    The conditional block measures the portfolio return days the classifier
+    assigned to the current regime - 19 days where the holding window holds 39
+    and the HMM model holds 252. Publishing the holding window's numbers there
+    described a sample that was never taken, so `covered_days`, `annualized`
+    and `truncated` all read the conditional sample and the holding window is
+    demoted to an explicitly labelled pool.
+    """
+    try:
+        sample = int(regime_summary.get("days"))
+    except (TypeError, ValueError):
+        sample = 0
+    try:
+        pool = int(holding_context.get("covered_days") or 0)
+    except (TypeError, ValueError):
+        pool = 0
+    return {
+        "scope": "conditional_current_regime",
+        "conditional": True,
+        "sample_basis": (
+            "Portfolio return days classified into the current regime; the "
+            "holding window below is the pool it was drawn from, not the sample."
+        ),
+        "observations": sample,
+        "covered_days": sample,
+        "covered_days_scope": "conditional_regime_return_days",
+        "annualized": annualizable(sample),
+        "minimum_observations_required": MIN_ANNUALIZE_DAYS,
+        # A conditional sample can only be as long as the pool it is drawn
+        # from; that gap is what `truncated` reports here.
+        "truncated": bool(pool and sample < pool),
+        "holding_window_days": pool or None,
+        "requested_start": holding_context.get("requested_start"),
+        "requested_end": holding_context.get("requested_end"),
+        "effective_start": None,
+        "intersection_start": holding_context.get("intersection_start"),
+        "oldest_holding": holding_context.get("oldest_holding"),
+        "holding_context": dict(holding_context),
+    }
+
+
+# --- Performance-history freshness (ticket 02) ------------------------------
+# The delivered window is measured against the requested one with a numeric,
+# deterministic rule. A 3-calendar-day tolerance absorbs a weekend/holiday
+# edge without excusing a materially shorter or staler series, and no gap is
+# ever backfilled to make a series look complete.
+PERFORMANCE_HISTORY_TOLERANCE_DAYS = 3
+#: Below this delivered fraction of the requested business days the series is
+#: `partial` even when it is not truncated and not stale.
+PERFORMANCE_HISTORY_MIN_COVERAGE_RATIO = 0.50
+PERFORMANCE_AS_OF_SEMANTICS = (
+    "Last delivered portfolio-value observation date; never the requested "
+    "window end, and never backfilled."
+)
+
+
+def _expected_observation_count(requested_start: Any, requested_end: Any) -> Optional[int]:
+    """Mon-Fri calendar days in the requested window, or None if unparseable.
+
+    Exchange holidays make a complete series land slightly below this count, so
+    the ratio is a coverage floor rather than an exact expectation. Nothing is
+    invented when the request is unparseable: the field is `None` and the
+    caller reports it.
+    """
+    try:
+        start = pd.Timestamp(requested_start).normalize()
+        end = pd.Timestamp(requested_end).normalize()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(start) or pd.isna(end) or start > end:
+        return None
+    return int(len(pd.bdate_range(start=start, end=end)))
+
+
+def _calendar_day_gap(later: Any, earlier: Any) -> Optional[int]:
+    """Whole calendar days from `earlier` to `later`, or None if unparseable."""
+    try:
+        a = pd.Timestamp(earlier).normalize()
+        b = pd.Timestamp(later).normalize()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(a) or pd.isna(b):
+        return None
+    return int((b - a).days)
+
+
+def _performance_history_envelope(
+    series: Any,
+    *,
+    requested_start: Any,
+    requested_end: Any,
+    warnings: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Opt-in metadata envelope for one delivered performance-history series.
+
+    Pure and deterministic: the same delivered rows and the same requested
+    window always produce the same envelope, with no clock read and no vendor
+    call. Freshness rule, all comparisons on calendar days:
+
+    * ``truncated``  - ``delivered_start`` is more than 3 calendar days after
+      ``requested_start``;
+    * ``stale``      - ``delivered_end`` is at least 3 calendar days before
+      ``requested_end``;
+    * ``partial``    - the series is non-empty and either flag is set, or fewer
+      than 50% of the requested Mon-Fri days were delivered;
+    * ``unavailable`` - nothing was delivered, and then ``as_of`` is ``None``.
+
+    ``as_of`` is the last delivered observation or ``None``. The requested end
+    is never substituted for it and a missing observation is never backfilled.
+    """
+    rows = [row for row in (series or []) if isinstance(row, Mapping)]
+    ordered = [
+        row for row in rows
+        if isinstance(row.get("date"), str) and row.get("date").strip()
+    ]
+    has_dates = len(ordered) == len(rows)
+    delivered_start = ordered[0]["date"] if ordered else None
+    delivered_end = ordered[-1]["date"] if ordered else None
+    observation_count = len(rows)
+    expected = _expected_observation_count(requested_start, requested_end)
+    if expected and observation_count:
+        coverage_ratio = round(min(1.0, observation_count / expected), 6)
+    else:
+        coverage_ratio = None
+
+    truncated = False
+    stale = False
+    unmeasurable = False
+    if delivered_start and delivered_end and has_dates:
+        late_start = _calendar_day_gap(delivered_start, requested_start)
+        if late_start is None:
+            unmeasurable = True
+        else:
+            truncated = late_start > PERFORMANCE_HISTORY_TOLERANCE_DAYS
+        gap_to_end = _calendar_day_gap(requested_end, delivered_end)
+        if gap_to_end is None:
+            unmeasurable = True
+        else:
+            stale = gap_to_end >= PERFORMANCE_HISTORY_TOLERANCE_DAYS
+    elif observation_count:
+        unmeasurable = True
+
+    short = bool(
+        coverage_ratio is not None
+        and coverage_ratio < PERFORMANCE_HISTORY_MIN_COVERAGE_RATIO
+    )
+    if not observation_count:
+        status = DATA_STATUS_UNAVAILABLE
+    elif truncated or stale or short or unmeasurable:
+        status = DATA_STATUS_PARTIAL
+    else:
+        status = DATA_STATUS_AVAILABLE
+
+    history: Dict[str, Any] = {
+        "requested_start": requested_start if isinstance(requested_start, str) else None,
+        "requested_end": requested_end if isinstance(requested_end, str) else None,
+        "requested_days": (
+            _calendar_day_gap(requested_end, requested_start)
+            if requested_start is not None and requested_end is not None
+            else None
+        ),
+        "delivered_start": delivered_start,
+        "delivered_end": delivered_end,
+        "observation_count": observation_count,
+        "expected_observation_count": expected,
+        "first_observation": delivered_start,
+        "last_observation": delivered_end,
+        "coverage_ratio": coverage_ratio,
+        "truncated": truncated,
+        "stale": stale,
+        "status": status,
+    }
+
+    messages: List[str] = [str(item) for item in (warnings or []) if item]
+    if not observation_count:
+        messages.append("No performance history was delivered for the requested window.")
+    else:
+        if truncated and delivered_start and isinstance(requested_start, str):
+            late = _calendar_day_gap(delivered_start, requested_start)
+            messages.append(
+                f"Delivered history starts {delivered_start}, {late} calendar days after "
+                f"the requested {requested_start}; the requested start was not delivered."
+            )
+        if stale and delivered_end and isinstance(requested_end, str):
+            gap = _calendar_day_gap(requested_end, delivered_end)
+            messages.append(
+                f"Last delivered observation is {delivered_end}, {gap} calendar days before "
+                f"the requested end {requested_end}; the series is stale."
+            )
+        if short and coverage_ratio is not None and expected:
+            messages.append(
+                f"Delivered {observation_count} of {expected} expected observations "
+                f"({coverage_ratio:.0%} of the requested window)."
+            )
+        if unmeasurable:
+            messages.append(
+                "Delivered observation dates are not ISO dates; freshness could not be measured."
+            )
+
+    return {
+        "data": rows,
+        "data_status": status,
+        "as_of": delivered_end,
+        "as_of_semantics": PERFORMANCE_AS_OF_SEMANTICS,
+        "history_coverage": history,
+        "warnings": messages,
+    }
+
+
+# --- Liquidity units, window and scoring disclosure (V3-09) ------------------
+# The liquidity score is a dimensionless 0-10 index whose INPUTS are monetary,
+# and the engine's tiers are fixed INR magnitudes. So the unit the score is
+# expressed in is a property of the rule, not of a quote, and it is published as
+# `derived` - never read off a market-cap payload and never invented per ticker.
+LIQUIDITY_SCORING_CURRENCY = "INR"
+LIQUIDITY_SCORE_PRECISION = 1
+LIQUIDITY_SCORE_SCALE = {"min": 2.5, "max": 10.0, "unit": "index_0_to_10"}
+
+
+def _liquidity_observation_window(frames: Mapping[str, Any]) -> Dict[str, Any]:
+    """Delivered liquidity range measured from the fetched frames themselves.
+
+    `data_range` is the request; this is what arrived. Nothing is substituted:
+    an undated frame contributes no bound, and the union end is the newest bar
+    any leg delivered.
+    """
+    bounds: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for ticker, frame in (frames or {}).items():
+        if not isinstance(frame, (pd.DataFrame, pd.Series)) or len(frame) == 0:
+            continue
+        first, last = _observation_bounds(frame)
+        bounds[str(ticker)] = (first, last)
+    starts = [first for first, _ in bounds.values() if first]
+    ends = [last for _, last in bounds.values() if last]
+    return {
+        "start": min(starts) if starts else None,
+        "end": max(ends) if ends else None,
+        "ticker_count": len(bounds),
+        "per_ticker": {
+            ticker: {"start": first, "end": last, "observations": int(len(frames[ticker]))}
+            for ticker, (first, last) in sorted(bounds.items())
+        },
+    }
+
+
+def _liquidity_scoring_block(
+    liquidity_result: Mapping[str, Any],
+    *,
+    data_range: Mapping[str, Any],
+    observation_window: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """How the score, the band and the inputs were produced.
+
+    Republishes the engine's own band rule so a consumer can check the published
+    score against the threshold that banded it, and names the window the
+    turnover/price inputs were measured over. A result the engine refused
+    publishes `None` scores and a null rule rather than a plausible default.
+    """
+    rule = liquidity_result.get("score_band_rule")
+    positions = liquidity_result.get("by_position")
+    positions = positions if isinstance(positions, Mapping) else {}
+    return {
+        "scale": dict(LIQUIDITY_SCORE_SCALE),
+        "score_precision": LIQUIDITY_SCORE_PRECISION,
+        "raw_score_field": "score_raw",
+        "published_score_field": "score",
+        "band_source": (rule or {}).get("band_source") if isinstance(rule, Mapping) else None,
+        "bands": (rule or {}).get("bands") if isinstance(rule, Mapping) else None,
+        "thresholds": (rule or {}).get("bands") if isinstance(rule, Mapping) else None,
+        "currency": LIQUIDITY_SCORING_CURRENCY,
+        "currency_provenance": "derived",
+        "monetary_unit": "rupees",
+        "volume_unit": "shares",
+        "turnover_unit": "rupees_per_session",
+        "market_cap_floor": {
+            "value": 1_000_000_000.0,
+            "currency": LIQUIDITY_SCORING_CURRENCY,
+            "provenance": "fallback",
+            "note": (
+                "Applied only when a quote cap and the annualised-turnover "
+                "estimate are both unavailable; positions using it publish "
+                "market_cap_provenance='fallback' and is_estimate=true."
+            ),
+        },
+        "requested_window": dict(data_range),
+        "observation_window": dict(observation_window),
+        "measured_positions": sorted(positions),
+        "unavailable_reason": (
+            liquidity_result.get("error")
+            if liquidity_result.get("overall_score") is None
+            else None
+        ),
+        "score_basis": "turnover_and_market_cap_tiers",
+    }
+
+
 def _sizing_basis_block(
     engine_result: Mapping[str, Any],
     *,
@@ -1128,7 +1592,7 @@ async def get_realized_risk(
         # Combine price data, restricted to actual holding history so
         # pre-purchase price action is never attributed to the portfolio.
         holdings = await resolve_holdings(db, calculation_tickers)
-        masked_dict, effectives = holding_window(price_data_dict, holdings)
+        masked_dict, effectives, start_detail = holding_window_detail(price_data_dict, holdings)
         wiped = sorted(set(price_data_dict) - set(masked_dict))
         price_data = pd.DataFrame(masked_dict)
         if price_data.empty:
@@ -1151,6 +1615,11 @@ async def get_realized_risk(
                 "error": "No price data within the current holding period",
             }
         covered_days = int(len(price_data))
+        # Each ticker's OWN return observations, measured from its own masked
+        # series. Seeding them before `holding_coverage` is what lets the
+        # per-position `limited_history` flag derive from the position itself
+        # instead of from a portfolio or global count.
+        own_return_observations = _own_return_observations(price_data)
         per_ticker = {
             t: {
                 "raw_days": int(len(s)) if s is not None else 0,
@@ -1160,7 +1629,11 @@ async def get_realized_risk(
             }
             for t, s in price_data_dict.items()
         }
-        history_coverage = holding_coverage(effectives, start, end, covered_days, per_ticker)
+        for ticker, count in own_return_observations.items():
+            per_ticker.setdefault(ticker, {})["return_observations"] = int(count)
+        history_coverage = holding_coverage(
+            effectives, start, end, covered_days, per_ticker, provenance=start_detail
+        )
 
         # --- Instrument risk on FULL exchange history (DSP-10) --------------
         # Risk characteristics belong to the assets, not the ownership
@@ -1245,43 +1718,45 @@ async def get_realized_risk(
         # Position-level metrics & data quality warnings
         positions = {}
         warnings_list = []
-        intersection = history_coverage.get("intersection_start") or history_coverage.get("effective_start")
         for ticker, pos_metrics in metrics.get("positions", {}).items():
-            is_limited = pos_metrics.get("is_limited_history", False)
+            engine_limited = bool(pos_metrics.get("is_limited_history", False))
             data_pts = pos_metrics.get("data_points", 0)
+            own_observations = own_return_observations.get(ticker)
+            # The gate reads this position's own sample; the engine's flag is
+            # only the feed's own declaration.
+            is_limited = position_limited_history(own_observations, engine_limited)
+            provenance = _position_provenance(start_detail, ticker)
             if is_limited:
-                own_start = effectives.get(ticker)
                 raw_s = price_data_dict.get(ticker)
                 raw_len = int(len(raw_s)) if raw_s is not None else 0
-                masked_s = masked_dict.get(ticker)
-                masked_len = int(len(masked_s)) if masked_s is not None else 0
+                attrs = getattr(raw_s, "attrs", {})
+                notice = position_history_note(
+                    ticker,
+                    return_observations=own_observations,
+                    analytics_start=provenance["analytics_start"],
+                    analytics_start_source=provenance["analytics_start_source"],
+                    stored_added_on=provenance["stored_added_on"],
+                    buy_price_inferred=provenance["buy_price_inferred"],
+                    coverage_reason=attrs.get("coverage_reason"),
+                    full_history_days=full_days,
+                    declared_limited=True if attrs.get("limited_history") else None,
+                )
+                # Every count in a per-ticker line is that ticker's own.
                 if raw_len and raw_len < MIN_ANNUALIZE_DAYS:
-                    notice = (
-                        f"{ticker} has only {data_pts} trading days of data available on exchange feeds. "
-                        "Historical risk ratios are constrained."
+                    notice += (
+                        f" Only {raw_len} trading days of data are available on "
+                        "exchange feeds; historical risk ratios are constrained."
                     )
-                elif masked_len < raw_len and intersection and own_start and intersection > own_start:
-                    notice = (
-                        f"{ticker} realized P&L covers {covered_days} trading days "
-                        f"since {intersection}; {ticker} held since {own_start}; instrument risk "
-                        f"uses full {history_coverage.get('full_history_days')} trading days "
-                        "of exchange history."
-                    )
-                elif history_coverage.get("truncated"):
-                    notice = (
-                        f"{ticker} realized P&L covers only {data_pts} trading days "
-                        f"(held since {history_coverage.get('effective_start')}); instrument risk "
-                        f"metrics use the full {history_coverage.get('full_history_days')} trading days "
-                        "of exchange history."
-                    )
-                else:
-                    notice = (
-                        f"{ticker} has only {data_pts} trading days of data available on exchange feeds. "
-                        "Historical risk ratios are constrained."
+                elif own_observations is not None:
+                    notice += (
+                        f" Its {int(own_observations)} own return observations are fewer "
+                        f"than the {MIN_ANNUALIZE_DAYS} required to annualize, so its "
+                        "annualized ratios are withheld."
                     )
                 warnings_list.append({
                     "ticker": ticker,
                     "data_points": data_pts,
+                    "return_observations": own_observations,
                     "message": notice,
                 })
             positions[ticker] = {
@@ -1292,8 +1767,10 @@ async def get_realized_risk(
                 "var_95": pos_metrics.get("var_95"),
                 "weight": pos_metrics.get("weight", 0),
                 "data_points": data_pts,
+                "return_observations": own_observations,
                 "is_limited_history": is_limited,
-                "history_warning": pos_metrics.get("history_warning")
+                "history_warning": pos_metrics.get("history_warning"),
+                **provenance,
             }
 
         # Short holding history must not annualize into triple-digit artefacts.
@@ -1302,20 +1779,27 @@ async def get_realized_risk(
             ["annual_return", "annual_volatility", "sharpe_ratio", "sortino_ratio"],
             covered_days,
         )
-        for pos_payload in positions.values():
+        for ticker, pos_payload in positions.items():
             apply_annualization_gate(
                 pos_payload,
                 ["annual_return", "annual_volatility", "sharpe_ratio"],
-                int(pos_payload.get("data_points", 0) or 0),
+                pos_payload.get("return_observations")
+                if pos_payload.get("return_observations") is not None
+                else int(pos_payload.get("data_points", 0) or 0),
             )
         for ticker in wiped:
+            provenance = _position_provenance(start_detail, ticker)
             warnings_list.append({
                 "ticker": ticker,
                 "data_points": 0,
+                "return_observations": 0,
                 "message": (
-                    f"{ticker} has no price data within the current holding period "
-                    f"(held since {effectives.get(ticker) or history_coverage.get('effective_start')}); "
-                    "excluded from realized metrics."
+                    f"{ticker}: no price data within the current holding period "
+                    f"— {analytics_start_claim(
+                        provenance['analytics_start'],
+                        provenance['analytics_start_source'],
+                        provenance['stored_added_on'],
+                    )}; excluded from realized metrics."
                 ),
             })
 
@@ -1379,9 +1863,13 @@ async def get_forecast_risk(
                     "volatility_forecast": None,
                     "var_forecast": None,
                     "cvar_forecast": None,
-                    "confidence_interval": None
+                    "confidence_interval": None,
+                    "observations": 0,
+                    "annualized": False,
+                    "minimum_observations_required": MIN_ANNUALIZE_DAYS,
                 },
                 "positions": {},
+                "portfolio_observations": 0,
                 "model_params": {"p": 1, "q": 1, "type": model},
                 "error": "No portfolio positions found"
             }
@@ -1395,9 +1883,13 @@ async def get_forecast_risk(
                     "volatility_forecast": None,
                     "var_forecast": None,
                     "cvar_forecast": None,
-                    "confidence_interval": None
+                    "confidence_interval": None,
+                    "observations": 0,
+                    "annualized": False,
+                    "minimum_observations_required": MIN_ANNUALIZE_DAYS,
                 },
                 "positions": {},
+                "portfolio_observations": 0,
                 "universe_coverage": _universe_coverage(ticker_list, []),
                 "data_status": "unavailable",
                 "error": "No active portfolio weights available for forecast",
@@ -1415,9 +1907,13 @@ async def get_forecast_risk(
                     "volatility_forecast": None,
                     "var_forecast": None,
                     "cvar_forecast": None,
-                    "confidence_interval": None
+                    "confidence_interval": None,
+                    "observations": 0,
+                    "annualized": False,
+                    "minimum_observations_required": MIN_ANNUALIZE_DAYS,
                 },
                 "positions": {},
+                "portfolio_observations": 0,
                 "model_params": {"p": 1, "q": 1, "type": model},
                 "universe_coverage": _universe_coverage(ticker_list, []),
                 "data_status": "unavailable",
@@ -1436,33 +1932,45 @@ async def get_forecast_risk(
         # Calculate portfolio volatility forecast using analytics engine
         forecast_result = await analytics_engine.forecast_volatility(portfolio_returns, model, horizon)
         
-        # Position-level forecasts using active price history
+        # Position-level forecasts using active price history.  The gate reads
+        # the position's OWN measured return observations: 30 price rows are 29
+        # returns, and a model fitted to 29 observations is the same thin
+        # sample the annualization gate exists to refuse.
         positions = {}
         warnings_list = []
+        own_return_observations = _own_return_observations(price_data)
         for ticker in price_data.columns:
             try:
                 raw_s = price_data[ticker].replace([np.inf, -np.inf], np.nan)
                 data_pts = int(raw_s.notna().sum())
-                if data_pts >= 30:
+                own_observations = own_return_observations.get(ticker)
+                is_limited = position_limited_history(own_observations, False)
+                if not is_limited:
                     # Keep the original union index so an interior gap does
                     # not become a synthetic multi-day return.
                     ticker_rets = raw_s.pct_change(fill_method=None).dropna()
                     ticker_forecast = await analytics_engine.forecast_volatility(ticker_rets, model, horizon)
                     vol_fc = ticker_forecast.get("volatility_forecast")
                     var_fc = ticker_forecast.get("var_forecast")
-                    is_limited = False
                     warning = None
                 else:
                     ticker_rets = raw_s.pct_change(fill_method=None).dropna()
                     h_factor = np.sqrt(max(1, horizon) / 252.0)
                     vol_fc = float(ticker_rets.std() * np.sqrt(252)) if len(ticker_rets) > 1 else None
                     var_fc = float(-vol_fc * 1.645 * h_factor) if vol_fc is not None else None
-                    is_limited = True
-                    warning = f"Only {data_pts} trading days available on exchange feed"
+                    warning = (
+                        f"Only {own_observations} own return observations available "
+                        f"from {data_pts} exchange-feed price rows"
+                    )
                     warnings_list.append({
                         "ticker": ticker,
                         "data_points": data_pts,
-                        "message": f"{ticker} has only {data_pts} trading days available. Forecast volatility uses sample volatility."
+                        "return_observations": own_observations,
+                        "message": (
+                            f"{ticker} has {own_observations} own return observations "
+                            f"from {data_pts} exchange-feed price rows. Forecast "
+                            "volatility uses sample volatility."
+                        )
                     })
                 
                 positions[ticker] = {
@@ -1470,7 +1978,8 @@ async def get_forecast_risk(
                     "var_forecast": var_fc,
                     "is_limited_history": is_limited,
                     "history_warning": warning,
-                    "data_points": data_pts
+                    "data_points": data_pts,
+                    "return_observations": own_observations,
                 }
             except Exception:
                 logger.error("Volatility forecast leg failed")
@@ -1479,7 +1988,8 @@ async def get_forecast_risk(
                     "var_forecast": None,
                     "is_limited_history": True,
                     "history_warning": "Forecast unavailable",
-                    "data_points": 0
+                    "data_points": 0,
+                    "return_observations": own_return_observations.get(ticker),
                 }
         
         usable_positions = [
@@ -1502,6 +2012,10 @@ async def get_forecast_risk(
             forecast_result.get(field) is not None
             for field in ("volatility_forecast", "var_forecast", "cvar_forecast")
         )
+        # The portfolio forecast is fitted to the aggregated portfolio return
+        # series, so its sample is that series' length - never a position count
+        # and never the number of tickers that happened to clear a per-leg gate.
+        portfolio_observations = int(portfolio_returns.notna().sum())
         response = {
             "model": model,
             "horizon": horizon,
@@ -1510,9 +2024,13 @@ async def get_forecast_risk(
                 "var_forecast": forecast_result.get("var_forecast"),
                 "cvar_forecast": forecast_result.get("cvar_forecast"),
                 "confidence_interval": forecast_result.get("confidence_interval"),
-                "term_structure": forecast_result.get("term_structure", [])
+                "term_structure": forecast_result.get("term_structure", []),
+                "observations": portfolio_observations,
+                "annualized": annualizable(portfolio_observations),
+                "minimum_observations_required": MIN_ANNUALIZE_DAYS,
             },
             "positions": positions,
+            "portfolio_observations": portfolio_observations,
             "universe_coverage": coverage,
             "data_status": _data_status(
                 coverage,
@@ -1609,7 +2127,9 @@ async def get_factor_exposure(
         # "Market-Like" for every position. Compute on full history; the
         # holding window stays disclosed via history_coverage.
         holdings = await resolve_holdings(db, calculation_tickers)
-        _, effectives = holding_window(price_data_dict, holdings)
+        # The mask is measured only to describe the holding tenure; the model
+        # below still runs on the unmasked frame.
+        holding_dict, effectives, start_detail = holding_window_detail(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
         factor_weights = {
             ticker: float(weight)
@@ -1622,16 +2142,39 @@ async def get_factor_exposure(
                 ticker: weight / factor_weight_total
                 for ticker, weight in factor_weights.items()
             }
+        holding_frame = pd.DataFrame(holding_dict)
+        holding_days = int(len(holding_frame)) if not holding_frame.empty else 0
+        own_return_observations = _own_return_observations(price_data)
         per_ticker = {
             ticker: {
                 "raw_days": int(len(series)) if series is not None else 0,
-                "masked_days": int(len(series)) if series is not None else 0,
+                "masked_days": int(len(holding_dict.get(ticker))) if ticker in holding_dict and holding_dict[ticker] is not None else 0,
+                "return_observations": int(own_return_observations.get(ticker, 0)),
+                "limited_history": bool(getattr(series, "attrs", {}).get("limited_history", False)),
+                "coverage_reason": getattr(series, "attrs", {}).get("coverage_reason"),
             }
             for ticker, series in price_data_dict.items()
         }
-        history_coverage = holding_coverage(
-            effectives, start, end, int(len(price_data)), per_ticker
+        holding_context = holding_coverage(
+            effectives, start, end, holding_days, per_ticker, provenance=start_detail
         )
+        # Model evidence lives in its own object: a full-history regression is
+        # not truncated to the holding window, so it publishes its own window,
+        # observation count, latest observation and annualization flag.
+        full_history = _full_history_evidence(
+            price_data,
+            requested_start=start,
+            requested_end=end,
+            declared_limited={
+                ticker: bool(getattr(series, "attrs", {}).get("limited_history", False))
+                for ticker, series in price_data_dict.items()
+            },
+            coverage_reasons={
+                ticker: getattr(series, "attrs", {}).get("coverage_reason")
+                for ticker, series in price_data_dict.items()
+            },
+        )
+        history_coverage = _model_history_coverage(holding_context, full_history)
 
         # Fetch benchmark returns via BenchmarkService (^NSEI)
         benchmark_returns = None
@@ -1639,7 +2182,7 @@ async def get_factor_exposure(
             benchmark_returns = await benchmark_service.get_returns(start=start, end=end)
         except Exception:
             logger.warning("Benchmark data unavailable")
-        history_coverage["calculation_basis"] = "full_exchange_history_current_weights"
+        history_coverage["calculation_basis"] = FULL_HISTORY_BASIS
         if benchmark_returns is not None:
             benchmark_series = benchmark_returns
             if isinstance(benchmark_series, pd.DataFrame):
@@ -1659,12 +2202,25 @@ async def get_factor_exposure(
             weights=factor_weights
         )
 
-        # Collect warnings for assets with limited history
+        # Collect warnings for assets with limited history. `data_points` is the
+        # benchmark-overlap sample the regression actually used; the full
+        # exchange-history return count is published beside it so a late-listed
+        # leg reads as sparse rather than as a short book.
         warnings_list = [
             {
                 "ticker": t,
                 "data_points": p.get("data_points", 0),
-                "message": f"{t} has only {p.get('data_points', 0)} trading days. Factor regression beta and alpha may be constrained."
+                "return_observations": own_return_observations.get(t),
+                "usable_observations": p.get("data_points", 0),
+                "limited_history": position_limited_history(
+                    own_return_observations.get(t), bool(p.get("is_limited_history"))
+                ),
+                "message": (
+                    f"{t} has {own_return_observations.get(t)} own return observations "
+                    f"over the full exchange window, of which {p.get('data_points', 0)} "
+                    "overlap the benchmark. Factor regression beta and alpha may be "
+                    "constrained."
+                ),
             }
             for t, p in factor_result.get("positions", {}).items()
             if p.get("is_limited_history")
@@ -1711,6 +2267,8 @@ async def get_factor_exposure(
             "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
             "data_range": {"start": start, "end": end},
             "latest_observation_date": _latest_observation_date(price_data),
+            "model_window": full_history.get("window"),
+            "full_history": full_history,
             "history_coverage": history_coverage,
             "lookback_days": lookback_days,
             "methodology": "Statistical factor model with market benchmark regression"
@@ -1749,6 +2307,12 @@ async def get_concentration_metrics(
                 "gini_coefficient": 0.0,
                 "by_weight": {},
                 "by_sector": {},
+                # No book means no weight mass and no rounding to disclose.
+                "by_sector_total": 0.0,
+                "by_sector_published_total": 0.0,
+                "by_sector_rounding_residual": None,
+                "by_sector_rounding_decimals": 4,
+                "sector_weight_basis": None,
                 "error": "No portfolio positions found",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1762,14 +2326,30 @@ async def get_concentration_metrics(
         # market-value weights the metrics above use (stored `weight` can be stale).
         sector_result = await db.execute(select(PortfolioPosition))
         positions = sector_result.scalars().all()
-        by_sector = {}
+        sector_totals: Dict[str, float] = {}
         for pos in positions:
             w = weights.get(pos.ticker, 0.0)
             if w <= 0:
                 continue
             sector = pos.sector or "Unknown"
-            by_sector[sector] = round(by_sector.get(sector, 0.0) + w, 4)
-        
+            sector_totals[sector] = sector_totals.get(sector, 0.0) + w
+
+        # Round ONCE, at the end.  Rounding a running partial sum per position
+        # let each of N positions add up to 5e-5 of error, so a sector published
+        # 0.0984 where the exact weight is 0.0983 and the displayed map summed
+        # to 1.0001. Ordering is by weight descending (ties by name) so a
+        # repeated export is byte-identical; nothing is renormalized, and the
+        # display-only rounding residual is published instead of being folded
+        # back into the largest sector.
+        by_sector = {
+            sector: round(weight, 4)
+            for sector, weight in sorted(
+                sector_totals.items(), key=lambda item: (-item[1], item[0])
+            )
+        }
+        sector_weight_total = float(sum(sector_totals.values()))
+        sector_published_total = float(sum(by_sector.values()))
+        sector_rounding_residual = round(1.0 - sector_published_total, 12)
         coverage = _universe_coverage(
             requested_tickers,
             concentration_result.get("by_weight", {}).keys(),
@@ -1787,6 +2367,13 @@ async def get_concentration_metrics(
             "gini_coefficient": concentration_result.get("gini_coefficient", 0.0),
             "by_weight": concentration_result.get("by_weight", {}),
             "by_sector": by_sector,
+            "by_sector_total": round(sector_weight_total, 12),
+            "by_sector_published_total": round(sector_published_total, 12),
+            "by_sector_rounding_residual": sector_rounding_residual,
+            "by_sector_rounding_decimals": 4,
+            "sector_weight_basis": (
+                "market_value_weights_normalized_to_100_percent"
+            ),
             "universe_coverage": coverage,
             "data_status": _data_status(coverage),
             "methodology": "Concentration analysis using Herfindahl-Hirschman Index (HHI), Effective Positions (N_eff), and Lorenz Gini Coefficient"
@@ -1817,10 +2404,20 @@ async def get_liquidity_metrics(
         if not allocation:
             return {
                 "overall_score": None,
+                "overall_score_raw": None,
+                "overall_band": None,
                 "liquidation_time_days": None,
                 "risk_level": None,
                 "by_position": {},
                 "volume_stats": {},
+                "currency": LIQUIDITY_SCORING_CURRENCY,
+                "base_currency": LIQUIDITY_SCORING_CURRENCY,
+                "currency_provenance": "derived",
+                "monetary_unit": "rupees",
+                "volume_unit": "shares",
+                "turnover_unit": "rupees_per_session",
+                "latest_observation_date": None,
+                "observation_window": {"start": None, "end": None, "ticker_count": 0, "per_ticker": {}},
                 "error": "No portfolio positions found",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1829,10 +2426,20 @@ async def get_liquidity_metrics(
         if not await _has_positive_portfolio_value(db):
             return {
                 "overall_score": None,
+                "overall_score_raw": None,
+                "overall_band": None,
                 "liquidation_time_days": None,
                 "risk_level": None,
                 "by_position": {},
                 "volume_stats": {},
+                "currency": LIQUIDITY_SCORING_CURRENCY,
+                "base_currency": LIQUIDITY_SCORING_CURRENCY,
+                "currency_provenance": "derived",
+                "monetary_unit": "rupees",
+                "volume_unit": "shares",
+                "turnover_unit": "rupees_per_session",
+                "latest_observation_date": None,
+                "observation_window": {"start": None, "end": None, "ticker_count": 0, "per_ticker": {}},
                 "error": "No positive portfolio market value available for liquidity analysis",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1880,10 +2487,21 @@ async def get_liquidity_metrics(
         if not price_data_dict:
             return {
                 "overall_score": None,
+                "overall_score_raw": None,
+                "overall_band": None,
                 "liquidation_time_days": None,
                 "risk_level": None,
                 "by_position": {},
                 "volume_stats": {},
+                "currency": LIQUIDITY_SCORING_CURRENCY,
+                "base_currency": LIQUIDITY_SCORING_CURRENCY,
+                "currency_provenance": "derived",
+                "monetary_unit": "rupees",
+                "volume_unit": "shares",
+                "turnover_unit": "rupees_per_session",
+                "data_range": {"start": start, "end": end},
+                "observation_window": {"start": None, "end": None, "ticker_count": 0, "per_ticker": {}},
+                "latest_observation_date": None,
                 "error": "No price data available for liquidity analysis",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1897,13 +2515,44 @@ async def get_liquidity_metrics(
             liquidity_result.get("by_position", {}).keys(),
             active=tickers,
         )
+        # The delivered range is measured from the frames that were actually
+        # handed to the engine, not from the requested window: a 30-day request
+        # whose newest bar is three days old must publish that gap rather than
+        # the request end as its freshness.
+        delivered = _liquidity_observation_window(price_data_dict)
+        latest_observation_date = _latest_observation_date(price_data_dict)
 
         return {
             "overall_score": liquidity_result.get("overall_score"),
+            "overall_score_raw": liquidity_result.get("overall_score_raw"),
+            "overall_band": liquidity_result.get("overall_band"),
             "liquidation_time_days": liquidity_result.get("liquidation_time_days"),
             "risk_level": liquidity_result.get("risk_level"),
             "by_position": liquidity_result.get("by_position", {}),
             "volume_stats": liquidity_result.get("volume_stats", {}),
+            "currency": LIQUIDITY_SCORING_CURRENCY,
+            "base_currency": LIQUIDITY_SCORING_CURRENCY,
+            "currency_provenance": "derived",
+            "currency_basis": (
+                "The liquidity score is computed against fixed INR-denominated "
+                "thresholds (turnover tiers in Cr/day, market-cap tiers in Cr, "
+                "INR 1bn floor), so INR is the unit the score is expressed in; "
+                "it is not read from a quote."
+            ),
+            "monetary_unit": "rupees",
+            "volume_unit": "shares",
+            "turnover_unit": "rupees_per_session",
+            "data_range": {"start": start, "end": end},
+            "observation_window": delivered,
+            "requested_days": int(
+                _calendar_day_gap(end, start) or 0
+            ),
+            "latest_observation_date": latest_observation_date,
+            "scoring": _liquidity_scoring_block(
+                liquidity_result,
+                data_range={"start": start, "end": end},
+                observation_window=delivered,
+            ),
             "universe_coverage": coverage,
             "data_status": _data_status(coverage),
             "methodology": "Liquidity scoring based on trading volume and market capitalization"
@@ -2384,7 +3033,7 @@ async def get_risk_score(
         # Combine price data, restricted to actual holding history.
         raw_price_data_dict = dict(price_data_dict)
         holdings = await resolve_holdings(db, calculation_tickers)
-        price_data_dict, effectives = holding_window(price_data_dict, holdings)
+        price_data_dict, effectives, start_detail = holding_window_detail(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
         if price_data.empty:
             return {
@@ -2428,8 +3077,20 @@ async def get_risk_score(
         for ticker, count in return_observations.items():
             per_ticker.setdefault(ticker, {})["return_observations"] = count
         history_coverage = holding_coverage(
-            effectives, start, end, int(len(price_data)), per_ticker
+            effectives, start, end, int(len(price_data)), per_ticker,
+            provenance=start_detail,
         )
+        history_coverage["position_observations"] = {
+            ticker: {
+                **_position_provenance(start_detail, ticker),
+                "return_observations": int(count),
+                "limited_history": position_limited_history(
+                    int(count),
+                    bool(per_ticker.get(ticker, {}).get("limited_history", False)),
+                ),
+            }
+            for ticker, count in return_observations.items()
+        }
 
         # Benchmark returns for the factor leg (best-effort: without them the
         # engine excludes + renormalizes instead of scoring a silent R²=0).
@@ -2452,6 +3113,19 @@ async def get_risk_score(
                 for ticker, weight in risk_weights.items()
             }
         risk_result = await analytics_engine.risk_scoring(price_data, risk_weights, benchmark_data=benchmark_returns)
+        # The score is driven by the aggregated portfolio return series, so its
+        # sample is that series' length - published next to the per-position
+        # counts so neither can be read as the other.
+        portfolio_observations = int(
+            aggregate_active_returns(
+                risk_returns.loc[:, [t for t in usable_tickers if t in risk_returns.columns]],
+                risk_weights,
+            ).notna().sum()
+        )
+        history_coverage["portfolio_return_observations"] = portfolio_observations
+        history_coverage["covered_days"] = portfolio_observations
+        history_coverage["covered_days_scope"] = "portfolio_return_observations"
+        history_coverage["annualized"] = annualizable(portfolio_observations)
         if not isinstance(risk_result, Mapping) or risk_result.get("overall_score") is None:
             return {
                 "overall_score": None,
@@ -2593,7 +3267,7 @@ async def get_analytics_summary(
         # unmasked dict is kept for instrument (asset) volatility below.
         holdings = await resolve_holdings(db, calculation_tickers)
         unmasked_dict = price_data_dict
-        price_data_dict, effectives = holding_window(price_data_dict, holdings)
+        price_data_dict, effectives, start_detail = holding_window_detail(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
         if price_data.empty:
             return {
@@ -2618,16 +3292,29 @@ async def get_analytics_summary(
                 "error": "No usable price data within the holding window for summary",
             }
         covered_days = int(len(price_data))
+        # Measured BEFORE the coverage call so the per-position gate can read
+        # each ticker's own return observations; patching them on afterwards
+        # (as this route used to) left `limited_history` on the feed's generic
+        # declaration instead of the position's own sample.
+        return_frame = price_data.pct_change(fill_method=None).iloc[1:]
+        return_observations = {
+            ticker: int(return_frame[ticker].notna().sum())
+            for ticker in requested_tickers
+            if ticker in return_frame.columns
+        }
         per_ticker = {
             ticker: {
                 "raw_days": int(len(unmasked_dict.get(ticker))) if ticker in unmasked_dict and unmasked_dict[ticker] is not None else 0,
                 "masked_days": int(len(price_data_dict.get(ticker))) if ticker in price_data_dict and price_data_dict[ticker] is not None else 0,
+                "return_observations": int(return_observations.get(ticker, 0)),
                 "limited_history": bool(getattr(unmasked_dict.get(ticker), "attrs", {}).get("limited_history", False)),
                 "coverage_reason": getattr(unmasked_dict.get(ticker), "attrs", {}).get("coverage_reason"),
             }
             for ticker in requested_tickers
         }
-        history_coverage = holding_coverage(effectives, start, end, covered_days, per_ticker)
+        history_coverage = holding_coverage(
+            effectives, start, end, covered_days, per_ticker, provenance=start_detail
+        )
 
         # Calculate portfolio metrics for summary
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
@@ -2635,6 +3322,8 @@ async def get_analytics_summary(
         # price frame; missing/interior bars are not covered observations.
         covered_days = int(metrics.get("active_observations") or metrics.get("observations") or 0)
         history_coverage["covered_days"] = covered_days
+        history_coverage["covered_days_scope"] = "portfolio_return_observations"
+        history_coverage["portfolio_return_observations"] = covered_days
         history_coverage["annualized"] = covered_days >= MIN_ANNUALIZE_DAYS
         concentration_result = await analytics_engine.concentration_analysis(weights)
         # Same best-effort benchmark leg as /risk-score so scores agree.
@@ -2675,26 +3364,26 @@ async def get_analytics_summary(
             instrument_volatility = iv_payload["instrument_volatility"]
 
         # Generate summary (annualized ratios suppressed on short history).
-        return_frame = price_data.pct_change(fill_method=None).iloc[1:]
-        return_observations = {
-            ticker: int(return_frame[ticker].notna().sum())
-            for ticker in requested_tickers
-            if ticker in return_frame.columns
-        }
-        for ticker, count in return_observations.items():
-            per_ticker.setdefault(ticker, {})["return_observations"] = count
-        history_coverage["tickers"].update({
+        # `return_observations` was measured before the coverage call above, so
+        # the per-ticker gate below and the published per-ticker
+        # `limited_history` flags read the same own-sample numbers.
+        history_coverage["position_observations"] = {
             ticker: {
-                **history_coverage["tickers"].get(ticker, {}),
-                "return_observations": count,
+                **_position_provenance(start_detail, ticker),
+                "return_observations": int(count),
+                "limited_history": position_limited_history(
+                    int(count),
+                    bool(per_ticker.get(ticker, {}).get("limited_history", False)),
+                ),
             }
             for ticker, count in return_observations.items()
-        })
+        }
         available_tickers = [
             ticker for ticker, count in return_observations.items() if count >= 2
         ]
         limited_history = any(
-            count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
+            position_limited_history(count, False)
+            for count in return_observations.values()
         )
         coverage = _universe_coverage(
             requested_tickers, available_tickers, active=_active_weight_tickers(weights)
@@ -2727,6 +3416,17 @@ async def get_analytics_summary(
             ),
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "latest_observation_date": _latest_observation_date(price_data),
+            "portfolio_return_observations": covered_days,
+            "instrument_risk": {
+                "basis": FULL_HISTORY_BASIS,
+                "observations": instrument_volatility_days,
+                "window": {
+                    "start": _observation_bounds(full_iv_df)[0],
+                    "end": _observation_bounds(full_iv_df)[1],
+                    "days": instrument_volatility_days,
+                },
+                "holding_context_note": FULL_HISTORY_RELATION,
+            },
             "history_coverage": history_coverage,
             "universe_coverage": coverage,
             "data_status": summary_status,
@@ -2745,18 +3445,43 @@ async def get_analytics_summary(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("/performance-history")
+# `response_model=None` keeps the default response the bare array the existing
+# consumers assume, without coercing the opt-in envelope into it.
+@router.get("/performance-history", response_model=None)
 async def get_performance_history(
     days: int = Query(default=90, ge=7, le=1825, description="Lookback window in days"),
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
     benchmark_service: BenchmarkService = Depends(get_benchmark_service),
-) -> List[Dict[str, Any]]:
+    include_metadata: bool = Query(
+        default=False,
+        description=(
+            "Opt-in freshness envelope: return {data, data_status, as_of, "
+            "as_of_semantics, history_coverage, warnings} instead of the bare "
+            "array. The default response is unchanged."
+        ),
+    ),
+) -> Any:
     """
     Historical portfolio value series (price x quantity) over time from cached OHLCV.
+
+    Returns a bare `List[Dict]` by default - the shape every existing consumer
+    (frontend hook, chart, backend tests) assumes. `include_metadata=true` opts
+    into an envelope that adds the delivered window, the observation count, the
+    last delivered observation and a documented freshness verdict; see
+    `_performance_history_envelope` for the exact numeric rule. The request is
+    never substituted for the delivery: `as_of` is the last delivered
+    observation, and no gap is backfilled.
     """
     try:
+        # A direct in-process call (backend unit tests) hands this function the
+        # FastAPI `Query` placeholder rather than a bool, and that placeholder is
+        # truthy. Only an explicit boolean opts in, so the default response stays
+        # the bare array for every caller that does not ask for the envelope.
+        if not isinstance(include_metadata, bool):
+            include_metadata = False
+
         # Resolve positions & quantities
         result = await db.execute(select(PortfolioPosition))
         db_positions = {p.ticker: p for p in result.scalars().all()}
@@ -2769,8 +3494,20 @@ async def get_performance_history(
         if len(ticker_list) > _MAX_TICKERS:
             raise HTTPException(status_code=422, detail=f"At most {_MAX_TICKERS} tickers are allowed")
 
+        end = datetime.now().strftime('%Y-%m-%d')
+        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        def _deliver(rows: List[Dict[str, Any]], extra: Optional[Iterable[str]] = None) -> Any:
+            if not include_metadata:
+                return rows
+            return _performance_history_envelope(
+                rows, requested_start=start, requested_end=end, warnings=extra
+            )
+
         if not ticker_list:
-            return []
+            return _deliver(
+                [], extra=["No positions resolved for the requested tickers."]
+            )
 
         quantities = {}
         for t in ticker_list:
@@ -2789,16 +3526,15 @@ async def get_performance_history(
                 quantities[t] = 1.0
 
         if not quantities:
-            return []
-
-        end = datetime.now().strftime('%Y-%m-%d')
-        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            return _deliver(
+                [], extra=["No position carried a usable share quantity."]
+            )
 
         # Fetch price data concurrently
         price_data_dict = await _fetch_price_series_dict(data_service, list(quantities), start, end)
 
         if not price_data_dict:
-            return []
+            return _deliver([], extra=["No price data was delivered for the requested window."])
 
         price_df = pd.DataFrame(price_data_dict)
         # Drop pre-holding dates: quantity x past-price before import is phantom
@@ -2825,7 +3561,9 @@ async def get_performance_history(
         # flat segment.
         price_df = pd.DataFrame(price_df_dict).sort_index().replace([np.inf, -np.inf], np.nan)
         if price_df.empty:
-            return []
+            return _deliver(
+                [], extra=["No price data falls inside the current holding window."]
+            )
         source_currencies: Dict[str, str] = {}
         for ticker in quantities:
             position = db_positions.get(ticker)
@@ -2873,7 +3611,9 @@ async def get_performance_history(
         portfolio_series = price_df.mul(q_series, axis=1).sum(axis=1, min_count=len(q_series))
         portfolio_series = portfolio_series.dropna()
         if portfolio_series.empty:
-            return []
+            return _deliver(
+                [], extra=["No date had a usable price for every priced position."]
+            )
 
         # The first observation has no measured return.  Omit it rather than
         # publishing a synthetic 0.0% return; the remaining series retains the
@@ -2922,7 +3662,7 @@ async def get_performance_history(
                 item["benchmark_value_currency"] = target_currency
             output.append(item)
 
-        return output
+        return _deliver(output)
 
     except HTTPException:
         raise
@@ -3264,18 +4004,46 @@ async def get_risk_contribution(
         # Euler risk contribution is an asset-risk question: the covariance of
         # the CURRENT book comes from full exchange history (DSP-10). Masking
         # to the ~6-day holding window degenerated contributions and N/A'd the
-        # portfolio vol. Holding-period truncation stays disclosed.
+        # portfolio vol. Holding-period truncation stays disclosed, but only as
+        # clearly ancillary context: the model evidence carries its own window,
+        # observation count and annualization flag.
         returns_df, port_ret, _ = await _build_wide_returns(
             ticker_list, weights, start, end, data_service,
         )
-        effectives = effective_starts(holdings, None)
-        holding_context = holding_coverage(effectives, start, end, len(port_ret))
-        history_coverage = {
-            **holding_context,
-            "calculation_basis": "full_exchange_history_current_weights",
-            "calculation_observations": len(port_ret),
-            "holding_context": holding_context,
+        # Provenance comes from the stored import stamps only. The buy-price
+        # inference needs the price frames this leg deliberately does not hold,
+        # so no start here is ever claimed as inferred without evidence - and
+        # this adds no vendor call.
+        start_detail = effective_start_detail(holdings, None)
+        effectives = {
+            ticker: entry.get("analytics_start") for ticker, entry in start_detail.items()
         }
+        own_return_observations = _own_return_observations(returns_df)
+        holding_context = holding_coverage(
+            effectives,
+            start,
+            end,
+            len(port_ret),
+            {
+                ticker: {
+                    "raw_days": int(returns_df[ticker].notna().sum()),
+                    "masked_days": int(returns_df[ticker].notna().sum()),
+                    "return_observations": int(count),
+                }
+                for ticker, count in own_return_observations.items()
+            },
+            provenance=start_detail,
+        )
+        full_history = _full_history_evidence(
+            returns_df,
+            requested_start=start,
+            requested_end=end,
+        )
+        # `covered_days` used to be the model's own 252 observations published
+        # under holding names, so a 39-day holding window read as a 252-day
+        # holding coverage. The two windows are now separate objects.
+        history_coverage = _model_history_coverage(holding_context, full_history)
+        history_coverage["calculation_observations"] = int(len(port_ret))
         assets = list(returns_df.columns)
         missing_assets = [ticker for ticker in ticker_list if ticker not in set(assets)]
         w = np.array([weights.get(a, 0.0) for a in assets])
@@ -3429,10 +4197,15 @@ async def get_risk_contribution(
             "portfolio_volatility_annualized": round(sigma_p, 4),
             "portfolio_var_95_daily": round(var_95, 6),
             "portfolio_cvar_95_daily": round(float(port_ret[tail].mean()), 6) if tail.any() else None,
+            "full_history": full_history,
             "history_coverage": history_coverage,
             "methodology": "Euler decomposition (volatility) + historical tail attribution (CVaR)",
         }
-        return apply_annualization_gate(result, ["portfolio_volatility_annualized"], len(port_ret))
+        result = apply_annualization_gate(result, ["portfolio_volatility_annualized"], len(port_ret))
+        # The gate above writes a portfolio-level `annualized`; the model's own
+        # verdict stays in `full_history` and is never overwritten by it.
+        result["full_history"] = full_history
+        return result
     except HTTPException:
         raise
     except Exception:
@@ -3715,11 +4488,20 @@ async def get_regime(
 
         result = await detect_regime(db, lookback_days=lookback_days, portfolio_returns=port_ret)
         if history_coverage is not None and "portfolio_in_current_regime" in result:
-            result["portfolio_in_current_regime"]["history_coverage"] = history_coverage
+            # The conditional block measured the days the classifier assigned
+            # to the CURRENT regime, so it gets a coverage object describing
+            # that sample - not the holding window it was drawn from.
+            result["portfolio_in_current_regime"]["history_coverage"] = (
+                _conditional_regime_coverage(
+                    result["portfolio_in_current_regime"], history_coverage
+                )
+            )
         if history_coverage is not None:
             # Top-level copy lets the UI distinguish "no overlap" from
-            # "no positions / no price data" (both omit the regime block).
+            # "no positions / no price data" (both omit the regime block). It
+            # is the holding-window POOL the conditional sample is drawn from.
             result.setdefault("history_coverage", history_coverage)
+            result.setdefault("holding_context", history_coverage)
             result["universe_coverage"] = _universe_coverage(
                 portfolio_tickers,
                 history_coverage.get("model_used_tickers", []),

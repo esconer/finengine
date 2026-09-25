@@ -807,6 +807,402 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
     }
 
 
+# ---------------------------------------------------------------------------
+# Dashboard composition helpers
+#
+# The dashboard page is a composition of independent analytics endpoints, so it
+# must disclose each leg's own delivered window instead of inheriting one
+# unrelated timestamp (a portfolio quote) for the whole page.  These helpers
+# are dashboard-local: the shared status/coverage/as-of contract helpers above
+# stay the single policy and are reused rather than re-implemented.
+# ---------------------------------------------------------------------------
+
+# Window the dashboard performance chart requests.  A shorter delivery is only
+# judgeable because the request is published beside the delivered rows.
+PERFORMANCE_HISTORY_DAYS = 90
+
+# Documented freshness rule for one performance component.
+#   available   -> the endpoint published a measured expectation, the delivered
+#                  observations cover at least PERFORMANCE_COVERAGE_FLOOR of it,
+#                  and it flagged neither truncation nor staleness;
+#   partial     -> coverage below that floor, or the endpoint declared the
+#                  window truncated/stale;
+#   unavailable -> no observation was delivered at all;
+#   unknown     -> the endpoint published no expectation (the legacy bare-array
+#                  response), so the window is neither provably complete nor
+#                  provably cut, and the exporter claims neither.
+PERFORMANCE_COVERAGE_FLOOR = 0.8
+
+# Composite as-of policy label.  A composite is only as fresh as its stalest
+# leg, which is exactly what the shared `_as_of` composite rule implements, so
+# the export publishes the policy name instead of a second date policy.
+COMPOSITE_AS_OF_SEMANTICS = "oldest_component_observation"
+
+# Severity order used when a component's payload status and its measured
+# freshness disagree: the worse of the two is published, never the kinder.
+_STATUS_SEVERITY: Dict[str, int] = {
+    "available": 0,
+    "unknown": 0,
+    "partial": 1,
+    "unavailable": 2,
+}
+
+# Reason vocabulary for the dashboard summary's field-level linkage.
+_SUMMARY_REASON_LINKED = "linked_from_canonical_sibling"
+_SUMMARY_REASON_ALREADY_PUBLISHED = "source_value_already_published"
+_SUMMARY_REASON_SECTION_PARTIAL = "source_section_partial"
+_SUMMARY_REASON_SECTION_UNAVAILABLE = "source_section_unavailable"
+_SUMMARY_REASON_VALUE_MISSING = "source_value_not_published"
+_SUMMARY_REASON_VALUE_NOT_FINITE = "source_value_not_finite"
+
+# The risk-score route hardcodes `change: 0` because no previous score is
+# persisted, so there is no genuine delta behind the number.  The route is not
+# owned by this ticket, so the export refuses to publish the zero as a measured
+# change: it becomes null with a machine-readable reason.
+#
+# Recommended backend one-liner (NOT applied here - app/api/analytics.py is
+# owned by the performance-history change): persist the previous score and
+# publish a real delta, e.g.
+#   "change": None if previous_score is None else previous_score - overall_score,
+#   "prior_score": previous_score,
+RISK_SCORE_UNMEASURED_REASON = "no_persisted_prior_score"
+# Any of these alongside `change` proves the zero is a measured delta.
+_RISK_SCORE_CHANGE_EVIDENCE = ("change_status", "prior_score", "change_basis")
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """Finite float or None; bools and numeric strings are not measurements."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    number = _finite_number(value)
+    if number is None:
+        return None
+    return int(number)
+
+
+def _date_text(value: Any) -> Optional[str]:
+    """ISO date portion of a declared timestamp, or None."""
+    text = _as_of_text(value)
+    return text[:10] if text else None
+
+
+# Which declared field produced an as-of, so freshness is self-describing.  The
+# keys mirror `_AS_OF_KEYS`; a series resolves through its newest record date.
+_AS_OF_SEMANTICS: Dict[str, str] = {
+    "latest_observation_date": "latest_observation_date",
+    "as_of": "declared_as_of",
+    "last_updated": "last_updated",
+    "updated_at": "updated_at",
+    "generated_at": "generated_at",
+    "date": "series_record_date",
+}
+
+
+def _declared_as_of_semantics(value: Any, resolved: Optional[str]) -> Optional[str]:
+    if not resolved:
+        return None
+    if isinstance(value, Mapping):
+        for key in _AS_OF_KEYS:
+            if _as_of_text(value.get(key)) == resolved:
+                return _AS_OF_SEMANTICS[key]
+        return _AS_OF_SEMANTICS["as_of"]
+    if isinstance(value, (list, tuple)):
+        return _AS_OF_SEMANTICS["date"]
+    return _AS_OF_SEMANTICS["as_of"]
+
+
+def _component_as_of_entry(
+    component: Any, declared_semantics: Optional[str] = None
+) -> Dict[str, Optional[str]]:
+    """One component's freshness, resolved by the shared `_as_of` policy.
+
+    The composite's own as-of is the oldest leg, so the per-component map must
+    use the same resolver; only the semantics label is added here.
+    """
+    data = component.get("data") if isinstance(component, Mapping) else component
+    resolved = _as_of(data)
+    return {
+        "as_of": resolved,
+        "as_of_semantics": declared_semantics or _declared_as_of_semantics(data, resolved),
+    }
+
+
+def _split_performance_response(value: Any) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
+    """Accept both the metadata envelope and the legacy bare array.
+
+    The route keeps its bare-array default; the exporter opts into the envelope
+    with `include_metadata=true`.  A bare array is still a valid delivery, it
+    simply carries no measured window, so its freshness stays unknown instead
+    of being called complete.
+    """
+    if isinstance(value, Mapping):
+        rows = value.get("data")
+        return (list(rows) if isinstance(rows, list) else []), dict(value)
+    if isinstance(value, (list, tuple)):
+        return list(value), None
+    return [], None
+
+
+def _window_text(start: Optional[str], end: Optional[str]) -> str:
+    if start and end:
+        return f"{start} to {end}"
+    return end or start or "unknown"
+
+
+def _performance_history_component(
+    component: Dict[str, Any],
+    requested_days: int = PERFORMANCE_HISTORY_DAYS,
+) -> Dict[str, Any]:
+    """Publish the delivered performance window beside the delivered rows.
+
+    The component keeps the endpoint's rows as its series and gains the
+    endpoint's own `history_coverage`, the as-of that actually measured those
+    rows, and a deterministic warning naming requested versus delivered.  A
+    materially short or stale delivery surfaces as `partial` instead of passing
+    as a complete chart, and a delivery with no measured expectation stays
+    `unknown` rather than being guessed either way.
+    """
+    rows, envelope = _split_performance_response(component.get("data"))
+    coverage = envelope.get("history_coverage") if envelope else None
+    coverage = coverage if isinstance(coverage, Mapping) else {}
+
+    row_dates = [
+        text
+        for text in (_date_text(row.get("date")) for row in rows if isinstance(row, Mapping))
+        if text
+    ]
+    declared_count = _optional_int(coverage.get("observation_count"))
+    observation_count = declared_count if declared_count is not None else len(rows)
+    expected = _optional_int(coverage.get("expected_observation_count"))
+    ratio = _finite_number(coverage.get("coverage_ratio"))
+    if ratio is None and expected:
+        ratio = round(observation_count / expected, 6)
+    delivered_start = _date_text(coverage.get("delivered_start")) or (min(row_dates) if row_dates else None)
+    delivered_end = _date_text(coverage.get("delivered_end")) or (max(row_dates) if row_dates else None)
+    truncated = coverage.get("truncated") if isinstance(coverage.get("truncated"), bool) else None
+    stale = coverage.get("stale") if isinstance(coverage.get("stale"), bool) else None
+    declared_status = _normalize_data_status(envelope.get("data_status") if envelope else None)
+
+    if observation_count == 0:
+        freshness = "unavailable"
+    elif declared_status in {"partial", "unavailable"}:
+        freshness = declared_status
+    elif expected is None:
+        # No measured expectation: the window is unmeasured, not complete.
+        freshness = "unknown"
+    elif ratio is not None and ratio < PERFORMANCE_COVERAGE_FLOOR:
+        freshness = "partial"
+    elif truncated is True or stale is True:
+        freshness = "partial"
+    else:
+        freshness = "available"
+
+    warnings: List[str] = []
+    for item in (envelope.get("warnings") if envelope else None) or []:
+        text = str(item).strip() if item is not None else ""
+        if text:
+            warnings.append(text)
+
+    requested = _optional_int(coverage.get("requested_days")) or requested_days
+    if freshness == "partial":
+        warnings.append(
+            "Performance history delivered "
+            f"{observation_count} of {expected} observations for the requested "
+            f"{requested}-day window ({_window_text(delivered_start, delivered_end)})"
+            + (", flagged stale by the endpoint" if stale is True else "")
+        )
+    elif freshness == "unknown":
+        warnings.append(
+            f"Performance history delivered {observation_count} observation(s) for the requested "
+            f"{requested}-day window; the endpoint published no expected observation count, "
+            "so the delivered window is unmeasured"
+        )
+    elif freshness == "unavailable":
+        warnings.append(
+            "Performance history delivered no observations for the requested "
+            f"{requested}-day window"
+        )
+
+    # The worse of the payload status and the measured freshness is published,
+    # never the kinder one.  An unrecognizable status is not a measurement of
+    # availability, so it resolves to `unavailable` instead of leaking through.
+    payload_status = _normalize_data_status(component.get("status")) or "unavailable"
+    status = max(
+        (payload_status, freshness),
+        key=lambda value: _STATUS_SEVERITY.get(value, 2),
+    )
+
+    as_of = _date_text(envelope.get("as_of")) if envelope else None
+    as_of = as_of or delivered_end
+    declared_semantics = envelope.get("as_of_semantics") if envelope else None
+    if not isinstance(declared_semantics, str) or not declared_semantics.strip():
+        declared_semantics = "last_delivered_observation" if as_of else None
+
+    result: Dict[str, Any] = {
+        "status": status,
+        "data": rows,
+        "as_of": as_of,
+        "as_of_semantics": declared_semantics,
+        "history_coverage": {
+            "requested_start": _date_text(coverage.get("requested_start")),
+            "requested_end": _date_text(coverage.get("requested_end")),
+            "requested_days": requested,
+            "delivered_start": delivered_start,
+            "delivered_end": delivered_end,
+            "observation_count": observation_count,
+            "expected_observation_count": expected,
+            "first_observation": _date_text(coverage.get("first_observation")) or delivered_start,
+            "last_observation": _date_text(coverage.get("last_observation")) or delivered_end,
+            "coverage_ratio": ratio,
+            "truncated": truncated,
+            "stale": stale,
+            "status": "unknown" if freshness == "unknown" else freshness,
+            "rule": (
+                f"partial when coverage_ratio < {PERFORMANCE_COVERAGE_FLOOR} or the endpoint "
+                "flags the window truncated/stale; unknown when the endpoint publishes no "
+                "expected observation count"
+            ),
+        },
+    }
+    if component.get("error"):
+        result["error"] = str(component["error"])
+    if warnings:
+        result["warnings"] = list(dict.fromkeys(warnings))
+    return result
+
+
+def _summary_source_value(component_name: str, data: Any) -> Tuple[Optional[float], str]:
+    """Canonical sibling value for one summary field, plus how it was read."""
+    if not isinstance(data, Mapping):
+        return None, _SUMMARY_REASON_VALUE_MISSING
+    if component_name == "forecast_risk":
+        portfolio = data.get("portfolio")
+        holders = (portfolio, data) if isinstance(portfolio, Mapping) else (data,)
+        keys = ("volatility_forecast", "forecast_volatility")
+    elif component_name == "liquidity":
+        holders = (data,)
+        keys = ("overall_score",)
+    else:
+        return None, _SUMMARY_REASON_VALUE_MISSING
+    for holder in holders:
+        for key in keys:
+            if key in holder:
+                raw = holder.get(key)
+                if raw is None:
+                    # Present but empty: the source published no measurement.
+                    return None, _SUMMARY_REASON_VALUE_MISSING
+                value = _finite_number(raw)
+                if value is not None:
+                    return value, _SUMMARY_REASON_LINKED
+                return None, _SUMMARY_REASON_VALUE_NOT_FINITE
+    return None, _SUMMARY_REASON_VALUE_MISSING
+
+
+# (summary field, canonical source section) pairs.  The dashboard summary
+# endpoint deliberately publishes these as null because it does not itself
+# compute a forecast or a liquidity score; the export links the already
+# canonical sibling result instead of leaving a null beside an available value.
+_SUMMARY_CANONICAL_SOURCES: Tuple[Tuple[str, str], ...] = (
+    ("forecast_volatility", "forecast_risk"),
+    ("liquidity_score", "liquidity"),
+)
+
+
+def _link_dashboard_summary(components: Dict[str, Any]) -> List[str]:
+    """Fill dashboard summary fields from canonical sibling results.
+
+    The link is published only when the value is finite AND the sibling section
+    is usable; otherwise the field stays null and a machine-readable
+    `field_status` entry records the value, source section, source status and
+    reason.  Every write goes to a deep copy, so a cached section is never
+    mutated and repeated assembly stays deterministic.
+    """
+    summary = components.get("summary")
+    if not isinstance(summary, Mapping):
+        return []
+    source = summary.get("data")
+    if not isinstance(source, Mapping):
+        return []
+
+    data = copy.deepcopy(source)
+    field_status: Dict[str, Any] = {}
+    warnings: List[str] = []
+    for field_name, component_name in _SUMMARY_CANONICAL_SOURCES:
+        sibling = components.get(component_name)
+        sibling_status = (
+            str(sibling.get("status") or "unavailable") if isinstance(sibling, Mapping) else "unavailable"
+        )
+        sibling_data = sibling.get("data") if isinstance(sibling, Mapping) else None
+        value, reason = _summary_source_value(component_name, sibling_data)
+        published = _finite_number(data.get(field_name))
+        if published is not None:
+            # The endpoint already published a measurement: keep it.
+            value, reason = published, _SUMMARY_REASON_ALREADY_PUBLISHED
+        elif sibling_status != "available":
+            # A partial/unavailable sibling never becomes a summary headline.
+            value, reason = None, (
+                _SUMMARY_REASON_SECTION_PARTIAL
+                if sibling_status == "partial"
+                else _SUMMARY_REASON_SECTION_UNAVAILABLE
+            )
+        if reason == _SUMMARY_REASON_LINKED and value is not None:
+            data[field_name] = value
+        elif reason == _SUMMARY_REASON_ALREADY_PUBLISHED:
+            pass
+        else:
+            value = None
+            data[field_name] = None
+            warnings.append(
+                f"Dashboard summary {field_name} is unavailable: canonical {component_name} "
+                f"section is {sibling_status} ({reason})"
+            )
+        field_status[field_name] = {
+            "value": value,
+            "source_section": component_name,
+            "source_status": sibling_status,
+            "reason": reason,
+        }
+
+    summary["data"] = data
+    summary["field_status"] = field_status
+    return warnings
+
+
+def _normalize_risk_score_change(component: Dict[str, Any]) -> List[str]:
+    """Stop publishing the risk score's hardcoded `change: 0` as a delta.
+
+    The route cannot compute a change because no prior score is persisted, so
+    an exact zero with no accompanying evidence is unmeasured, not unchanged.
+    The value becomes null with a reason instead of an invented delta; the
+    score itself is never compared against the summary's score, which would
+    fabricate a delta from two different measurements.
+    """
+    data = component.get("data")
+    if not isinstance(data, Mapping) or "change" not in data:
+        return []
+    change = _finite_number(data.get("change"))
+    if change is None or change != 0.0:
+        return []
+    if any(key in data for key in _RISK_SCORE_CHANGE_EVIDENCE):
+        return []
+
+    payload = copy.deepcopy(data)
+    payload["change"] = None
+    payload["change_status"] = "unavailable"
+    payload["change_reason"] = RISK_SCORE_UNMEASURED_REASON
+    component["data"] = payload
+    return [
+        "Risk-score change is unmeasured ("
+        f"{RISK_SCORE_UNMEASURED_REASON}): the risk-score route publishes a hardcoded 0 "
+        "with no persisted prior score"
+    ]
+
+
 class PortfolioContextService:
     """Collect the portfolio pages into one stable AI-facing document."""
 
@@ -960,6 +1356,10 @@ class PortfolioContextService:
                     status=dashboard.status,
                     detail=options.detail,
                 )
+                # A composite page is only as fresh as its stalest leg, so the
+                # published date stays the shared `_as_of` composite result and
+                # only its policy is labelled here.
+                sections["dashboard"]["as_of_semantics"] = COMPOSITE_AS_OF_SEMANTICS
                 context.cached_sections["dashboard"] = sections["dashboard"]
 
         # Keep the envelope's section order aligned with the requested/default
@@ -1120,6 +1520,36 @@ class PortfolioContextService:
             logger.error("AI context component %s failed: %s", name, type(exc).__name__)
             return {"status": "unavailable", "data": None, "error": _safe_error(exc)}
 
+    async def _performance_history_request(self, context: _BuildContext) -> Any:
+        """Request the delivered-window envelope, tolerating a legacy signature.
+
+        The route keeps its bare-array default; the exporter opts in with
+        `include_metadata=true` so a short delivery is measurable.  If the route
+        does not accept the flag yet, retry the plain call rather than failing
+        the whole dashboard - the delivered window then stays unmeasured instead
+        of being assumed complete.
+        """
+        try:
+            return await analytics_api.get_performance_history(
+                days=PERFORMANCE_HISTORY_DAYS,
+                tickers=context.ticker_csv,
+                db=self.db,
+                data_service=self.data_service,
+                benchmark_service=self.benchmark_service,
+                include_metadata=True,
+            )
+        except TypeError as exc:
+            if "include_metadata" not in str(exc):
+                raise
+            logger.debug("performance-history envelope unsupported; using the array response")
+            return await analytics_api.get_performance_history(
+                days=PERFORMANCE_HISTORY_DAYS,
+                tickers=context.ticker_csv,
+                db=self.db,
+                data_service=self.data_service,
+                benchmark_service=self.benchmark_service,
+            )
+
     async def _collect_dashboard(self, context: _BuildContext) -> _Collected:
         """Collect the dashboard's visible data without duplicating sections.
 
@@ -1127,7 +1557,9 @@ class PortfolioContextService:
         default export also requests those endpoints as named sections, so
         reuse their canonical section envelopes here. Components that have no
         standalone export section (risk score and the dashboard summary) are
-        fetched once and kept request-scoped.
+        fetched once and kept request-scoped. Every component keeps its own
+        freshness evidence, so the page-level as-of is the oldest measured leg
+        rather than an unrelated portfolio quote.
         """
         async def cached_or_fetch(
             name: str,
@@ -1181,16 +1613,12 @@ class PortfolioContextService:
                 benchmark_service=self.benchmark_service,
             ),
         )
-        components["performance_history"] = await cached_or_fetch(
-            "performance_history",
-            None,
-            lambda: analytics_api.get_performance_history(
-                days=90,
-                tickers=context.ticker_csv,
-                db=self.db,
-                data_service=self.data_service,
-                benchmark_service=self.benchmark_service,
+        components["performance_history"] = _performance_history_component(
+            await self._component(
+                "performance_history",
+                lambda: self._performance_history_request(context),
             ),
+            PERFORMANCE_HISTORY_DAYS,
         )
         components["realized_risk"] = await cached_or_fetch(
             "realized_risk",
@@ -1279,6 +1707,28 @@ class PortfolioContextService:
             ),
         )
         data = {"components": components}
+        # Summary linkage and the risk-score delta both need every component to
+        # be collected first, because they read canonical sibling results.
+        warnings: List[str] = []
+        warnings.extend(_link_dashboard_summary(components))
+        warnings.extend(_normalize_risk_score_change(components.get("risk_score") or {}))
+        # Component-level warnings (the delivered performance window, the
+        # unmeasured risk delta) live beside their component's data, so they are
+        # lifted onto the section here for human-readable disclosures.
+        for component in components.values():
+            if isinstance(component, Mapping):
+                warnings.extend(str(item) for item in component.get("warnings") or [])
+        declared_semantics = {
+            "performance_history": components["performance_history"].get("as_of_semantics")
+        }
+        data["component_as_of"] = {
+            name: _component_as_of_entry(component, declared_semantics.get(name))
+            for name, component in components.items()
+        }
+        # Label the composite policy beside the per-component map. The date
+        # itself stays owned by the shared `_as_of` composite rule (oldest
+        # component wins), so no second as-of policy can drift from it.
+        data["as_of_semantics"] = COMPOSITE_AS_OF_SEMANTICS
         for component_name in ("risk_contribution", "summary", "realized_risk"):
             component = components.get(component_name)
             if not isinstance(component, Mapping):
@@ -1290,8 +1740,9 @@ class PortfolioContextService:
                 break
         return _Collected(
             data=data,
-            inputs={"performance_days": 90, "tickers": context.tickers},
+            inputs={"performance_days": PERFORMANCE_HISTORY_DAYS, "tickers": context.tickers},
             status=_group_status(components),
+            warnings=warnings,
         )
 
     async def _collect_realized_risk(self, context: _BuildContext) -> _Collected:
@@ -1713,6 +2164,19 @@ def _compact_detail(key: str, data: Any, detail: str) -> Tuple[Any, List[str]]:
             if isinstance(values, list) and len(values) > 90:
                 performance["data"] = values[-90:]
                 omitted.append("components.performance_history.data")
+                # Trimming the series must not leave the declared coverage
+                # describing a longer window than the rows a consumer can see.
+                # Recompute the count/first-observation from the delivered rows
+                # and say the series was shortened, rather than publishing an
+                # observation_count with no matching data behind it.
+                coverage = performance.get("history_coverage")
+                if isinstance(coverage, dict):
+                    coverage["observation_count"] = len(performance["data"])
+                    first = performance["data"][0] if performance["data"] else None
+                    if isinstance(first, dict):
+                        coverage["first_observation"] = first.get("date", coverage.get("first_observation"))
+                    coverage["series_trimmed_in_summary"] = True
+                    coverage["series_trimmed_observation_count"] = len(values)
     elif key == "tear_sheet" and isinstance(compact, dict):
         monthly = compact.get("monthly_returns")
         if isinstance(monthly, dict) and len(monthly) > 24:

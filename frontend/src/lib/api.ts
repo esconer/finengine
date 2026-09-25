@@ -128,6 +128,42 @@ export interface ErrorResponse {
   status_code: number;
 }
 
+// Performance history wire shapes. Declared locally: the endpoint keeps its
+// bare-row default and only wraps the rows when `include_metadata=true`, so
+// both responses must typecheck. A row carries the measured portfolio value.
+export interface PerformanceHistoryRow {
+  date: string;
+  portfolio_value: number;
+  benchmark_value?: number;
+  return?: number;
+  [key: string]: unknown;
+}
+
+export interface PerformanceHistoryCoverage {
+  requested_start?: string | null;
+  requested_end?: string | null;
+  requested_days?: number | null;
+  delivered_start?: string | null;
+  delivered_end?: string | null;
+  observation_count?: number | null;
+  expected_observation_count?: number | null;
+  first_observation?: string | null;
+  last_observation?: string | null;
+  coverage_ratio?: number | null;
+  truncated?: boolean | null;
+  stale?: boolean | null;
+  status?: string | null;
+}
+
+export interface PerformanceHistoryEnvelope {
+  data: PerformanceHistoryRow[];
+  data_status?: 'available' | 'partial' | 'unavailable';
+  as_of?: string | null;
+  as_of_semantics?: string | null;
+  history_coverage?: PerformanceHistoryCoverage | null;
+  warnings?: string[] | null;
+}
+
 // Portfolio API
 export const portfolioApi = {
   // Get portfolio summary (defaults to INR currency for Indian market)
@@ -429,11 +465,16 @@ export const analyticsApi = {
     return response.data;
   },
 
-  // Get historical performance
+  // Get historical performance.
+  // Default response is the bare row array. `include_metadata=true` opts into
+  // the disclosure envelope: { data, data_status, as_of, as_of_semantics,
+  // history_coverage, warnings } so a short delivery is measurable instead of
+  // being presented as a complete chart.
   async getPerformanceHistory(params?: {
     days?: number;
     tickers?: string;
-  }): Promise<Array<{ date: string; value: number; benchmark?: number }>> {
+    include_metadata?: boolean;
+  }): Promise<PerformanceHistoryEnvelope | PerformanceHistoryRow[]> {
     const response = await apiClient.get('/analytics/performance-history', { params });
     return response.data;
   },

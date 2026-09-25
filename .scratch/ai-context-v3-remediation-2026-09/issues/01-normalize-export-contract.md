@@ -12,7 +12,7 @@
 
 **bfinance gate:** No bfinance edits. A bfinance limitation must be labelled `estimated`, `fallback`, or `unavailable`; if a source change is genuinely required, stop and write a source-specific proposal for explicit user approval.
 
-**Status:** claimed
+**Status:** resolved
 
 ## Comments
 
@@ -40,11 +40,14 @@ regression set green (1 known pre-existing baseline failure), frontend 203/203,
 
 **Still outstanding for this ticket:**
 
-- Bump `SCHEMA_VERSION` to `2.0` (breaking contract revision) and update the
-  docs/`schema_version` references. Deferred to avoid a mid-wave edit of a file
-  the contract agent still owned.
-- Ticket 02 must add explicit `as_of_semantics` to the section model once the
-  dashboard/India components publish one.
+- Bump `SCHEMA_VERSION` to `2.0` — DONE (service constant, both backend test
+  fixtures, `docs/ai-context.md`, frontend fixtures). The `as_of_semantics`
+  section field is still open and belongs to ticket 02.
+- `test_optimizer_reports_weight_basis_only_for_a_dropped_leg` reached the live
+  USD/INR vendor, so it passed or failed depending on FX availability. Added an
+  offline `_StubFX` seam; that file now runs in 0.8s instead of 28s.
+
+**Committed:** `432e7ca`.
 
 - [ ] `weight_basis` is emitted only when an active leg was actually dropped and weights were renormalized; weightless analyses do not claim an allocation basis.
 - [ ] Public `data_status` values are normalized to `available|partial|unavailable`; coverage keeps `complete|partial|unavailable|unknown`; coverage values never leak into `data_status`.

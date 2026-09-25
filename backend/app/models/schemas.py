@@ -137,6 +137,11 @@ class AIContextSection(BaseModel):
     detail: Literal["summary", "full"]
     generated_at: datetime
     as_of: Optional[str] = None
+    # Which declared field produced `as_of` (e.g. `latest_observation_date`,
+    # `last_updated`, or `oldest_component_observation` for a composite page
+    # whose value is its stalest measured component). Absent when the section
+    # measured no freshness at all.
+    as_of_semantics: Optional[str] = None
     currency: Optional[str] = None
     inputs: Dict[str, Any] = Field(default_factory=dict)
     coverage: Optional[Dict[str, Any]] = None

@@ -61,7 +61,7 @@ export default function DashboardSummary() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const { data: analyticsData, loading: analyticsLoading, refresh: refreshAnalytics } = usePortfolioAnalytics();
-  const { performanceData, loading: performanceLoading } = usePerformanceData(90);
+  const { performanceData, loading: performanceLoading, freshness: performanceFreshness } = usePerformanceData(90);
   const sectorData = useSectorAllocation();
   const [regimeInfo, setRegimeInfo] = useState<{ current_regime: string; stability_pct: number } | null>(null);
   const [riskDrivers, setRiskDrivers] = useState<[string, number][] | null>(null);
@@ -180,6 +180,47 @@ export default function DashboardSummary() {
   const instrumentVol: number | null = summaryAny?.instrument_volatility ?? null;
   const instrumentVolDays: number | null = summaryAny?.instrument_volatility_days ?? null;
   const volCardValue = instrumentVol ?? portfolioMetrics.volatility;
+
+  // The risk-score route publishes a hardcoded `change: 0` because no previous
+  // score is persisted, so an exact zero with no accompanying evidence is
+  // UNMEASURED, not "unchanged". Render N/A rather than a fabricated 0.00% and
+  // never derive a delta by comparing two different scores.
+  const riskScoreDelta = useMemo<{ display: string; reason: string | null } | null>(() => {
+    const riskScore = analyticsData.riskScore as any;
+    if (!riskScore) return null;
+    const change = typeof riskScore.change === 'number' && Number.isFinite(riskScore.change)
+      ? riskScore.change
+      : null;
+    const hasEvidence = Boolean(riskScore.change_status || riskScore.prior_score != null);
+    if (change === null || (change === 0 && !hasEvidence)) {
+      return { display: 'N/A', reason: 'no persisted prior score' };
+    }
+    return { display: `${change > 0 ? '+' : ''}${change.toFixed(2)}`, reason: null };
+  }, [analyticsData.riskScore]);
+
+  // Caption the delivered performance window whenever it is not a complete
+  // measurement. An unavailable window never gets a freshness claim.
+  const performanceFreshnessCaption = useMemo<string | null>(() => {
+    if (!performanceFreshness) return null;
+    const { status } = performanceFreshness;
+    if (status === 'available' || status === 'unknown') return null;
+    if (status === 'unavailable') {
+      return 'Performance window unavailable — no delivered observations for the requested range';
+    }
+    const expected = performanceFreshness.expectedObservationCount;
+    const delivered = `${performanceFreshness.observationCount}${
+      expected === null ? '' : ` of ${expected}`
+    } observations`;
+    const window = performanceFreshness.deliveredStart && performanceFreshness.deliveredEnd
+      ? `${performanceFreshness.deliveredStart} to ${performanceFreshness.deliveredEnd}`
+      : performanceFreshness.deliveredEnd ?? performanceFreshness.deliveredStart;
+    const requested = performanceFreshness.requestedDays === null
+      ? ''
+      : ` · requested ${performanceFreshness.requestedDays}d`;
+    return `Partial performance window — ${delivered}${window ? ` · ${window}` : ''}${requested}${
+      performanceFreshness.stale === true ? ' · last observation stale' : ''
+    }`;
+  }, [performanceFreshness]);
 
   // DataTable columns with enhanced functionality
   const positionColumns = useMemo(() => [
@@ -494,14 +535,31 @@ export default function DashboardSummary() {
         loading={analyticsLoading}
       />
 
+      {riskScoreDelta && (
+        <p data-testid="risk-score-delta-caption" className="text-xs text-gray-500 dark:text-gray-400 -mt-4">
+          Risk-score change: {riskScoreDelta.display}
+          {riskScoreDelta.reason ? ` — ${riskScoreDelta.reason}` : ''}
+        </p>
+      )}
+
       {/* Performance Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <PerformanceChart
-          data={performanceData}
-          loading={performanceLoading}
-          showBenchmark={false}
-          currency="INR"
-        />
+        <div>
+          {performanceFreshnessCaption && (
+            <p
+              data-testid="performance-freshness-caption"
+              className="mb-2 text-xs text-amber-700 dark:text-amber-400"
+            >
+              {performanceFreshnessCaption}
+            </p>
+          )}
+          <PerformanceChart
+            data={performanceData}
+            loading={performanceLoading}
+            showBenchmark={false}
+            currency="INR"
+          />
+        </div>
         <SectorAllocationChart
           data={sectorData}
           loading={isOverallLoading}
