@@ -11,6 +11,14 @@ Turn the v3 portfolio AI-context export into a self-consistent, authoritative JS
 - Requested, available, measured, and calculated values remain explicitly distinguishable.
 - No unavailable value is replaced with a plausible zero, score, date, or assumption.
 
+## Shared vocabularies
+
+- Section `status`: `available`, `partial`, `unavailable`.
+- Public `data_status`: `available`, `partial`, `unavailable`.
+- Coverage `status`: `complete`, `partial`, `unavailable`, `unknown`.
+- Input provenance: `measured`, `derived`, `estimated`, `fallback`, `unavailable`.
+- The export is a breaking contract revision and moves to `schema_version: 2.0`; `not_requested` is removed from documentation/types because unselected sections are omitted rather than serialized.
+
 ## Required outcomes
 
 - Coverage metadata describes only the universe relevant to the section.
@@ -22,6 +30,8 @@ Turn the v3 portfolio AI-context export into a self-consistent, authoritative JS
 - Dashboard values link to sibling canonical components instead of unexplained nulls or placeholders.
 - India composite coverage represents heterogeneous flow, delivery, and liquidity components honestly.
 - The exported status and currency vocabularies are stable and documented.
+- Every partial/unavailable section or dashboard component carries a machine-readable reason; successful sections omit inapplicable error fields.
+- Two exports of the same unchanged book are deterministic except allow-listed run metadata (`export_id`, `generated_at`, `completed_at`, `snapshot_consistency`).
 
 ## bfinance boundary
 
