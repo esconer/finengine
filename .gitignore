@@ -78,6 +78,12 @@ frontend/html.meta.json.gz
 *.sqlite
 *.sqlite3
 backups/
+# Generated export artifacts contain live portfolio holdings, quantities, cost
+# basis and P&L. Keep the audit SCRIPTS (reusable tooling); never the data.
+.scratch/**/evidence/*-export.json
+.scratch/**/evidence/*-export.md
+.scratch/**/evidence/*-audit.md
+.scratch/**/evidence/*-determinism.md
 .scratch/**/evidence/runtime/
 .scratch/**/evidence/network/
 .scratch/**/evidence/screenshots/
