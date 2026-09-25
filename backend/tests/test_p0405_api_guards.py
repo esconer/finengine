@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pandas as pd
 import pytest
+from fastapi import HTTPException
 
 from app.api.analytics import (
     get_delivery_anomalies,
@@ -100,3 +101,22 @@ async def test_monte_carlo_num_paths_clamped():
     await _run(5)
     await _run(None)
     assert seen == [20000, 100, 2000]
+
+
+async def test_monte_carlo_rejects_mixed_currency_until_base_returns_exist():
+    positions = [
+        _pos("AAPL"),
+        _pos("TCS.NS"),
+    ]
+    with patch(
+        "app.api.analytics.resolve_allocation",
+        new=AsyncMock(return_value=(["AAPL", "TCS.NS"], {"AAPL": 0.5, "TCS.NS": 0.5})),
+    ), pytest.raises(HTTPException) as error:
+        await run_monte_carlo(
+            body={"target_value": 20000.0, "horizon_years": 3},
+            tickers="AAPL,TCS.NS",
+            db=_mock_db(positions),
+            data_service=Mock(),
+        )
+    assert error.value.status_code == 422
+    assert "base-currency total-return" in error.value.detail

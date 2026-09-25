@@ -169,6 +169,7 @@ def test_numeric_risk_score_components_are_not_mistaken_for_group_envelopes():
         "overall_score": 13.1,
         "components": {"volatility": 11, "factor_risk": 30},
     }) == "available"
+    assert _component_status([]) == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -241,7 +242,7 @@ async def test_dashboard_contains_visible_component_contract():
     }
     components = {
         "summary": {"portfolio_value": 1000.0, "currency": "INR"},
-        "performance_history": [],
+        "performance_history": [{"date": "2025-01-01", "portfolio_value": 1000.0, "return": 0.0}],
         "realized_risk": {"portfolio": {"annual_return": 0.1}, "positions": {"AAPL": {}}},
         "forecast_risk": {"portfolio": {"volatility_forecast": 0.1}, "positions": {"AAPL": {}}},
         "factor_exposure": {"portfolio": {"market": 1.0}, "positions": {"AAPL": {}}},

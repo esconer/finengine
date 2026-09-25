@@ -200,6 +200,29 @@ def _resolve_position_region(ticker: str, requested: Optional[str]) -> str:
     return resolved
 
 
+def _native_position_value(position: Any) -> float:
+    """Return live native value; explicit zero quantity means exited."""
+    try:
+        quantity_raw = getattr(position, "quantity", None)
+        quantity = float(quantity_raw) if quantity_raw is not None else None
+    except (TypeError, ValueError):
+        quantity = None
+    if quantity is not None and quantity <= 0:
+        return 0.0
+    try:
+        price = float(getattr(position, "last_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+    value = (quantity or 0.0) * price
+    if math.isfinite(value) and value > 0:
+        return value
+    try:
+        stored = float(getattr(position, "market_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    return stored if math.isfinite(stored) and stored > 0 else 0.0
+
+
 async def _convert_money(
     amount: float,
     source_currency: str,
@@ -356,15 +379,30 @@ async def get_portfolio(
             source_currency = _position_currency(position)
             position_currencies[position.ticker] = source_currency
             source_currencies.add(source_currency)
-            native_value = float((position.quantity or 0.0) * (position.last_price or 0.0))
-            converted_value, rate, conversion_provenance = await _convert_money(
-                native_value, source_currency, target_currency, currency_service
-            )
-            if source_currency != target_currency and rate is None:
-                raise CurrencyUnavailableError()
-            converted_values.append((converted_value, rate, conversion_provenance))
-            total_mv_target += converted_value
-            if source_currency != target_currency:
+            native_value = _native_position_value(position)
+            if native_value > 0:
+                converted_value, rate, conversion_provenance = await _convert_money(
+                    native_value, source_currency, target_currency, currency_service
+                )
+                if source_currency != target_currency and rate is None:
+                    raise CurrencyUnavailableError()
+                converted_values.append((converted_value, rate, conversion_provenance))
+                total_mv_target += converted_value
+            else:
+                converted_value, rate, conversion_provenance = 0.0, None, {
+                    "provenance": "not_applicable",
+                    "source": "identity",
+                    "is_fallback": False,
+                }
+                converted_values.append((converted_value, rate, conversion_provenance))
+            if source_currency == target_currency:
+                pairs.setdefault(f"{source_currency}->{target_currency}", {
+                    "rate": 1.0,
+                    "provenance": "identity",
+                    "source": "identity",
+                    "is_fallback": False,
+                })
+            elif converted_value > 0:
                 pair_key = f"{source_currency}->{target_currency}"
                 pair_data = pairs.setdefault(pair_key, {
                     "rate": rate,
@@ -382,13 +420,6 @@ async def get_portfolio(
                         conversion_provenance.get("is_fallback")
                         or (bool(fx_info) and fx_info.get("last_updated") is None)
                     )
-            else:
-                pairs.setdefault(f"{source_currency}->{target_currency}", {
-                    "rate": 1.0,
-                    "provenance": "identity",
-                    "source": "identity",
-                    "is_fallback": False,
-                })
 
         for position, (converted_value, rate, conversion_provenance) in zip(
             positions, converted_values

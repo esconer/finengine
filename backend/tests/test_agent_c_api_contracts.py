@@ -270,6 +270,19 @@ async def test_c01_analytics_allocation_converts_mixed_currency_before_weights()
 
 
 @pytest.mark.asyncio
+async def test_zero_value_foreign_rows_do_not_trigger_fx_or_enter_allocation():
+    positions = [
+        SimpleNamespace(ticker="AAPL", region="US", quantity=0.0, last_price=100.0, market_value=999.0),
+        SimpleNamespace(ticker="TCS.NS", region="IN", quantity=10.0, last_price=100.0, market_value=1000.0),
+    ]
+    service = Mock()
+    with patch("app.api.analytics.get_currency_service", return_value=service):
+        values, provenance = await analytics_mod._convert_analytics_positions(positions)
+    assert values == {"TCS.NS": pytest.approx(1000.0)}
+    assert "USD->INR" not in provenance["pairs"]
+
+
+@pytest.mark.asyncio
 async def test_c01_uniform_usd_values_are_not_mislabelled_as_inr():
     positions = [
         SimpleNamespace(

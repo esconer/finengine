@@ -57,7 +57,7 @@ class TestLoadPortfolioAllocationLadder:
         assert weights == {"AAA": 0.25, "BBB": 0.75}
 
     @pytest.mark.asyncio
-    async def test_equal_weight_fallback_when_all_zero(self):
+    async def test_all_zero_positions_have_no_active_allocation(self):
         db = AsyncMock(spec=AsyncSession)
         p1 = PortfolioPosition(ticker="AAA", market_value=0.0, quantity=0.0, last_price=0.0, weight=0.0)
         p2 = PortfolioPosition(ticker="BBB", market_value=0.0, quantity=0.0, last_price=0.0, weight=0.0)
@@ -67,9 +67,7 @@ class TestLoadPortfolioAllocationLadder:
         db.execute.return_value = mock_result
 
         weights = await _load_portfolio_allocation(db)
-        assert pytest.approx(weights["AAA"], 1e-6) == 1.0 / 3.0
-        assert pytest.approx(weights["BBB"], 1e-6) == 1.0 / 3.0
-        assert pytest.approx(weights["CCC"], 1e-6) == 1.0 / 3.0
+        assert weights == {}
 
 
 class TestRealizedMetricConventionsAndProperties:

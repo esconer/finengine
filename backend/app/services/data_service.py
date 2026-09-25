@@ -363,6 +363,27 @@ class DataService:
         end = pd.Timestamp(req_end).tz_localize(None) if pd.Timestamp(req_end).tzinfo else pd.Timestamp(req_end)
         return df[(d >= start) & (d <= end)].copy()
 
+    @staticmethod
+    def _annotate_frame_acceptance(
+        df: Optional[pd.DataFrame], start: str, end: str
+    ) -> Optional[pd.DataFrame]:
+        """Carry late-listing provenance through L1/L2 cache slices."""
+        if df is None or df.empty:
+            return df
+        try:
+            acceptance = accept_vendor_frame(df, start, end)
+            reason = df.attrs.get("coverage_reason") or acceptance.reason
+            df.attrs["coverage_reason"] = reason
+            df.attrs["limited_history"] = bool(
+                df.attrs.get("limited_history", False)
+                or reason == "accepted_late_listing"
+            )
+            df.attrs.setdefault("accepted_frame_start", acceptance.frame_start.isoformat() if acceptance.frame_start else None)
+            df.attrs.setdefault("accepted_frame_end", acceptance.frame_end.isoformat() if acceptance.frame_end else None)
+        except Exception:
+            pass
+        return df
+
     def _l1_slice(
         self,
         ticker: str,
@@ -402,7 +423,8 @@ class DataService:
         if (req_end - hi).days >= 3 and (datetime.now(timezone.utc).replace(tzinfo=None) - req_end).days <= 2:
             return None
         try:
-            return self._slice_window(self._as_column_frame(full_df), req_start, req_end)
+            sliced = self._slice_window(self._as_column_frame(full_df), req_start, req_end)
+            return self._annotate_frame_acceptance(sliced, start, end)
         except Exception:
             return None
 
@@ -573,7 +595,8 @@ class DataService:
         # while runtime controls/source preferences are read must invalidate
         # this request rather than silently granting it the newer generation.
         generation = get_cache_generation()
-        config = await self._refresh_runtime_config()
+        async with self._db_lock:
+            config = await self._refresh_runtime_config()
         now_ts = time.time()
         if source_order is None:
             source_order = await self._resolve_source_order()
@@ -612,6 +635,7 @@ class DataService:
                 if not cache_generation_is_current(generation):
                     return None
                 served = self._as_column_frame(cached_data)
+                served = self._annotate_frame_acceptance(served, start, end)
                 cache_source = "sqlite"
                 if "source_used" in served.columns and not served.empty:
                     source_values = {
@@ -866,7 +890,8 @@ class DataService:
         # begins while runtime controls or source preferences are read must not
         # grant this request the newer generation and repopulate the quote memo.
         generation = get_cache_generation()
-        config = await self._refresh_runtime_config()
+        async with self._db_lock:
+            config = await self._refresh_runtime_config()
         source_order = await self._resolve_source_order()
         source_key = "|".join(source_order)
         now_ts = time.time()

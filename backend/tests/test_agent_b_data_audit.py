@@ -254,6 +254,16 @@ def test_b04_late_listing_frame_is_accepted_as_limited_history():
     assert result.rows_in_window == 4
 
 
+def test_b04_cache_hit_annotator_retains_late_listing_marker():
+    service = DataService(None)
+    result = service._annotate_frame_acceptance(
+        _raw("2025-08-24", 4), "2025-01-02", "2025-08-28"
+    )
+    assert result is not None
+    assert result.attrs.get("limited_history") is True
+    assert result.attrs.get("coverage_reason") == "accepted_late_listing"
+
+
 @pytest.mark.asyncio
 async def test_b05_sqlite_inclusive_end_date(test_db):
     test_db.add(StockTimeseries(
@@ -454,6 +464,7 @@ async def test_b11_institutional_flow_lookback_counts_stored_sessions(test_db):
     metadata = await service.get_institutional_flows(lookback_days=2, return_metadata=True)
     assert metadata["data_status"] == "partial"
     assert metadata["missing_categories"] == ["DII"]
+    assert metadata["incomplete_dates"] == ["2025-01-02", "2025-01-05"]
 
 
 @pytest.mark.asyncio

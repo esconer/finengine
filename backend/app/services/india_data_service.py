@@ -341,9 +341,13 @@ class IndiaDataService:
             category for categories in categories_by_day.values() for category in categories
         })
         missing_categories = sorted({"FII", "DII"} - set(available_categories))
+        incomplete_dates = [
+            day for day, categories in categories_by_day.items()
+            if categories != {"FII", "DII"}
+        ]
         if not ordered:
             status = "unavailable"
-        elif missing_categories:
+        elif missing_categories or incomplete_dates:
             status = "partial"
         else:
             status = "available"
@@ -353,6 +357,7 @@ class IndiaDataService:
             "as_of": ordered[-1].get("date") if ordered else None,
             "available_categories": available_categories,
             "missing_categories": missing_categories,
+            "incomplete_dates": sorted(incomplete_dates),
             "data_status": status,
         }
 

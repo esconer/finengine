@@ -106,14 +106,14 @@ export default function IndiaFlowsPage() {
                                     {flows.map((f, idx) => (
                                         <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/30">
                                             <td className="px-4 py-3 font-semibold text-gray-900 dark:text-white">{f.date}</td>
-                                            <td className={`px-4 py-3 font-mono ${(f.fii_net_crores ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                                                {f.fii_net_crores}
+                                            <td className={`px-4 py-3 font-mono ${f.fii_net_crores == null ? 'text-gray-400' : f.fii_net_crores >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                                {f.fii_net_crores ?? '—'}
                                             </td>
-                                            <td className={`px-4 py-3 font-mono ${(f.dii_net_crores ?? 0) >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                                                {f.dii_net_crores}
+                                            <td className={`px-4 py-3 font-mono ${f.dii_net_crores == null ? 'text-gray-400' : f.dii_net_crores >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                                {f.dii_net_crores ?? '—'}
                                             </td>
                                             <td className="px-4 py-3 font-mono font-semibold">
-                                                {f.total_net_crores}
+                                                {f.total_net_crores ?? '—'}
                                             </td>
                                         </tr>
                                     ))}
@@ -199,8 +199,9 @@ export default function IndiaFlowsPage() {
                             </thead>
                             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                                 {liquidity.positions.map((p: any, idx: number) => {
-                                    const formatInr = (val: number) => {
-                                        if (!val) return '₹0';
+                                    const formatInr = (val: number | null | undefined) => {
+                                        if (val == null || !Number.isFinite(val)) return 'N/A';
+                                        if (val === 0) return '₹0';
                                         if (val >= 10000000) return `₹${(val / 10000000).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} Cr`;
                                         if (val >= 100000) return `₹${(val / 100000).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} L`;
                                         return `₹${val.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
@@ -208,7 +209,8 @@ export default function IndiaFlowsPage() {
                                     // Sub-0.1 day liquidation windows are real but round to "0d";
                                     // only a zero market value is a true 0-day position.
                                     const formatDays = (days: number | null | undefined, marketValue: number, adv: number) => {
-                                        const d = typeof days === 'number' && !isNaN(days) ? days : 0;
+                                        if (days == null || !Number.isFinite(days)) return 'N/A';
+                                        const d = days;
                                         if (d > 0 && d < 0.1) return '<0.1d';
                                         if (d === 0 && marketValue > 0 && adv > 0) return '<0.1d';
                                         return `${d}d`;

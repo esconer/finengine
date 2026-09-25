@@ -96,7 +96,13 @@ def _history_coverage(series_a: pd.Series, series_b: pd.Series) -> str:
     end = frame.index[-1]
     start_text = start.strftime("%Y-%m-%d") if hasattr(start, "strftime") else str(start)[:32]
     end_text = end.strftime("%Y-%m-%d") if hasattr(end, "strftime") else str(end)[:32]
-    return f"{len(frame)}:{start_text}:{end_text}"
+    numeric = frame.apply(pd.to_numeric, errors="coerce")
+    if numeric.notna().any().any():
+        payload = np.ascontiguousarray(numeric.fillna(0.0).to_numpy(dtype=float))
+    else:
+        payload = np.ascontiguousarray(frame.astype(str).to_numpy())
+    value_digest = sha1(payload.tobytes()).hexdigest()[:12]
+    return f"{len(frame)}:{start_text}:{end_text}:{value_digest}"
 
 
 def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional[float]]:

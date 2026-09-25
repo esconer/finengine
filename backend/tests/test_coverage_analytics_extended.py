@@ -135,15 +135,14 @@ class TestAnalyticsHelpersAndEdgeCases:
         await test_db.execute(delete(PortfolioPosition))
         await test_db.commit()
 
-        # DB with all zeros -> equal weight fallback
+        # DB with all zeros -> no active allocation
         pos5 = PortfolioPosition(ticker="E", quantity=0, last_price=0, market_value=0, weight=0.0)
         pos6 = PortfolioPosition(ticker="F", quantity=0, last_price=0, market_value=0, weight=0.0)
         test_db.add_all([pos5, pos6])
         await test_db.commit()
 
         alloc3 = await _load_portfolio_allocation(test_db)
-        assert alloc3["E"] == 0.5
-        assert alloc3["F"] == 0.5
+        assert alloc3 == {}
 
         # Clean up
         await test_db.execute(delete(PortfolioPosition))

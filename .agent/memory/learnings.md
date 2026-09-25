@@ -25,3 +25,9 @@ importance: medium
 - Latest-observation metadata must inspect DataFrame mappings and date columns, not only Series indexes; otherwise a valid DataFrame price frame is reported as having no observation date.
 - India flow availability must be category-aware: preserve missing FII/DII legs as null/partial metadata rather than zero-filling them; the UI must branch on `data_status` before showing an empty/no-anomaly result.
 - Ordered request metadata belongs in response-cache identity; sorting ticker order in a cache key can return the previous request's `requested_tickers` order.
+- Shared AsyncSession reads used by concurrent market-data fetches must be behind the service DB gate, including runtime-config reads before network I/O.
+- Explicit `quantity=0` means exited even if a stale stored market value remains; zero rows must not trigger FX or become equal-weight fallback allocations.
+- Mixed-currency Monte Carlo cannot use local-price returns with an INR/USD balance; fail explicitly until base-currency total-return history exists.
+- Late-listing acceptance metadata must survive L1/L2 cache slicing; annotate every cache-hit frame, not only fresh vendor responses.
+- Empty performance/analytics collections are unavailable, not available empty successes; unavailable payloads must not retain plausible fallback score/risk constants.
+- Cointegration cache identity must include a digest of effective overlapping prices, not only dates/counts, or same-day corrections reuse stale diagnostics.

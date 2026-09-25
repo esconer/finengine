@@ -189,6 +189,7 @@ class _BuildContext:
     total_value: float
     cached: Dict[str, Any] = field(default_factory=dict)
     cached_sections: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    active_tickers: List[str] = field(default_factory=list)
 
 
 def _now() -> str:
@@ -332,6 +333,8 @@ def _has_material_data(value: Any) -> bool:
 
 def _payload_status(value: Any) -> str:
     if value is None:
+        return "unavailable"
+    if isinstance(value, (list, tuple, set)) and not value:
         return "unavailable"
     if isinstance(value, Mapping):
         components = value.get("components")
@@ -669,6 +672,26 @@ class PortfolioContextService:
             for position in positions
             if isinstance(position, Mapping) and position.get("ticker")
         ]
+        active_tickers: List[str] = []
+        for position in positions:
+            if not isinstance(position, Mapping) or not position.get("ticker"):
+                continue
+            raw_value = position.get("market_value_base")
+            if raw_value is None:
+                raw_value = position.get("market_value")
+            try:
+                if math.isfinite(float(raw_value or 0.0)) and float(raw_value or 0.0) > 0:
+                    active_tickers.append(str(position["ticker"]))
+            except (TypeError, ValueError):
+                continue
+        if tickers and not active_tickers and not any(
+            isinstance(position, Mapping)
+            and ("market_value_base" in position or "market_value" in position)
+            for position in positions
+        ):
+            # Lightweight test/adapter payloads may omit value fields; retain
+            # their explicit ticker roster rather than treating it as empty.
+            active_tickers = list(tickers)
         ticker_csv = ",".join(tickers) if tickers else None
         total_value = float(portfolio_json.get("total_value", 0.0) or 0.0) if isinstance(portfolio_json, Mapping) else 0.0
         context = _BuildContext(
@@ -678,6 +701,7 @@ class PortfolioContextService:
             tickers=tickers,
             ticker_csv=ticker_csv,
             total_value=total_value,
+            active_tickers=active_tickers,
         )
 
         sections: Dict[str, Dict[str, Any]] = {}
@@ -705,7 +729,7 @@ class PortfolioContextService:
                     error=portfolio_error,
                     detail=options.detail,
                 )
-        elif not tickers:
+        elif not active_tickers:
             # Market-context pages can still be useful without holdings. Do not
             # launch every portfolio calculation only to return the same empty
             # contract for each one.
@@ -718,8 +742,11 @@ class PortfolioContextService:
                     sections[key] = self._make_section(
                         key=key,
                         data=None,
-                        inputs={},
-                        error="No portfolio positions found",
+                        inputs={"tickers": tickers},
+                        error=(
+                            "No positive portfolio value available for analytics"
+                            if tickers else "No portfolio positions found"
+                        ),
                         detail=options.detail,
                     )
         else:

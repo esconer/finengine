@@ -535,6 +535,29 @@ async def _get_live_fx_rate(
         raise CurrencyUnavailableError() from exc
 
 
+def _native_position_value(position: Any) -> float:
+    """Read a live position value without reviving an explicitly exited row."""
+    try:
+        quantity_raw = getattr(position, "quantity", None)
+        quantity = float(quantity_raw) if quantity_raw is not None else None
+    except (TypeError, ValueError):
+        quantity = None
+    if quantity is not None and quantity <= 0:
+        return 0.0
+    try:
+        price = float(getattr(position, "last_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+    live_value = (quantity or 0.0) * price
+    if math.isfinite(live_value) and live_value > 0:
+        return live_value
+    try:
+        stored = float(getattr(position, "market_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    return stored if math.isfinite(stored) and stored > 0 else 0.0
+
+
 async def _convert_analytics_positions(
     positions: List[Any],
     *,
@@ -551,13 +574,12 @@ async def _convert_analytics_positions(
     native_values: Dict[str, float] = {}
     source_currencies: Dict[str, str] = {}
     for position in positions:
-        value = float(
-            (getattr(position, "quantity", 0.0) or 0.0)
-            * (getattr(position, "last_price", 0.0) or 0.0)
-        )
-        if not math.isfinite(value) or value < 0:
-            value = float(getattr(position, "market_value", 0.0) or 0.0)
-        native_values[position.ticker] = value
+        live_value = _native_position_value(position)
+        if live_value <= 0:
+            # Fully exited/zero-value rows remain visible in the portfolio
+            # snapshot, but must not trigger FX or enter an active allocation.
+            continue
+        native_values[position.ticker] = live_value
         source_currencies[position.ticker] = _analytics_position_currency(position)
 
     unique_sources = set(source_currencies.values())
@@ -568,8 +590,8 @@ async def _convert_analytics_positions(
         "source_currencies": sorted(unique_sources),
         "supported_currencies": ["INR", "USD"],
         "aggregation": (
-            "per_position_conversion"
-            if needs_conversion
+            "empty" if not native_values
+            else "per_position_conversion" if needs_conversion
             else "native_uniform"
         ),
         "pairs": {},
@@ -628,26 +650,31 @@ async def _load_portfolio_allocation(db: AsyncSession) -> Optional[Dict[str, flo
     if total_mv > 0:
         return {t: value / total_mv for t, value in values.items() if value > 0}
 
-    total_weight = sum(float(pos.weight or 0.0) for pos in positions)
+    positive_weights: Dict[str, float] = {}
+    for position in positions:
+        try:
+            weight = float(getattr(position, "weight", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(weight) and weight > 0:
+            positive_weights[position.ticker] = weight
+    total_weight = sum(positive_weights.values())
     if total_weight > 0:
-        return {pos.ticker: float(pos.weight or 0.0) / total_weight for pos in positions}
+        return {
+            ticker: weight / total_weight
+            for ticker, weight in positive_weights.items()
+        }
 
-    n = len(positions)
-    return {pos.ticker: 1.0 / n for pos in positions}
+    return {}
+
+
+def _position_has_positive_value(position: Any) -> bool:
+    return _native_position_value(position) > 0
 
 
 async def _has_positive_portfolio_value(db: AsyncSession) -> bool:
     result = await db.execute(select(PortfolioPosition))
-    for position in result.scalars().all():
-        try:
-            value = float(getattr(position, "market_value", 0.0) or 0.0)
-            if not math.isfinite(value) or value <= 0:
-                value = float(getattr(position, "quantity", 0.0) or 0.0) * float(getattr(position, "last_price", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(value) and value > 0:
-            return True
-    return False
+    return any(_position_has_positive_value(position) for position in result.scalars().all())
 
 
 @router.get("/realized-risk")
@@ -1418,11 +1445,11 @@ async def get_liquidity_metrics(
         requested_tickers = await _load_portfolio_tickers(db)
         if not allocation:
             return {
-                "overall_score": 5.0,
-                "liquidation_time_days": "5-10",
-                "risk_level": "Medium",
+                "overall_score": None,
+                "liquidation_time_days": None,
+                "risk_level": None,
                 "by_position": {},
-                "volume_stats": {"avg_volume": 0, "total_portfolio_volume": 0, "high_volume_pct": 0, "medium_volume_pct": 0, "low_volume_pct": 100},
+                "volume_stats": {},
                 "error": "No portfolio positions found",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1481,11 +1508,11 @@ async def get_liquidity_metrics(
         
         if not price_data_dict:
             return {
-                "overall_score": 5.0,
-                "liquidation_time_days": "5-10",
-                "risk_level": "Medium",
+                "overall_score": None,
+                "liquidation_time_days": None,
+                "risk_level": None,
                 "by_position": {},
-                "volume_stats": {"avg_volume": 0, "total_portfolio_volume": 0, "high_volume_pct": 0, "medium_volume_pct": 0, "low_volume_pct": 100},
+                "volume_stats": {},
                 "error": "No price data available for liquidity analysis",
                 "data_status": "unavailable",
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -1498,8 +1525,8 @@ async def get_liquidity_metrics(
 
         return {
             "overall_score": liquidity_result.get("overall_score"),
-            "liquidation_time_days": liquidity_result.get("liquidation_time_days", "2-5"),
-            "risk_level": liquidity_result.get("risk_level", "Medium"),
+            "liquidation_time_days": liquidity_result.get("liquidation_time_days"),
+            "risk_level": liquidity_result.get("risk_level"),
             "by_position": liquidity_result.get("by_position", {}),
             "volume_stats": liquidity_result.get("volume_stats", {}),
             "universe_coverage": coverage,
@@ -3211,12 +3238,7 @@ async def run_monte_carlo(
         if initial_value is None:
             result = await db.execute(select(PortfolioPosition))
             positions = result.scalars().all()
-            initial_value = sum(
-                float(p.market_value)
-                if (p.market_value and float(p.market_value) > 0)
-                else float(p.quantity or 0.0) * float(p.last_price or 0.0)
-                for p in positions
-            )
+            initial_value = sum(_native_position_value(p) for p in positions)
         if not math.isfinite(float(initial_value)) or initial_value <= 0:
             raise HTTPException(
                 status_code=404,
@@ -3229,6 +3251,21 @@ async def run_monte_carlo(
             ticker_list, weights = await resolve_allocation(requested_csv, db)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="No portfolio positions found") from exc
+
+        position_rows = await db.execute(select(PortfolioPosition))
+        active_currencies = {
+            _analytics_position_currency(position)
+            for position in position_rows.scalars().all()
+            if _position_has_positive_value(position)
+        }
+        if len(active_currencies) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Mixed-currency Monte Carlo is unavailable until base-currency "
+                    "total-return history is available"
+                ),
+            )
 
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
@@ -3493,7 +3530,8 @@ async def get_india_institutional_flows(
                 "count": len(flows),
                 "as_of": flows[-1].get("date") if flows else None,
                 "available_categories": [],
-                "missing_categories": ["FII", "DII"] if flows else ["FII", "DII"],
+                "missing_categories": ["FII", "DII"],
+                "incomplete_dates": [flow.get("date") for flow in flows],
                 "data_status": "partial" if flows else "unavailable",
             }
         return {

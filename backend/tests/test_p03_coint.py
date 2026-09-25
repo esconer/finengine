@@ -9,6 +9,7 @@ import pytest
 
 from app.services.cointegration_service import (
     _db_cache_keys,
+    _history_coverage,
     CointegrationService,
 )
 from app.models.schemas import CointPairResult
@@ -61,6 +62,15 @@ def test_keys_fit_columns_and_differ():
 def test_keys_stable_and_order_sensitive():
     assert _db_cache_keys("A.NS", "B.NS", "2026-09-03") == _db_cache_keys("A.NS", "B.NS", "2026-09-03")
     assert _db_cache_keys("A.NS", "B.NS", "2026-09-03") != _db_cache_keys("B.NS", "A.NS", "2026-09-03")
+
+
+def test_history_coverage_digest_changes_when_prices_are_corrected():
+    import pandas as pd
+
+    index = pd.date_range("2026-01-01", periods=4, freq="B")
+    first = _history_coverage(pd.Series([1.0, 2.0, 3.0, 4.0], index=index), pd.Series([4.0, 3.0, 2.0, 1.0], index=index))
+    corrected = _history_coverage(pd.Series([1.0, 2.0, 3.5, 4.0], index=index), pd.Series([4.0, 3.0, 2.0, 1.0], index=index))
+    assert first != corrected
 
 
 async def test_two_pairs_same_day_no_eviction():
