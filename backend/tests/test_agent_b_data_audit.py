@@ -246,6 +246,14 @@ def test_b04_typed_coverage_predicate_rejects_outside_frame():
     assert accepted.accepted is True
 
 
+def test_b04_late_listing_frame_is_accepted_as_limited_history():
+    late = _raw("2025-08-24", 4)
+    result = accept_vendor_frame(late, "2025-01-02", "2025-08-29")
+    assert result.accepted is True
+    assert result.reason == "accepted_late_listing"
+    assert result.rows_in_window == 4
+
+
 @pytest.mark.asyncio
 async def test_b05_sqlite_inclusive_end_date(test_db):
     test_db.add(StockTimeseries(

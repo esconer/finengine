@@ -374,6 +374,39 @@ async def test_c01_coverage_counts_active_return_observations():
 
 
 @pytest.mark.asyncio
+async def test_realized_risk_gates_limited_position_metrics_by_own_sample():
+    dates = pd.bdate_range("2025-01-01", periods=40)
+    values = np.linspace(100.0, 140.0, len(dates))
+
+    class Market:
+        async def fetch_historical_data(self, ticker, *_args):
+            if ticker == "B":
+                return pd.DataFrame({"close": values[-20:]}, index=dates[-20:])
+            return pd.DataFrame({"close": values}, index=dates)
+
+    async def allocation(_tickers, _db):
+        return ["A", "B"], {"A": 0.5, "B": 0.5}
+
+    async def holdings(*_args):
+        return {}
+
+    with patch.object(analytics_mod, "resolve_allocation", side_effect=allocation), \
+         patch.object(analytics_mod, "resolve_holdings", side_effect=holdings):
+        result = await analytics_mod.get_realized_risk(
+            tickers="A,B", start="2025-01-01", end="2025-03-01",
+            db=Mock(), data_service=Market(),
+            analytics_engine=analytics_mod.AnalyticsEngine(),
+        )
+
+    limited = result["positions"]["B"]
+    assert limited["is_limited_history"] is True
+    assert limited["annualized"] is False
+    assert limited["annual_return"] is None
+    assert limited["annual_volatility"] is None
+    assert limited["sharpe_ratio"] is None
+
+
+@pytest.mark.asyncio
 async def test_c01_mixed_fx_outage_maps_to_503_for_analytics_routes():
     positions = [
         SimpleNamespace(
@@ -702,6 +735,30 @@ async def test_c02_single_holding_optimizer_preserves_price_gap():
 
 
 @pytest.mark.asyncio
+async def test_optimization_does_not_emit_sell_for_unavailable_ticker():
+    dates = pd.bdate_range("2025-01-01", periods=40)
+    returns = pd.DataFrame({"A": np.linspace(-0.01, 0.01, len(dates))}, index=dates)
+
+    async def allocation(_tickers, _db):
+        return ["A", "B"], {"A": 0.5, "B": 0.5}
+
+    async def build(*_args, **_kwargs):
+        return returns, returns["A"], {"covered_days": len(returns)}
+
+    result = None
+    with patch.object(analytics_mod, "resolve_allocation", side_effect=allocation), \
+         patch.object(analytics_mod, "_build_wide_returns", side_effect=build), \
+         patch.object(analytics_mod, "optimize", return_value={"weights": {"A": 1.0, "B": 0.0}}):
+        result = await run_optimization(
+            body={"strategy": "hrp"}, db=Mock(), data_service=Mock()
+        )
+
+    assert "B" not in result["trades_required"]
+    assert result["data_unavailable_tickers"] == ["B"]
+    assert result["universe_coverage"]["missing_tickers"] == ["B"]
+
+
+@pytest.mark.asyncio
 async def test_c02_single_holding_correlation_is_undefined():
     async def allocation(_tickers, _db):
         return ["A"], {"A": 1.0}
@@ -750,6 +807,36 @@ async def test_c02_risk_contribution_does_not_impute_missing_tail_leg():
 
     assert "A" in result["positions"]["cvar_tail"]
     assert "B" not in result["positions"]["cvar_tail"]
+    assert "B" in result["excluded_assets"]["cvar_tail"]
+
+
+@pytest.mark.asyncio
+async def test_c02_risk_contribution_reports_entirely_missing_ticker():
+    dates = pd.bdate_range("2025-01-01", periods=40)
+    returns = pd.DataFrame({"A": np.linspace(-0.01, 0.01, len(dates))}, index=dates)
+    portfolio = returns["A"].copy()
+
+    async def allocation(_tickers, _db):
+        return ["A", "B"], {"A": 0.5, "B": 0.5}
+
+    async def holdings(*_args):
+        return {}
+
+    async def build(*_args, **_kwargs):
+        return returns, portfolio, {"covered_days": len(portfolio)}
+
+    with patch.object(analytics_mod, "resolve_allocation", side_effect=allocation), \
+         patch.object(analytics_mod, "resolve_holdings", side_effect=holdings), \
+         patch.object(analytics_mod, "_build_wide_returns", side_effect=build):
+        result = await get_risk_contribution(
+            tickers="A,B", db=_DB([
+                PortfolioPosition(ticker="A", sector="Tech", weight=0.5),
+                PortfolioPosition(ticker="B", sector="Other", weight=0.5),
+            ]), data_service=Mock()
+        )
+
+    assert result["universe_coverage"]["missing_tickers"] == ["B"]
+    assert "B" in result["excluded_assets"]["volatility"]
     assert "B" in result["excluded_assets"]["cvar_tail"]
 
 
@@ -959,6 +1046,37 @@ async def test_c05_tail_memo_key_includes_normalized_weights():
         )
     assert calls == ["evt", "copula", "evt", "copula"]
     assert len(analytics_mod._TAILS_RESPONSE_CACHE) == 2
+    analytics_mod._TAILS_RESPONSE_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_tail_parent_ticker_list_matches_matrix_universe():
+    analytics_mod._TAILS_RESPONSE_CACHE.clear()
+    returns = pd.DataFrame({
+        "A": [0.01, -0.02] * 40,
+        "B": [-0.01, 0.02] * 40,
+    })
+
+    async def allocation(_tickers, _db):
+        return ["A", "B", "C"], {"A": 0.4, "B": 0.4, "C": 0.2}
+
+    matrix = {
+        "tickers": ["A", "B"],
+        "matrix": [[1.0, 0.1], [0.1, 1.0]],
+        "high_tail_risk_pairs": [],
+    }
+    with patch.object(analytics_mod, "resolve_allocation", side_effect=allocation), \
+         patch.object(analytics_mod, "_build_wide_returns", new=AsyncMock(return_value=(returns, returns.mean(axis=1), {}))), \
+         patch("app.services.tail_risk_service.TailRiskService.calculate_evt_pot_var_es", return_value={"total_observations": 80}), \
+         patch("app.services.tail_risk_service.TailRiskService.calculate_tail_dependence_matrix", return_value=matrix):
+        result = await get_tail_risk_and_copula(
+            tickers="A,B,C", lookback_days=756, confidence_level=.99,
+            threshold_quantile=.95, db=Mock(), data_service=Mock(),
+        )
+
+    assert result["tickers"] == matrix["tickers"]
+    assert result["requested_tickers"] == ["A", "B", "C"]
+    assert result["universe_coverage"]["missing_tickers"] == ["C"]
     analytics_mod._TAILS_RESPONSE_CACHE.clear()
 
 

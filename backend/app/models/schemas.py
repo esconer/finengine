@@ -139,6 +139,7 @@ class AIContextSection(BaseModel):
     as_of: Optional[str] = None
     currency: Optional[str] = None
     inputs: Dict[str, Any] = Field(default_factory=dict)
+    coverage: Optional[Dict[str, Any]] = None
     data: Optional[Any] = None
     omitted_fields: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
@@ -150,6 +151,8 @@ class AIContextResponse(BaseModel):
     schema_version: str
     export_id: str
     generated_at: datetime
+    completed_at: datetime
+    snapshot_consistency: Literal["best_effort", "frozen"]
     base_currency: Literal["INR", "USD"]
     currency_policy: str
     detail: Literal["summary", "full"]
@@ -400,6 +403,11 @@ class CorrelationStabilityResponse(BaseModel):
     alert_level: str  # "CRITICAL", "ELEVATED", "NORMAL"
     message: str
     series: List[CorrelationDataPoint]
+    requested_tickers: List[str] = Field(default_factory=list)
+    available_tickers: List[str] = Field(default_factory=list)
+    missing_tickers: List[str] = Field(default_factory=list)
+    data_status: str = "available"
+    universe_coverage: Optional[Dict[str, Any]] = None
 
 
 # Cointegration Scanner Schemas
@@ -418,6 +426,12 @@ class CointPairResult(BaseModel):
     johansen_cointegrated: bool
     last_price_a: float
     last_price_b: float
+    observation_date_a: Optional[str] = None
+    observation_date_b: Optional[str] = None
+    overlap_start: Optional[str] = None
+    overlap_end: Optional[str] = None
+    overlap_observations: Optional[int] = None
+    price_basis: str = "adjusted_close_when_available"
     signal: str
     spread_series: Optional[List[Dict[str, Any]]] = None
 
@@ -425,10 +439,23 @@ class CointPairResult(BaseModel):
 class CointScannerResponse(BaseModel):
     """Schema for cointegration scanner response"""
     as_of: str
+    as_of_semantics: str = "latest_available_observation"
+    latest_observation_date: Optional[str] = None
     universe_size: int
     scanned_pairs_count: int
     cointegrated_pairs_count: int
     pairs: List[CointPairResult]
+    requested_tickers: List[str] = Field(default_factory=list)
+    available_tickers: List[str] = Field(default_factory=list)
+    missing_tickers: List[str] = Field(default_factory=list)
+    requested_universe_size: int = 0
+    analyzed_pairs_count: int = 0
+    returned_pairs_count: int = 0
+    returned_cointegrated_pairs_count: int = 0
+    returned_non_cointegrated_pairs_count: int = 0
+    unpairable_tickers: List[str] = Field(default_factory=list)
+    data_status: str = "available"
+    universe_coverage: Optional[Dict[str, Any]] = None
 
 
 # Volatility Term Structure & Cone Schemas

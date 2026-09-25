@@ -136,6 +136,10 @@ class TestCointegrationService:
         assert res.hedge_ratio_beta > 0
         assert res.is_cointegrated is True
         assert res.current_spread_zscore is not None
+        assert res.observation_date_a == res.overlap_end
+        assert res.observation_date_b == res.overlap_end
+        assert res.overlap_observations == 250
+        assert res.price_basis == "adjusted_close_when_available"
 
     def test_non_cointegrated_pair_signal_gated(self):
         # Independent random walks: high EG p-value -> no trade signal.
@@ -157,6 +161,9 @@ class TestCointegrationService:
 
         res = await service.scan_pairs(price_data=price_dict)
         assert res.scanned_pairs_count >= 1
+        assert res.analyzed_pairs_count == res.scanned_pairs_count
+        assert res.returned_pairs_count == len(res.pairs)
+        assert res.returned_cointegrated_pairs_count + res.returned_non_cointegrated_pairs_count == len(res.pairs)
         assert len(res.pairs) >= 1
 
 

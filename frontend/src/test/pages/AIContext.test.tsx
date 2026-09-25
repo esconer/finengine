@@ -12,9 +12,11 @@ vi.mock('@/lib/api', () => ({
 }));
 
 const response = {
-  schema_version: '1.0',
+  schema_version: '1.1',
   export_id: 'test',
   generated_at: '2026-09-25T12:00:00Z',
+  completed_at: '2026-09-25T12:00:01Z',
+  snapshot_consistency: 'best_effort' as const,
   base_currency: 'INR' as const,
   currency_policy: 'Portfolio section uses the requested base_currency; analytics sections retain endpoint units.',
   detail: 'summary' as const,
@@ -30,6 +32,7 @@ const response = {
       generated_at: '2026-09-25T12:00:00Z',
       as_of: null,
       inputs: {},
+      coverage: null,
       data: { total_value: 1000 },
       omitted_fields: [],
       warnings: [],
@@ -43,6 +46,7 @@ const response = {
       generated_at: '2026-09-25T12:00:00Z',
       as_of: null,
       inputs: {},
+      coverage: null,
       data: null,
       omitted_fields: [],
       warnings: ['Short history'],

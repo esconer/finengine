@@ -9,9 +9,11 @@ import pytest
 def _payload():
     now = datetime.now(timezone.utc).isoformat()
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "export_id": "test-export",
         "generated_at": now,
+        "completed_at": now,
+        "snapshot_consistency": "best_effort",
         "base_currency": "INR",
         "currency_policy": "Portfolio section uses the requested base_currency; analytics sections retain endpoint units.",
         "detail": "summary",
@@ -59,7 +61,7 @@ async def test_ai_context_endpoint_returns_json_contract(async_client):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["schema_version"] == "1.0"
+    assert body["schema_version"] == "1.1"
     assert body["base_currency"] == "INR"
     assert set(body["sections"]) == {"portfolio", "realized_risk"}
     assert body["sections"]["portfolio"]["status"] == "available"
@@ -81,6 +83,168 @@ async def test_ai_context_endpoint_can_return_markdown(async_client):
     assert response.text == render_markdown(payload)
     assert "# FinEngine Portfolio AI Context" in response.text
     assert "Equity Research" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_service_marks_missing_result_tickers_as_partial():
+    from app.services.ai_context_service import ContextOptions, PortfolioContextService
+
+    portfolio = {
+        "positions": [{"ticker": "AAPL"}, {"ticker": "NIFTYIETF.NS"}],
+        "total_value": 1000.0,
+        "currency": "INR",
+    }
+    service = PortfolioContextService(
+        db=Mock(),
+        data_service=Mock(),
+        analytics_engine=Mock(),
+        benchmark_service=Mock(),
+        cache_service=Mock(),
+    )
+    with patch(
+        "app.services.ai_context_service.portfolio_api.get_portfolio",
+        new=AsyncMock(return_value=portfolio),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_realized_risk",
+        new=AsyncMock(return_value={
+            "portfolio": {"annual_return": 0.1},
+            "positions": {"AAPL": {"annual_return": 0.1}},
+        }),
+    ), patch(
+        "app.services.ai_context_service.data_api.get_api_config",
+        new=AsyncMock(return_value={"primary_source": "yfinance"}),
+    ):
+        payload = await service.build(ContextOptions(include=("realized_risk",)))
+
+    section = payload["sections"]["realized_risk"]
+    assert section["status"] == "partial"
+    assert section["coverage"]["missing_tickers"] == ["NIFTYIETF.NS"]
+    assert any("NIFTYIETF.NS" in warning for warning in section["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_service_does_not_trust_a_narrower_explicit_coverage_claim():
+    from app.services.ai_context_service import ContextOptions, PortfolioContextService
+
+    service = PortfolioContextService(
+        db=Mock(),
+        data_service=Mock(),
+        analytics_engine=Mock(),
+        benchmark_service=Mock(),
+        cache_service=Mock(),
+    )
+    with patch(
+        "app.services.ai_context_service.portfolio_api.get_portfolio",
+        new=AsyncMock(return_value={
+            "positions": [{"ticker": "AAPL"}, {"ticker": "NIFTYIETF.NS"}],
+            "total_value": 1000.0,
+        }),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_realized_risk",
+        new=AsyncMock(return_value={
+            "portfolio": {"annual_return": 0.1},
+            "universe_coverage": {
+                "requested_tickers": ["AAPL"],
+                "available_tickers": ["AAPL"],
+                "missing_tickers": [],
+                "status": "complete",
+            },
+        }),
+    ), patch(
+        "app.services.ai_context_service.data_api.get_api_config",
+        new=AsyncMock(return_value={}),
+    ):
+        payload = await service.build(ContextOptions(include=("realized_risk",)))
+
+    section = payload["sections"]["realized_risk"]
+    assert section["status"] == "partial"
+    assert section["coverage"]["requested_tickers"] == ["AAPL", "NIFTYIETF.NS"]
+    assert section["coverage"]["missing_tickers"] == ["NIFTYIETF.NS"]
+
+
+def test_numeric_risk_score_components_are_not_mistaken_for_group_envelopes():
+    from app.services.ai_context_service import _component_status
+
+    assert _component_status({
+        "overall_score": 13.1,
+        "components": {"volatility": 11, "factor_risk": 30},
+    }) == "available"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_contains_visible_component_contract():
+    from app.services.ai_context_service import ContextOptions, PortfolioContextService
+
+    service = PortfolioContextService(
+        db=Mock(),
+        data_service=Mock(),
+        analytics_engine=Mock(),
+        benchmark_service=Mock(),
+        cache_service=Mock(),
+    )
+    portfolio = {
+        "positions": [{"ticker": "AAPL"}],
+        "total_value": 1000.0,
+        "currency": "INR",
+    }
+    components = {
+        "summary": {"portfolio_value": 1000.0, "currency": "INR"},
+        "performance_history": [],
+        "realized_risk": {"portfolio": {"annual_return": 0.1}, "positions": {"AAPL": {}}},
+        "forecast_risk": {"portfolio": {"volatility_forecast": 0.1}, "positions": {"AAPL": {}}},
+        "factor_exposure": {"portfolio": {"market": 1.0}, "positions": {"AAPL": {}}},
+        "concentration": {"by_weight": {"AAPL": 1.0}},
+        "liquidity": {"by_position": {"AAPL": {}}},
+        "risk_score": {"overall_score": 50, "risk_level": "Medium"},
+        "regime": {"current_regime": "normal"},
+        "risk_contribution": {"positions": {"volatility": {"AAPL": {}}, "cvar_tail": {"AAPL": {}}}},
+    }
+    with patch(
+        "app.services.ai_context_service.portfolio_api.get_portfolio",
+        new=AsyncMock(return_value=portfolio),
+    ), patch(
+        "app.services.ai_context_service.data_api.get_api_config",
+        new=AsyncMock(return_value={}),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_analytics_summary",
+        new=AsyncMock(return_value=components["summary"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_performance_history",
+        new=AsyncMock(return_value=components["performance_history"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_realized_risk",
+        new=AsyncMock(return_value=components["realized_risk"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_forecast_risk",
+        new=AsyncMock(return_value=components["forecast_risk"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_factor_exposure",
+        new=AsyncMock(return_value=components["factor_exposure"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_concentration_metrics",
+        new=AsyncMock(return_value=components["concentration"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_liquidity_metrics",
+        new=AsyncMock(return_value=components["liquidity"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_risk_score",
+        new=AsyncMock(return_value=components["risk_score"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_regime",
+        new=AsyncMock(return_value=components["regime"]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_risk_contribution",
+        new=AsyncMock(return_value=components["risk_contribution"]),
+    ):
+        payload = await service.build(ContextOptions(include=("dashboard",)))
+
+    dashboard = payload["sections"]["dashboard"]
+    assert dashboard["status"] == "available"
+    assert set(dashboard["data"]["components"]) == {
+        "portfolio", "summary", "performance_history", "realized_risk",
+        "forecast_risk", "factor_exposure", "concentration", "liquidity",
+        "risk_score", "regime", "risk_contribution",
+    }
 
 
 @pytest.mark.asyncio
@@ -106,7 +270,7 @@ async def test_service_collects_a_selected_analytics_section():
         "app.services.ai_context_service.analytics_api.get_realized_risk",
         new=AsyncMock(return_value={
             "portfolio": {"annual_return": 0.1},
-            "positions": {},
+            "positions": {"AAPL": {"annual_return": 0.1}},
             "warnings": [{"ticker": "AAPL", "message": "Short history"}],
         }),
     ) as realized, patch(

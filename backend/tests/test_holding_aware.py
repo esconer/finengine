@@ -156,6 +156,7 @@ def test_portfolio_regime_summary_branches():
     out2 = portfolio_regime_summary(small)
     assert out2["days"] == 7 and out2["annualized"] is False
     assert out2["ann_ret"] is None
+    assert out2["ann_vol"] is None
     assert out2["total_ret"] == pytest.approx(round(float((1.01 ** 7) - 1), 4))
     empty = portfolio_regime_summary(pd.Series([], dtype=float))
     assert empty["days"] == 0 and empty["ann_ret"] is None

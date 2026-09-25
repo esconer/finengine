@@ -217,17 +217,22 @@ def portfolio_regime_summary(sub: pd.Series) -> Dict[str, Any]:
     """Realized stats for returns inside the current regime (pure).
 
     Below MIN_ANNUALIZE_DAYS the CAGR-style annualization is suppressed
-    (ann_ret None) and only the holding-period total is reported, so a
-    week-old book can never display a triple-digit "annualized" artefact.
+    (ann_ret and ann_vol are None) and only the holding-period total is
+    reported, so a week-old book can never display a triple-digit
+    "annualized" artefact.
     """
     sub = sub.dropna()
     n = len(sub)
     total = float(np.prod(1.0 + sub.values) - 1.0) if n else 0.0
-    ann_v = float(sub.std() * np.sqrt(252)) if n > 1 and not np.isnan(sub.std()) else 0.0
+    ann_v = (
+        float(sub.std() * np.sqrt(252))
+        if n >= MIN_ANNUALIZE_DAYS and n > 1 and not np.isnan(sub.std())
+        else None
+    )
     out: Dict[str, Any] = {
         "days": int(n),
         "ann_ret": None,
-        "ann_vol": round(ann_v, 4),
+        "ann_vol": round(ann_v, 4) if ann_v is not None else None,
         "total_ret": round(total, 4),
         "annualized": False,
     }

@@ -226,7 +226,7 @@ export default function AIContextPage() {
               <div>
                 <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Export status</h2>
                 <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                  {response.generated_at} · base currency {response.base_currency} · schema {response.schema_version}
+                  {response.generated_at} → {response.completed_at} · snapshot {response.snapshot_consistency} · base currency {response.base_currency} · schema {response.schema_version}
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -273,6 +273,11 @@ export default function AIContextPage() {
                       {statusLabel(section.status)}
                     </span>
                   </div>
+                  {section.coverage?.missing_tickers?.length ? (
+                    <p className="mt-2 text-xs text-amber-600 dark:text-amber-300">
+                      Missing result coverage: {section.coverage.missing_tickers.join(', ')}
+                    </p>
+                  ) : null}
                   {section.error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-300">{section.error}</p>}
                 </div>
               ))}

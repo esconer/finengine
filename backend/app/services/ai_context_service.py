@@ -33,7 +33,7 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 DEFAULT_SECTIONS: Tuple[str, ...] = (
     "portfolio",
     "dashboard",
@@ -188,6 +188,7 @@ class _BuildContext:
     ticker_csv: Optional[str]
     total_value: float
     cached: Dict[str, Any] = field(default_factory=dict)
+    cached_sections: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -333,9 +334,17 @@ def _payload_status(value: Any) -> str:
     if value is None:
         return "unavailable"
     if isinstance(value, Mapping):
-        if "components" in value:
-            return _group_status(value.get("components"))
-        if value.get("zero_metrics") and not _has_material_data(value):
+        components = value.get("components")
+        if isinstance(components, Mapping) and any(
+            isinstance(component, Mapping)
+            and component.get("status") in {"available", "partial", "unavailable"}
+            for component in components.values()
+        ):
+            return _group_status(components)
+        data_status = value.get("data_status")
+        if data_status in {"unavailable", "partial"}:
+            return str(data_status)
+        if value.get("zero_metrics") is True:
             return "unavailable"
         if value.get("error") and not _has_material_data(value):
             return "unavailable"
@@ -363,16 +372,22 @@ def _group_status(components: Any) -> str:
 def _as_of(value: Any) -> Optional[str]:
     if not isinstance(value, Mapping):
         return None
-    for key in ("as_of", "last_updated", "generated_at", "updated_at"):
+    for key in ("latest_observation_date", "as_of", "last_updated", "generated_at", "updated_at"):
         candidate = value.get(key)
         if isinstance(candidate, (str, datetime, date)) and str(candidate).strip():
             return candidate.isoformat() if isinstance(candidate, (datetime, date)) else str(candidate)
-    for key in ("data_range", "window"):
-        nested = value.get(key)
-        if isinstance(nested, Mapping):
-            candidate = nested.get("end")
+    nested = value.get("data")
+    if isinstance(nested, Mapping):
+        candidate = _as_of(nested)
+        if candidate:
+            return candidate
+    components = value.get("components")
+    if isinstance(components, Mapping):
+        for component in components.values():
+            component_data = component.get("data") if isinstance(component, Mapping) else component
+            candidate = _as_of(component_data)
             if candidate:
-                return str(candidate)
+                return candidate
     return None
 
 
@@ -381,7 +396,19 @@ def _component_status(value: Any) -> str:
 
 
 def _infer_currency(data: Any, inputs: Mapping[str, Any]) -> Optional[str]:
-    for source in (inputs, data if isinstance(data, Mapping) else {}):
+    sources = [inputs]
+    if isinstance(data, Mapping):
+        sources.append(data)
+        nested_data = data.get("data")
+        if isinstance(nested_data, Mapping):
+            sources.append(nested_data)
+        components = data.get("components")
+        if isinstance(components, Mapping):
+            for component in components.values():
+                component_data = component.get("data") if isinstance(component, Mapping) else component
+                if isinstance(component_data, Mapping):
+                    sources.append(component_data)
+    for source in sources:
         for key in (
             "currency",
             "base_currency",
@@ -397,8 +424,9 @@ def _infer_currency(data: Any, inputs: Mapping[str, Any]) -> Optional[str]:
 def _collect_warnings(value: Any) -> List[str]:
     warnings: List[str] = []
     if isinstance(value, Mapping):
-        raw = value.get("warnings")
-        if isinstance(raw, list):
+        for raw in (value.get("warnings"), value.get("alerts")):
+            if not isinstance(raw, list):
+                continue
             for item in raw:
                 if item is None:
                     continue
@@ -410,12 +438,169 @@ def _collect_warnings(value: Any) -> List[str]:
                     text = str(item)
                 if text:
                     warnings.append(text)
+        if value.get("error") and not value.get("warnings") and not value.get("alerts"):
+            warnings.append(str(value["error"]))
         components = value.get("components")
         if isinstance(components, Mapping):
             for component in components.values():
                 if isinstance(component, Mapping):
                     warnings.extend(_collect_warnings(component.get("data")))
+                    if component.get("error"):
+                        warnings.append(str(component["error"]))
     return warnings
+
+
+def _ticker_list(value: Any) -> List[str]:
+    if value is None or isinstance(value, (str, bytes)):
+        return []
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return []
+    output: List[str] = []
+    seen = set()
+    for item in iterator:
+        if not isinstance(item, str):
+            continue
+        ticker = item.strip().upper()
+        if ticker and ticker not in seen:
+            seen.add(ticker)
+            output.append(ticker)
+    return output
+
+
+def _available_tickers_for_section(key: str, data: Any) -> Optional[List[str]]:
+    """Extract the universe that actually produced a section result."""
+    if not isinstance(data, Mapping):
+        return None
+
+    def mapping_keys(field: str) -> Optional[List[str]]:
+        value = data.get(field)
+        if isinstance(value, Mapping):
+            return _ticker_list(value.keys())
+        return None
+
+    if key in {"realized_risk", "forecast_risk", "factor_exposure"}:
+        return mapping_keys("positions")
+    if key == "liquidity":
+        return mapping_keys("by_position")
+    if key == "concentration":
+        return mapping_keys("by_weight")
+    if key == "volatility_sizing":
+        return mapping_keys("volatility_sources") or mapping_keys("recommended_weights")
+    if key == "optimization":
+        return mapping_keys("weights")
+    if key == "risk_contribution":
+        positions = data.get("positions")
+        if isinstance(positions, Mapping):
+            available = set()
+            for model in ("volatility", "cvar_tail"):
+                available.update(_ticker_list((positions.get(model) or {}).keys()))
+            return sorted(available)
+    if key == "pairs":
+        pair_rows = data.get("pairs")
+        if isinstance(pair_rows, list):
+            available = set()
+            for row in pair_rows:
+                if isinstance(row, Mapping):
+                    available.update(_ticker_list([row.get("ticker_a"), row.get("ticker_b")]))
+            return sorted(available)
+        return None
+    if key == "tear_sheet":
+        return mapping_keys("holdings")
+    if key == "stress_testing":
+        available = set()
+        scenarios = data.get("scenarios")
+        if isinstance(scenarios, Mapping):
+            for scenario in scenarios.values():
+                if isinstance(scenario, Mapping):
+                    available.update(_ticker_list((scenario.get("position_impacts") or {}).keys()))
+        return sorted(available)
+    if key == "risk_studio":
+        components = data.get("components")
+        if isinstance(components, Mapping):
+            risk_contribution = components.get("risk_contribution")
+            if isinstance(risk_contribution, Mapping):
+                return _available_tickers_for_section("risk_contribution", risk_contribution.get("data"))
+        return None
+    if key == "portfolio":
+        positions = data.get("positions")
+        if isinstance(positions, list):
+            return _ticker_list(
+                position.get("ticker") for position in positions if isinstance(position, Mapping)
+            )
+    return None
+
+
+def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optional[Dict[str, Any]]:
+    requested = _ticker_list(inputs.get("tickers"))
+    explicit: Optional[Dict[str, Any]] = None
+    if isinstance(data, Mapping) and isinstance(data.get("universe_coverage"), Mapping):
+        candidate = _jsonable(data["universe_coverage"])
+        if isinstance(candidate, dict):
+            explicit = candidate
+
+    if explicit is not None:
+        declared_requested = _ticker_list(explicit.get("requested_tickers"))
+        requested = list(dict.fromkeys(requested + declared_requested))
+        available = _ticker_list(explicit.get("available_tickers"))
+        declared_missing = _ticker_list(explicit.get("missing_tickers"))
+        if key == "risk_contribution":
+            excluded = data.get("excluded_assets")
+            if isinstance(excluded, Mapping):
+                for values in excluded.values():
+                    declared_missing.extend(_ticker_list(values))
+        available_set = set(available)
+        declared_missing_set = set(declared_missing)
+        effective_available = [ticker for ticker in available if ticker not in declared_missing_set]
+        effective_available_set = set(effective_available)
+        covered = [ticker for ticker in requested if ticker in effective_available_set]
+        missing = list(dict.fromkeys(declared_missing + [
+            ticker for ticker in requested if ticker not in effective_available_set
+        ]))
+        if effective_available != available:
+            explicit["raw_available_tickers"] = available
+        explicit.update({
+            "requested_tickers": requested,
+            "available_tickers": effective_available,
+            "covered_tickers": covered,
+            "missing_tickers": missing,
+            "requested_count": len(requested),
+            "available_count": len(covered),
+            "coverage_ratio": round(len(covered) / len(requested), 6) if requested else None,
+            "complete": not missing if requested else None,
+            "status": "partial" if missing else "complete" if requested else "unknown",
+        })
+        return explicit
+
+    available = _available_tickers_for_section(key, data)
+    if not requested:
+        return None
+    if available is None:
+        return {
+            "requested_tickers": requested,
+            "available_tickers": None,
+            "missing_tickers": None,
+            "coverage_ratio": None,
+            "complete": None,
+            "status": "unknown",
+            "weight_basis": "active_weights_renormalized_to_100_percent",
+        }
+    available_set = set(available)
+    covered = [ticker for ticker in requested if ticker in available_set]
+    missing = [ticker for ticker in requested if ticker not in available_set]
+    return {
+        "requested_tickers": requested,
+        "available_tickers": available,
+        "covered_tickers": covered,
+        "missing_tickers": missing,
+        "requested_count": len(requested),
+        "available_count": len(covered),
+        "coverage_ratio": round(len(covered) / len(requested), 6) if requested else None,
+        "complete": not missing,
+        "status": "complete" if not missing else "partial",
+        "weight_basis": "active_weights_renormalized_to_100_percent",
+    }
 
 
 class PortfolioContextService:
@@ -484,7 +669,11 @@ class PortfolioContextService:
             sections["portfolio"] = self._make_section(
                 key="portfolio",
                 data=portfolio_json,
-                inputs={"currency": options.base_currency, "force_refresh": False},
+                inputs={
+                    "currency": options.base_currency,
+                    "force_refresh": False,
+                    "tickers": tickers,
+                },
                 error=portfolio_error,
                 detail=options.detail,
             )
@@ -518,10 +707,34 @@ class PortfolioContextService:
                         detail=options.detail,
                     )
         else:
+            # Collect non-dashboard sections first so the dashboard can reuse
+            # the exact canonical results instead of issuing duplicate live
+            # calculations for the same page components.
             for key in selected:
-                if key == "portfolio":
+                if key in {"portfolio", "dashboard"}:
                     continue
-                sections[key] = await self._collect_section(key, context)
+                section = await self._collect_section(key, context)
+                sections[key] = section
+                context.cached_sections[key] = section
+                if "data" in section:
+                    context.cached[key] = section.get("data")
+
+            if "dashboard" in selected:
+                dashboard = await self._collect_dashboard(context)
+                sections["dashboard"] = self._make_section(
+                    key="dashboard",
+                    data=dashboard.data,
+                    inputs=dashboard.inputs,
+                    warnings=dashboard.warnings,
+                    error=dashboard.error,
+                    status=dashboard.status,
+                    detail=options.detail,
+                )
+                context.cached_sections["dashboard"] = sections["dashboard"]
+
+        # Keep the envelope's section order aligned with the requested/default
+        # catalog even though dashboard collection is intentionally deferred.
+        sections = {key: sections[key] for key in selected if key in sections}
 
         environment: Dict[str, Any]
         try:
@@ -532,11 +745,16 @@ class PortfolioContextService:
             environment = {}
             warnings.append(f"Data-source metadata unavailable: {_safe_error(exc)}")
             logger.error("AI context environment metadata failed: %s", type(exc).__name__)
+        if isinstance(environment, dict):
+            environment["source_semantics"] = "primary_source is preference order, not per-observation vendor proof"
 
+        completed_at = _now()
         return {
             "schema_version": SCHEMA_VERSION,
             "export_id": f"portfolio-{uuid.uuid4().hex[:12]}",
             "generated_at": generated_at,
+            "completed_at": completed_at,
+            "snapshot_consistency": "best_effort",
             "base_currency": options.base_currency,
             "currency_policy": (
                 "Portfolio section uses the requested base_currency; analytics sections "
@@ -596,10 +814,21 @@ class PortfolioContextService:
         resolved_status = status or _payload_status(compact_data)
         if error is None and isinstance(compact_data, Mapping) and compact_data.get("error"):
             error = str(compact_data["error"])
+        coverage = _section_coverage(key, inputs, compact_data)
         if error and resolved_status == "available":
             resolved_status = "partial"
         section_warnings = list(warnings or [])
         section_warnings.extend(_collect_warnings(compact_data))
+        if coverage:
+            if coverage.get("status") in {"partial", "unavailable"} and resolved_status == "available":
+                resolved_status = str(coverage["status"])
+            if coverage.get("missing_tickers"):
+                if resolved_status == "available":
+                    resolved_status = "partial"
+                missing = ", ".join(coverage["missing_tickers"])
+                section_warnings.append(
+                    f"Result coverage is missing requested ticker(s): {missing}"
+                )
         section_warnings = list(dict.fromkeys(section_warnings))
         section = {
             "key": key,
@@ -611,6 +840,7 @@ class PortfolioContextService:
             "as_of": _as_of(compact_data),
             "currency": _infer_currency(compact_data, inputs),
             "inputs": _jsonable(inputs),
+            "coverage": coverage,
             "data": compact_data,
             "omitted_fields": omitted,
             "warnings": section_warnings,
@@ -634,6 +864,9 @@ class PortfolioContextService:
             value = await callback()
             json_value = _jsonable(value)
             status = _component_status(json_value)
+            coverage = json_value.get("universe_coverage") if isinstance(json_value, Mapping) else None
+            if isinstance(coverage, Mapping) and coverage.get("missing_tickers") and status == "available":
+                status = "partial"
             result: Dict[str, Any] = {"status": status, "data": json_value}
             if status != "available" and isinstance(json_value, Mapping) and json_value.get("error"):
                 result["error"] = str(json_value["error"])
@@ -644,27 +877,155 @@ class PortfolioContextService:
             return {"status": "unavailable", "data": None, "error": _safe_error(exc)}
 
     async def _collect_dashboard(self, context: _BuildContext) -> _Collected:
-        components = {
-            "summary": await self._component(
-                "summary",
-                lambda: analytics_api.get_analytics_summary(
-                    db=self.db,
-                    data_service=self.data_service,
-                    analytics_engine=self.analytics_engine,
-                ),
-            ),
-            "performance_history": await self._component(
-                "performance_history",
-                lambda: analytics_api.get_performance_history(
-                    days=90,
-                    tickers=context.ticker_csv,
-                    db=self.db,
-                    data_service=self.data_service,
-                    benchmark_service=self.benchmark_service,
-                ),
-            ),
+        """Collect the dashboard's visible data without duplicating sections.
+
+        The dashboard page is a composition of several analytics endpoints. The
+        default export also requests those endpoints as named sections, so
+        reuse their canonical section envelopes here. Components that have no
+        standalone export section (risk score and the dashboard summary) are
+        fetched once and kept request-scoped.
+        """
+        async def cached_or_fetch(
+            name: str,
+            section_key: Optional[str],
+            callback: Callable[[], Awaitable[Any]],
+        ) -> Dict[str, Any]:
+            if section_key and section_key in context.cached_sections:
+                section = context.cached_sections[section_key]
+                result: Dict[str, Any] = {
+                    "status": section.get("status", "unavailable"),
+                    "data": section.get("data"),
+                }
+                if section.get("error"):
+                    result["error"] = section["error"]
+                return result
+            result = await self._component(name, callback)
+            # Dashboard-only calls are not standalone sections, but retaining
+            # them makes a second dashboard assembly deterministic and cheap.
+            context.cached_sections[f"_dashboard_{name}"] = result
+            return result
+
+        components: Dict[str, Any] = {}
+        components["portfolio"] = {
+            "status": _component_status(context.portfolio),
+            "data": _jsonable(context.portfolio),
         }
+        components["summary"] = await cached_or_fetch(
+            "summary",
+            None,
+            lambda: analytics_api.get_analytics_summary(
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["performance_history"] = await cached_or_fetch(
+            "performance_history",
+            None,
+            lambda: analytics_api.get_performance_history(
+                days=90,
+                tickers=context.ticker_csv,
+                db=self.db,
+                data_service=self.data_service,
+                benchmark_service=self.benchmark_service,
+            ),
+        )
+        components["realized_risk"] = await cached_or_fetch(
+            "realized_risk",
+            "realized_risk",
+            lambda: analytics_api.get_realized_risk(
+                tickers=context.ticker_csv,
+                start=None,
+                end=None,
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["forecast_risk"] = await cached_or_fetch(
+            "forecast_risk",
+            "forecast_risk",
+            lambda: analytics_api.get_forecast_risk(
+                model=context.options.forecast_model,
+                horizon=context.options.forecast_horizon,
+                tickers=context.ticker_csv,
+                start=None,
+                end=None,
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["factor_exposure"] = await cached_or_fetch(
+            "factor_exposure",
+            "factor_exposure",
+            lambda: analytics_api.get_factor_exposure(
+                tickers=context.ticker_csv,
+                lookback_days=context.options.factor_lookback_days,
+                db=self.db,
+                data_service=self.data_service,
+                benchmark_service=self.benchmark_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["concentration"] = await cached_or_fetch(
+            "concentration",
+            "concentration",
+            lambda: analytics_api.get_concentration_metrics(
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["liquidity"] = await cached_or_fetch(
+            "liquidity",
+            "liquidity",
+            lambda: analytics_api.get_liquidity_metrics(
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+            ),
+        )
+        components["risk_score"] = await cached_or_fetch(
+            "risk_score",
+            None,
+            lambda: analytics_api.get_risk_score(
+                db=self.db,
+                data_service=self.data_service,
+                analytics_engine=self.analytics_engine,
+                benchmark_service=self.benchmark_service,
+            ),
+        )
+        components["regime"] = await cached_or_fetch(
+            "regime",
+            "regime",
+            lambda: analytics_api.get_regime(
+                lookback_days=1100,
+                with_portfolio=bool(context.tickers),
+                db=self.db,
+                data_service=self.data_service,
+                benchmark=self.benchmark_service,
+            ),
+        )
+        components["risk_contribution"] = await cached_or_fetch(
+            "risk_contribution",
+            "risk_contribution",
+            lambda: analytics_api.get_risk_contribution(
+                tickers=context.ticker_csv,
+                db=self.db,
+                data_service=self.data_service,
+            ),
+        )
         data = {"components": components}
+        for component_name in ("risk_contribution", "summary", "realized_risk"):
+            component = components.get(component_name)
+            if not isinstance(component, Mapping):
+                continue
+            component_data = component.get("data")
+            coverage = component_data.get("universe_coverage") if isinstance(component_data, Mapping) else None
+            if isinstance(coverage, Mapping):
+                data["universe_coverage"] = coverage
+                break
         return _Collected(
             data=data,
             inputs={"performance_days": 90, "tickers": context.tickers},
@@ -749,7 +1110,26 @@ class PortfolioContextService:
                 await self._rollback_quietly()
                 failures[scenario] = _safe_error(exc)
         data = {"scenarios": results, "failures": failures}
-        status = "available" if results and not failures else "partial" if results else "unavailable"
+        scenario_universes = []
+        for scenario in results.values():
+            coverage = scenario.get("universe_coverage") if isinstance(scenario, Mapping) else None
+            if isinstance(coverage, Mapping):
+                scenario_universes.append(set(_ticker_list(coverage.get("available_tickers"))))
+        if scenario_universes:
+            available = sorted(set.intersection(*scenario_universes))
+            missing = [ticker for ticker in context.tickers if ticker not in set(available)]
+            data["universe_coverage"] = {
+                "requested_tickers": _ticker_list(context.tickers),
+                "available_tickers": available,
+                "covered_tickers": [ticker for ticker in context.tickers if ticker in set(available)],
+                "missing_tickers": missing,
+                "requested_count": len(context.tickers),
+                "available_count": len(available),
+                "coverage_ratio": round(len(available) / len(context.tickers), 6) if context.tickers else None,
+                "complete": not missing if context.tickers else None,
+                "status": "partial" if missing else "complete" if context.tickers else "unknown",
+            }
+        status = "available" if results and not failures and not data.get("universe_coverage", {}).get("missing_tickers") else "partial" if results else "unavailable"
         return _Collected(
             data=data,
             inputs={"tickers": context.tickers, "scenarios": list(_STRESS_SCENARIOS)},
@@ -783,6 +1163,13 @@ class PortfolioContextService:
         return _Collected(data=data, inputs={"tickers": context.tickers, "lookback_days": 365})
 
     async def _collect_risk_contribution(self, context: _BuildContext) -> _Collected:
+        if "risk_contribution" in context.cached:
+            data = context.cached["risk_contribution"]
+            return _Collected(
+                data=data,
+                inputs={"tickers": context.tickers},
+                status=_component_status(data),
+            )
         data = await analytics_api.get_risk_contribution(
             tickers=context.ticker_csv,
             db=self.db,
@@ -795,8 +1182,12 @@ class PortfolioContextService:
         components: Dict[str, Any] = {}
         if "risk_contribution" in context.cached:
             cached = _jsonable(context.cached["risk_contribution"])
+            cached_status = _component_status(cached)
+            cached_coverage = cached.get("universe_coverage") if isinstance(cached, Mapping) else None
+            if isinstance(cached_coverage, Mapping) and cached_coverage.get("missing_tickers") and cached_status == "available":
+                cached_status = "partial"
             components["risk_contribution"] = {
-                "status": _component_status(cached),
+                "status": cached_status,
                 "data": cached,
             }
         else:
@@ -808,6 +1199,7 @@ class PortfolioContextService:
                     data_service=self.data_service,
                 ),
             )
+            context.cached["risk_contribution"] = components["risk_contribution"].get("data")
         components["tail_dependence"] = await self._component(
             "tail_dependence",
             lambda: analytics_api.get_tail_risk_and_copula(
@@ -838,9 +1230,43 @@ class PortfolioContextService:
                 data_service=self.data_service,
             ),
         )
+        data = {"components": components}
+        coverage_candidates = []
+        for component in components.values():
+            if not isinstance(component, Mapping):
+                continue
+            component_data = component.get("data")
+            coverage = component_data.get("universe_coverage") if isinstance(component_data, Mapping) else None
+            if isinstance(coverage, Mapping):
+                coverage_candidates.append(coverage)
+        if coverage_candidates:
+            requested = _ticker_list(context.tickers)
+            available_sets = [set(_ticker_list(candidate.get("available_tickers"))) for candidate in coverage_candidates]
+            available = sorted(set.intersection(*available_sets)) if available_sets else []
+            missing = [ticker for ticker in requested if ticker not in set(available)]
+            data["universe_coverage"] = {
+                "requested_tickers": requested,
+                "available_tickers": available,
+                "covered_tickers": [ticker for ticker in requested if ticker in set(available)],
+                "missing_tickers": missing,
+                "requested_count": len(requested),
+                "available_count": len(available),
+                "coverage_ratio": round(len(available) / len(requested), 6) if requested else None,
+                "complete": not missing if requested else None,
+                "status": "partial" if missing else "complete" if requested else "unknown",
+            }
         return _Collected(
-            data={"components": components},
-            inputs={"tickers": context.tickers, "lookback_days": 756},
+            data=data,
+            inputs={
+                "tickers": context.tickers,
+                "lookback_days": 756,
+                "component_lookbacks": {
+                    "risk_contribution": 365,
+                    "tail_dependence": 756,
+                    "volatility_cone": 756,
+                    "correlation_stability": 756,
+                },
+            },
             status=_group_status(components),
         )
 
@@ -1044,6 +1470,8 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
         "# FinEngine Portfolio AI Context",
         "",
         f"- Generated: `{safe_payload.get('generated_at', '')}`",
+        f"- Completed: `{safe_payload.get('completed_at', '')}`",
+        f"- Snapshot consistency: `{safe_payload.get('snapshot_consistency', 'unknown')}`",
         f"- Base currency: `{safe_payload.get('base_currency', '')}`",
         f"- Currency policy: {safe_payload.get('currency_policy', '')}",
         f"- Detail: `{safe_payload.get('detail', 'summary')}`",
@@ -1076,6 +1504,13 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
                 lines.append(f"- As of: `{section['as_of']}`")
             if section.get("currency"):
                 lines.append(f"- Monetary unit: `{section['currency']}`")
+            coverage = section.get("coverage")
+            if isinstance(coverage, Mapping) and coverage.get("missing_tickers"):
+                lines.append(
+                    "- Missing result tickers: `"
+                    + ", ".join(coverage["missing_tickers"])
+                    + "`"
+                )
             if section.get("inputs"):
                 lines.extend(["", "### Inputs", "", "```json", _pretty(section["inputs"]), "```"])
             if section.get("error"):

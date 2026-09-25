@@ -58,6 +58,8 @@ class PortfolioSummaryEnvelope(PortfolioSummaryResponse):
     base_currency: str
     currency_provenance: Dict[str, Any] = Field(default_factory=dict)
     position_currencies: Dict[str, str] = Field(default_factory=dict)
+    holding_date_provenance: Dict[str, Any] = Field(default_factory=dict)
+    as_of: Optional[str] = None
 
 
 class BulkAddEnvelope(BulkAddResponse):
@@ -83,6 +85,31 @@ def _normalise_currency(value: Any) -> str:
     if currency not in _SUPPORTED_CURRENCIES:
         raise HTTPException(status_code=400, detail=f"Unsupported currency: {currency}")
     return currency
+
+
+def _quote_as_of(positions: List[PortfolioPosition]) -> Optional[str]:
+    """Use the newest persisted quote timestamp for snapshot provenance."""
+    values = []
+    for position in positions:
+        value = getattr(position, "updated_on", None)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            values.append(value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"))
+        elif value:
+            values.append(str(value))
+    return max(values) if values else None
+
+
+def _holding_date_provenance() -> Dict[str, Any]:
+    return {
+        "added_on": "PortfolioPosition.added_on (stored import date)",
+        "updated_on": "PortfolioPosition.updated_on (persisted quote timestamp)",
+        "effective_start": (
+            "Analytics holding_window uses the earliest valid added_on or "
+            "buy-price-implied start; it is not the quote timestamp."
+        ),
+    }
 
 
 def _raise_provider_http_error(exc: ProviderError) -> None:
@@ -297,6 +324,8 @@ async def get_portfolio(
                     "pairs": {},
                 },
                 position_currencies={},
+                holding_date_provenance=_holding_date_provenance(),
+                as_of=None,
             )
 
         await _update_portfolio_prices(positions, data_service, force=bool(force_refresh))
@@ -441,6 +470,8 @@ async def get_portfolio(
             base_currency=target_currency,
             currency_provenance=provenance,
             position_currencies=position_currencies,
+            holding_date_provenance=_holding_date_provenance(),
+            as_of=_quote_as_of(positions),
         )
     except ProviderError as exc:
         _raise_provider_http_error(exc)

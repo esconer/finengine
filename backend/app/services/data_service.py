@@ -140,6 +140,18 @@ def accept_vendor_frame(
     covers_end = frame_end >= bounds.end - edge_tolerance
     minimum = 1 if expected <= 5 else max(3, int(expected * 0.30))
     if count < minimum or not (covers_start and covers_end):
+        # A newly listed/ETF issuer can legitimately have no bars near the
+        # requested start. Accept a small, end-anchored actual history rather
+        # than dropping the ticker entirely; downstream coverage/annualization
+        # gates will label the result limited instead of fabricating a return.
+        late_listing = (
+            frame_start > bounds.start + edge_tolerance
+            and covers_end
+            and count >= 3
+        )
+        if late_listing:
+            return FrameAcceptance(True, "accepted_late_listing", bounds.start, bounds.end,
+                                  frame_start, frame_end, count, expected, ratio)
         return FrameAcceptance(False, "sparse_or_outside_window", bounds.start, bounds.end,
                               frame_start, frame_end, count, expected, ratio)
     return FrameAcceptance(True, "accepted", bounds.start, bounds.end,
@@ -692,7 +704,11 @@ class DataService:
                 if not served.empty:
                     served.attrs["source"] = actual_source
                     served.attrs["requested_ticker"] = normalized_ticker
-                    self.last_fetch_metadata.update({"source": actual_source})
+                    self.last_fetch_metadata.update({
+                        "source": actual_source,
+                        "coverage_reason": valid_acceptance.reason,
+                        "rows": int(len(valid)),
+                    })
                     logger.info("Successfully fetched %s records for %s via %s", len(valid), normalized_ticker, actual_source)
                     return served
             except ProviderError as exc:
@@ -752,7 +768,11 @@ class DataService:
                             if not served.empty:
                                 served.attrs["source"] = "alphavantage"
                                 served.attrs["requested_ticker"] = normalized_ticker
-                                self.last_fetch_metadata.update({"source": "alphavantage"})
+                                self.last_fetch_metadata.update({
+                                    "source": "alphavantage",
+                                    "coverage_reason": valid_acceptance.reason,
+                                    "rows": int(len(valid)),
+                                })
                                 return served
         except (AlphaVantageIdentityError, AlphaVantageUnknownTickerError) as exc:
             errors.append(exc)

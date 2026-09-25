@@ -328,6 +328,14 @@ export interface AIContextSection {
   as_of: string | null;
   currency: string | null;
   inputs: Record<string, unknown>;
+  coverage: {
+    requested_tickers: string[];
+    available_tickers: string[] | null;
+    missing_tickers: string[] | null;
+    coverage_ratio: number | null;
+    complete: boolean | null;
+    status: 'complete' | 'partial' | 'unknown';
+  } | null;
   data: unknown;
   omitted_fields: string[];
   warnings: string[];
@@ -338,6 +346,8 @@ export interface AIContextResponse {
   schema_version: string;
   export_id: string;
   generated_at: string;
+  completed_at: string;
+  snapshot_consistency: 'best_effort' | 'frozen';
   base_currency: 'INR' | 'USD';
   currency_policy: string;
   detail: AIContextDetail;

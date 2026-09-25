@@ -276,6 +276,14 @@ def analyze_pair_cointegration(
                 "zscore": z_val,
             })
 
+    def _date_text(value: Any) -> Optional[str]:
+        try:
+            return pd.Timestamp(value).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            return None
+
+    overlap_start = _date_text(df.index[0])
+    overlap_end = _date_text(df.index[-1])
     return CointPairResult(
         ticker_a=ticker_a,
         ticker_b=ticker_b,
@@ -290,6 +298,12 @@ def analyze_pair_cointegration(
         johansen_cointegrated=johansen_coint,
         last_price_a=round(last_p_a, 2),
         last_price_b=round(last_p_b, 2),
+        observation_date_a=overlap_end,
+        observation_date_b=overlap_end,
+        overlap_start=overlap_start,
+        overlap_end=overlap_end,
+        overlap_observations=len(df),
+        price_basis="adjusted_close_when_available",
         signal=signal,
         spread_series=spread_points,
     )
@@ -467,9 +481,16 @@ class CointegrationService:
         if n < 2:
             return CointScannerResponse(
                 as_of=_utcnow().strftime("%Y-%m-%d"),
+                latest_observation_date=None,
+                as_of_semantics="latest_available_observation",
                 universe_size=n,
                 scanned_pairs_count=0,
+                analyzed_pairs_count=0,
                 cointegrated_pairs_count=0,
+                returned_pairs_count=0,
+                returned_cointegrated_pairs_count=0,
+                returned_non_cointegrated_pairs_count=0,
+                data_status="unavailable",
                 pairs=[],
             )
 
@@ -558,10 +579,25 @@ class CointegrationService:
         ]
         cointegrated_count = sum(1 for p in kept_pairs if p.is_cointegrated)
 
+        returned_cointegrated = sum(1 for pair in kept_pairs if pair.is_cointegrated)
+        returned_universe = {
+            ticker
+            for pair in kept_pairs
+            for ticker in (pair.ticker_a, pair.ticker_b)
+        }
         return CointScannerResponse(
             as_of=as_of_date,
+            latest_observation_date=as_of_date,
+            as_of_semantics="latest_available_observation",
             universe_size=n,
+            requested_universe_size=n,
             scanned_pairs_count=scanned_count,
+            analyzed_pairs_count=scanned_count,
             cointegrated_pairs_count=cointegrated_count,
+            returned_pairs_count=len(kept_pairs),
+            returned_cointegrated_pairs_count=returned_cointegrated,
+            returned_non_cointegrated_pairs_count=len(kept_pairs) - returned_cointegrated,
+            unpairable_tickers=sorted(set(tickers) - returned_universe),
+            data_status="partial" if set(tickers) - returned_universe else "available",
             pairs=kept_pairs,
         )

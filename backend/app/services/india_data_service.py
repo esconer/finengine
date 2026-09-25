@@ -318,9 +318,15 @@ class IndiaDataService:
         return sorted(date_map.values(), key=lambda item: item["date"])
 
     async def get_delivery_anomalies(
-        self, symbols: List[str], lookback_days: int = 20, sigma_threshold: float = 2.0
-    ) -> List[Dict[str, Any]]:
+        self,
+        symbols: List[str],
+        lookback_days: int = 20,
+        sigma_threshold: float = 2.0,
+        return_metadata: bool = False,
+    ) -> Any:
         anomalies = []
+        covered_symbols = set()
+        latest_date: Optional[str] = None
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=lookback_days * 2)
         for symbol in symbols:
             clean_symbol = str(symbol).replace(".NS", "").replace(".BO", "").upper().strip()
@@ -330,6 +336,10 @@ class IndiaDataService:
                 .order_by(desc(NSEBhavcopy.date))
             )
             rows = result.scalars().all()
+            if rows:
+                row_date = rows[0].date
+                row_date_text = row_date.isoformat() if hasattr(row_date, "isoformat") else str(row_date)[:10]
+                latest_date = max(latest_date or row_date_text, row_date_text)
             if len(rows) < 3:
                 continue
             delivery = [row.deliv_per for row in rows if row.deliv_per is not None]
@@ -339,6 +349,7 @@ class IndiaDataService:
             historical = delivery[1: lookback_days + 1]
             mean = float(np.mean(historical))
             std = float(np.std(historical))
+            covered_symbols.add(clean_symbol)
             if not math.isfinite(std) or std <= 0:
                 continue
             z_score = (current - mean) / std
@@ -354,6 +365,18 @@ class IndiaDataService:
                 "last_price": rows[0].close,
                 "turnover_lacs": rows[0].turnover_lacs,
             })
+        if return_metadata:
+            requested = {str(symbol).replace(".NS", "").replace(".BO", "").upper().strip() for symbol in symbols}
+            missing = sorted(requested - covered_symbols)
+            return {
+                "anomalies": anomalies,
+                "count": len(anomalies),
+                "requested_symbols": sorted(requested),
+                "covered_symbols": sorted(covered_symbols),
+                "missing_symbols": missing,
+                "as_of": latest_date,
+                "data_status": "available" if requested and not missing else "partial" if covered_symbols else "unavailable",
+            }
         return anomalies
 
     @staticmethod
@@ -404,6 +427,7 @@ class IndiaDataService:
         weighted_days_10: Optional[float] = 0.0
         weighted_days_20: Optional[float] = 0.0
         all_available = True
+        any_available = False
 
         for position in positions:
             native_value, position_value, fx_rate, native_currency = position_values(position)
@@ -436,6 +460,7 @@ class IndiaDataService:
             if days_10 is None or adv_rupees is None:
                 all_available = False
             else:
+                any_available = True
                 weighted_days_10 = (weighted_days_10 or 0.0) + weight * days_10
                 weighted_days_20 = (weighted_days_20 or 0.0) + weight * (days_20 or 0.0)
             if amihud is not None:
@@ -478,6 +503,6 @@ class IndiaDataService:
             "portfolio_weighted_days_to_liquidate_10pct": None if not all_available else round(weighted_days_10 or 0.0, 2),
             "portfolio_weighted_days_to_liquidate_20pct": None if not all_available else round(weighted_days_20 or 0.0, 2),
             "portfolio_amihud_score": None if not all_available else round(weighted_amihud or 0.0, 6),
-            "data_status": "measured" if all_available else "unavailable",
+            "data_status": "measured" if all_available else "partial" if any_available else "unavailable",
             "positions": position_limits,
         }
