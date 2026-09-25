@@ -41,6 +41,8 @@ logger = setup_logger(__name__)
 
 
 SCHEMA_VERSION = "2.0"
+# Set once per export so a "written during this run" timestamp can be recognised.
+_EXPORT_STARTED_AT: List[Optional[datetime]] = [None]
 # Public section-status vocabulary, mirrored by AIContextSection.status.
 # A section that was not requested is absent from the export; it is never
 # serialized as a `not_requested` placeholder row.
@@ -607,7 +609,15 @@ def _collect_warnings(value: Any) -> List[str]:
                 if isinstance(item, Mapping):
                     ticker = str(item.get("ticker")).strip() if item.get("ticker") else ""
                     message = str(item.get("message") or item.get("detail") or "").strip()
-                    text = f"{ticker}: {message}" if ticker and message else message or str(item)
+                    # A structured warning already carries a `ticker` field, and
+                    # the message it ships with frequently opens with that same
+                    # ticker ("NIFTYIETF.NS: 20 own return observations ...").
+                    # Prefixing again renders "NIFTYIETF.NS: NIFTYIETF.NS: ...".
+                    already_prefixed = bool(ticker) and message.startswith(f"{ticker}:")
+                    if ticker and message and not already_prefixed:
+                        text = f"{ticker}: {message}"
+                    else:
+                        text = message or (ticker or str(item))
                 else:
                     text = str(item)
                 if text:
@@ -891,6 +901,28 @@ def _date_text(value: Any) -> Optional[str]:
     return text[:10] if text else None
 
 
+def _parse_iso_timestamp(value: Any) -> Optional[datetime]:
+    """Parse a declared ISO timestamp, tolerating a trailing `Z`.
+
+    Returns `None` rather than guessing when the text is not a real timestamp;
+    a date-only value is midnight, which is honest for a date comparison.
+    """
+    text = _as_of_text(value)
+    if not text:
+        return None
+    candidate = text.strip()
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(candidate[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 # Which declared field produced an as-of, so freshness is self-describing.  The
 # keys mirror `_AS_OF_KEYS`; a series resolves through its newest record date.
 _AS_OF_SEMANTICS: Dict[str, str] = {
@@ -914,6 +946,70 @@ def _declared_as_of_semantics(value: Any, resolved: Optional[str]) -> Optional[s
     if isinstance(value, (list, tuple)):
         return _AS_OF_SEMANTICS["date"]
     return _AS_OF_SEMANTICS["as_of"]
+
+
+def _payload_as_of_semantics(data: Any, resolved: Optional[str]) -> Optional[str]:
+    """What the resolved `as_of` measures, for the section as a whole.
+
+    A payload may declare its own meaning (`liquidity_component_only`,
+    `latest_available_observation`, ...). Honour it first: the exporter must not
+    overwrite a precise label with a generic one. Otherwise derive the label from
+    the key the date came from, so a bare date never ships unlabelled.
+    """
+    if not resolved:
+        return None
+    for source in _semantics_sources(data):
+        declared = source.get("as_of_semantics")
+        if isinstance(declared, str) and declared.strip():
+            return declared.strip()
+    return _declared_as_of_semantics(data, resolved)
+
+
+def _semantics_sources(data: Any) -> List[Mapping[str, Any]]:
+    """Containers that may carry a declared `as_of_semantics`, nearest first."""
+    sources: List[Mapping[str, Any]] = []
+    if isinstance(data, Mapping):
+        sources.append(data)
+        nested = data.get("data")
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    return sources
+
+
+# A date inside this envelope's own collection window is a value the run just
+# wrote, not a prior measurement.
+_RUN_TIMESTAMP_SLACK_SECONDS = 300
+
+
+def _run_timestamp_as_of(data: Any, resolved: Optional[str]) -> Optional[str]:
+    """Warn when `as_of` was produced during this export, not observed before it.
+
+    A portfolio quote is re-stamped every time the export refreshes it, so its
+    timestamp necessarily lands inside the collection window. That is honest data
+    with an honest meaning — it is just NOT a historical observation date, and a
+    consumer reading `as_of` alone would assume it was. Disclosing the
+    distinction is cheaper than pretending the distinction does not exist.
+    """
+    if not resolved:
+        return None
+    stamp = _parse_iso_timestamp(resolved)
+    if stamp is None:
+        return None
+    started = _parse_iso_timestamp(_EXPORT_STARTED_AT[0])
+    if started is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    age = (started - stamp).total_seconds()
+    if not (-_RUN_TIMESTAMP_SLACK_SECONDS <= age <= _RUN_TIMESTAMP_SLACK_SECONDS):
+        return None
+    return (
+        f"as_of {resolved} is a quote/update timestamp written during this export "
+        "(it falls inside the collection window), so it marks when the value was "
+        "refreshed, not a historical observation date"
+    )
 
 
 def _component_as_of_entry(
@@ -1232,6 +1328,7 @@ class PortfolioContextService:
         options = _validate_options(options or ContextOptions())
         selected = parse_include(",".join(options.include))
         generated_at = _now()
+        _EXPORT_STARTED_AT[0] = generated_at
         warnings: List[str] = []
 
         portfolio_data: Any = None
@@ -1468,6 +1565,15 @@ class PortfolioContextService:
                 + ", ".join(mixed_units)
                 + "); no single currency is declared for the composite"
             )
+        resolved_as_of = _as_of(compact_data)
+        as_of_semantics = _payload_as_of_semantics(compact_data, resolved_as_of)
+        run_freshness = _run_timestamp_as_of(compact_data, resolved_as_of)
+        if run_freshness:
+            # A "freshness" date that lands inside this export's own collection
+            # window is a quote refresh that happened DURING the run, not a
+            # historical measurement. Saying so beats implying an observation
+            # precision the source never had.
+            section_warnings.append(run_freshness)
         section_warnings = list(dict.fromkeys(section_warnings))
         section = {
             "key": key,
@@ -1476,7 +1582,8 @@ class PortfolioContextService:
             "status": resolved_status,
             "detail": detail,
             "generated_at": _now(),
-            "as_of": _as_of(compact_data),
+            "as_of": resolved_as_of,
+            "as_of_semantics": as_of_semantics,
             "currency": currency,
             "inputs": _jsonable(inputs),
             "coverage": coverage,
@@ -2195,9 +2302,18 @@ def _compact_detail(key: str, data: Any, detail: str) -> Tuple[Any, List[str]]:
         components = compact.get("components") if isinstance(compact, dict) else None
         correlation = components.get("correlation_stability") if isinstance(components, dict) else None
         if isinstance(correlation, dict) and isinstance(correlation.get("data"), dict):
-            trim_list(correlation["data"], "series", 60)
-            if omitted and omitted[-1] == "series":
-                omitted[-1] = "components.correlation_stability.series"
+            series = correlation["data"].get("series")
+            if isinstance(series, list) and len(series) > 60:
+                correlation["data"]["series"] = series[-60:]
+                # `omitted_fields` says a field was OMITTED, but this one is
+                # still present (just shorter). Listing the bare path made a
+                # consumer skip a field that exists. Name the real path, state
+                # how much was dropped, and say plainly that it was shortened
+                # rather than removed.
+                correlation["data"]["series_trimmed_in_summary"] = True
+                correlation["data"]["series_observations"] = len(series)
+                correlation["data"]["series_retained"] = 60
+                omitted.append("components.correlation_stability.data.series")
     elif key == "india_flows":
         components = compact.get("components") if isinstance(compact, dict) else None
         flows = components.get("institutional_flows") if isinstance(components, dict) else None

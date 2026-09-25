@@ -15,6 +15,15 @@ explicit ``source_component``) instead of publishing ``unknown`` while a nested
 14/14 coverage block sits right underneath it, and never claims a weight basis
 for a market-wide leg.
 
+Because that promotion describes only one of the three components, the promoted
+block also carries ``covers_components``, ``coverage_completeness_scope`` and a
+composite-scoped ``composite_coverage_status``/``composite_coverage_status_reason``,
+so a mixed-universe composite can never be read as universally covered from
+``status``/``complete`` alone.  The composite's own ``warnings`` state, in plain
+sentences, that it is only as complete as its weakest component and which
+component is degraded and why - derived from the real component statuses and
+coverage reasons, never from a hardcoded component name.
+
 This module is deliberately pure: it takes the three already-computed component
 payloads as plain dicts and returns a plain dict.  It performs no IO, touches no
 database, and fabricates nothing - a component that measured nothing stays
@@ -76,6 +85,62 @@ _MARKET_WIDE_COVERAGE_POLICY = (
     "Market-wide institutional flows have no ticker universe, so ticker coverage is "
     "unknown and no portfolio weight was renormalized for this component."
 )
+
+# The composite is only as complete as its weakest component.  Two machine facts
+# describe that: ``data_status`` (was there measured data?) and the coverage
+# vocabulary (was every named universe actually covered?).
+COMPOSITE_WEAKNESS_POLICY = (
+    "The composite is only as complete as its weakest component; the section "
+    "coverage status below describes the promoted component's own universe only."
+)
+
+# Machine reason -> plain sentence.  A warning must read as something a human can
+# act on, so every ``coverage_status_reason`` this module emits gets a gloss.
+# Keys are the exact tokens produced by the component coverage functions above;
+# an unrecognized token is quoted verbatim rather than dropped or invented.
+_COVERAGE_REASON_PROSE: Dict[str, str] = {
+    "market_wide_aggregate_has_no_ticker_universe": (
+        "ticker coverage does not apply to it and no portfolio weight was "
+        "renormalized for it"
+    ),
+    "no_requested_symbol_had_usable_delivery_history": (
+        "no requested symbol had a stored delivery history in the ingested NSE "
+        "bhavcopy records"
+    ),
+    "requested_symbols_without_usable_delivery_history": (
+        "the requested symbols had no stored delivery history in the ingested "
+        "NSE bhavcopy records"
+    ),
+    "delivery_symbol_universe_not_reported_by_the_source": (
+        "the source published no symbol universe for it, so its coverage is unmeasured"
+    ),
+    "every_requested_symbol_has_usable_delivery_history": (
+        "every requested symbol had a usable stored delivery history"
+    ),
+    "every_portfolio_position_had_price_history": (
+        "every portfolio position had usable price history"
+    ),
+    "portfolio_positions_without_price_history": (
+        "some portfolio positions had no usable price history"
+    ),
+    "no_portfolio_position_had_price_history": (
+        "no portfolio position had usable price history"
+    ),
+    "liquidity_universe_not_reported_by_the_source": (
+        "the source published no universe for it, so its coverage is unmeasured"
+    ),
+}
+
+# How each scope reads in a sentence, so a market-wide aggregate is never
+# described as though it had been measured over a ticker roster.
+_SCOPE_PROSE: Dict[str, str] = {
+    SCOPE_MARKET_WIDE: (
+        "it is a market-wide aggregate measured over the whole market and has no "
+        "ticker universe"
+    ),
+    SCOPE_SYMBOL_SCOPED: "it is measured symbol-scoped over the requested scrip roster",
+    SCOPE_PORTFOLIO_POSITIONS: "it is measured over portfolio positions",
+}
 
 
 def _as_mapping(value: Any) -> Dict[str, Any]:
@@ -141,6 +206,178 @@ def aggregate_data_status(statuses: Sequence[str]) -> str:
     if all(status == "available" for status in values):
         return "available"
     return "partial"
+
+
+def normalize_coverage_status(value: Any) -> str:
+    """Map a declared coverage word onto the coverage vocabulary.
+
+    An unrecognized or absent declaration resolves to ``unknown``: a universe
+    that never said it was covered is unmeasured, not covered.  A data_status
+    word is deliberately *not* aliased onto a coverage word - ``available`` data
+    is not ``complete`` coverage.
+    """
+    if not isinstance(value, str):
+        return "unknown"
+    text = value.strip().lower()
+    return text if text in COVERAGE_STATUS_VOCABULARY else "unknown"
+
+
+def aggregate_coverage_status(statuses: Sequence[str]) -> str:
+    """The composite's own coverage: complete only when every component is.
+
+    A heterogeneous composite is ``complete`` only when every component reported
+    ``complete``; otherwise it is ``partial`` as soon as at least one component
+    measured a universe, ``unavailable`` when nothing was measured and a leg is
+    known to be unavailable, and ``unknown`` when nothing was measured at all.
+    """
+    values = [normalize_coverage_status(status) for status in statuses if status]
+    if not values:
+        return "unknown"
+    if all(status == "complete" for status in values):
+        return "complete"
+    if any(status in {"complete", "partial"} for status in values):
+        return "partial"
+    if any(status == "unavailable" for status in values):
+        return "unavailable"
+    return "unknown"
+
+
+def _coverage_status_detail(component_coverage: Mapping[str, Any]) -> List[str]:
+    """``name=status (reason)`` for every component that is not fully covered."""
+    detail: List[str] = []
+    for name in INDIA_COMPONENTS:
+        block = _as_mapping(component_coverage.get(name))
+        status = normalize_coverage_status(block.get("coverage_status"))
+        if status == "complete":
+            continue
+        reason = str(block.get("coverage_status_reason") or "").strip()
+        detail.append(f"{name}={status}" + (f" ({reason})" if reason else ""))
+    return detail
+
+
+def composite_coverage(component_coverage: Mapping[str, Any]) -> Dict[str, Any]:
+    """Composite-scoped coverage status, machine reason, and per-component detail.
+
+    Returned in published component order so repeated exports are identical.
+    """
+    statuses = [
+        normalize_coverage_status(_as_mapping(component_coverage.get(name)).get("coverage_status"))
+        for name in INDIA_COMPONENTS
+    ]
+    status = aggregate_coverage_status(statuses)
+    detail = _coverage_status_detail(component_coverage)
+    reason = (
+        "every_named_component_reported_complete_coverage"
+        if status == "complete"
+        else "not_every_named_component_reported_complete_coverage: " + "; ".join(detail)
+    )
+    return {"status": status, "reason": reason, "detail": detail}
+
+
+def _reason_prose(coverage: Mapping[str, Any]) -> str:
+    """Gloss a component's machine coverage reason as a plain sentence."""
+    token = str(coverage.get("coverage_status_reason") or "").strip()
+    if not token:
+        return "the source reported no coverage reason for it"
+    return _COVERAGE_REASON_PROSE.get(token, f"its reported coverage reason is {token!r}")
+
+
+def _coverage_counts_prose(coverage: Mapping[str, Any]) -> str:
+    """Measured coverage counts, when the component reported a universe."""
+    requested = coverage.get("requested_count")
+    covered = coverage.get("covered_count")
+    if not isinstance(requested, int) or not isinstance(covered, int):
+        return ""
+    return f" ({covered} of {requested} in its universe were covered)"
+
+
+def _coverage_claims_no_gap(coverage: Mapping[str, Any]) -> bool:
+    """Whether a component's own coverage reason asserts zero missing coverage.
+
+    Read off the reason token this module emits for a gap-free universe
+    (``every_...``); an unrecognised or absent token claims nothing.
+    """
+    token = str(coverage.get("coverage_status_reason") or "").strip()
+    return token.startswith("every_")
+
+
+def _component_measurement_clause(status: str, coverage: Mapping[str, Any]) -> str:
+    """Why this component is short, without ever upgrading an unavailable leg.
+
+    A component that published no measurement cannot be excused by a coverage
+    block that reports no gap, so that disagreement is stated rather than
+    smoothed over.
+    """
+    if status == "unavailable" and _coverage_claims_no_gap(coverage):
+        return (
+            "the component published no measurement, so its coverage block reporting no "
+            f"gap ({coverage.get('coverage_status_reason')}) does not mean any "
+            "observation is available"
+        )
+    if status == "partial" and _coverage_claims_no_gap(coverage):
+        return (
+            "the component published only partial data, so its coverage block reporting "
+            f"no gap ({coverage.get('coverage_status_reason')}) does not mean every "
+            "observation is available"
+        )
+    if status == "unavailable":
+        return f"no measurement was published; {_reason_prose(coverage)}"
+    if status == "partial":
+        return f"only partial data was published; {_reason_prose(coverage)}"
+    return f"{_reason_prose(coverage)}{_coverage_counts_prose(coverage)}"
+
+
+def _component_warning(name: str, status: str, coverage: Mapping[str, Any]) -> str:
+    """One sentence naming a degraded component, its scope, and why it is short."""
+    scope = str(coverage.get("scope") or "").strip()
+    scope_prose = _SCOPE_PROSE.get(
+        scope, "the source reported no scope for it, so its universe is unstated"
+    )
+    return (
+        f"{name} is {status}: {scope_prose}; "
+        f"{_component_measurement_clause(status, coverage)}."
+    )
+
+
+def composite_warnings(
+    *,
+    component_status: Mapping[str, Any],
+    component_coverage: Mapping[str, Any],
+    composite_coverage_detail: Sequence[str],
+) -> List[str]:
+    """Plain, deterministic statements about what the composite is missing.
+
+    Every clause is derived from the component's own ``data_status`` and from the
+    coverage status/reason it published; no component name or reason is written
+    into this function.  Per-component lines appear only for a degraded leg, so a
+    section whose components all measured data carries no defect line - but the
+    composite-coverage line survives as long as any leg's coverage is not
+    ``complete``, which is always true while the market-wide flow leg has no
+    ticker universe by construction.
+    """
+    warnings: List[str] = []
+    statuses = {
+        name: normalize_data_status(component_status.get(name)) for name in INDIA_COMPONENTS
+    }
+    degraded = [name for name in INDIA_COMPONENTS if statuses[name] != "available"]
+    if degraded:
+        detail = ", ".join(f"{name}={statuses[name]}" for name in degraded)
+        warnings.append(
+            "Composite data status is only as complete as its weakest component: "
+            f"{aggregate_data_status([statuses[name] for name in INDIA_COMPONENTS])}; "
+            f"degraded components ({len(degraded)} of {len(INDIA_COMPONENTS)}): {detail}."
+        )
+        for name in degraded:
+            warnings.append(
+                _component_warning(name, statuses[name], _as_mapping(component_coverage.get(name)))
+            )
+    if composite_coverage_detail:
+        warnings.append(
+            "Composite coverage is only as complete as its weakest component: "
+            + "; ".join(composite_coverage_detail)
+            + "."
+        )
+    return warnings
 
 
 def coverage_status_for(
@@ -290,12 +527,18 @@ def _liquidity_universe_coverage(
     *,
     liquidity_coverage_status: str,
     fallback_requested: Sequence[str],
+    composite: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """Promote the nested liquidity coverage for the section-level block.
 
     The promotion is explicit about its origin so a consumer cannot mistake it
     for flow or delivery ticker coverage.  An unavailable liquidity component
     stays unavailable - the context roster is never substituted as coverage.
+
+    ``status``/``complete``/``coverage_ratio`` keep describing the promoted
+    component's own universe; the composite-scoped fields say how far that
+    status actually reaches, so a heterogeneous composite is never read as
+    universally covered from those two keys alone.
     """
     coverage = _liquidity_universe(liquidity)
     promoted: Dict[str, Any] = dict(coverage) if coverage else {}
@@ -326,6 +569,10 @@ def _liquidity_universe_coverage(
     # (i.e. an active leg was actually dropped and weights were renormalized).
     if "weight_basis" not in coverage:
         promoted.pop("weight_basis", None)
+    # The promoted status describes the promoted component's universe and nothing
+    # else, so name that universe and publish the composite's own coverage next
+    # to it rather than letting `complete` stand in for the whole section.
+    covers_components = [LIQUIDITY_LIMITS]
     promoted.update({
         "source_component": LIQUIDITY_LIMITS,
         "scope": SCOPE_PORTFOLIO_POSITIONS,
@@ -333,7 +580,13 @@ def _liquidity_universe_coverage(
             "Price-history coverage of portfolio positions, measured by the "
             "liquidity_limits component only."
         ),
-        "not_applicable_components": [INSTITUTIONAL_FLOWS, DELIVERY_ANOMALIES],
+        "coverage_completeness_scope": LIQUIDITY_LIMITS,
+        "covers_components": covers_components,
+        "not_applicable_components": [
+            name for name in INDIA_COMPONENTS if name not in covers_components
+        ],
+        "composite_coverage_status": str(composite.get("status") or "unknown"),
+        "composite_coverage_status_reason": str(composite.get("reason") or ""),
     })
     return promoted
 
@@ -366,7 +619,9 @@ def compose_india_composite(
     Returns:
         The composite section body: ``components`` (unchanged payloads),
         ``component_inputs``, ``component_coverage``, ``component_as_of``,
-        ``as_of``/``as_of_semantics``, ``universe_coverage`` and ``data_status``.
+        ``as_of``/``as_of_semantics``, ``universe_coverage``, ``data_status``,
+        the composite-scoped ``coverage_status``, and ``warnings`` naming every
+        degraded component and why.
     """
     flow_payload = _as_mapping(flows)
     delivery_payload = _as_mapping(delivery)
@@ -475,6 +730,21 @@ def compose_india_composite(
             return dict(envelope)
         return {"status": status, "data": payload or None}
 
+    component_coverage: Dict[str, Any] = {
+        INSTITUTIONAL_FLOWS: flow_coverage,
+        DELIVERY_ANOMALIES: delivery_coverage,
+        LIQUIDITY_LIMITS: liquidity_coverage,
+    }
+    component_status: Dict[str, str] = {
+        INSTITUTIONAL_FLOWS: flow_status,
+        DELIVERY_ANOMALIES: delivery_status,
+        LIQUIDITY_LIMITS: liquidity_status,
+    }
+    # The composite's own coverage, stated beside the promoted one: the promoted
+    # status answers "was this component's universe covered", this one answers
+    # "was every component the section names covered".
+    composite_cov = composite_coverage(component_coverage)
+
     composite: Dict[str, Any] = {
         "components": {
             INSTITUTIONAL_FLOWS: _envelope(flow_envelope, flow_payload, flow_status),
@@ -488,17 +758,10 @@ def compose_india_composite(
         "data_status": aggregate_data_status(
             [flow_status, delivery_status, liquidity_status]
         ),
-        "component_status": {
-            INSTITUTIONAL_FLOWS: flow_status,
-            DELIVERY_ANOMALIES: delivery_status,
-            LIQUIDITY_LIMITS: liquidity_status,
-        },
+        "coverage_status": composite_cov["status"],
+        "component_status": component_status,
         "component_inputs": component_inputs,
-        "component_coverage": {
-            INSTITUTIONAL_FLOWS: flow_coverage,
-            DELIVERY_ANOMALIES: delivery_coverage,
-            LIQUIDITY_LIMITS: liquidity_coverage,
-        },
+        "component_coverage": component_coverage,
         "component_as_of": component_as_of,
         "as_of": as_of,
         "as_of_semantics": as_of_semantics,
@@ -507,12 +770,22 @@ def compose_india_composite(
             liquidity_payload,
             liquidity_coverage_status=str(liquidity_coverage["coverage_status"]),
             fallback_requested=roster,
+            composite=composite_cov,
         ),
         "coverage_notes": [
             "Section coverage is the liquidity component's portfolio-position price "
             "history; see component_coverage for the market-wide flow and "
             "symbol-scoped delivery universes.",
+            COMPOSITE_WEAKNESS_POLICY,
             _MARKET_WIDE_COVERAGE_POLICY,
         ],
+        # A degraded section must say why: without these, a consumer sees a
+        # partial composite with no stated reason and a `complete` coverage block
+        # covering one of three components.
+        "warnings": composite_warnings(
+            component_status=component_status,
+            component_coverage=component_coverage,
+            composite_coverage_detail=composite_cov["detail"],
+        ),
     }
     return composite

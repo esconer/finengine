@@ -113,6 +113,11 @@ def _holding_date_provenance() -> Dict[str, Any]:
             "Analytics holding_window uses the earliest valid added_on or "
             "buy-price-implied start; it is not the quote timestamp."
         ),
+        "quote_timestamp_timezone": (
+            "updated_on is a naive datetime column and carries no offset. as_of "
+            "renders it as UTC (a trailing Z) so the envelope stays ISO-parseable; "
+            "the UTC designation is an interpretation, not a stored fact."
+        ),
     }
 
 

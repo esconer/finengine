@@ -11,7 +11,10 @@ plain dicts, so every case here is exercised without a database, a network, or
 a provider.  The regression it guards is the v3 artifact's ``status: unknown``
 section coverage (while nested liquidity coverage was 14/14) plus a bogus
 ``weight_basis`` claim, and a composite ``as_of`` that silently borrowed the
-portfolio quote date.
+portfolio quote date.  The v4 export audit added two more: a ``partial``
+composite published with ``warnings: []``, and a promoted section coverage
+(``status: complete``, 14/14) that read as universal coverage of a composite
+whose other two components were unavailable.
 """
 from __future__ import annotations
 
@@ -27,8 +30,10 @@ from app.services.ai_context_india import (
     SCOPE_MARKET_WIDE,
     SCOPE_PORTFOLIO_POSITIONS,
     SCOPE_SYMBOL_SCOPED,
+    aggregate_coverage_status,
     aggregate_data_status,
     compose_india_composite,
+    normalize_coverage_status,
 )
 from app.services.india_data_service import LIQUIDITY_ADV_LOOKBACK_SESSIONS
 
@@ -497,3 +502,224 @@ def test_exporter_resolves_as_of_and_coverage_from_the_composite():
     assert coverage["missing_tickers"] == []
     assert coverage["source_component"] == LIQUIDITY_LIMITS
     assert "weight_basis" not in coverage
+
+
+# --------------------------------------------------------------------------
+# v4 audit: a `partial` composite may not ship without a stated reason, and
+# the promoted `complete` coverage may not read as coverage of all three legs.
+# --------------------------------------------------------------------------
+def _degraded_composite(**overrides):
+    """The v4 export shape: only the liquidity leg measured anything.
+
+    ``institutional_flows`` is a market-wide aggregate with no ticker universe
+    and no stored rows, and no requested symbol has a stored delivery history,
+    so both legs are genuinely unavailable - not a degraded measurement.
+    """
+    kwargs = {
+        "flows": _flow_payload(),
+        "delivery": _delivery_payload(
+            status="unavailable", requested=SCRIPS, covered=[], missing=SCRIPS
+        ),
+        "liquidity": _liquidity_payload(),
+    }
+    kwargs.update(overrides)
+    return _compose(**kwargs)
+
+
+def test_degraded_composite_never_publishes_an_empty_warning_list():
+    composite = _degraded_composite()
+
+    assert composite["data_status"] == "partial"
+    warnings = composite["warnings"]
+    assert isinstance(warnings, list) and warnings
+    assert all(isinstance(warning, str) and warning.strip() for warning in warnings)
+    # The headline states the weakest-component rule in plain language.
+    assert "only as complete as its weakest component" in warnings[0]
+    assert "degraded components (2 of 3)" in warnings[0]
+
+
+def test_warnings_name_each_unavailable_component_and_why():
+    warnings = _degraded_composite()["warnings"]
+
+    flow_line = next(w for w in warnings if w.startswith(f"{INSTITUTIONAL_FLOWS} is "))
+    assert f"{INSTITUTIONAL_FLOWS} is unavailable" in flow_line
+    # A market-wide aggregate is never described as having a ticker universe.
+    assert "market-wide aggregate" in flow_line
+    assert "has no ticker universe" in flow_line
+    assert "no portfolio weight was renormalized" in flow_line
+
+    delivery_line = next(w for w in warnings if w.startswith(f"{DELIVERY_ANOMALIES} is "))
+    assert f"{DELIVERY_ANOMALIES} is unavailable" in delivery_line
+    assert "stored delivery history" in delivery_line
+    assert "bhavcopy" in delivery_line
+
+    # The measured liquidity leg is not degraded, so it gets no defect line.
+    assert not any(w.startswith(f"{LIQUIDITY_LIMITS} is ") for w in warnings)
+
+
+def test_warnings_are_derived_from_the_components_not_hardcoded():
+    # Degrade a different leg: the same builder must name liquidity, its own
+    # reason, and nothing about the two legs that are fine.
+    composite = _compose(
+        flows=_flow_payload(status="available"),
+        delivery=_delivery_payload(status="available"),
+        liquidity=_liquidity_payload(status="unavailable", coverage_status="unavailable"),
+    )
+
+    warnings = composite["warnings"]
+    assert "degraded components (1 of 3): liquidity_limits=unavailable" in warnings[0]
+    liquidity_line = next(w for w in warnings if w.startswith(f"{LIQUIDITY_LIMITS} is "))
+    assert "portfolio positions" in liquidity_line
+    assert "price history" in liquidity_line
+    assert not any(w.startswith(f"{INSTITUTIONAL_FLOWS} is ") for w in warnings)
+    assert not any(w.startswith(f"{DELIVERY_ANOMALIES} is ") for w in warnings)
+
+
+def test_warnings_never_upgrade_an_unavailable_leg_with_a_no_gap_coverage():
+    # A sloppy upstream can report an unavailable component whose coverage
+    # claims zero gaps; the warning must not launder that into "covered".
+    composite = _compose(
+        flows=_flow_payload(status="available"),
+        delivery=_delivery_payload(status="unavailable"),  # covered=SCRIPS, status unavailable
+    )
+
+    delivery_line = next(
+        w for w in composite["warnings"] if w.startswith(f"{DELIVERY_ANOMALIES} is ")
+    )
+    assert "published no measurement" in delivery_line
+    assert "every_requested_symbol_has_usable_delivery_history" in delivery_line
+    assert "does not mean any observation is available" in delivery_line
+
+
+def test_warnings_are_stable_across_runs_and_published_component_order():
+    first = _degraded_composite()["warnings"]
+    second = _degraded_composite()["warnings"]
+
+    assert first == second
+    component_lines = [w for w in first if " is unavailable:" in w or " is partial:" in w]
+    assert [w.split(" is ")[0] for w in component_lines] == [
+        INSTITUTIONAL_FLOWS, DELIVERY_ANOMALIES
+    ]
+
+
+def test_measured_components_get_no_defect_warning():
+    composite = _compose(
+        flows=_flow_payload(status="available"),
+        delivery=_delivery_payload(status="available"),
+        liquidity=_liquidity_payload(status="available"),
+    )
+
+    assert composite["data_status"] == "available"
+    # Nothing measured short, so no degraded-component lines at all.  The
+    # market-wide flow leg's coverage is `unknown` by construction, so the
+    # composite-coverage line is expected to stay (see
+    # test_promoted_coverage_carries_a_composite_scoped_status).
+    assert not any(" is unavailable:" in w or " is partial:" in w for w in composite["warnings"])
+    assert not any("degraded components" in w for w in composite["warnings"])
+
+
+def test_warnings_never_fabricate_a_missing_fii_dii_leg():
+    flows = _flow_payload(status="partial", missing_categories=["DII"])
+    flows["flows"] = [{"date": "2026-09-22", "fii_net_crores": -120.5, "dii_net_crores": None}]
+    composite = _compose(flows=flows)
+
+    flow_line = next(
+        w for w in composite["warnings"] if w.startswith(f"{INSTITUTIONAL_FLOWS} is ")
+    )
+    assert f"{INSTITUTIONAL_FLOWS} is partial" in flow_line
+    # The missing leg is still null, and the warning never reports it as zero.
+    assert composite["components"][INSTITUTIONAL_FLOWS]["data"]["flows"][0]["dii_net_crores"] is None
+    assert "zero" not in flow_line.lower()
+
+
+def test_promoted_coverage_carries_a_composite_scoped_status():
+    composite = _degraded_composite()
+
+    coverage = composite["universe_coverage"]
+    # The promoted status still describes the promoted component's universe...
+    assert coverage["status"] == "complete"
+    assert coverage["complete"] is True
+    # ...and says so, machine-readably, next to the composite's own status.
+    assert coverage["covers_components"] == [LIQUIDITY_LIMITS]
+    assert coverage["coverage_completeness_scope"] == LIQUIDITY_LIMITS
+    assert coverage["not_applicable_components"] == [INSTITUTIONAL_FLOWS, DELIVERY_ANOMALIES]
+    assert coverage["composite_coverage_status"] == "partial"
+    assert coverage["composite_coverage_status"] in COVERAGE_STATUS_VOCABULARY
+    reason = coverage["composite_coverage_status_reason"]
+    assert reason.startswith("not_every_named_component_reported_complete_coverage")
+    assert f"{INSTITUTIONAL_FLOWS}=unknown" in reason
+    assert f"{DELIVERY_ANOMALIES}=unavailable" in reason
+    # A consumer reading only the two legacy keys sees the scope fields too.
+    assert composite["coverage_status"] == "partial"
+    assert composite["coverage_status"] != coverage["status"]
+
+
+def test_promoted_coverage_is_complete_only_when_every_component_is():
+    complete = _compose(
+        flows=_flow_payload(status="available"),
+        delivery=_delivery_payload(status="available"),
+        liquidity=_liquidity_payload(status="available"),
+    )["universe_coverage"]
+    assert complete["composite_coverage_status"] == "partial"  # flow universe is unknown
+    assert complete["composite_coverage_status_reason"] == (
+        "not_every_named_component_reported_complete_coverage: "
+        "institutional_flows=unknown (market_wide_aggregate_has_no_ticker_universe)"
+    )
+    # The market-wide leg is still never given a ticker universe or a basis.
+    assert "requested_tickers" in complete
+    assert "weight_basis" not in complete
+
+
+def test_promoted_coverage_reports_unavailable_when_no_component_measured():
+    composite = compose_india_composite(
+        tickers=TICKERS,
+        flows=_flow_payload(),
+        delivery=_delivery_payload(status="unavailable", requested=SCRIPS, covered=[], missing=SCRIPS),
+        liquidity=None,
+    )
+
+    coverage = composite["universe_coverage"]
+    assert coverage["status"] == "unavailable"
+    # The promoted status still refers to the liquidity universe, and the
+    # composite's own status is the weakest of the three.
+    assert coverage["covers_components"] == [LIQUIDITY_LIMITS]
+    assert coverage["composite_coverage_status"] == "unavailable"
+    assert composite["coverage_status"] == "unavailable"
+    assert composite["warnings"]
+
+
+def test_exporter_keeps_the_scoped_coverage_fields_next_to_a_complete_status():
+    from app.services.ai_context_service import _section_coverage
+
+    composite = _degraded_composite()
+    coverage = _section_coverage(
+        "india_flows", {"tickers": TICKERS, "flow_lookback_days": 30}, composite
+    )
+
+    # The exporter recomputes the ticker math of the promoted universe...
+    assert coverage["status"] == "complete"
+    assert coverage["complete"] is True
+    # ...and the composite scope survives that recompute, so `complete` cannot
+    # be read as coverage of the two legs that measured nothing.
+    assert coverage["covers_components"] == [LIQUIDITY_LIMITS]
+    assert coverage["coverage_completeness_scope"] == LIQUIDITY_LIMITS
+    assert coverage["composite_coverage_status"] == "partial"
+    assert coverage["not_applicable_components"] == [INSTITUTIONAL_FLOWS, DELIVERY_ANOMALIES]
+    assert "weight_basis" not in coverage
+    # The warnings travel with the section data, so the section reports them.
+    assert composite["warnings"]
+
+
+def test_coverage_status_vocabulary_rules():
+    assert aggregate_coverage_status(["complete", "complete", "complete"]) == "complete"
+    assert aggregate_coverage_status(["complete", "unknown"]) == "partial"
+    assert aggregate_coverage_status(["partial", "complete"]) == "partial"
+    assert aggregate_coverage_status(["unavailable", "unavailable", "unknown"]) == "unavailable"
+    assert aggregate_coverage_status(["unknown", "unknown"]) == "unknown"
+    assert aggregate_coverage_status([]) == "unknown"
+    for status in aggregate_coverage_status(["complete"]), aggregate_coverage_status(["nonsense"]):
+        assert status in COVERAGE_STATUS_VOCABULARY
+    # A data_status word is never promoted onto a coverage word.
+    assert normalize_coverage_status("available") == "unknown"
+    assert normalize_coverage_status("Complete") == "complete"
+    assert normalize_coverage_status(None) == "unknown"

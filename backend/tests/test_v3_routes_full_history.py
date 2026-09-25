@@ -263,7 +263,12 @@ async def test_risk_contribution_holding_context_keeps_its_own_window():
 
     coverage = result["history_coverage"]
     holding = coverage["holding_context"]
-    expected_holding_days = int((dates[1:] >= pd.Timestamp("2026-08-04")).sum())
+    # A return needs two HELD prices, and the bar on the start date is the first
+    # held price: it has no held predecessor, so the return dated on it is a
+    # pre-purchase return the user never earned on this position. `>=` counted
+    # it; the count every holding-window section now publishes is the strictly
+    # after rows, which is why the window is 24 observations and not 25 (V3-08).
+    expected_holding_days = int((dates[1:] > pd.Timestamp("2026-08-04")).sum())
     assert holding["intersection_start"] == "2026-08-04"
     assert holding["tickers"]["A.NS"]["analytics_start"] == "2026-08-04"
     assert holding["tickers"]["A.NS"]["analytics_start_source"] == "stored_added_on"

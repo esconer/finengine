@@ -62,6 +62,7 @@ from app.utils.holdings import (
     annualizable,
     apply_annualization_gate,
     coerce_holding_date,
+    effective_start,
     effective_start_detail,
     holding_coverage,
     holding_window,
@@ -917,6 +918,315 @@ def _conditional_regime_coverage(
         "oldest_holding": holding_context.get("oldest_holding"),
         "holding_context": dict(holding_context),
     }
+
+
+# --- Canonical holding-window publication (V3-08) ---------------------------
+# ONE rule for "when did this composition start?", used by every section that
+# publishes a holding window. The v4 export answered it three ways and the same
+# portfolio then carried three different holding dates:
+#
+#   * the buy-price inference was fed whatever price frames the SECTION
+#     happened to fetch, so a 1100-day regime window inferred a date 10.7
+#     months earlier than a 252-day realized-risk window did for the very same
+#     stored `added_on` (and published it as a bare `effective_start`, with no
+#     source, so it read as a holding date nobody had stored);
+#   * the counts were measured in different units - masked price rows, aligned
+#     return rows, model return observations - and one section held no price
+#     frames at all, so it answered with the stored date and moved the window
+#     start by a day;
+#   * nothing declared the unit of a count, so 39 and 40 were both "the
+#     holding window" in one export.
+#
+# The rule, in one place: a position's window start is its stored import date,
+# or an earlier buy-price match found INSIDE the canonical evidence window
+# (HOLDING_PROVENANCE_LOOKBACK_DAYS days ending at the section's requested
+# end). The evidence window is a function of the request's END, never of the
+# route's own analytics window, so a 1100-day HMM window and a 365-day
+# tear-sheet request resolve the same date for the same stored position.
+# Counts are return observations that two HELD prices can produce, under one
+# label. Provenance is attached to every start, and a section that could not
+# read the evidence says so with a reason instead of answering differently.
+#
+# `get_realized_risk` (the reference section) resolves the same rule from its
+# own requested window; that window and the canonical one coincide whenever it
+# is asked for its default horizon, and `provenance_evidence_window` publishes
+# the window a section actually used so any difference is declared, not silent.
+
+#: Calendar days of price evidence the buy-price inference may look at, anchored
+#: to the section's requested end. Mirrors the realized-risk default horizon
+#: (`_date_window(..., default_days=252)`), so the reference section and every
+#: publisher of a holding window resolve a position from the same bars. A wider
+#: or narrower analytics window cannot change a holding date.
+HOLDING_PROVENANCE_LOOKBACK_DAYS = 252
+
+#: The unit of a holding window's observation count, used by every section: the
+#: return observations that fall entirely inside the holding window. The bar on
+#: the start date is the first HELD price and has no held predecessor, so it
+#: cannot produce one - which is why 40 price rows are 39 return observations.
+#: Publishing a price-row count and a return-row count under the same name is
+#: how one portfolio reported 39 days in one section and 40 in another.
+HOLDING_COVERED_DAYS_SCOPE = "holding_window_aligned_return_rows"
+
+HOLDING_PROVENANCE_RULE = (
+    "One window start per position for every section: the stored import date, "
+    "or an earlier close within tolerance of the buy price found inside the "
+    f"canonical evidence window ({HOLDING_PROVENANCE_LOOKBACK_DAYS} calendar "
+    "days ending at the section's requested end). A start that differs from the "
+    "stored import date is always published as buy_price_inferred beside that "
+    "stored date, and the evidence window used is published with it."
+)
+
+#: `evidence_source` values, so a consumer can tell a resolved start from a
+#: degraded one without parsing prose.
+HOLDING_EVIDENCE_IN_HAND = "in_hand_price_frames"
+HOLDING_EVIDENCE_CANONICAL = "canonical_window_price_frames"
+HOLDING_EVIDENCE_STORED_ONLY = "stored_dates_only"
+
+
+def holding_evidence_window(
+    end: Any,
+    *,
+    lookback_days: int = HOLDING_PROVENANCE_LOOKBACK_DAYS,
+) -> Dict[str, Any]:
+    """The canonical buy-price evidence window for one requested end date.
+
+    Deterministic and clock-free: no `now()` read, so re-running the same
+    request with the same end reproduces the same holding dates. An
+    unparseable end yields a `None` start and the caller answers with stored
+    dates - a window is never guessed.
+    """
+    end_s = end if isinstance(end, str) and end else None
+    start: Optional[str] = None
+    days: Optional[int] = None
+    if end_s:
+        try:
+            stamp = pd.Timestamp(end_s)
+        except (TypeError, ValueError, OverflowError):
+            stamp = None
+        if stamp is not None and not pd.isna(stamp):
+            days = int(lookback_days)
+            start = (stamp - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    return {"start": start, "end": end_s, "days": days}
+
+
+def _evidence_frames(
+    frames: Optional[Dict[str, pd.Series]],
+    window: Mapping[str, Any],
+) -> Dict[str, pd.Series]:
+    """Price frames cut to the canonical evidence window.
+
+    A section may hand over the wide frames it already holds (the regime model
+    window is 1100 days); the inference only ever sees the canonical slice, so
+    a wider window cannot resolve an earlier date than a narrower one. A
+    dateless or empty series carries no date evidence and is dropped rather
+    than guessed at.
+    """
+    start = window.get("start") if isinstance(window, Mapping) else None
+    if not frames or not isinstance(start, str):
+        return {}
+    try:
+        cutoff = pd.Timestamp(start).normalize()
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    out: Dict[str, pd.Series] = {}
+    for ticker, series in frames.items():
+        index = getattr(series, "index", None)
+        if series is None or not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
+            continue
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        sliced = series.loc[index.normalize() >= cutoff]
+        if len(sliced):
+            out[ticker] = sliced
+    return out
+
+
+async def holding_provenance(
+    data_service: DataService,
+    holdings: Optional[Dict[str, Dict[str, Any]]],
+    tickers: Optional[Iterable[str]],
+    *,
+    end: Any,
+    frames: Optional[Dict[str, pd.Series]] = None,
+) -> Dict[str, Any]:
+    """THE holding-window start rule, for every section that publishes one.
+
+    Returns the `effective_start_detail` map, the per-ticker starts, the block
+    start and the evidence window that produced them - one answer per position,
+    whichever section asked.
+
+    `frames` are price frames the caller already holds; only their canonical
+    slice feeds the inference. When the caller holds none, the canonical window
+    is read through the same cache-first `DataService` that section's own leg
+    already used. It is a strict sub-window of the request every one of these
+    sections makes, so the read is served from the cache that leg populated
+    rather than from the vendor - and it is what removes the "no price frames,
+    so answer with the stored date" downgrade. A read that yields nothing
+    degrades to stored import dates and declares it (`evidence_source` =
+    `stored_dates_only`, plus a `provenance_divergence_reason` on the payload),
+    because quietly answering differently is the defect this removes.
+    """
+    window = holding_evidence_window(end)
+    evidence = _evidence_frames(frames, window)
+    source = HOLDING_EVIDENCE_IN_HAND
+    if not evidence and tickers and isinstance(window.get("start"), str):
+        ordered = list(dict.fromkeys(tickers or []))
+        fetched: Dict[str, pd.Series] = {}
+        if ordered:
+            try:
+                fetched = await _fetch_price_series_dict(
+                    data_service, ordered, window["start"], window["end"]
+                )
+            except Exception:  # noqa: BLE001 - provenance never fails a route
+                logger.warning(
+                    "Holding provenance evidence unavailable; answering with stored dates",
+                    exc_info=True,
+                )
+        evidence = _evidence_frames(fetched, window)
+        source = HOLDING_EVIDENCE_CANONICAL if evidence else HOLDING_EVIDENCE_STORED_ONLY
+    detail = effective_start_detail(holdings, evidence)
+    effectives = {
+        ticker: entry.get("analytics_start")
+        for ticker, entry in detail.items()
+        if isinstance(entry, Mapping)
+    }
+    return {
+        "detail": detail,
+        "effectives": effectives,
+        "start": effective_start(effectives),
+        "evidence_window": {**window, "source": source},
+    }
+
+
+def canonical_holding_window_input(
+    detail: Optional[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Holdings map that pins a masked leg to the canonical start.
+
+    The canonical start is handed over AS the import date and the buy price is
+    withheld, so `_build_wide_returns` masks at the canonical cutoff and no
+    second inference - however wide that leg's own price window is - can move
+    the date afterwards. Unknown starts stay absent, exactly as before: they
+    never constrain the window.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for ticker, entry in (detail or {}).items():
+        if not isinstance(entry, Mapping):
+            continue
+        start = entry.get("analytics_start")
+        if isinstance(start, str):
+            out[ticker] = {"added_on": start, "buy_price": None}
+    return out
+
+
+def holding_window_observation_count(
+    frame: Any,
+    start: Optional[str],
+    *,
+    measured_count: Optional[int] = None,
+    measured_start: Optional[str] = None,
+) -> Tuple[int, Optional[pd.Series]]:
+    """(count, mask) of the return observations inside the holding window.
+
+    The unit every section publishes: a return needs two HELD prices, and the
+    bar on `start` is the first held price, so only rows strictly after `start`
+    count. An unknown start or a dateless frame carries no holding
+    information - every row counts and the tenure stays hypothetical rather
+    than guessed.
+
+    `measured_count` / `measured_start` let a caller whose frame was already
+    masked at this very start hand its own measurement in rather than
+    re-deriving one; a frame masked to a different start is measured here, and
+    the returned mask is what the caller re-cuts the frame to.
+    """
+    index = getattr(frame, "index", None)
+    if index is None:
+        return (int(measured_count) if isinstance(measured_count, int) else 0), None
+    if not isinstance(index, pd.DatetimeIndex) or len(index) == 0 or not isinstance(start, str):
+        return int(len(index)), pd.Series(True, index=index)
+    try:
+        cutoff = pd.Timestamp(start).normalize()
+    except (TypeError, ValueError, OverflowError):
+        return int(len(index)), pd.Series(True, index=index)
+    normalized = index.tz_localize(None) if index.tz is not None else index
+    mask = pd.Series(normalized.normalize() > cutoff, index=index)
+    if measured_start == start and isinstance(measured_count, int):
+        # The frame was masked at this very start, so its count IS this count.
+        return measured_count, mask
+    return int(mask.sum()), mask
+
+
+def _coverage_per_ticker(
+    coverage: Optional[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Per-ticker measured counts carried by a `_build_wide_returns` coverage."""
+    entries = coverage.get("tickers") if isinstance(coverage, Mapping) else None
+    out: Dict[str, Dict[str, Any]] = {}
+    for ticker, entry in (entries or {}).items():
+        if not isinstance(entry, Mapping):
+            continue
+        out[ticker] = {
+            key: entry[key]
+            for key in (
+                "raw_days", "masked_days", "return_observations",
+                "limited_history", "coverage_reason",
+            )
+            if key in entry
+        }
+    return out
+
+
+def publish_holding_coverage(
+    *,
+    detail: Mapping[str, Any],
+    per_ticker: Optional[Mapping[str, Mapping[str, Any]]],
+    requested_start: Any,
+    requested_end: Any,
+    covered_days: int,
+    evidence_window: Mapping[str, Any],
+    covered_days_scope: str = HOLDING_COVERED_DAYS_SCOPE,
+) -> Dict[str, Any]:
+    """The one holding-window payload every one of these sections publishes.
+
+    `holding_coverage` (app/utils/holdings.py) does the work - starts,
+    provenance, truncation, annualization. This adds the two fields that used
+    to be decided per section: the unit the count is measured in, and the
+    evidence window the starts were resolved against. So every published start
+    arrives with the source that produced it, every count with its unit, and a
+    section that resolved its starts without price evidence publishes the
+    reason beside them instead of quietly disagreeing with the others.
+    """
+    starts = {
+        ticker: entry.get("analytics_start")
+        for ticker, entry in (detail or {}).items()
+        if isinstance(entry, Mapping)
+    }
+    counts = {
+        ticker: dict(counts) for ticker, counts in (per_ticker or {}).items()
+        if isinstance(counts, Mapping)
+    }
+    payload = holding_coverage(
+        starts,
+        requested_start,
+        requested_end,
+        int(covered_days),
+        counts,
+        provenance=detail or {},
+    )
+    payload["covered_days_scope"] = covered_days_scope
+    payload["provenance_rule"] = HOLDING_PROVENANCE_RULE
+    payload["provenance_evidence_window"] = dict(evidence_window or {})
+    if requested_end is not None:
+        payload["requested_end"] = requested_end
+    if (evidence_window or {}).get("source") == HOLDING_EVIDENCE_STORED_ONLY:
+        payload["provenance_divergence_reason"] = (
+            "No price evidence was readable for the canonical window, so every "
+            "start here is the stored import date. A section that could read the "
+            "evidence may resolve an earlier buy-price match for the same "
+            "position; the stored dates are still published, so the difference "
+            "is visible rather than silent."
+        )
+    return payload
 
 
 # --- Performance-history freshness (ticket 02) ------------------------------
@@ -2524,9 +2834,27 @@ async def get_liquidity_metrics(
                 )
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
                 if vol_col and price_col in df.columns:
-                    price_data_dict[ticker] = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
+                    frame = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
                 elif price_col in df.columns:
-                    price_data_dict[ticker] = df[[price_col]].rename(columns={price_col: 'Close'})
+                    frame = df[[price_col]].rename(columns={price_col: 'Close'})
+                else:
+                    frame = None
+                if frame is not None:
+                    # A fresh yfinance fetch carries `date` as a COLUMN over an
+                    # integer row index, so slicing the frame keeps a RangeIndex
+                    # and every delivered-window date comes out null. Promote the
+                    # real date column to the index so the liquidity engine still
+                    # sees the Close/Volume frame it expects, while the reported
+                    # observation window describes actual observations rather than
+                    # row numbers. Never synthesise dates from a positional index.
+                    date_col = next((c for c in ("date", "Date") if c in frame.columns), None)
+                    if date_col is not None:
+                        dated = pd.to_datetime(frame[date_col], errors="coerce")
+                        frame = frame.drop(columns=[date_col])
+                        keep = ~dated.isna()
+                        frame = frame[keep.to_numpy()]
+                        frame.index = pd.DatetimeIndex(dated[keep.to_numpy()], name=frame.index.name)
+                    price_data_dict[ticker] = frame
         
         if not price_data_dict:
             return {
@@ -3837,9 +4165,34 @@ async def get_tear_sheet(
             raise HTTPException(status_code=404, detail="Requested resource not found")
 
         holdings = await resolve_holdings(db, ticker_list)
-        returns_df, port_ret, history_coverage = await _build_wide_returns(
+        # The holding leg is masked to the canonical window start (one rule for
+        # every section), not to whatever the 365-day request implies, and the
+        # start it used is published with its provenance.
+        provenance = await holding_provenance(
+            data_service, holdings, _active_weight_tickers(weights), end=end,
+        )
+        returns_df, port_ret, leg_coverage = await _build_wide_returns(
             ticker_list, weights, start, end, data_service,
-            holdings=holdings,
+            holdings=canonical_holding_window_input(provenance["detail"]),
+        )
+        covered_days, mask = holding_window_observation_count(
+            port_ret,
+            provenance["start"],
+            measured_count=leg_coverage.get("covered_days"),
+            measured_start=leg_coverage.get("intersection_start"),
+        )
+        if mask is not None and leg_coverage.get("intersection_start") != provenance["start"]:
+            port_ret = port_ret[mask]
+        history_coverage = publish_holding_coverage(
+            detail=provenance["detail"],
+            per_ticker=_coverage_per_ticker(leg_coverage),
+            requested_start=start,
+            requested_end=end,
+            covered_days=covered_days,
+            evidence_window=provenance["evidence_window"],
+        )
+        history_coverage["model_used_tickers"] = list(
+            leg_coverage.get("model_used_tickers") or []
         )
 
         # Full-history spans entire cache depth (Phase 1 get_coverage), not
@@ -3915,6 +4268,13 @@ async def get_tear_sheet(
             full_history_start = str(full_port_ret.index.min().date())
         except Exception:
             full_history_start = full_start
+        # Same evidence shape Factor Exposure and Risk Contribution publish: the
+        # full-history leg carries its own window, observation count, scope and
+        # truncation flag, so it can never be read as the holding window and
+        # the holding window can never be read as this model's sample.
+        full_history_evidence = _full_history_evidence(
+            full_returns_df, requested_start=start, requested_end=end,
+        )
 
         full_relative: Dict[str, Any] = {}
         if bench_ret is not None and len(bench_ret) > 20:
@@ -3990,8 +4350,30 @@ async def get_tear_sheet(
         tear_sheet_status = _data_status(
             coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
         )
+        # `window` is the REQUEST. The metrics beside it are measured over the
+        # holding window, so the request is labelled as such and the measured
+        # window and its observation count are published next to it: a 365-day
+        # request must never sit on 39 days of numbers unlabelled.
+        measured_first, measured_last = _observation_bounds(port_ret)
+        measured_window = {
+            "start": measured_first,
+            "end": measured_last or _latest_observation_date(port_ret),
+            "days": int(covered_days),
+            "observation_count": int(covered_days),
+            "covered_days_scope": HOLDING_COVERED_DAYS_SCOPE,
+            "truncated_to_holding_window": bool(history_coverage.get("truncated")),
+            "holding_window_start": history_coverage.get("intersection_start"),
+        }
         return {
-            "window": {"start": start, "end": end},
+            "window": {
+                "start": start,
+                "end": end,
+                "kind": "requested_analytics_window",
+            },
+            "requested_window": {"start": start, "end": end},
+            "measured_window": measured_window,
+            "observation_count": int(covered_days),
+            "annualized": annualizable(covered_days),
             "holdings": weights,
             "universe_coverage": coverage,
             "data_status": tear_sheet_status,
@@ -4002,6 +4384,7 @@ async def get_tear_sheet(
             },
             "metrics": metrics,
             "full_history": {
+                **full_history_evidence,
                 "metrics": full_metrics,
                 "universe_coverage": full_coverage,
                 "relative_vs_nifty": full_relative,
@@ -4054,36 +4437,43 @@ async def get_risk_contribution(
         returns_df, port_ret, _ = await _build_wide_returns(
             ticker_list, weights, start, end, data_service,
         )
-        # Provenance comes from the stored import stamps only. The buy-price
-        # inference needs the price frames this leg deliberately does not hold,
-        # so no start here is ever claimed as inferred without evidence - and
-        # this adds no vendor call.
-        start_detail = effective_start_detail(holdings, None)
-        effectives = {
-            ticker: entry.get("analytics_start") for ticker, entry in start_detail.items()
-        }
+        # The holding window is the SAME question every section answers, so it
+        # is resolved by the same rule rather than from the stored import dates
+        # alone - the buy-price inference needs price evidence, and answering
+        # with stored stamps instead is what moved this section's window start a
+        # day away from every other section. The read is issued after the leg
+        # above and asks for a strict sub-window of it, so the cache-first
+        # DataService serves it from what that leg just loaded: no extra vendor
+        # request, and no inferred date is ever dropped for want of a frame.
+        provenance = await holding_provenance(
+            data_service, holdings, _active_weight_tickers(weights), end=end,
+        )
+        start_detail = provenance["detail"]
         own_return_observations = _own_return_observations(returns_df)
-        # The holding-context window is measured on the delivered index against
-        # the stored intersection start, so `covered_days` there describes the
-        # holding tenure instead of repeating the model's own observation count.
-        # No extra vendor call and no masked frame is needed for that.
-        holding_days, holding_mask = _holding_window_row_mask(returns_df, effectives)
-        holding_context = holding_coverage(
-            effectives,
-            start,
-            end,
-            holding_days,
-            {
+        # The holding-context window is measured on the delivered portfolio
+        # return series against the canonical intersection start, so
+        # `covered_days` there describes the holding tenure (return
+        # observations two held prices can produce) instead of repeating the
+        # model's own observation count or the route's own date.
+        holding_days, holding_mask = holding_window_observation_count(
+            port_ret, provenance["start"],
+        )
+        holding_context = publish_holding_coverage(
+            detail=start_detail,
+            per_ticker={
                 ticker: {
                     "raw_days": int(returns_df[ticker].notna().sum()),
-                    "masked_days": int(returns_df[ticker][holding_mask].notna().sum()),
+                    "masked_days": int(returns_df[ticker][holding_mask].notna().sum())
+                    if holding_mask is not None else int(returns_df[ticker].notna().sum()),
                     "return_observations": int(count),
                 }
                 for ticker, count in own_return_observations.items()
             },
-            provenance=start_detail,
+            requested_start=start,
+            requested_end=end,
+            covered_days=holding_days,
+            evidence_window=provenance["evidence_window"],
         )
-        holding_context["covered_days_scope"] = "holding_window_aligned_return_rows"
         full_history = _full_history_evidence(
             returns_df,
             requested_start=start,
@@ -4528,9 +4918,42 @@ async def get_regime(
                 if calculation_tickers:
                     end = datetime.now().strftime("%Y-%m-%d")
                     start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-                    _, port_ret, history_coverage = await _build_wide_returns(
+                    holdings = await resolve_holdings(db, calculation_tickers)
+                    # The HMM window below is 1100 days wide; the holding window
+                    # is a question about the PORTFOLIO, not about that model
+                    # window. Its start therefore comes from the canonical rule
+                    # (one evidence window for every section) and the model leg
+                    # is masked to it, so a wider regime window can no longer
+                    # resolve an earlier buy-price date than realized risk does
+                    # for the same stored `added_on`.
+                    provenance = await holding_provenance(
+                        data_service, holdings, calculation_tickers, end=end,
+                    )
+                    _, port_ret, leg_coverage = await _build_wide_returns(
                         calculation_tickers, weights, start, end, data_service,
-                        holdings=await resolve_holdings(db, calculation_tickers),
+                        holdings=canonical_holding_window_input(provenance["detail"]),
+                    )
+                    covered_days, mask = holding_window_observation_count(
+                        port_ret,
+                        provenance["start"],
+                        measured_count=leg_coverage.get("covered_days"),
+                        measured_start=leg_coverage.get("intersection_start"),
+                    )
+                    if mask is not None and leg_coverage.get("intersection_start") != provenance["start"]:
+                        # Defensive: the leg was masked to a start this section
+                        # no longer publishes, so its rows are re-cut here and
+                        # the published count keeps describing the frame.
+                        port_ret = port_ret[mask]
+                    history_coverage = publish_holding_coverage(
+                        detail=provenance["detail"],
+                        per_ticker=_coverage_per_ticker(leg_coverage),
+                        requested_start=start,
+                        requested_end=end,
+                        covered_days=covered_days,
+                        evidence_window=provenance["evidence_window"],
+                    )
+                    history_coverage["model_used_tickers"] = list(
+                        leg_coverage.get("model_used_tickers") or []
                     )
             except (ValueError, HTTPException):
                 logger.debug("Regime portfolio leg unavailable")
@@ -4785,6 +5208,188 @@ async def get_cointegration_pairs(
     Johansen rank tests, OLS hedge ratios, Ornstein-Uhlenbeck mean-reversion half-life,
     and spread z-scores.
     """
+    # The shared depth threshold, so the warning below never quotes a number this
+    # route invented when the scan did not publish one.
+    from app.services.cointegration_service import MIN_PAIR_DEPTH_RATIO
+
+    class _PairsDisclosure(CointScannerResponse):
+        """The scanner response plus the fields this route owes its consumers.
+
+        `CointScannerResponse` is a closed contract (foundation-owned schema, and
+        the DB cache rebuilds rows from it), and `model_copy(update=...)` on it
+        writes unknown keys into `__dict__` only to have the serializer drop
+        them again. So the currency/degradation declarations ride on an
+        `extra="allow"` subclass: every declared field keeps its own type,
+        default and validation, `isinstance` still holds, and `model_dump()` -
+        exactly what the AI-context exporter serialises - keeps the new fields.
+        """
+
+        model_config = {"extra": "allow"}
+
+        def __getattr__(self, name: str) -> Any:
+            # A clean scan publishes NO `error` key at all (see `_publish`),
+            # so the pre-existing `result.error` read stays safe and falsy
+            # instead of raising.
+            if name == "error":
+                return None
+            return super().__getattr__(name)
+
+    def _publish(
+        response: CointScannerResponse,
+        *,
+        extras: Optional[Mapping[str, Any]] = None,
+    ) -> CointScannerResponse:
+        """Attach the declared extras and guarantee no `error: null` ships.
+
+        A literal `error: null` is the same misleading null-sentinel the export
+        envelope forbids: it reads as "a failure that has no message" rather
+        than "no failure". Absent means absent.
+        """
+        error = getattr(response, "error", None)
+        if not (isinstance(error, str) and error.strip()):
+            error = None
+        payload = response.model_dump()
+        if error is None:
+            payload.pop("error", None)
+        published = _PairsDisclosure(**payload, **dict(extras or {}))
+        if error is None:
+            # `error` is declared on the parent model, so the constructor puts
+            # it back as None; drop it again so the key cannot be serialized.
+            published.__dict__.pop("error", None)
+        return published
+
+    def _quote_unit(ticker: str) -> str:
+        """Native quote currency of one scanned scrip.
+
+        The platform's own quote contract (`DataService._normalize_quote_payload`
+        and `_analytics_position_currency`) treats an NSE/BSE scrip as rupee
+        quoted and anything else as dollar quoted, and the pair scan applies no
+        FX conversion to the prices it fits, so that is the unit those prices
+        are expressed in.
+        """
+        return "INR" if ticker.endswith((".NS", ".BO")) else "USD"
+
+    def _depth_warning(
+        response: CointScannerResponse,
+        depth_by_ticker: Mapping[str, int],
+        shallow: List[str],
+    ) -> str:
+        """One measured sentence naming why a depth-limited scan is `partial`."""
+        threshold = getattr(response, "minimum_depth_ratio", None)
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            threshold = MIN_PAIR_DEPTH_RATIO
+        pairs = list(getattr(response, "pairs", None) or [])
+        limited = getattr(response, "depth_limited_pair_count", None)
+        if isinstance(limited, bool) or not isinstance(limited, int):
+            # Recount from the delivered rows rather than print a made-up count.
+            limited = sum(
+                1 for pair in pairs if getattr(pair, "depth_status", None) == "partial"
+            )
+        counts = {
+            ticker: value
+            for ticker, value in (depth_by_ticker or {}).items()
+            if not isinstance(value, bool) and isinstance(value, int)
+        }
+        deepest = max(counts.values()) if counts else None
+
+        def describe(ticker: str) -> str:
+            value = counts.get(ticker)
+            if value is None or not deepest:
+                return f"{ticker} (usable observation count not measured)"
+            return (
+                f"{ticker} ({value} of {deepest} usable price observations, "
+                f"{value / deepest:.0%})"
+            )
+
+        if shallow and deepest:
+            named = ", ".join(describe(ticker) for ticker in sorted(shallow))
+        else:
+            named = (
+                "no single ticker is individually below the threshold, so the "
+                "limited pairs are the ones whose overlapping window is shorter "
+                "than the deepest pair's"
+            )
+        return (
+            f"Depth-limited pairs: {limited} of {len(pairs)} delivered pairs ran "
+            f"on less than {threshold:.0%} of the deepest pair's overlap "
+            f"(minimum_depth_ratio {threshold}). Shallow history: {named}. "
+            f"Their Engle-Granger p-values, Johansen ranks and OU half-lives rest "
+            f"on that shorter sample, so they are weaker evidence than the "
+            f"full-depth pairs and the scan is reported as partial."
+        )
+
+    def _disclosure(
+        response: CointScannerResponse,
+        *,
+        depth_by_ticker: Optional[Mapping[str, int]] = None,
+        shallow: Optional[List[str]] = None,
+        depth_status: str = "unavailable",
+    ) -> Dict[str, Any]:
+        """Declare the payload's monetary unit and any degradation, measured.
+
+        Every monetary value this payload carries is a price: `last_price_a`,
+        `last_price_b`, and the price-space OLS intercept `intercept_alpha`,
+        which shares their unit. `hedge_ratio_beta`, the spread z-score and the
+        OU half-life are ratios of those prices and stay dimensionless. The unit
+        is therefore resolved from the tickers whose prices actually reached the
+        payload, and declared only when they agree.
+        """
+        pairs = list(getattr(response, "pairs", None) or [])
+        tickers = sorted(
+            {
+                str(getattr(pair, leg, "") or "").strip().upper()
+                for pair in pairs
+                for leg in ("ticker_a", "ticker_b")
+                if getattr(pair, leg, None)
+            }
+        )
+        units = sorted({_quote_unit(ticker) for ticker in tickers})
+        warnings: List[str] = []
+        extras: Dict[str, Any] = {}
+
+        if len(units) == 1:
+            unit = units[0]
+            extras["currency"] = unit
+            extras["currency_provenance"] = "derived"
+            extras["currency_basis"] = (
+                f"last_price_a, last_price_b and the price-space "
+                f"intercept_alpha are the raw native quote prices of the "
+                f"{len(tickers)} scanned scrips, so {unit} is the unit this fit "
+                f"is expressed in; it follows from the scrips' exchange suffix "
+                f"and is a property of the calculation's input prices rather "
+                f"than a field read off a quote payload. No FX conversion is "
+                f"applied."
+            )
+        elif units:
+            # A genuine cross-currency fit has no single unit to declare, and
+            # picking one of the two would mislabel the other.
+            extras["currency_provenance"] = "mixed"
+            extras["currency_basis"] = (
+                f"The delivered pair prices span {' and '.join(units)} and the "
+                f"scan applies no FX conversion, so hedge_ratio_beta and "
+                f"intercept_alpha are a fit across two monetary units and no "
+                f"single currency is declared for this payload."
+            )
+            warnings.append(
+                f"Pair prices from {' and '.join(units)} were fitted together "
+                f"without FX conversion, so no single monetary unit is declared "
+                f"for this scan."
+            )
+        else:
+            extras["currency_provenance"] = "unavailable"
+            extras["currency_basis"] = (
+                "No pair row was delivered, so this payload publishes no "
+                "monetary value and no unit is declared for it."
+            )
+
+        if depth_status == "partial":
+            warnings.append(
+                _depth_warning(response, depth_by_ticker or {}, list(shallow or []))
+            )
+        if warnings:
+            extras["warnings"] = warnings
+        return extras
+
     try:
         if isinstance(tickers, str) and tickers.strip():
             parsed = _parse_tickers(tickers, max_items=_MAX_COINT_TICKERS)
@@ -4801,7 +5406,7 @@ async def get_cointegration_pairs(
 
         if len(ticker_list) < 2:
             coverage = _universe_coverage(ticker_list, [])
-            return CointScannerResponse(
+            response = CointScannerResponse(
                 as_of=datetime.now().strftime("%Y-%m-%d"),
                 latest_observation_date=None,
                 as_of_semantics="latest_available_observation",
@@ -4823,6 +5428,7 @@ async def get_cointegration_pairs(
                 test_roles=TEST_ROLES,
                 pairs=[],
             )
+            return _publish(response, extras=_disclosure(response))
 
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -4832,7 +5438,7 @@ async def get_cointegration_pairs(
 
         if len(price_data_dict) < 2:
             coverage = _universe_coverage(ticker_list, price_data_dict.keys())
-            return CointScannerResponse(
+            response = CointScannerResponse(
                 as_of=end,
                 as_of_semantics="request_end_no_usable_price_data",
                 latest_observation_date=_latest_observation_date(price_data_dict),
@@ -4856,6 +5462,7 @@ async def get_cointegration_pairs(
                 pairs=[],
                 error="Insufficient price data available for at least 2 tickers",
             )
+            return _publish(response, extras=_disclosure(response))
 
         coint_service = CointegrationService(db_session=db, cache_service=cache_service)
         result = await coint_service.scan_pairs(
@@ -4883,30 +5490,44 @@ async def get_cointegration_pairs(
             "shallow_tickers": shallow,
             "usable_observations_by_ticker": depth_by_ticker,
         }
-        return result.model_copy(
-            update={
-                "requested_tickers": coverage["requested_tickers"],
-                "available_tickers": coverage["available_tickers"],
-                "missing_tickers": coverage["missing_tickers"],
-                "requested_universe_size": len(ticker_list),
-                "analyzed_pairs_count": result.scanned_pairs_count,
-                "returned_pairs_count": len(result.pairs),
-                "returned_cointegrated_pairs_count": returned_cointegrated,
-                "returned_non_cointegrated_pairs_count": len(result.pairs) - returned_cointegrated,
-                "universe_scope": UNIVERSE_SCOPES[1] if explicit_universe else UNIVERSE_SCOPES[0],
-                "depth_status": depth_status,
-                "shallow_tickers": shallow,
-                "usable_observations_by_ticker": depth_by_ticker,
-                "test_roles": TEST_ROLES,
-                # Pair scanning is weightless: it never renormalizes portfolio
-                # weights, so its coverage must not claim a weight basis.
-                "data_status": _data_status(
-                    coverage,
-                    partial=bool(result.unpairable_tickers) or depth_status == "partial",
-                ),
-                "universe_coverage": coverage,
-                "error": result.error if hasattr(result, "error") else None,
-            }
+        update: Dict[str, Any] = {
+            "requested_tickers": coverage["requested_tickers"],
+            "available_tickers": coverage["available_tickers"],
+            "missing_tickers": coverage["missing_tickers"],
+            "requested_universe_size": len(ticker_list),
+            "analyzed_pairs_count": result.scanned_pairs_count,
+            "returned_pairs_count": len(result.pairs),
+            "returned_cointegrated_pairs_count": returned_cointegrated,
+            "returned_non_cointegrated_pairs_count": len(result.pairs) - returned_cointegrated,
+            "universe_scope": UNIVERSE_SCOPES[1] if explicit_universe else UNIVERSE_SCOPES[0],
+            "depth_status": depth_status,
+            "shallow_tickers": shallow,
+            "usable_observations_by_ticker": depth_by_ticker,
+            "test_roles": TEST_ROLES,
+            # Pair scanning is weightless: it never renormalizes portfolio
+            # weights, so its coverage must not claim a weight basis.
+            "data_status": _data_status(
+                coverage,
+                partial=bool(result.unpairable_tickers) or depth_status == "partial",
+            ),
+            "universe_coverage": coverage,
+        }
+        # `error` is absent from a clean scan on purpose: passing the model's
+        # `None` default through would publish a literal `error: null`, which
+        # reads as "a failure with no message" instead of "no failure". Only a
+        # real, non-blank failure earns the key.
+        scan_error = getattr(result, "error", None)
+        if isinstance(scan_error, str) and scan_error.strip():
+            update["error"] = scan_error
+        response = result.model_copy(update=update)
+        return _publish(
+            response,
+            extras=_disclosure(
+                response,
+                depth_by_ticker=depth_by_ticker,
+                shallow=shallow,
+                depth_status=depth_status,
+            ),
         )
     except HTTPException:
         raise
