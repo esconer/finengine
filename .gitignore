@@ -65,3 +65,23 @@ backend/_diag_rc.py
 frontend/assets/
 frontend/html.meta.json.gz
 
+# Nested generated/runtime artifacts
+**/node_modules/
+**/.next/
+**/.pytest_cache/
+**/__pycache__/
+**/coverage/
+**/dist/
+**/build/
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backups/
+.scratch/**/evidence/runtime/
+.scratch/**/evidence/network/
+.scratch/**/evidence/screenshots/
+.scratch/**/evidence/calculations/
+.scratch/frontend-audit/evidence/
+.scratch/frontend-audit/shots/
+
