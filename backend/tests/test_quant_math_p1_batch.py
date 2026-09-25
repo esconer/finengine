@@ -302,7 +302,9 @@ class TestRiskScoringFactorLeg:
         r1 = await engine.risk_scoring(df, weights)
         r2 = await engine.risk_scoring(df, weights)
         assert r1["overall_score"] == r2["overall_score"]
-        assert r1["change"] == 0 and r2["change"] == 0
+        # No prior score is persisted, so the delta is unmeasured, not zero.
+        assert r1["change"] is None and r2["change"] is None
+        assert r1["change_status"] == "unavailable"
         assert not hasattr(engine, "_previous_risk_score")
 
 

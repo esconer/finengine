@@ -1210,14 +1210,17 @@ class AnalyticsEngine:
                               for component in active_weights)
             
             # Determine risk level (stateless: no cross-request score memory,
-            # so no singleton bleed or async race; change is always 0)
+            # so no singleton bleed or async race. Scoring is stateless: no
+            # prior score is persisted anywhere, so there is NO genuine delta to
+            # report. Publishing `change: 0` would present an unmeasured value
+            # as a measured "unchanged" score.
             if overall_score < 15:
                 risk_level = "LOW"
             elif overall_score < 25:
                 risk_level = "MEDIUM"
             else:
                 risk_level = "HIGH"
-            change = 0
+            change = None
             
             # Generate alerts
             alerts = []
@@ -1236,6 +1239,8 @@ class AnalyticsEngine:
                 "overall_score": round(overall_score, 1),
                 "risk_level": risk_level,
                 "change": change,
+                "change_status": "unavailable",
+                "change_reason": "no_persisted_prior_score",
                 "components": {k: (round(v, 1) if v is not None else None) for k, v in scores.items()},
                 "alerts": alerts,
                 "excluded_components": excluded,

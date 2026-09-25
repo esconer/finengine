@@ -199,22 +199,33 @@ async def test_resolve_holdings(test_db: AsyncSession, seeded_positions):
     assert "GHOST.NS" not in holdings
 
 
+def _recent_business_days(periods: int) -> pd.DatetimeIndex:
+    """`periods` business days ending on the last business day on/before today.
+
+    Anchoring to "now" is what made these tests time-of-day sensitive: on a
+    weekend `date_range(end=<today>, freq="B")` lands on Friday, so a holding
+    stamped today has no rows at all in the frame and the gate sees an empty
+    window instead of a short one.
+    """
+    return pd.date_range(end=pd.Timestamp.now().normalize(), periods=periods, freq="B")
+
+
 async def test_tearsheet_gates_short_history(test_db: AsyncSession):
+    dates = _recent_business_days(10)
     fresh = PortfolioPosition(
         ticker="NEW.NS", weight=1.0, quantity=10, buy_price=100.0,
         last_price=110.0, market_value=1100.0, sector="X", industry="Y",
-        added_on=datetime.now(),
+        added_on=dates[0].to_pydatetime(),
     )
     test_db.add(fresh)
     await test_db.commit()
-    dates = pd.date_range(end=pd.Timestamp.now().normalize(), periods=10, freq="B")
     frame = pd.DataFrame({"date": dates, "adj_close": _prices(dates, seed=9).values,
                           "volume": np.full(10, 1000.0)})
     mock_ds = Mock()
     mock_ds.fetch_historical_data = AsyncMock(return_value=frame)
     mock_bench = Mock()
     mock_bench.get_returns = AsyncMock(return_value=None)
-    today = pd.Timestamp.now().normalize().strftime("%Y-%m-%d")
+    today = dates[-1].strftime("%Y-%m-%d")
     res = await get_tear_sheet(
         tickers="NEW.NS", start="2026-01-01", end=today,
         db=test_db, data_service=mock_ds, benchmark=mock_bench,
@@ -227,23 +238,23 @@ async def test_tearsheet_gates_short_history(test_db: AsyncSession):
 
 
 async def test_tearsheet_relative_gated_on_short_overlap(test_db: AsyncSession):
+    dates = _recent_business_days(10)
     fresh = PortfolioPosition(
         ticker="NEW2.NS", weight=1.0, quantity=10, buy_price=100.0,
         last_price=110.0, market_value=1100.0, sector="X", industry="Y",
-        added_on=datetime.now(),
+        added_on=dates[0].to_pydatetime(),
     )
     test_db.add(fresh)
     await test_db.commit()
-    dates = pd.date_range(end=pd.Timestamp.now().normalize(), periods=10, freq="B")
     frame = pd.DataFrame({"date": dates, "adj_close": _prices(dates, seed=9).values,
                           "volume": np.full(10, 1000.0)})
     mock_ds = Mock()
     mock_ds.fetch_historical_data = AsyncMock(return_value=frame)
     bench = pd.Series(np.random.default_rng(4).normal(0.0005, 0.01, 300),
-                      index=pd.date_range(end=pd.Timestamp.now().normalize(), periods=300, freq="B"))
+                      index=_recent_business_days(300))
     mock_bench = Mock()
     mock_bench.get_returns = AsyncMock(return_value=bench)
-    today = pd.Timestamp.now().normalize().strftime("%Y-%m-%d")
+    today = dates[-1].strftime("%Y-%m-%d")
     res = await get_tear_sheet(
         tickers="NEW2.NS", start="2025-01-01", end=today,
         db=test_db, data_service=mock_ds, benchmark=mock_bench,

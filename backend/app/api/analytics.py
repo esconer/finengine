@@ -246,6 +246,16 @@ _COVERAGE_TO_DATA_STATUS = {
 # surviving active weights were renormalized back to 100%.
 ACTIVE_WEIGHT_BASIS = "active_weights_renormalized_to_100_percent"
 
+# Risk scoring is stateless — no prior score is persisted — so a period-over-period
+# delta cannot be computed. Every unavailable branch published `change: 0`, which
+# reads as a measured "unchanged" score. The honest state is an explicit null with
+# a machine-readable reason, so a consumer never mistakes it for a real delta.
+RISK_SCORE_CHANGE_UNAVAILABLE: Dict[str, Any] = {
+    "change": None,
+    "change_status": "unavailable",
+    "change_reason": "no_persisted_prior_score",
+}
+
 
 def _ticker_sequence(value: Optional[Iterable[Any]]) -> List[str]:
     """Uppercased, de-duplicated ticker list that preserves first-seen order."""
@@ -704,19 +714,31 @@ def _own_return_observations(frame: Any) -> Dict[str, int]:
     return {str(ticker): int(returns[ticker].notna().sum()) for ticker in returns.columns}
 
 
-def _own_finite_observations(frame: Any) -> Dict[str, int]:
-    """Per-ticker FINITE return count: the legs a model can actually regress."""
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return {}
-    cleaned = frame.replace([np.inf, -np.inf], np.nan).sort_index()
-    returns = cleaned.pct_change(fill_method=None)
-    if len(returns) < 2:
-        return {}
-    returns = returns.iloc[1:].replace([np.inf, -np.inf], np.nan)
-    return {
-        str(ticker): int(np.isfinite(returns[ticker].to_numpy(dtype=float)).sum())
-        for ticker in returns.columns
-    }
+def _holding_window_row_mask(
+    frame: Any,
+    effectives: Mapping[str, Optional[str]],
+) -> Tuple[int, pd.Series]:
+    """Rows of a delivered frame that fall inside the holding window.
+
+    Counted on the delivered index against the stored intersection start, so a
+    route that runs its model on full history can still state how much of that
+    index the user actually held. A dateless frame carries no holding
+    information, so every row counts and the tenure stays hypothetical rather
+    than guessed.
+    """
+    index = getattr(frame, "index", None)
+    if not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
+        return (int(len(index)) if index is not None else 0,
+                pd.Series(True, index=index if index is not None else []))
+    known = [value for value in (effectives or {}).values() if isinstance(value, str)]
+    if not known:
+        return len(index), pd.Series(True, index=index)
+    try:
+        cutoff = pd.Timestamp(max(known)).normalize()
+    except (TypeError, ValueError, OverflowError):
+        return len(index), pd.Series(True, index=index)
+    mask = index.normalize() >= cutoff
+    return int(mask.sum()), mask
 
 
 def _position_provenance(detail: Optional[Mapping[str, Any]], ticker: str) -> Dict[str, Any]:
@@ -746,7 +768,7 @@ FULL_HISTORY_RELATION = (
 
 
 def _full_history_evidence(
-    price_frame: Any,
+    returns_frame: Any,
     *,
     requested_start: Optional[str],
     requested_end: Optional[str],
@@ -755,33 +777,47 @@ def _full_history_evidence(
 ) -> Dict[str, Any]:
     """Self-describing evidence for a model measured on full exchange history.
 
+    Takes the RETURN frame the model actually consumed, so the published window
+    and observation count describe the observations used and nothing is
+    double-counted by re-deriving returns from an already-returned frame.
+
     Own window, own observation count, own latest observation and own
     annualization flag. Sparse or late-listed legs are published with their own
     usable observation count and limited-history flag instead of being averaged
     away by the rest of the book.
     """
-    counts = _own_return_observations(price_frame)
-    finite = _own_finite_observations(price_frame)
-    first, last = _observation_bounds(price_frame)
-    price_rows = int(len(price_frame)) if isinstance(price_frame, pd.DataFrame) else 0
-    return_rows = max(0, price_rows - 1) if price_rows else 0
+    frame = returns_frame if isinstance(returns_frame, pd.DataFrame) else pd.DataFrame()
+    clean = frame.replace([np.inf, -np.inf], np.nan) if not frame.empty else frame
+    counts = (
+        {str(ticker): int(clean[ticker].notna().sum()) for ticker in clean.columns}
+        if not clean.empty
+        else {}
+    )
+    finite = (
+        {
+            str(ticker): int(np.isfinite(clean[ticker].to_numpy(dtype=float)).sum())
+            for ticker in clean.columns
+        }
+        if not clean.empty
+        else {}
+    )
+    first, last = _observation_bounds(frame)
+    observations = int(len(frame))
     flags = declared_limited or {}
     reasons = coverage_reasons or {}
     tickers: Dict[str, Any] = {}
     for ticker in sorted(set(counts) | set(finite)):
-        usable = finite.get(ticker, counts.get(ticker, 0))
-        column = price_frame[ticker] if isinstance(price_frame, pd.DataFrame) and ticker in price_frame else None
+        count = int(counts.get(ticker, 0))
         tickers[ticker] = {
-            "price_observations": int(len(column)) if column is not None else None,
-            "return_observations": int(counts.get(ticker, 0)),
-            "usable_observations": int(usable),
+            "return_observations": count,
+            "usable_observations": int(finite.get(ticker, count)),
             "limited_history": position_limited_history(
-                int(counts.get(ticker, 0)), bool(flags.get(ticker, False))
+                count, bool(flags.get(ticker, False))
             ),
             "coverage_reason": reasons.get(ticker),
         }
     meets = bool(
-        return_rows >= MIN_ANNUALIZE_DAYS
+        observations >= MIN_ANNUALIZE_DAYS
         and counts
         and min(counts.values()) >= MIN_ANNUALIZE_DAYS
     )
@@ -790,16 +826,15 @@ def _full_history_evidence(
         "scope": "full_exchange_history",
         "truncated_to_holding_window": False,
         "requested_window": {"start": requested_start, "end": requested_end},
-        "window": {"start": first, "end": last, "days": return_rows},
+        "window": {"start": first, "end": last, "days": observations},
         "first_observation": first,
         "last_observation": last,
-        "latest_observation_date": _latest_observation_date(price_frame),
-        "observation_count": return_rows,
-        "price_observation_count": price_rows,
+        "latest_observation_date": _latest_observation_date(frame),
+        "observation_count": observations,
         "per_ticker_return_observations": counts,
         "annualized": meets,
         "minimum_observations_required": MIN_ANNUALIZE_DAYS,
-        "model_used_tickers": list(price_frame.columns) if isinstance(price_frame, pd.DataFrame) else [],
+        "model_used_tickers": [str(c) for c in frame.columns],
         "tickers": tickers,
         "holding_context_note": FULL_HISTORY_RELATION,
     }
@@ -907,6 +942,8 @@ def _expected_observation_count(requested_start: Any, requested_end: Any) -> Opt
     invented when the request is unparseable: the field is `None` and the
     caller reports it.
     """
+    if requested_start is None or requested_end is None:
+        return None
     try:
         start = pd.Timestamp(requested_start).normalize()
         end = pd.Timestamp(requested_end).normalize()
@@ -919,6 +956,8 @@ def _expected_observation_count(requested_start: Any, requested_end: Any) -> Opt
 
 def _calendar_day_gap(later: Any, earlier: Any) -> Optional[int]:
     """Whole calendar days from `earlier` to `later`, or None if unparseable."""
+    if later is None or earlier is None:
+        return None
     try:
         a = pd.Timestamp(earlier).normalize()
         b = pd.Timestamp(later).normalize()
@@ -954,13 +993,16 @@ def _performance_history_envelope(
     is never substituted for it and a missing observation is never backfilled.
     """
     rows = [row for row in (series or []) if isinstance(row, Mapping)]
-    ordered = [
-        row for row in rows
-        if isinstance(row.get("date"), str) and row.get("date").strip()
-    ]
-    has_dates = len(ordered) == len(rows)
-    delivered_start = ordered[0]["date"] if ordered else None
-    delivered_end = ordered[-1]["date"] if ordered else None
+    # Only a genuinely dated row is an observation. A positional label or an
+    # unparseable string is not a date, so it never becomes `as_of`.
+    dated: List[Tuple[str, str]] = []
+    for row in rows:
+        stamp = _observation_date(row.get("date"))
+        if stamp is not None:
+            dated.append((stamp, str(row.get("date"))))
+    has_dates = len(dated) == len(rows)
+    delivered_start = dated[0][0] if dated else None
+    delivered_end = dated[-1][0] if dated else None
     observation_count = len(rows)
     expected = _expected_observation_count(requested_start, requested_end)
     if expected and observation_count:
@@ -2160,9 +2202,12 @@ async def get_factor_exposure(
         )
         # Model evidence lives in its own object: a full-history regression is
         # not truncated to the holding window, so it publishes its own window,
-        # observation count, latest observation and annualization flag.
+        # observation count, latest observation and annualization flag. The
+        # return frame the regression consumes is the thing described, so the
+        # counts are the observations the model used.
+        model_returns = price_data.pct_change(fill_method=None).iloc[1:]
         full_history = _full_history_evidence(
-            price_data,
+            model_returns,
             requested_start=start,
             requested_end=end,
             declared_limited={
@@ -2190,9 +2235,8 @@ async def get_factor_exposure(
             if isinstance(benchmark_series, pd.Series):
                 if benchmark_series.abs().gt(1.0).any():
                     benchmark_series = benchmark_series.pct_change(fill_method=None).dropna()
-                asset_returns = price_data.pct_change(fill_method=None).iloc[1:]
                 history_coverage["benchmark_overlap_observations"] = int(
-                    len(asset_returns.index.intersection(benchmark_series.index))
+                    len(model_returns.index.intersection(benchmark_series.index))
                 )
 
         # Perform factor exposure analysis using analytics engine
@@ -2984,7 +3028,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["No portfolio positions found for risk scoring"],
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -2995,7 +3039,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["No positive portfolio market value available for risk scoring"],
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -3022,7 +3066,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -3039,7 +3083,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -3066,7 +3110,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
                 "universe_coverage": _universe_coverage(requested_tickers, []),
@@ -3130,7 +3174,7 @@ async def get_risk_score(
             return {
                 "overall_score": None,
                 "risk_level": None,
-                "change": 0,
+                **RISK_SCORE_CHANGE_UNAVAILABLE,
                 "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
                 "universe_coverage": _universe_coverage(
@@ -4019,21 +4063,27 @@ async def get_risk_contribution(
             ticker: entry.get("analytics_start") for ticker, entry in start_detail.items()
         }
         own_return_observations = _own_return_observations(returns_df)
+        # The holding-context window is measured on the delivered index against
+        # the stored intersection start, so `covered_days` there describes the
+        # holding tenure instead of repeating the model's own observation count.
+        # No extra vendor call and no masked frame is needed for that.
+        holding_days, holding_mask = _holding_window_row_mask(returns_df, effectives)
         holding_context = holding_coverage(
             effectives,
             start,
             end,
-            len(port_ret),
+            holding_days,
             {
                 ticker: {
                     "raw_days": int(returns_df[ticker].notna().sum()),
-                    "masked_days": int(returns_df[ticker].notna().sum()),
+                    "masked_days": int(returns_df[ticker][holding_mask].notna().sum()),
                     "return_observations": int(count),
                 }
                 for ticker, count in own_return_observations.items()
             },
             provenance=start_detail,
         )
+        holding_context["covered_days_scope"] = "holding_window_aligned_return_rows"
         full_history = _full_history_evidence(
             returns_df,
             requested_start=start,

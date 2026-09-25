@@ -350,11 +350,15 @@ class TestAnalyticsEngine:
         result1 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
         result2 = await engine.risk_scoring(mock_price_dataframe, sample_portfolio_weights)
 
-        # Stateless: identical inputs give identical scores, change stays 0,
-        # and no cross-request memory is stored on the shared engine
+        # Stateless: identical inputs give identical scores, and no
+        # cross-request memory is stored on the shared engine. Because no prior
+        # score is persisted, there is no genuine delta to report: `change` is an
+        # explicit null with a reason, never a 0 that reads as "unchanged".
         assert result1["overall_score"] == result2["overall_score"]
-        assert result1["change"] == 0
-        assert result2["change"] == 0
+        assert result1["change"] is None
+        assert result2["change"] is None
+        assert result1["change_status"] == "unavailable"
+        assert result1["change_reason"] == "no_persisted_prior_score"
         assert not hasattr(engine, "_previous_risk_score")
     
     def test_calculate_portfolio_returns(self, mock_price_dataframe, sample_portfolio_weights):
