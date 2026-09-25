@@ -31,6 +31,10 @@ from app.services.currency_service import (
     get_currency_service,
 )
 from app.services.cache_service import ProviderError
+from app.utils.allocations import (
+    WEIGHT_NORMALIZATION_RULE,
+    normalize_rebalance_weights,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -1373,6 +1377,17 @@ async def rebalance_portfolio(
                 status_code=400,
                 detail=f"Negative weights not allowed: {', '.join(negatives)}"
             )
+        # A non-finite leg carries no instruction; dropping it silently would
+        # trade the book against a target the caller never asked for.
+        non_finite = [
+            k for k, v in payload.new_weights.items()
+            if not math.isfinite(float(v))
+        ]
+        if non_finite:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Non-finite weights not allowed: {', '.join(non_finite)}"
+            )
         unknown = [k for k in payload.new_weights if k not in known]
         if unknown:
             raise HTTPException(
@@ -1380,8 +1395,35 @@ async def rebalance_portfolio(
                 detail=f"Unknown tickers: {', '.join(unknown)}"
             )
             
-        sum_weights = sum(payload.new_weights.values())
-        normalized_weights = {k: v / sum_weights for k, v in payload.new_weights.items()} if sum_weights > 0 else payload.new_weights
+        # The same normalization rule the volatility-sizing engine publishes
+        # (`divide_all_legs_by_gross_exposure`).  A submitted target whose gross
+        # exposure exceeds 100 % needs financing this workflow cannot create,
+        # so it is rejected instead of being normalized down into a fully
+        # funded book: that silent 129 % -> 100 % rewrite is what made a
+        # leveraged sizing target look applicable as a plain rebalance (V3-03).
+        normalization = normalize_rebalance_weights(payload.new_weights)
+        if normalization["rejection"] is not None:
+            rejection = normalization["rejection"]
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Rebalance target rejected ({rejection['code']}): "
+                    f"{rejection['detail']}. Normalization rule "
+                    f"'{WEIGHT_NORMALIZATION_RULE}' does not create financing; "
+                    "submit a fully funded target or size the position explicitly."
+                ),
+            )
+        normalized_weights = normalization["weights"]
+        weight_normalization = {
+            "normalization_rule": WEIGHT_NORMALIZATION_RULE,
+            "normalization_mode": normalization["normalization_mode"],
+            "weights_normalized": normalization["weights_normalized"],
+            "submitted_gross_exposure": normalization["submitted_gross_exposure"],
+            "gross_exposure": normalization["gross_exposure"],
+            "execution_eligible": normalization["execution_eligible"],
+            "financing_required": normalization["financing_required"],
+            "net_cash_weight": round(1.0 - normalization["gross_exposure"], 6),
+        }
         
         simulated_orders = []
         total_buy_inr = 0.0
@@ -1451,6 +1493,7 @@ async def rebalance_portfolio(
                 "currency_provenance": currency_provenance,
                 "total_turnover_pct": round(total_weight_delta / 2.0, 4),
                 "weights": {p.ticker: p.weight for p in positions},
+                "weight_normalization": weight_normalization,
                 "orders": simulated_orders
             }
         else:
@@ -1466,6 +1509,7 @@ async def rebalance_portfolio(
                 "total_turnover_pct": round(total_weight_delta / 2.0, 4),
                 "total_buy_inr": round(total_buy_inr, 2),
                 "total_sell_inr": round(total_sell_inr, 2),
+                "weight_normalization": weight_normalization,
                 "orders": simulated_orders,
                 "simulated_weights": normalized_weights
             }

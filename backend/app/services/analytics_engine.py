@@ -21,9 +21,27 @@ except ImportError:  # pragma: no cover - arch layout guard
 import statsmodels.api as sm
 
 from app.config import settings
+from app.utils.allocations import (
+    build_sizing_basis,
+    build_trade_instructions,
+    normalization_block,
+    sizing_history_block,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+def _finite_weight(weights: Optional[Dict[str, Any]], ticker: str) -> float:
+    """Current weight of `ticker` as a finite float; 0.0 when unusable.
+
+    A malformed or non-finite stored weight must not poison a weight delta.
+    """
+    try:
+        value = float((weights or {}).get(ticker, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if np.isfinite(value) else 0.0
 
 
 def aggregate_active_returns(
@@ -58,6 +76,109 @@ def aggregate_active_returns(
     numerator = clean.where(active, 0.0).mul(weight_frame, axis=1).sum(axis=1)
     portfolio = numerator.loc[active_weight > 0.0] / active_weight.loc[active_weight > 0.0]
     return portfolio.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+
+
+# ---------------------------------------------------------------------------
+# liquidity: one documented score-band contract (V3-09)
+# ---------------------------------------------------------------------------
+# The published `score` is the raw score rounded once, and the band is a
+# function of THAT published value.  Deriving the band from the unrounded score
+# let a raw 7.96 publish `score=8.0` with a "Medium" band while the volume
+# distribution counted the same position as high.  Every band label, every
+# liquidation window and every high/medium/low count now reads the published
+# score through the single table below.
+LIQUIDITY_SCORE_PRECISION = 1
+
+# (band, inclusive lower bound on the published score, liquidation window)
+LIQUIDITY_SCORE_BANDS = (
+    ("High", 8.0, "1-2"),
+    ("Medium", 6.0, "2-5"),
+    ("Low", None, "5-10"),
+)
+
+# Risk level inverts the score band: a high liquidity score is a low risk.
+LIQUIDITY_BAND_RISK_LEVEL = {"High": "Low", "Medium": "Medium", "Low": "High"}
+
+LIQUIDITY_SCORE_BAND_RULE = {
+    "raw_score_field": "score_raw",
+    "published_score_field": "score",
+    "rounding": "round(raw_score, 1) applied once; `score` is that rounded value",
+    "band_source": "published_score",
+    "score_range": [0.0, 10.0],
+    "bands": [
+        {
+            "band": "High",
+            "min_published_score": 8.0,
+            "max_published_score": None,
+            "liquidation_days": "1-2",
+            "volume_stats_bucket": "high",
+        },
+        {
+            "band": "Medium",
+            "min_published_score": 6.0,
+            "max_published_score": 8.0,
+            "liquidation_days": "2-5",
+            "volume_stats_bucket": "medium",
+        },
+        {
+            "band": "Low",
+            "min_published_score": None,
+            "max_published_score": 6.0,
+            "liquidation_days": "5-10",
+            "volume_stats_bucket": "low",
+        },
+    ],
+    "volume_stats_basis": "positions per published-score band, as a share of measured positions",
+    "risk_level_rule": "inverted band: High->Low, Medium->Medium, Low->High",
+}
+
+# Market cap provenance (V3-09).  The only market-cap input is the quote the
+# route supplies; a missing cap is either annualised from measured turnover or
+# floored, and both substitutes must be labelled instead of looking measured.
+LIQUIDITY_MARKET_CAP_FLOOR_INR = 1_000_000_000.0
+LIQUIDITY_IMPLIED_TURNOVER_DAYS = 250
+
+# Stress shock-proxy configuration (V3-10).  These are the inputs behind the
+# deterministic factor proxy; they travel with the result so a reader can see
+# that the published drawdown is a proxy, not a simulated statistic.
+STRESS_VOL_REFERENCE = 0.22
+STRESS_VOL_ADJ_MIN = 0.85
+STRESS_VOL_ADJ_MAX = 1.25
+STRESS_VOL_MIN_OBSERVATIONS = 20
+STRESS_DRAWDOWN_UPLIFT = 1.15
+STRESS_CONFIDENCE_LABEL = 0.95
+
+
+def _liquidity_band(published_score: float) -> tuple[str, str]:
+    """Band label and liquidation window for an ALREADY-ROUNDED published score."""
+    for band, floor, window in LIQUIDITY_SCORE_BANDS:
+        if floor is None or published_score >= floor:
+            return band, window
+    last_band, _floor, last_window = LIQUIDITY_SCORE_BANDS[-1]
+    return last_band, last_window
+
+
+def _market_cap_provenance(
+    supplied: Any, daily_turnover: float
+) -> tuple[float, str, str]:
+    """Resolve `(market_cap, provenance, source)` for one position.
+
+    `measured` means a quote supplied a finite positive market cap.
+    `estimated` means the cap was annualised from measured daily turnover, and
+    `fallback` means the fixed INR 1bn floor was used because turnover was not
+    measured at all.  The last two are estimates; neither is a measured cap.
+    """
+    try:
+        candidate = float(supplied)
+    except (TypeError, ValueError):
+        candidate = 0.0
+    if np.isfinite(candidate) and candidate > 0.0:
+        return candidate, "measured", "quote"
+
+    implied = float(daily_turnover) * LIQUIDITY_IMPLIED_TURNOVER_DAYS
+    if np.isfinite(implied) and implied > LIQUIDITY_MARKET_CAP_FLOOR_INR:
+        return implied, "estimated", "implied_annual_turnover"
+    return LIQUIDITY_MARKET_CAP_FLOOR_INR, "fallback", "fixed_floor_1e9_inr"
 
 
 class AnalyticsEngine:
@@ -319,7 +440,14 @@ class AnalyticsEngine:
     ) -> Dict[str, Any]:
         """
         Analyze portfolio liquidity using turnover (volume * price), market cap, and empirical spreads.
-        
+
+        The published `score` is the raw tier score rounded once, and the
+        category, liquidation window and high/medium/low counts are all derived
+        from that published score through `LIQUIDITY_SCORE_BAND_RULE`, which is
+        returned with the result so the threshold is discoverable.  A market cap
+        that was annualised from turnover or floored at INR 1bn is reported with
+        its provenance and `is_estimate=True` instead of passing as measured.
+
         Args:
             price_data: Dictionary mapping tickers to price DataFrames
             market_caps: Optional mapping of tickers to market cap in INR
@@ -348,47 +476,47 @@ class AnalyticsEngine:
                 volume = float(df[vol_col].mean())
                 price = float(df[close_col].iloc[-1]) if close_col and not df.empty else 0.0
                 daily_turnover = volume * price
-                
-                # Market cap / AUM dynamic resolution
-                mc = 0.0
-                if market_caps and ticker in market_caps and market_caps[ticker]:
-                    mc = float(market_caps[ticker])
-                
-                # If market cap is missing (e.g. ETFs or unlisted fund units), compute dynamic implied annual capitalization
-                if mc <= 0.0:
-                    mc = max(1000000000.0, daily_turnover * 250.0)
-                
+
+                # Market cap / AUM dynamic resolution, with its provenance.  A
+                # missing or unusable cap is never allowed to look measured: the
+                # annualised-turnover substitute and the INR 1bn floor are both
+                # reported as estimates, because that is what they are.
+                mc, mc_provenance, mc_source = _market_cap_provenance(
+                    (market_caps or {}).get(ticker), daily_turnover
+                )
+
                 # Institutional Turnover & Market Cap Liquidity Scoring (0 - 10)
                 # Tier 1: Mega / Large Turnover (> 50 Cr/day) or Mega Cap (> 50,000 Cr)
                 if daily_turnover >= 500000000.0 or mc >= 500000000000.0:
-                    score = min(10.0, 9.0 + min(1.0, (daily_turnover / 1e9) * 0.2))
-                    category = "High"
+                    score_raw = min(10.0, 9.0 + min(1.0, (daily_turnover / 1e9) * 0.2))
                     spread = round(max(0.0002, 0.0006 - min(0.0003, (daily_turnover / 2e9) * 0.0003)), 4)
-                    liquidation_days = "1-2"
                 # Tier 2: Liquid Midcap / Top ETF (Turnover 10 Cr - 50 Cr/day) or Cap 10,000 Cr - 50,000 Cr
                 elif daily_turnover >= 100000000.0 or mc >= 100000000000.0:
-                    score = min(8.9, 7.8 + (daily_turnover / 5e8) * 1.1)
-                    category = "High" if score >= 8.0 else "Medium"
+                    score_raw = min(8.9, 7.8 + (daily_turnover / 5e8) * 1.1)
                     spread = round(max(0.0006, 0.0014 - (daily_turnover / 5e8) * 0.0006), 4)
-                    liquidation_days = "1-2" if score >= 8.0 else "2-3"
                 # Tier 3: Moderate Turnover (Turnover 2 Cr - 10 Cr/day)
                 elif daily_turnover >= 20000000.0 or mc >= 10000000000.0:
-                    score = min(7.7, 6.2 + (daily_turnover / 1e8) * 0.15)
-                    category = "Medium"
+                    score_raw = min(7.7, 6.2 + (daily_turnover / 1e8) * 0.15)
                     spread = round(max(0.0012, 0.0028 - (daily_turnover / 1e8) * 0.0012), 4)
-                    liquidation_days = "2-5"
                 # Tier 4: Smallcap / Lower Turnover (< 2 Cr/day)
                 else:
-                    score = max(2.5, min(5.9, 3.0 + (daily_turnover / 2e7) * 2.9))
-                    category = "Low"
+                    score_raw = max(2.5, min(5.9, 3.0 + (daily_turnover / 2e7) * 2.9))
                     spread = round(max(0.0025, 0.0060 - (daily_turnover / 2e7) * 0.0030), 4)
-                    liquidation_days = "5-10"
-                
+
+                # Round once, then band the published score.  Banding the raw
+                # score is what let a raw 7.96 publish score=8.0 as "Medium".
+                score = round(float(score_raw), LIQUIDITY_SCORE_PRECISION)
+                category, liquidation_days = _liquidity_band(score)
+
                 liquidity_scores[ticker] = {
-                    'score': round(score, 1),
+                    'score': score,
+                    'score_raw': round(float(score_raw), 6),
                     'avg_volume': volume,
                     'avg_turnover': daily_turnover,
                     'market_cap': mc,
+                    'market_cap_provenance': mc_provenance,
+                    'market_cap_source': mc_source,
+                    'is_estimate': mc_provenance in ('estimated', 'fallback'),
                     'category': category,
                     'spread': spread,
                     'liquidation_days': liquidation_days
@@ -399,32 +527,33 @@ class AnalyticsEngine:
             
             # Calculate overall metrics
             if liquidity_scores:
-                overall_score = float(np.mean([score_data['score'] for score_data in liquidity_scores.values()]))
+                published_scores = [data['score'] for data in liquidity_scores.values()]
+                overall_score_raw = float(np.mean(published_scores))
+                overall_score = round(overall_score_raw, LIQUIDITY_SCORE_PRECISION)
                 avg_volume = float(np.mean(volume_stats['volumes'])) if volume_stats['volumes'] else 0.0
-                
-                # Volume & Score distribution
-                high_count = sum(1 for s in liquidity_scores.values() if s['score'] >= 8.0)
-                medium_count = sum(1 for s in liquidity_scores.values() if 6.0 <= s['score'] < 8.0)
-                low_count = sum(1 for s in liquidity_scores.values() if s['score'] < 6.0)
+
+                # Volume & Score distribution: buckets follow the same published
+                # score band as `category`, so a position cannot be "High" here
+                # and "Medium" there.
+                bands = [_liquidity_band(value)[0] for value in published_scores]
+                high_count = bands.count("High")
+                medium_count = bands.count("Medium")
+                low_count = bands.count("Low")
                 total_positions = len(liquidity_scores)
                 
                 volume_pct = lambda x: (x / total_positions * 100.0) if total_positions > 0 else 0.0
                 
-                # Determine liquidation time and risk level
-                if overall_score >= 8.0:
-                    liquidation_time = "1-2"
-                    risk_level = "Low"
-                elif overall_score >= 6.0:
-                    liquidation_time = "2-5"
-                    risk_level = "Medium"
-                else:
-                    liquidation_time = "5-10"
-                    risk_level = "High"
+                # Liquidation time and risk level come from the same band rule
+                overall_band, liquidation_time = _liquidity_band(overall_score)
+                risk_level = LIQUIDITY_BAND_RISK_LEVEL[overall_band]
                 
                 return {
-                    "overall_score": round(overall_score, 1),
+                    "overall_score": overall_score,
+                    "overall_score_raw": round(overall_score_raw, 6),
                     "liquidation_time_days": liquidation_time,
                     "risk_level": risk_level,
+                    "overall_band": overall_band,
+                    "score_band_rule": dict(LIQUIDITY_SCORE_BAND_RULE),
                     "by_position": liquidity_scores,
                     "volume_stats": {
                         "avg_volume": avg_volume,
@@ -450,7 +579,14 @@ class AnalyticsEngine:
     ) -> Dict[str, Any]:
         """
         Run multi-factor sector-elastic stress test scenario
-        
+
+        This is a deterministic factor shock proxy, not a simulation: no price
+        paths are sampled, `max_drawdown` is `portfolio_impact * 1.15` on that
+        same proxy, and `confidence_level` is a nominal label.  Every published
+        figure therefore ships with a `*_basis` tag, the `shock_inputs` it was
+        built from, and its `units`, so a reader cannot read a proxy as a
+        simulated statistic (V3-10).
+
         Args:
             price_data: Historical price data
             weights: Portfolio weights
@@ -550,12 +686,17 @@ class AnalyticsEngine:
                 # Custom shock: parse a signed percentage if present, else fixed -20%
                 shock_match = re.search(r'([+-]?\d+(?:\.\d+)?)\s*%', scenario or "")
                 custom_shock = float(shock_match.group(1)) / 100.0 if shock_match else -0.20
+                shock_basis = (
+                    "parsed_from_scenario_text" if shock_match else "default_minus_20pct"
+                )
                 matched_scenario = ("custom_stress", {
                     "market_shock": custom_shock,
                     "recovery_months": 12,
                     "description": scenario or "Custom Scenario Shock",
                     "sectors": {}
                 })
+            else:
+                shock_basis = "scenario_config"
 
             sc_name, sc_cfg = matched_scenario
             market_shock = sc_cfg["market_shock"]
@@ -574,27 +715,57 @@ class AnalyticsEngine:
             position_impacts: Dict[str, float] = {}
             weighted_impact = 0.0
             sectors_map = sectors or {}
+            instrument_overrides: Dict[str, Any] = {}
+            volatility_adjustment: Dict[str, Any] = {}
 
             for ticker, weight in weights.items():
                 sec = sectors_map.get(ticker, "Exchange Traded Fund")
                 sec_mult = sector_table.get(sec, 1.0)
+                elasticity_basis = (
+                    "scenario_sector_table" if sec in sector_table
+                    else "default_elasticity_1.0"
+                )
                 
                 # Special instrument sensitivity
                 if ticker == "MAFANG.NS" and sc_name == "tech_sector_correction":
                     sec_mult = 2.0
+                    elasticity_basis = "instrument_override_mafang_tech_correction"
                 elif ticker == "MIDCAPIETF.NS" and sc_name in ["market_crash", "volatility_spike"]:
                     sec_mult = 1.30
+                    elasticity_basis = "instrument_override_midcap_etf"
                 elif ticker == "SELECTIPO.NS":
                     sec_mult = 1.15
+                    elasticity_basis = "instrument_override_selectipo"
+
+                if elasticity_basis.startswith("instrument_override"):
+                    instrument_overrides[ticker] = {
+                        "sector": sec,
+                        "sector_elasticity": sec_mult,
+                        "basis": elasticity_basis,
+                    }
 
                 # Idiosyncratic volatility factor adjustment (bounded between 0.85 and 1.25)
                 vol_adj = 1.0
+                vol_basis = "unavailable_no_price_window"
                 if ticker in returns.columns:
                     s = returns[ticker]
                     non_zero = s[s != 0.0].clip(lower=-0.20, upper=0.20)
-                    if len(non_zero) >= 20:
+                    if len(non_zero) >= STRESS_VOL_MIN_OBSERVATIONS:
                         ticker_vol = float(non_zero.std() * np.sqrt(252))
-                        vol_adj = max(0.85, min(1.25, ticker_vol / 0.22)) if ticker_vol > 0 else 1.0
+                        vol_adj = (
+                            max(STRESS_VOL_ADJ_MIN, min(STRESS_VOL_ADJ_MAX, ticker_vol / STRESS_VOL_REFERENCE))
+                            if ticker_vol > 0 else 1.0
+                        )
+                        vol_basis = (
+                            "measured_annualized_volatility_over_reference"
+                            if ticker_vol > 0 else "unavailable_zero_dispersion"
+                        )
+                    else:
+                        vol_basis = "unavailable_insufficient_observations"
+                volatility_adjustment[ticker] = {
+                    "factor": round(float(vol_adj), 4),
+                    "basis": vol_basis,
+                }
 
                 ticker_impact = float(market_shock * sec_mult * vol_adj)
                 ticker_impact = max(-0.75, min(-0.02, ticker_impact)) if market_shock < 0 else ticker_impact
@@ -603,17 +774,71 @@ class AnalyticsEngine:
                 weighted_impact += ticker_impact * weight
 
             portfolio_impact = round(weighted_impact, 4)
-            max_drawdown = round(portfolio_impact * 1.15, 4)
+            max_drawdown = round(portfolio_impact * STRESS_DRAWDOWN_UPLIFT, 4)
+
+            # The published drawdown is a fixed 1.15 uplift on the same
+            # deterministic factor proxy, and the confidence is a nominal
+            # label: neither is a simulated statistic, so the inputs and units
+            # ship with the result instead of the word "simulation".
+            shock_inputs = {
+                "market_shock": market_shock,
+                "market_shock_basis": shock_basis,
+                "sector_elasticity_table": dict(sector_table),
+                "sector_elasticity_basis": "static_configured_table",
+                "sector_elasticity_default": 1.0,
+                "default_sector": "Exchange Traded Fund",
+                "instrument_overrides": instrument_overrides,
+                "position_impact_clip": [-0.75, -0.02],
+                "position_impact_clip_basis": "configured_bounds_not_simulated",
+                "volatility_adjustment": {
+                    "basis": "measured_annualized_volatility_over_reference",
+                    "reference_annualized_volatility": STRESS_VOL_REFERENCE,
+                    "bounds": [STRESS_VOL_ADJ_MIN, STRESS_VOL_ADJ_MAX],
+                    "min_observations": STRESS_VOL_MIN_OBSERVATIONS,
+                    "return_clip": [-0.20, 0.20],
+                    "annualization_trading_days": 252,
+                    "by_ticker": volatility_adjustment,
+                },
+            }
+            units = {
+                "market_shock": "fraction_return_signed",
+                "portfolio_impact": "fraction_of_portfolio_value",
+                "position_impacts": "fraction_of_position_value",
+                "max_drawdown": "fraction_of_portfolio_value",
+                "recovery_time": "months",
+                "confidence_level": "unitless_nominal_label",
+            }
+            methodology = (
+                "Deterministic factor shock proxy; no path sampling and no simulation. "
+                "position_impact = market_shock * sector_elasticity (static scenario "
+                "table or a named instrument override) * volatility_adjustment "
+                "(measured annualized volatility divided by "
+                f"{STRESS_VOL_REFERENCE}, clipped to "
+                f"[{STRESS_VOL_ADJ_MIN}, {STRESS_VOL_ADJ_MAX}]) and clipped to "
+                "[-0.75, -0.02] for a negative shock; portfolio_impact = sum of "
+                "position_impact * weight; max_drawdown = portfolio_impact * 1.15, a "
+                "fixed uplift on that same proxy, not a simulated peak-to-trough "
+                "path; recovery_time is the scenario's configured month estimate, "
+                "not a simulated recovery path; confidence_level is a nominal 0.95 "
+                "label with no simulated distribution behind it"
+            )
 
             return {
                 "scenario": scenario,
                 "scenario_description": description,
                 "max_drawdown": max_drawdown,
+                "max_drawdown_basis": "derived_from_shock_proxy",
+                "max_drawdown_formula": f"portfolio_impact * {STRESS_DRAWDOWN_UPLIFT}",
                 "portfolio_impact": portfolio_impact,
+                "impact_basis": "deterministic_factor_proxy",
                 "position_impacts": position_impacts,
                 "recovery_time": recovery_months,
-                "confidence_level": 0.95,
-                "methodology": "Factor beta and volatility scaled stress shock simulation"
+                "recovery_time_basis": "configured_recovery_estimate_not_simulated",
+                "confidence_level": STRESS_CONFIDENCE_LABEL,
+                "confidence_basis": "nominal_label_not_simulated",
+                "shock_inputs": shock_inputs,
+                "units": units,
+                "methodology": methodology
             }
             
         except Exception as e:
@@ -626,17 +851,35 @@ class AnalyticsEngine:
         weights: Dict[str, float], 
         model: str = "EWMA", 
         target_volatility: float = 0.15,
-        portfolio_value: Optional[float] = None
+        portfolio_value: Optional[float] = None,
+        price_currency: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Calculate volatility-adjusted position sizing
-        
+
+        The analytical target is inverse-volatility risk parity scaled to
+        `target_volatility`, so the legs sum to the scale factor rather than to
+        1.0. That gross exposure is preserved (renormalizing a risk-parity
+        target to 100 % would delete the leverage it was asked to quantify) and
+        reported through the shared normalization rule consumed by the rebalance
+        workflow: `execution` states gross exposure, the financing it needs, and
+        whether the target may be applied as a plain rebalance.
+
+        Trade instructions are pinned to ONE aligned sizing price date and
+        whole shares are derived from the reported notional with a documented
+        half-up rule, so amount, `shares_delta`, and `sizing_price` reconcile.
+
         Args:
             price_data: Historical price data
             weights: Current portfolio weights
             model: Volatility model
             target_volatility: Target portfolio volatility
-            
+            portfolio_value: Budget for notional sizing; without it no trade
+                amount is computable and instructions report `unavailable`
+                instead of a fabricated zero
+            price_currency: Currency of `price_data`; the engine cannot infer
+                it, so it stays `unavailable` when the caller omits it
+        
         Returns:
             Dictionary with sizing recommendations
         """
@@ -781,35 +1024,60 @@ class AnalyticsEngine:
                 return self._empty_volatility_sizing()
             scale = float(target_volatility / rec_vol_ann)
             scaled_weights = {k: round(v * scale, 6) for k, v in recommended_weights.items()}
-            cash_weight = round(max(0.0, 1.0 - scale), 6)
-            leveraged = bool(scale > 1.0)
+
+            # One documented normalization rule, shared with the rebalance
+            # workflow.  The analytical target keeps its gross exposure and
+            # reports the financing that exposure requires; `cash_weight` is the
+            # signed net cash weight, so a 129 % book can no longer read as
+            # "zero cash" with no financing leg anywhere.
+            execution = normalization_block(
+                scaled_weights,
+                portfolio_value=portfolio_value,
+                currency=price_currency,
+                weights_normalized=False,
+            )
+            leveraged = bool(execution["financing_required"])
+            # Signed net cash weight: a 129 % book reports -0.29 here, never 0.
+            # `execution.net_cash_weight` is the same quantity derived from the
+            # rounded published legs; the two agree to the published precision.
+            cash_weight = round(1.0 - scale, 6)
             achieved_vol = float(rec_vol_ann * scale)
 
-            # Calculate trade recommendations
-            trades = {}
-            for ticker in returns.columns:
-                current_weight = weights.get(ticker, 0)
-                recommended_weight = scaled_weights.get(ticker, 0)
-                weight_delta = recommended_weight - current_weight
-                
-                current_price = float(price_data[ticker].iloc[-1]) if ticker in price_data.columns else 100.0
-                # Without a real portfolio value, trade sizes cannot be computed;
-                # report zero-delta trades rather than fabricating a total
-                estimated_portfolio_value = portfolio_value if (portfolio_value is not None and portfolio_value > 0) else 0.0
+            history = sizing_history_block(
+                returns, price_frame=cleaned_prices, model=model_type
+            )
+            basis = build_sizing_basis(
+                cleaned_prices, list(returns.columns), currency=price_currency
+            )
+            instructions = build_trade_instructions(
+                {
+                    ticker: scaled_weights.get(ticker, 0.0) - _finite_weight(weights, ticker)
+                    for ticker in returns.columns
+                },
+                basis["sizing_price"],
+                portfolio_value=portfolio_value,
+                currency=price_currency,
+                sizing_price_as_of=basis["sizing_price_as_of"],
+                sizing_price_provenance=basis["sizing_price_provenance"],
+            )
+            trades = instructions["trades"]
 
-                weight_value_delta = weight_delta * estimated_portfolio_value
-                shares_delta = weight_value_delta / current_price if current_price > 0 else 0
-                
-                trades[ticker] = {
-                    "shares_delta": int(shares_delta),
-                    "amount": weight_value_delta
-                }
-            
+            financing_text = (
+                f"financing required {execution['financing_requirement']} "
+                f"{price_currency or 'in the sizing currency'}"
+                if execution["financing_requirement"] is not None
+                else "financing required (unquantified: no portfolio value)"
+            )
             methodology = (
                 f"{model} inverse-volatility risk parity scaled to target volatility "
-                f"{target_volatility} (scale={round(scale, 4)}, cash={cash_weight}, "
+                f"{target_volatility} (scale={round(scale, 4)}, "
+                f"gross_exposure={execution['gross_exposure']}, cash={cash_weight}, "
                 f"achieved_vol={round(achieved_vol, 4)}"
-                + (", leverage required" if leveraged else ", unlevered long-only + cash")
+                + (
+                    f", {financing_text}; not executable as a normal rebalance"
+                    if leveraged
+                    else ", unlevered long-only + cash"
+                )
                 + "; not full ERC: no Euler RC_i decomposition)"
             )
             return {
@@ -824,7 +1092,21 @@ class AnalyticsEngine:
                 "cash_weight": cash_weight,
                 "leveraged": leveraged,
                 "achieved_volatility": round(achieved_vol, 6),
-                "methodology": methodology
+                "methodology": methodology,
+                "execution": execution,
+                "sizing_history": history,
+                "trade_instructions_status": instructions["status"],
+                "trade_reconciliation": instructions["reconciliation"],
+                "sizing_price": basis["sizing_price"],
+                "sizing_price_as_of": basis["sizing_price_as_of"],
+                "sizing_price_currency": basis["sizing_price_currency"],
+                "sizing_price_provenance": basis["sizing_price_provenance"],
+                "sizing_price_unavailable_reason": basis["sizing_price_unavailable_reason"],
+                "sizing_price_missing_tickers": basis["missing_tickers"],
+                "sizing_price_unpriced_tickers": basis["unpriced_tickers"],
+                "price_currency_provenance": (
+                    "measured" if price_currency else "unavailable"
+                ),
             }
             
         except Exception as e:
@@ -1536,28 +1818,50 @@ class AnalyticsEngine:
         }
     
     def _empty_liquidity(self) -> Dict[str, Any]:
+        # An unavailable result claims nothing.  Returning a plausible
+        # overall_score=5.0 / risk_level="Medium" / "5-10" made an absence
+        # indistinguishable from a measured mid-liquidity portfolio (V3-09).
+        # The volume split is all zeros because no position was measured:
+        # publishing `low_volume_pct=100` asserted a worst-case book nobody
+        # observed.
         return {
-            "overall_score": 5.0,
-            "liquidation_time_days": "5-10",
-            "risk_level": "Medium",
+            "overall_score": None,
+            "overall_score_raw": None,
+            "liquidation_time_days": None,
+            "risk_level": None,
+            "overall_band": None,
             "by_position": {},
             "volume_stats": {
                 "avg_volume": 0,
                 "total_portfolio_volume": 0,
                 "high_volume_pct": 0,
                 "medium_volume_pct": 0,
-                "low_volume_pct": 100
+                "low_volume_pct": 0
             },
+            "score_band_rule": dict(LIQUIDITY_SCORE_BAND_RULE),
             "error": "No liquidity data available"
         }
     
     def _empty_stress_test(self) -> Dict[str, Any]:
+        # Mirrors the success payload key-for-key with None values: with no
+        # price history there is no proxy, no recovery estimate, no confidence
+        # label and no shock input to report.
         return {
             "scenario": "unknown",
+            "scenario_description": None,
             "max_drawdown": None,
+            "max_drawdown_basis": None,
+            "max_drawdown_formula": None,
             "portfolio_impact": None,
+            "impact_basis": None,
             "position_impacts": {},
             "recovery_time": None,
+            "recovery_time_basis": None,
+            "confidence_level": None,
+            "confidence_basis": None,
+            "shock_inputs": None,
+            "units": None,
+            "methodology": None,
             "error": "Insufficient data for stress testing"
         }
     

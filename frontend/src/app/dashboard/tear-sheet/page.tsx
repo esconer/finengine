@@ -10,6 +10,13 @@ import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
 import {
+  analyticsStartClaim,
+  provenanceNote,
+  resolveWindowStart,
+  startQualifier,
+  type HistoryCoverage,
+} from '@/lib/historyFormat';
+import {
   Newspaper,
   AlertTriangle,
   RefreshCw,
@@ -285,15 +292,7 @@ interface TearSheetData {
   monthly_returns: Record<string, Record<string, number>>;
   underwater: { date: string; drawdown: number }[];
   methodology: string;
-  history_coverage?: {
-    effective_start: string | null;
-    intersection_start?: string | null;
-    oldest_holding?: string | null;
-    covered_days: number;
-    truncated: boolean;
-    annualized: boolean;
-    requested_start: string | null;
-  } | null;
+  history_coverage?: HistoryCoverage | null;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -346,6 +345,20 @@ export default function TearSheetPage() {
   const bookStart = data?.history_coverage?.intersection_start
     ?? data?.history_coverage?.effective_start
     ?? null;
+  // Provenance of the book window: a start reconstructed from the buy price is
+  // labelled as an inferred analytics start, never as a holding date.
+  const bookWindow = resolveWindowStart({ coverage: data?.history_coverage });
+  const bookStartLabel = bookStart
+    ? `since ${bookStart}${startQualifier(bookWindow.source)}`
+    : null;
+  const bookProvenanceNote = data
+    ? provenanceNote({ coverage: data.history_coverage })
+    : null;
+  const bookStartClaim = analyticsStartClaim(
+    bookWindow.start,
+    bookWindow.source,
+    bookWindow.storedAddedOn,
+  );
 
   const years = data ? Object.keys(data.monthly_returns).sort() : [];
 
@@ -456,8 +469,12 @@ export default function TearSheetPage() {
                   Benchmark: <span className="font-bold text-white ml-1">NIFTY 50 (^NSEI)</span>
                 </div>
                 {data.history_coverage?.truncated && (
-                  <div className="bg-amber-500/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-amber-100 text-xs font-medium border border-amber-300/20">
-                    Holding history: <span className="font-bold text-white ml-1">{data.history_coverage.covered_days}d since {data.history_coverage.effective_start}</span>
+                  <div
+                    data-testid="holding-window-chip"
+                    className="bg-amber-500/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-amber-100 text-xs font-medium border border-amber-300/20"
+                    title={bookStartClaim}
+                  >
+                    Holding history: <span className="font-bold text-white ml-1">{data.history_coverage.covered_days}d {bookStartLabel ?? `since ${data.history_coverage.effective_start}`}</span>
                   </div>
                 )}
               </div>
@@ -587,12 +604,17 @@ export default function TearSheetPage() {
             <div data-testid="holding-section" className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-bold text-white">
-                  Current book since {bookStart}
+                  Current book since {bookStart}{startQualifier(bookWindow.source)}
                 </h3>
                 <span className="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono">
                   BOOK-TRUE
                 </span>
               </div>
+              {bookProvenanceNote && (
+                <p data-testid="holding-provenance" className="text-xs text-amber-200/80 font-mono -mt-2 mb-3">
+                  {bookProvenanceNote}
+                </p>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                   <span className="text-xs font-semibold text-slate-400">Holding Total Return</span>
@@ -826,8 +848,11 @@ export default function TearSheetPage() {
                 </div>
                 <div className="flex items-center space-x-2">
                   {bookStart && (
-                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono">
-                      Book-true · since {bookStart}
+                    <span
+                      className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono"
+                      title={bookStartClaim}
+                    >
+                      Book-true · since {bookStart}{startQualifier(bookWindow.source)}
                     </span>
                   )}
                   <CalendarDays className="w-5 h-5 text-slate-400" />
@@ -902,8 +927,11 @@ export default function TearSheetPage() {
                   </div>
                   <div className="flex items-center">
                     {bookStart && (
-                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono mr-2">
-                        Book-true · since {bookStart}
+                      <span
+                        className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono mr-2"
+                        title={bookStartClaim}
+                      >
+                        Book-true · since {bookStart}{startQualifier(bookWindow.source)}
                       </span>
                     )}
                     <span className="text-xs px-2.5 py-1 rounded-full bg-rose-950/40 text-rose-300 border border-rose-800/50 font-mono font-bold">

@@ -19,7 +19,6 @@ const STATUS_STYLES: Record<AIContextStatus, string> = {
   available: 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800',
   partial: 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800',
   unavailable: 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800',
-  not_requested: 'bg-gray-50 text-gray-600 border-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-700',
 };
 
 function isAIContextResponse(value: AIContextResponse | string): value is AIContextResponse {
@@ -50,7 +49,6 @@ export default function AIContextPage() {
       available: 0,
       partial: 0,
       unavailable: 0,
-      not_requested: 0,
     };
     Object.values(response?.sections || {}).forEach((section) => {
       counts[section.status] = (counts[section.status] || 0) + 1;

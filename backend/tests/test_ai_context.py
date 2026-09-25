@@ -9,7 +9,7 @@ import pytest
 def _payload():
     now = datetime.now(timezone.utc).isoformat()
     return {
-        "schema_version": "1.1",
+        "schema_version": "2.0",
         "export_id": "test-export",
         "generated_at": now,
         "completed_at": now,
@@ -61,7 +61,7 @@ async def test_ai_context_endpoint_returns_json_contract(async_client):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["schema_version"] == "1.1"
+    assert body["schema_version"] == "2.0"
     assert body["base_currency"] == "INR"
     assert set(body["sections"]) == {"portfolio", "realized_risk"}
     assert body["sections"]["portfolio"]["status"] == "available"

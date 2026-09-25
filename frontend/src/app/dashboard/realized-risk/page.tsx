@@ -11,6 +11,19 @@ import { usePortfolioAnalytics, usePerformanceData } from '@/hooks/useAnalytics'
 import { usePortfolioStore, useUIStore } from '@/lib/store';
 import { CSVExporter } from '@/lib/export';
 import {
+  describeOwnHistory,
+  holdingWindowCaption,
+  holdingWindowHeadline,
+  isOwnHistoryLimited,
+  perTickerDetail,
+  positionHistoryTooltip,
+  provenanceNote,
+  resolveTickerStart,
+  resolveWindowStart,
+  startQualifier,
+  type HistoryCoverage,
+} from '@/lib/historyFormat';
+import {
   ResponsiveContainer,
   LineChart,
   Line,
@@ -35,7 +48,6 @@ import {
 
 export default function RealizedRiskPage() {
   const [loading, setLoading] = useState(false);
-  const [positionData, setPositionData] = useState<any[]>([]);
   const [showCoverageDetail, setShowCoverageDetail] = useState(false);
 
   const { data: analyticsData, loading: analyticsLoading, refresh } = usePortfolioAnalytics();
@@ -44,6 +56,16 @@ export default function RealizedRiskPage() {
   const { updateLastUpdated } = useUIStore();
 
   const realizedRisk = analyticsData.realizedRisk;
+
+  // Stored import dates, used only to label a window start the route has not
+  // annotated: a start that predates `added_on` cannot be the stored date.
+  const storedAddedOnByTicker = React.useMemo(() => {
+    const out: Record<string, string | null> = {};
+    for (const p of positions as any[]) {
+      if (p?.ticker) out[p.ticker] = p?.added_on ?? null;
+    }
+    return out;
+  }, [positions]);
 
   useEffect(() => {
     if (analyticsData.realizedRisk) {
@@ -93,23 +115,34 @@ export default function RealizedRiskPage() {
     return { drawdownSeries: dd, rollingVolSeries: vol };
   }, [performanceData]);
 
-  // Generate position risk data for table
-  useEffect(() => {
-    if (realizedRisk?.positions) {
-      // DSP-10: per-position risk rows come from the FULL-history
-      // instrument_risk block; holding-period data stays in realizedRisk.positions.
-      const instrumentPositions = realizedRisk.instrument_risk?.positions || {};
-      const source = Object.keys(instrumentPositions).length ? instrumentPositions : realizedRisk.positions;
-      const positionsList = Object.entries(source).map(([ticker, data]: [string, any]) => ({
+  // Generate position risk data for table. Derived, never stored in state: a
+  // state round-trip here would re-run on every store snapshot change.
+  const positionData = React.useMemo(() => {
+    if (!realizedRisk?.positions) return [];
+    // DSP-10: per-position risk rows come from the FULL-history
+    // instrument_risk block; holding-period data stays in realizedRisk.positions.
+    const instrumentPositions = realizedRisk.instrument_risk?.positions || {};
+    const source = Object.keys(instrumentPositions).length ? instrumentPositions : realizedRisk.positions;
+    // Limited-history status is that position's OWN measured sample: a
+    // portfolio-sized count must never make a 20-observation leg look like
+    // full history, and the route's honest warning (when present) is kept.
+    return Object.entries(source).map(([ticker, data]: [string, any]) => {
+      const start = resolveTickerStart(
+        realizedRisk.history_coverage?.tickers?.[ticker],
+        storedAddedOnByTicker[ticker],
+      );
+      return {
+        ...data,
         ticker,
         weight: realizedRisk.positions?.[ticker]?.weight,
-        is_limited_history: (data?.data_points ?? 0) < 30,
-        history_warning: `Only ${data?.data_points ?? 0} trading days of exchange history available`,
-        ...data,
-      }));
-      setPositionData(positionsList);
-    }
-  }, [realizedRisk]);
+        analytics_start: start.start,
+        analytics_start_source: start.source,
+        stored_added_on: start.storedAddedOn,
+        is_limited_history: isOwnHistoryLimited(data),
+        history_warning: data?.history_warning ?? describeOwnHistory(data),
+      };
+    });
+  }, [realizedRisk, storedAddedOnByTicker]);
 
   const handleRefresh = async () => {
     setLoading(true);
@@ -150,9 +183,14 @@ export default function RealizedRiskPage() {
             {data.is_limited_history && (
               <span
                 className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700/50"
-                title={data.history_warning || `Limited history: ${data.data_points} trading days`}
+                title={positionHistoryTooltip(data.ticker, data, {
+                  start: data.analytics_start ?? null,
+                  source: data.analytics_start_source,
+                  storedAddedOn: data.stored_added_on ?? null,
+                  buyPriceInferred: null,
+                })}
               >
-                ⚠️ &lt;30d history
+                ⚠️ &lt;30d own history
               </span>
             )}
           </div>
@@ -253,7 +291,7 @@ export default function RealizedRiskPage() {
   const fullHistory = realizedRisk?.instrument_risk?.portfolio;
 
   // Phase 2 disclosure: one summary banner for the holding-intersection window.
-  const coverage = realizedRisk?.history_coverage;
+  const coverage = realizedRisk?.history_coverage as HistoryCoverage | undefined;
   const coverageWarnings = realizedRisk?.warnings || [];
   const intersection = coverage?.intersection_start || coverage?.effective_start;
   const coveredDays = coverage?.covered_days ?? coverageWarnings[0]?.data_points;
@@ -268,6 +306,10 @@ export default function RealizedRiskPage() {
           coverageTickers[t].effective_start < intersection
       ).length
     : null;
+  // The window start's provenance: the route's own source when it published
+  // one, otherwise derived from the stored import dates above.
+  const windowStart = resolveWindowStart({ coverage, storedAddedOnByTicker });
+  const inferredNote = provenanceNote({ coverage, storedAddedOnByTicker });
 
   return (
     <div className="space-y-6">
@@ -310,18 +352,25 @@ export default function RealizedRiskPage() {
           <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
           <div className="text-sm flex-1">
             <h4 className="font-semibold text-amber-900 dark:text-amber-200">
-              Realized P&amp;L covers {coveredDays ?? '?'} trading days
-              {intersection ? ` since ${intersection}` : ''}
-              {heldLonger !== null
-                ? ` — ${heldLonger} of ${coverageTotal} positions held longer`
-                : ''}
-              {fullDays ? `; instrument risk uses full ${fullDays}d` : ''}
+              {holdingWindowHeadline({
+                coveredDays,
+                start: intersection,
+                source: windowStart.source,
+                heldLonger,
+                total: coverageTotal,
+                fullDays,
+              })}
             </h4>
-            {intersection && fullDays ? (
+            {holdingWindowCaption(intersection, fullDays) && (
               <p data-testid="coverage-caption" className="text-xs font-mono text-amber-700 dark:text-amber-400 mt-1">
-                {`{${intersection} · ${fullDays}d raw}`}
+                {holdingWindowCaption(intersection, fullDays)}
               </p>
-            ) : null}
+            )}
+            {inferredNote && (
+              <p data-testid="coverage-provenance" className="text-xs text-amber-800 dark:text-amber-300 mt-1">
+                {inferredNote}
+              </p>
+            )}
             <button
               type="button"
               data-testid="coverage-details-toggle"
@@ -333,11 +382,17 @@ export default function RealizedRiskPage() {
             </button>
             {showCoverageDetail && (
               <div data-testid="coverage-details" className="text-amber-800 dark:text-amber-300 mt-2 space-y-1">
-                {coverageWarnings.map((w: any, idx: number) => (
-                  <p key={idx}>
-                    • <strong className="font-mono">{w.ticker}</strong>: {w.message}
-                  </p>
-                ))}
+                {coverageWarnings.map((w: any, idx: number) => {
+                  // Both the route's message and the derived detail lead with
+                  // the ticker, so the bullet is not prefixed a second time.
+                  const own = w.message ?? perTickerDetail(
+                    w.ticker,
+                    coverageTickers[w.ticker],
+                    realizedRisk?.positions?.[w.ticker],
+                    storedAddedOnByTicker[w.ticker],
+                  );
+                  return <p key={idx}>• {own}</p>;
+                })}
                 <p className="text-xs text-amber-700 dark:text-amber-400 mt-2">
                   💡 <em>Tip:</em> For continuous multi-year historical risk metrics and backtesting on Nifty 50, use continuous ETF benchmarks like <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">NIFTYBEES.NS</code> or <code className="font-bold font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">SETFNIF50.NS</code> in your portfolio.
                 </p>
@@ -392,8 +447,8 @@ export default function RealizedRiskPage() {
           <TrendingDown className="w-4 h-4 text-red-500" />
           <span>
             Holding-Period Realized P&amp;L
-            {realizedRisk?.history_coverage?.effective_start
-              ? ` (since ${realizedRisk.history_coverage.effective_start})`
+            {intersection
+              ? ` (since ${intersection}${startQualifier(windowStart.source)})`
               : ''}
           </span>
         </h3>

@@ -454,6 +454,20 @@ class TestAnalyticsEngine:
         assert "error" in empty_stress
         assert "error" in empty_vol_sizing
         assert "error" in empty_risk_score
+        
+        # An unavailable liquidity result claims nothing: a fabricated
+        # overall_score=5.0 / "Medium" / "5-10" was indistinguishable from a
+        # measured mid-liquidity portfolio.
+        assert empty_liquidity["overall_score"] is None
+        assert empty_liquidity["risk_level"] is None
+        assert empty_liquidity["liquidation_time_days"] is None
+        
+        # The stress proxy tags are absent claims, not real ones.
+        assert empty_stress["confidence_level"] is None
+        assert empty_stress["confidence_basis"] is None
+        assert empty_stress["impact_basis"] is None
+        assert empty_stress["shock_inputs"] is None
+        assert empty_stress["units"] is None
 
 
 @pytest.mark.unit

@@ -201,6 +201,12 @@ export const portfolioApi = {
   },
 
   // Rebalance portfolio (live or dry-run simulation)
+  //
+  // The workflow applies the same normalization rule the volatility-sizing
+  // engine publishes (`divide_all_legs_by_gross_exposure`) and REJECTS a
+  // target whose gross exposure exceeds 100 % with HTTP 400, because
+  // normalization cannot create the financing it requires. `weight_normalization`
+  // is the audit trail for the target that was accepted.
   async rebalancePortfolio(
     new_weights: Record<string, number>,
     dry_run = false
@@ -209,10 +215,24 @@ export const portfolioApi = {
     dry_run?: boolean;
     message: string;
     total_portfolio_value: number;
+    total_portfolio_value_currency?: string;
     total_turnover_pct?: number;
     total_buy_inr?: number;
     total_sell_inr?: number;
     weights?: Record<string, number>;
+    simulated_weights?: Record<string, number>;
+    weight_normalization?: {
+      normalization_rule: string;
+      normalization_mode: string;
+      weights_normalized: boolean;
+      /** Gross exposure of the submitted target, before normalization. */
+      submitted_gross_exposure: number;
+      /** Gross exposure actually executed; 1.0 for an accepted target. */
+      gross_exposure: number;
+      execution_eligible: boolean;
+      financing_required: boolean;
+      net_cash_weight: number;
+    };
     orders?: Array<{
       ticker: string;
       current_weight: number;
@@ -222,6 +242,8 @@ export const portfolioApi = {
       target_quantity: number;
       shares_delta: number;
       price: number;
+      price_currency?: string;
+      value_currency?: string;
       cash_delta: number;
       action: string;
     }>;

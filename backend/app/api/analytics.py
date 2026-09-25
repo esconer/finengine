@@ -43,7 +43,19 @@ from app.models.schemas import (
     StressTestRequest, CorrelationStabilityResponse, CointScannerResponse
 )
 from app.services.correlation_service import analyze_correlation_stability
-from app.services.cointegration_service import CointegrationService
+from app.services.cointegration_service import (
+    TEST_ROLES,
+    UNIVERSE_SCOPES,
+    CointegrationService,
+    shallow_tickers,
+    usable_observations_by_ticker,
+)
+from app.utils.allocations import (
+    WEIGHT_NORMALIZATION_RULE,
+    normalization_block,
+    normalize_rebalance_weights,
+    sizing_history_block,
+)
 from app.utils.holdings import (
     MIN_ANNUALIZE_DAYS,
     apply_annualization_gate,
@@ -207,11 +219,98 @@ def _parse_tickers(value: Any, *, max_items: int = _MAX_TICKERS) -> Optional[str
     return ",".join(items) if items else None
 
 
-def _universe_coverage(requested: Iterable[str], available: Iterable[str]) -> Dict[str, Any]:
-    """Describe the exact requested/available ticker universe for a result."""
-    requested_list = list(dict.fromkeys(str(item).strip().upper() for item in requested if str(item).strip()))
-    available_list = list(dict.fromkeys(str(item).strip().upper() for item in available if str(item).strip()))
-    available_set = set(available_list)
+# Shared export vocabulary (see docs/ai-context.md).
+#   data_status  -> available | partial | unavailable   (was there measured data?)
+#   coverage     -> complete | partial | unavailable | unknown (universe completeness)
+# The two are independent: coverage completeness stays inside `universe_coverage`
+# and never leaks into the public `data_status` field.
+DATA_STATUS_AVAILABLE = "available"
+DATA_STATUS_PARTIAL = "partial"
+DATA_STATUS_UNAVAILABLE = "unavailable"
+DATA_STATUS_VOCABULARY = (
+    DATA_STATUS_AVAILABLE,
+    DATA_STATUS_PARTIAL,
+    DATA_STATUS_UNAVAILABLE,
+)
+_COVERAGE_TO_DATA_STATUS = {
+    "complete": DATA_STATUS_AVAILABLE,
+    "partial": DATA_STATUS_PARTIAL,
+    "unavailable": DATA_STATUS_UNAVAILABLE,
+}
+# One canonical weight-basis claim: a positive-weight leg was dropped and the
+# surviving active weights were renormalized back to 100%.
+ACTIVE_WEIGHT_BASIS = "active_weights_renormalized_to_100_percent"
+
+
+def _ticker_sequence(value: Optional[Iterable[Any]]) -> List[str]:
+    """Uppercased, de-duplicated ticker list that preserves first-seen order."""
+    if value is None:
+        return []
+    ordered: List[str] = []
+    seen = set()
+    for item in value:
+        ticker = str(item).strip().upper()
+        if ticker and ticker not in seen:
+            seen.add(ticker)
+            ordered.append(ticker)
+    return ordered
+
+
+def _ordered_universe(requested: List[str], available: Iterable[str]) -> List[str]:
+    """Deterministic ticker order: request order first, extras sorted."""
+    available_set = set(available)
+    extras = sorted(available_set - set(requested))
+    return [ticker for ticker in requested if ticker in available_set] + extras
+
+
+def _data_status(
+    coverage: Optional[Mapping[str, Any]] = None,
+    *,
+    partial: bool = False,
+    unavailable: bool = False,
+) -> str:
+    """Return a public `data_status` from the documented vocabulary.
+
+    `coverage` supplies the universe-completeness signal; `partial` names an
+    extra degradation (limited history, engine error, short sample) and
+    `unavailable` forces the explicit no-measured-data state. An `unknown`
+    coverage status (market-wide payload with no ticker universe) is not a
+    data failure, so it contributes no demotion on its own.
+    """
+    status = DATA_STATUS_AVAILABLE
+    if isinstance(coverage, Mapping):
+        status = _COVERAGE_TO_DATA_STATUS.get(
+            str(coverage.get("status") or "").strip().lower(),
+            DATA_STATUS_AVAILABLE,
+        )
+    if unavailable:
+        return DATA_STATUS_UNAVAILABLE
+    if partial and status == DATA_STATUS_AVAILABLE:
+        return DATA_STATUS_PARTIAL
+    return status
+
+
+def _universe_coverage(
+    requested: Iterable[str],
+    available: Iterable[str],
+    *,
+    active: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Describe the exact requested/available ticker universe for a result.
+
+    Ordering is deterministic: `requested_tickers` keeps first-seen request
+    order and every other list follows that order (extras appended sorted), so
+    a repeated universe exports identically.
+
+    `weight_basis` is emitted only when a weight-bearing leg (an entry of
+    `active`, i.e. a positive finite portfolio weight) was actually dropped
+    from the delivered universe, which is exactly when the surviving active
+    weights were renormalized to 100%. Weightless analyses and coverage gaps
+    made up only of zero-value rows never claim an allocation basis.
+    """
+    requested_list = _ticker_sequence(requested)
+    available_set = set(_ticker_sequence(available))
+    available_list = _ordered_universe(requested_list, available_set)
     covered = [ticker for ticker in requested_list if ticker in available_set]
     missing = [ticker for ticker in requested_list if ticker not in available_set]
     if not requested_list:
@@ -222,7 +321,7 @@ def _universe_coverage(requested: Iterable[str], available: Iterable[str]) -> Di
         status = "partial"
     else:
         status = "complete"
-    return {
+    coverage: Dict[str, Any] = {
         "requested_tickers": requested_list,
         "available_tickers": available_list,
         "covered_tickers": covered,
@@ -232,8 +331,12 @@ def _universe_coverage(requested: Iterable[str], available: Iterable[str]) -> Di
         "coverage_ratio": round(len(covered) / len(requested_list), 6) if requested_list else None,
         "complete": not missing if requested_list else None,
         "status": status,
-        "weight_basis": "active_weights_renormalized_to_100_percent",
     }
+    if active is not None:
+        active_list = _ticker_sequence(active)
+        if any(ticker not in available_set for ticker in active_list):
+            coverage["weight_basis"] = ACTIVE_WEIGHT_BASIS
+    return coverage
 
 
 def _active_weight_tickers(weights: Mapping[str, Any]) -> List[str]:
@@ -492,6 +595,204 @@ def _latest_observation_date(price_data: Any) -> Optional[str]:
     return None
 
 
+def _observation_date(label: Any) -> Optional[str]:
+    """ISO date for a real date-ish index label, else None.
+
+    A RangeIndex label is a row number, not a date. Converting it would
+    fabricate the freshness claim the history blocks exist to make, so a
+    positional label yields None exactly like `app.utils.allocations` does.
+    """
+    if label is None or isinstance(label, bool):
+        return None
+    if isinstance(label, (int, float, np.integer, np.floating)):
+        return None
+    try:
+        stamp = pd.Timestamp(label)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if pd.isna(stamp):
+        return None
+    return stamp.date().isoformat()
+
+
+def _observation_bounds(frame: Any) -> Tuple[Optional[str], Optional[str]]:
+    """First and last dated observation of a frame or series index."""
+    index = getattr(frame, "index", None)
+    if index is None or len(index) == 0:
+        return None, None
+    return _observation_date(index[0]), _observation_date(index[-1])
+
+
+def _return_observation_counts(returns: Any) -> Dict[str, int]:
+    """Measured return count per ticker; nothing is imputed for a gap."""
+    if isinstance(returns, pd.DataFrame):
+        return {str(ticker): int(returns[ticker].notna().sum()) for ticker in returns.columns}
+    if isinstance(returns, pd.Series):
+        name = str(returns.name) if returns.name is not None else "series"
+        return {name: int(returns.notna().sum())}
+    return {}
+
+
+def _history_window(
+    requested_start: Optional[str],
+    requested_end: Optional[str],
+    returns: Any,
+    *,
+    price_frame: Any = None,
+) -> Dict[str, Any]:
+    """The window that was asked for next to the window that was measured.
+
+    `requested_end` is a request, never evidence: `first_observation` and
+    `latest_observation` are the delivered price dates and
+    `return_observations` counts the returns actually computed, so a caller can
+    tell a 2-day answer from a 252-day one without trusting the request. The
+    minimum-sample gate matches the annualization gate used everywhere else, so
+    "short history" means one thing across sizing and realized risk.
+    """
+    counts = _return_observation_counts(returns)
+    observations = (
+        int(len(returns)) if isinstance(returns, (pd.DataFrame, pd.Series)) else 0
+    )
+    first, latest = _observation_bounds(price_frame)
+    if first is None or latest is None:
+        return_first, return_latest = _observation_bounds(returns)
+        first = first if first is not None else return_first
+        latest = latest if latest is not None else return_latest
+    meets = bool(
+        counts
+        and observations >= MIN_ANNUALIZE_DAYS
+        and min(counts.values()) >= MIN_ANNUALIZE_DAYS
+    )
+    return {
+        "requested_start": requested_start,
+        "requested_end": requested_end,
+        "first_observation": first,
+        "latest_observation": latest,
+        "return_observations": observations,
+        "per_ticker_return_observations": counts,
+        "minimum_observations_required": MIN_ANNUALIZE_DAYS,
+        "meets_minimum_sample": meets,
+    }
+
+
+def _sizing_basis_block(
+    engine_result: Mapping[str, Any],
+    *,
+    base_currency: str,
+    portfolio_value: Optional[float],
+) -> Dict[str, Any]:
+    """One block for the price and currency the share deltas came from.
+
+    Notionals are struck in the base currency and share deltas are whole shares,
+    so the price that converts one into the other has to be the same
+    base-currency price the budget was struck in. A basis the engine could not
+    measure stays `unavailable` with an empty price map and a reason: the
+    retired 100.0 placeholder is precisely the fabricated price this replaces.
+    """
+    prices = engine_result.get("sizing_price")
+    prices = dict(prices) if isinstance(prices, Mapping) else {}
+    as_of = engine_result.get("sizing_price_as_of")
+    currency = engine_result.get("sizing_price_currency")
+    currency = (
+        str(currency).strip().upper()
+        if isinstance(currency, str) and currency.strip()
+        else base_currency
+    )
+    currency_provenance = engine_result.get("price_currency_provenance")
+    if not isinstance(currency_provenance, str) or not currency_provenance.strip():
+        currency_provenance = "measured" if currency else "unavailable"
+    price_provenance = engine_result.get("sizing_price_provenance")
+    if not isinstance(price_provenance, str) or not price_provenance.strip():
+        price_provenance = "unavailable"
+    reason = engine_result.get("sizing_price_unavailable_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = None if price_provenance == "measured" else "no_aligned_price_snapshot"
+    return {
+        "sizing_price": prices,
+        "sizing_price_as_of": as_of if isinstance(as_of, str) and as_of.strip() else None,
+        "sizing_price_currency": currency,
+        "price_currency": currency,
+        "price_currency_provenance": currency_provenance,
+        "sizing_price_provenance": price_provenance,
+        "sizing_price_unavailable_reason": reason,
+        "missing_tickers": list(engine_result.get("sizing_price_missing_tickers") or []),
+        "unpriced_tickers": list(engine_result.get("sizing_price_unpriced_tickers") or []),
+        "portfolio_value": float(portfolio_value) if portfolio_value is not None else None,
+        "portfolio_value_currency": base_currency,
+    }
+
+
+def _exposure_projection(
+    execution: Mapping[str, Any], result: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Flat exposure read-out projected from the shared `execution` block.
+
+    One measurement, two shapes: `exposure` republishes what `execution` and
+    the engine's scale factor already measured so a flat consumer does not have
+    to walk a nested block. It never recomputes gross exposure or financing.
+    """
+    gross = execution.get("gross_exposure")
+    try:
+        gross_value = float(gross) if gross is not None else None
+    except (TypeError, ValueError):
+        gross_value = None
+    return {
+        "normalization_rule": execution.get("normalization_rule") or WEIGHT_NORMALIZATION_RULE,
+        "gross_exposure": gross,
+        "net_cash_weight": execution.get("net_cash_weight"),
+        "cash_weight": result.get("cash_weight"),
+        "scale_factor": result.get("scale_factor"),
+        "financing_required": bool(execution.get("financing_required")),
+        "financing_fraction": (
+            round(gross_value - 1.0, 6)
+            if gross_value is not None and gross_value > 1.0
+            else 0.0
+        ),
+        "financing_requirement": execution.get("financing_requirement"),
+        "financing_requirement_currency": execution.get("financing_requirement_currency"),
+        "execution_eligible": bool(execution.get("execution_eligible")),
+        "block_reason": execution.get("block_reason"),
+    }
+
+
+# The rebalance workflow publishes this exact block for a submitted target; the
+# optimizer publishes the same shape for the weights its solver produced, so one
+# rule string describes both. Solver weights are published rounded to six
+# decimals, so a long-only vector that sums to 1.0 can sit up to n / 2e6 above
+# it (2.5e-5 for a 50-leg book); the shared rule's default 1e-6 tolerance would
+# read that rounding as financing and refuse a legitimately funded target. The
+# optimizer validates a solver output, not a user submission, so it validates at
+# the precision it publishes, and 1e-4 still sits far below any real leverage.
+_SOLVER_GROSS_TOLERANCE = 1e-4
+
+
+def _weight_normalization_block(
+    weights: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Validate a target through the shared rule and report it like rebalance.
+
+    The validated `weights` are not substituted into the response: this is a
+    disclosure of what the shared rule measured about the published target, not
+    a silent rewrite of a solver answer.
+    """
+    normalization = normalize_rebalance_weights(weights, tolerance=_SOLVER_GROSS_TOLERANCE)
+    block = {
+        "normalization_rule": WEIGHT_NORMALIZATION_RULE,
+        "normalization_mode": normalization["normalization_mode"],
+        "weights_normalized": normalization["weights_normalized"],
+        "submitted_gross_exposure": normalization["submitted_gross_exposure"],
+        "gross_exposure": normalization["gross_exposure"],
+        "execution_eligible": normalization["execution_eligible"],
+        "financing_required": normalization["financing_required"],
+        "net_cash_weight": round(1.0 - normalization["gross_exposure"], 6),
+    }
+    if normalization["rejection"] is not None:
+        # Never silent: a target the rebalance workflow would refuse is named
+        # here too, whatever the solver believed.
+        block["rejection"] = normalization["rejection"]
+    return block
+
+
 def _analytics_position_currency(position: Any) -> str:
     """Infer the position's native cash-equity currency for analytics math."""
     for attr in ("currency", "position_currency", "quote_currency", "_quote_currency"):
@@ -629,6 +930,70 @@ async def _convert_analytics_positions(
     if not all(math.isfinite(value) for value in converted.values()):
         raise CurrencyUnavailableError()
     return converted, provenance
+
+
+def _fx_rates_by_ticker(
+    positions: Iterable[Any],
+    *,
+    base_currency: str,
+    provenance: Any,
+) -> Dict[str, Optional[float]]:
+    """Native-to-base rate per ticker from the FX snapshot already verified.
+
+    The rates are the ones `_convert_analytics_positions` used to value the
+    book, so a second refresh cannot split the valuation budget from the prices
+    derived from it. A leg with no verified rate is reported as `None` instead
+    of falling back to 1.0, which would price a foreign book as if it were
+    already in the base currency.
+    """
+    pairs = provenance.get("pairs") if isinstance(provenance, Mapping) else None
+    rates: Dict[str, Optional[float]] = {}
+    for position in positions:
+        ticker = str(getattr(position, "ticker", "") or "")
+        if not ticker:
+            continue
+        source = _analytics_position_currency(position)
+        if source == base_currency:
+            rates[ticker] = 1.0
+            continue
+        pair = pairs.get(f"{source}->{base_currency}") if isinstance(pairs, Mapping) else None
+        rate: Optional[float] = None
+        if isinstance(pair, Mapping):
+            try:
+                candidate = float(pair.get("rate"))
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                rate = candidate
+        rates[ticker] = rate
+    return rates
+
+
+def _base_currency_price_series(
+    price_data_dict: Mapping[str, pd.Series],
+    rates: Mapping[str, Optional[float]],
+) -> Dict[str, pd.Series]:
+    """Re-express delivered price series in the base currency.
+
+    Scaling a whole series by one constant leaves its returns - and therefore
+    every volatility the sizing engine measures - unchanged, while making the
+    exported `sizing_price` the same unit as the notional it is divided into.
+    A leg with no verified rate has no truthful base-currency price, so it is
+    left out of the sizing universe instead of being priced as INR.
+    """
+    converted: Dict[str, pd.Series] = {}
+    for ticker, series in (price_data_dict or {}).items():
+        rate = rates.get(ticker)
+        if rate is None:
+            continue
+        try:
+            factor = float(rate)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(factor) or factor <= 0:
+            continue
+        converted[ticker] = series if factor == 1.0 else series * factor
+    return converted
 
 
 async def _load_portfolio_allocation(db: AsyncSession) -> Optional[Dict[str, float]]:
@@ -959,18 +1324,15 @@ async def get_realized_risk(
             for ticker, position in positions.items()
             if int(position.get("data_points", 0) or 0) >= 2
         ]
-        coverage = _universe_coverage(ticker_list, usable_tickers)
+        coverage = _universe_coverage(
+            ticker_list, usable_tickers, active=calculation_tickers
+        )
         limited_history = any(
             bool(position.get("is_limited_history"))
             for position in positions.values()
             if isinstance(position, Mapping)
         )
-        if coverage["status"] == "unavailable":
-            data_status = "unavailable"
-        elif coverage["status"] == "partial" or limited_history:
-            data_status = "partial"
-        else:
-            data_status = "available"
+        data_status = _data_status(coverage, partial=limited_history)
         return {
             "portfolio": portfolio_metrics,
             "positions": positions,
@@ -1128,7 +1490,9 @@ async def get_forecast_risk(
                 or position.get("var_forecast") is not None
             )
         ]
-        coverage = _universe_coverage(ticker_list, usable_positions)
+        coverage = _universe_coverage(
+            ticker_list, usable_positions, active=calculation_tickers
+        )
         limited_history = any(
             bool(position.get("is_limited_history"))
             for position in positions.values()
@@ -1150,10 +1514,11 @@ async def get_forecast_risk(
             },
             "positions": positions,
             "universe_coverage": coverage,
-            "data_status": (
-                "unavailable" if coverage["status"] == "unavailable"
-                else "partial" if coverage["status"] == "partial" or limited_history or forecast_result.get("error") or not portfolio_forecast_usable
-                else "available"
+            "data_status": _data_status(
+                coverage,
+                partial=limited_history
+                or bool(forecast_result.get("error"))
+                or not portfolio_forecast_usable,
             ),
             "warnings": warnings_list,
             "model_params": forecast_result.get("model_params", {"p": 1, "q": 1, "type": model}),
@@ -1317,7 +1682,9 @@ async def get_factor_exposure(
                 for field in ("alpha", "beta", "market", "r_squared")
             )
         }
-        coverage = _universe_coverage(ticker_list, usable_positions.keys())
+        coverage = _universe_coverage(
+            ticker_list, usable_positions.keys(), active=calculation_tickers
+        )
         limited_history = any(
             bool(position.get("is_limited_history"))
             for position in factor_positions.values()
@@ -1328,12 +1695,12 @@ async def get_factor_exposure(
             portfolio_factor.get(field) is not None
             for field in ("alpha", "market", "beta", "r_squared")
         )
-        if coverage["status"] == "unavailable":
-            data_status = "unavailable"
-        elif coverage["status"] == "partial" or limited_history or not portfolio_factor_usable or factor_result.get("error"):
-            data_status = "partial"
-        else:
-            data_status = "available"
+        data_status = _data_status(
+            coverage,
+            partial=limited_history
+            or not portfolio_factor_usable
+            or bool(factor_result.get("error")),
+        )
         return {
             "portfolio": factor_result.get("portfolio", {}),
             "positions": factor_result.get("positions", {}),
@@ -1403,7 +1770,11 @@ async def get_concentration_metrics(
             sector = pos.sector or "Unknown"
             by_sector[sector] = round(by_sector.get(sector, 0.0) + w, 4)
         
-        coverage = _universe_coverage(requested_tickers, concentration_result.get("by_weight", {}).keys())
+        coverage = _universe_coverage(
+            requested_tickers,
+            concentration_result.get("by_weight", {}).keys(),
+            active=_active_weight_tickers(weights),
+        )
         return {
             "largest_position": concentration_result.get("largest_position", 0.0),
             "top_3": concentration_result.get("top_3", 0.0),
@@ -1417,7 +1788,7 @@ async def get_concentration_metrics(
             "by_weight": concentration_result.get("by_weight", {}),
             "by_sector": by_sector,
             "universe_coverage": coverage,
-            "data_status": coverage["status"],
+            "data_status": _data_status(coverage),
             "methodology": "Concentration analysis using Herfindahl-Hirschman Index (HHI), Effective Positions (N_eff), and Lorenz Gini Coefficient"
         }
         
@@ -1521,7 +1892,11 @@ async def get_liquidity_metrics(
         
         # Calculate liquidity metrics using analytics engine
         liquidity_result = await analytics_engine.liquidity_analysis(price_data_dict, market_caps=market_caps_dict)
-        coverage = _universe_coverage(requested_tickers, liquidity_result.get("by_position", {}).keys())
+        coverage = _universe_coverage(
+            requested_tickers,
+            liquidity_result.get("by_position", {}).keys(),
+            active=tickers,
+        )
 
         return {
             "overall_score": liquidity_result.get("overall_score"),
@@ -1530,7 +1905,7 @@ async def get_liquidity_metrics(
             "by_position": liquidity_result.get("by_position", {}),
             "volume_stats": liquidity_result.get("volume_stats", {}),
             "universe_coverage": coverage,
-            "data_status": coverage["status"],
+            "data_status": _data_status(coverage),
             "methodology": "Liquidity scoring based on trading volume and market capitalization"
         }
         
@@ -1606,12 +1981,10 @@ async def run_stress_test(
         # Run multi-factor sector-elastic stress test using analytics engine
         stress_result = await analytics_engine.stress_test(price_data, weights, request.scenario, sectors=sectors)
         stress_result = dict(stress_result)
-        stress_result["universe_coverage"] = _universe_coverage(ticker_list, price_data_dict.keys())
-        stress_result["data_status"] = (
-            "available"
-            if not stress_result["universe_coverage"]["missing_tickers"]
-            else "partial"
+        stress_result["universe_coverage"] = _universe_coverage(
+            ticker_list, price_data_dict.keys(), active=_active_weight_tickers(weights)
         )
+        stress_result["data_status"] = _data_status(stress_result["universe_coverage"])
         return stress_result
         
     except HTTPException:
@@ -1636,8 +2009,15 @@ async def get_volatility_sizing(
 ) -> Dict:
     """
     Get volatility-adjusted position sizing recommendations
+
+    The response is one executable contract: the weights, the gross exposure
+    and financing they require under the shared normalization rule, the
+    base-currency price and date every share delta was derived from, and the
+    history window that was actually measured. Nothing here is inferred: a
+    price, currency, or window the data cannot supply stays `unavailable`.
     """
     try:
+        base_currency = "INR"
         model = _validate_model_name(model, _VOLATILITY_MODELS)
         if not math.isfinite(float(target_volatility)) or not 0 < float(target_volatility) < 1:
             raise HTTPException(status_code=422, detail="target_volatility must be finite and between 0 and 1")
@@ -1654,10 +2034,12 @@ async def get_volatility_sizing(
                 "recommended_weights": {},
                 "trades": {},
                 "target_volatility": target_volatility,
-                "currency": "INR",
-                "base_currency": "INR",
+                "currency": base_currency,
+                "base_currency": base_currency,
+                "execution_normalization_rule": WEIGHT_NORMALIZATION_RULE,
+                "latest_observation_date": None,
                 "currency_provenance": {
-                    "base_currency": "INR",
+                    "base_currency": base_currency,
                     "aggregation": "empty",
                     "source_currencies": [],
                     "pairs": {},
@@ -1665,11 +2047,11 @@ async def get_volatility_sizing(
                 "error": "No portfolio positions found for volatility sizing"
             }
 
-        # Use one FX snapshot for both current weights and the INR valuation
-        # budget.  Re-querying/re-converting could otherwise split the trade
-        # sizing basis when live rates move between calls.
+        # Use one FX snapshot for both current weights and the base-currency
+        # valuation budget.  Re-querying/re-converting could otherwise split the
+        # trade sizing basis when live rates move between calls.
         converted_position_values, allocation_provenance = await _convert_analytics_positions(
-            positions_list, target_currency="INR"
+            positions_list, target_currency=base_currency
         )
         converted_total = sum(
             value for value in converted_position_values.values()
@@ -1692,18 +2074,19 @@ async def get_volatility_sizing(
                 equal_weight = 1.0 / len(positions_list)
                 weights = {position.ticker: equal_weight for position in positions_list}
 
-        # Calculate actual INR portfolio value from DB if not explicitly passed.
+        # Calculate actual base-currency portfolio value from DB if not
+        # explicitly passed.
         if portfolio_value is None:
             resolved_pv = converted_total
             currency_provenance = allocation_provenance
         else:
             resolved_pv = portfolio_value
             currency_provenance = {
-                "base_currency": "INR",
+                "base_currency": base_currency,
                 "aggregation": "explicit_input",
-                "source_currencies": ["INR"],
+                "source_currencies": [base_currency],
                 "pairs": {
-                    "INR->INR": {
+                    f"{base_currency}->{base_currency}": {
                         "rate": 1.0,
                         "provenance": "explicit_input",
                         "source": "caller",
@@ -1717,8 +2100,10 @@ async def get_volatility_sizing(
                 "recommended_weights": weights,
                 "trades": {ticker: {"shares_delta": 0, "amount": 0.0} for ticker in weights.keys()},
                 "target_volatility": target_volatility,
-                "currency": "INR",
-                "base_currency": "INR",
+                "currency": base_currency,
+                "base_currency": base_currency,
+                "execution_normalization_rule": WEIGHT_NORMALIZATION_RULE,
+                "latest_observation_date": None,
                 "currency_provenance": currency_provenance,
                 "universe_coverage": _universe_coverage(requested_tickers, []),
                 "data_status": "unavailable",
@@ -1739,13 +2124,53 @@ async def get_volatility_sizing(
                 "recommended_weights": weights,
                 "trades": {ticker: {"shares_delta": 0, "amount": 0} for ticker in weights.keys()},
                 "target_volatility": target_volatility,
-                "currency": "INR",
-                "base_currency": "INR",
+                "currency": base_currency,
+                "base_currency": base_currency,
+                "execution_normalization_rule": WEIGHT_NORMALIZATION_RULE,
+                "latest_observation_date": None,
                 "currency_provenance": currency_provenance,
                 "universe_coverage": _universe_coverage(requested_tickers, []),
                 "data_status": "unavailable",
                 "data_unavailable_tickers": list(requested_tickers),
                 "error": "No price data available for volatility sizing"
+            }
+
+        # Every notional below is struck in the base currency, and a share
+        # delta is the notional divided by a price, so that price has to be in
+        # the base currency too.  Re-expressing the delivered series with the
+        # one FX snapshot already used to value the book leaves the measured
+        # returns (and therefore every volatility) unchanged while making the
+        # exported sizing price the same unit as the amounts it is divided into.
+        # A leg with no verified rate has no truthful base-currency price, so it
+        # leaves the sizing universe rather than being priced as if it were INR.
+        fx_rates = _fx_rates_by_ticker(
+            positions_list, base_currency=base_currency, provenance=allocation_provenance
+        )
+        unconvertible = sorted(
+            ticker for ticker in price_data_dict if fx_rates.get(ticker) is None
+        )
+        if unconvertible:
+            logger.warning(
+                "Volatility sizing dropped legs with no verified %s rate: %s",
+                base_currency,
+                ", ".join(unconvertible),
+            )
+        price_data_dict = _base_currency_price_series(price_data_dict, fx_rates)
+        if not price_data_dict:
+            return {
+                "current_weights": weights,
+                "recommended_weights": weights,
+                "trades": {ticker: {"shares_delta": 0, "amount": 0} for ticker in weights.keys()},
+                "target_volatility": target_volatility,
+                "currency": base_currency,
+                "base_currency": base_currency,
+                "execution_normalization_rule": WEIGHT_NORMALIZATION_RULE,
+                "latest_observation_date": None,
+                "currency_provenance": currency_provenance,
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "data_unavailable_tickers": list(requested_tickers),
+                "error": "No base-currency price data available for volatility sizing",
             }
         
         # Combine price data and remove legs with no measured return.
@@ -1762,8 +2187,11 @@ async def get_volatility_sizing(
                 "recommended_weights": weights,
                 "trades": {ticker: {"shares_delta": 0, "amount": 0} for ticker in weights.keys()},
                 "target_volatility": target_volatility,
-                "currency": "INR",
-                "base_currency": "INR",
+                "currency": base_currency,
+                "base_currency": base_currency,
+                "execution_normalization_rule": WEIGHT_NORMALIZATION_RULE,
+                "latest_observation_date": _latest_observation_date(price_data),
+                "history_window": _history_window(start, end, sizing_returns, price_frame=price_data),
                 "currency_provenance": currency_provenance,
                 "universe_coverage": _universe_coverage(requested_tickers, []),
                 "data_status": "unavailable",
@@ -1771,6 +2199,12 @@ async def get_volatility_sizing(
                 "error": "No finite return observations for volatility sizing",
             }
         price_data = price_data.loc[:, usable_tickers]
+        # Returns measured over the delivered universe only; the history blocks
+        # below report from this frame so a dropped leg cannot inflate the
+        # evidence for the legs that stayed.
+        delivered_returns = sizing_returns.loc[
+            :, [ticker for ticker in usable_tickers if ticker in sizing_returns.columns]
+        ]
         sizing_weights = {
             ticker: float(weights[ticker])
             for ticker in usable_tickers
@@ -1783,13 +2217,17 @@ async def get_volatility_sizing(
                 for ticker, weight in sizing_weights.items()
             }
         
-        # Calculate volatility sizing using analytics engine
+        # Calculate volatility sizing using analytics engine.  The base
+        # currency is passed explicitly because the engine cannot infer it: it
+        # is what makes `sizing_price_currency` and its provenance `measured`
+        # instead of `unavailable`.
         sizing_result = await analytics_engine.volatility_sizing(
             price_data, 
             sizing_weights,
             model, 
             target_volatility, 
-            portfolio_value=resolved_pv
+            portfolio_value=resolved_pv,
+            price_currency=base_currency,
         )
         if not isinstance(sizing_result, dict):
             raise RuntimeError("Volatility sizing result unavailable")
@@ -1803,26 +2241,71 @@ async def get_volatility_sizing(
             available_tickers = [
                 ticker for ticker in recommended_tickers if ticker in usable_tickers
             ]
-        coverage = _universe_coverage(requested_tickers, available_tickers)
+        coverage = _universe_coverage(
+            requested_tickers, available_tickers, active=_active_weight_tickers(weights)
+        )
         limited_history = any(
             count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
         )
-        sizing_status = (
-            "unavailable" if coverage["status"] == "unavailable"
-            else "partial" if coverage["status"] == "partial" or limited_history or sizing_result.get("error")
-            else "available"
+        sizing_status = _data_status(
+            coverage,
+            partial=limited_history or bool(sizing_result.get("error")),
         )
         response.update({
             "portfolio_value": round(float(resolved_pv), 2),
-            "portfolio_value_currency": "INR",
-            "currency": "INR",
-            "base_currency": "INR",
+            "portfolio_value_currency": base_currency,
+            "currency": base_currency,
+            "base_currency": base_currency,
             "currency_provenance": currency_provenance,
             "universe_coverage": coverage,
             "data_status": sizing_status,
             "data_unavailable_tickers": coverage["missing_tickers"],
-            "weight_basis": "available_universe_renormalized" if coverage["missing_tickers"] else "full_universe",
         })
+        if coverage["missing_tickers"]:
+            # A leg without usable returns left the calculation universe, so the
+            # surviving active weights were renormalized. Nothing was dropped in
+            # the full-universe case, so no allocation basis is claimed.
+            response["weight_basis"] = ACTIVE_WEIGHT_BASIS
+
+        # One rule string, cited by the export and the UI without reaching into
+        # a nested block, and the same rule the rebalance workflow enforces.
+        response["execution_normalization_rule"] = WEIGHT_NORMALIZATION_RULE
+        # Freshness is the newest delivered observation, never the requested end.
+        response["latest_observation_date"] = _latest_observation_date(price_data)
+        response["history_window"] = _history_window(
+            start, end, delivered_returns, price_frame=price_data
+        )
+        # The engine's own measured sample, or the same block rebuilt from the
+        # delivered frame when the engine published none: a window is never
+        # claimed without the frame that produced it.
+        response["sizing_history"] = (
+            dict(sizing_result["sizing_history"])
+            if isinstance(sizing_result.get("sizing_history"), Mapping)
+            else sizing_history_block(delivered_returns, price_frame=price_data, model=model)
+        )
+        response["sizing_basis"] = _sizing_basis_block(
+            sizing_result, base_currency=base_currency, portfolio_value=resolved_pv
+        )
+        execution = sizing_result.get("execution")
+        if not isinstance(execution, Mapping):
+            # A degraded engine published no rule block, but the target it did
+            # publish still has to be measured against the same rule. With no
+            # target at all there is nothing to normalize, and the engine's
+            # fail-closed result stands on its own.
+            execution = (
+                normalization_block(
+                    response.get("recommended_weights") or {},
+                    portfolio_value=resolved_pv,
+                    currency=base_currency,
+                    weights_normalized=False,
+                )
+                if response.get("recommended_weights")
+                else None
+            )
+        if execution is not None:
+            execution = dict(execution)
+            response["execution"] = execution
+            response["exposure"] = _exposure_projection(execution, response)
         return response
         
     except HTTPException:
@@ -1976,20 +2459,23 @@ async def get_risk_score(
                 "change": 0,
                 "components": {},
                 "alerts": ["Insufficient data for comprehensive risk analysis"],
-                "universe_coverage": _universe_coverage(requested_tickers, usable_tickers),
+                "universe_coverage": _universe_coverage(
+                    requested_tickers, usable_tickers, active=_active_weight_tickers(weights)
+                ),
                 "data_status": "partial" if usable_tickers else "unavailable",
                 "error": "Risk score unavailable for the measured return sample",
             }
         risk_result["history_coverage"] = history_coverage
-        coverage = _universe_coverage(requested_tickers, usable_tickers)
+        coverage = _universe_coverage(
+            requested_tickers, usable_tickers, active=_active_weight_tickers(weights)
+        )
         limited_history = any(
             count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
         )
         risk_result["universe_coverage"] = coverage
-        risk_result["data_status"] = (
-            "unavailable" if coverage["status"] == "unavailable"
-            else "partial" if coverage["status"] == "partial" or limited_history or risk_result.get("error")
-            else "available"
+        risk_result["data_status"] = _data_status(
+            coverage,
+            partial=limited_history or bool(risk_result.get("error")),
         )
 
         return risk_result
@@ -2210,13 +2696,15 @@ async def get_analytics_summary(
         limited_history = any(
             count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
         )
-        coverage = _universe_coverage(requested_tickers, available_tickers)
-        if coverage["status"] == "unavailable":
-            summary_status = "unavailable"
-        elif coverage["status"] == "partial" or limited_history or risk_result.get("error") or risk_result.get("overall_score") is None:
-            summary_status = "partial"
-        else:
-            summary_status = "available"
+        coverage = _universe_coverage(
+            requested_tickers, available_tickers, active=_active_weight_tickers(weights)
+        )
+        summary_status = _data_status(
+            coverage,
+            partial=limited_history
+            or bool(risk_result.get("error"))
+            or risk_result.get("overall_score") is None,
+        )
         summary = {
             "portfolio_value": round(portfolio_value, 2),
             "portfolio_value_currency": "INR",
@@ -2710,12 +3198,13 @@ async def get_tear_sheet(
         except Exception:  # noqa: BLE001
             logger.debug("Drawdown series unavailable")
 
-        coverage = _universe_coverage(ticker_list, returns_df.columns)
-        full_coverage = _universe_coverage(ticker_list, full_returns_df.columns)
-        tear_sheet_status = (
-            "unavailable" if coverage["status"] == "unavailable"
-            else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
-            else "available"
+        active_tickers = _active_weight_tickers(weights)
+        coverage = _universe_coverage(ticker_list, returns_df.columns, active=active_tickers)
+        full_coverage = _universe_coverage(
+            ticker_list, full_returns_df.columns, active=active_tickers
+        )
+        tear_sheet_status = _data_status(
+            coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
         )
         return {
             "window": {"start": start, "end": end},
@@ -2885,25 +3374,38 @@ async def get_risk_contribution(
                     )
                 sector_rollup[model_name] = roll
 
-        coverage = _universe_coverage(ticker_list, assets)
+        coverage = _universe_coverage(
+            ticker_list, assets, active=_active_weight_tickers(weights)
+        )
         excluded_union = sorted(set(volatility_excluded_assets) | set(cvar_excluded_assets))
         if excluded_union:
-            coverage["raw_available_tickers"] = coverage["available_tickers"]
-            coverage["available_tickers"] = [
+            excluded_set = set(excluded_union)
+            effective_available = [
                 ticker for ticker in coverage["available_tickers"]
-                if ticker not in set(excluded_union)
+                if ticker not in excluded_set
             ]
-            coverage["missing_tickers"] = sorted(set(coverage["missing_tickers"]) | set(excluded_union))
+            coverage["raw_available_tickers"] = coverage["available_tickers"]
+            coverage["available_tickers"] = effective_available
+            effective_available_set = set(effective_available)
+            # Requested order stays authoritative so a repeated universe exports
+            # identically; a leg with no return history is never re-counted as
+            # covered just because it was excluded from one model.
             coverage["covered_tickers"] = [
                 ticker for ticker in coverage["requested_tickers"]
-                if ticker not in set(excluded_union)
+                if ticker in effective_available_set
             ]
+            coverage["missing_tickers"] = [
+                ticker for ticker in coverage["requested_tickers"]
+                if ticker not in effective_available_set
+            ] + sorted(excluded_set - set(coverage["requested_tickers"]))
             coverage["available_count"] = len(coverage["covered_tickers"])
             coverage["coverage_ratio"] = round(
                 len(coverage["covered_tickers"]) / len(coverage["requested_tickers"]), 6
             ) if coverage["requested_tickers"] else None
             coverage["complete"] = False
             coverage["status"] = "partial"
+            if excluded_set & set(_active_weight_tickers(weights)):
+                coverage["weight_basis"] = ACTIVE_WEIGHT_BASIS
         coverage["model_used_tickers"] = {
             "volatility": sorted(vol_assets),
             "cvar_tail": sorted(cvar_rc),
@@ -2916,11 +3418,7 @@ async def get_risk_contribution(
             },
             "sector_rollup": sector_rollup,
             "universe_coverage": coverage,
-            "data_status": (
-                "unavailable" if coverage["status"] == "unavailable"
-                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
-                else "available"
-            ),
+            "data_status": _data_status(coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS),
             "latest_observation_date": _latest_observation_date(port_ret),
             "calculation_window": {"start": start, "end": end, "days": len(port_ret)},
             # A leg can support one model while its history is underdetermined for the other.
@@ -2955,6 +3453,11 @@ async def run_optimization(
     Strategies: hrp | min_vol | max_sharpe | min_cvar
     (numpy/cvxpy implementations - see services/optimization_service.py header
     for why riskfolio/pypfopt are bypassed on this dependency stack).
+
+    The solved target is reported next to the shared weight-normalization block,
+    the risk-free rate actually used, and the history window that was measured,
+    so a reader can check that the weights are fundable from the book's own cash
+    and that the Sharpe numerator is the one they think it is.
     """
     try:
         request = _coerce_request(OptimizeRequest, body)
@@ -2978,8 +3481,10 @@ async def run_optimization(
             start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
             prices = (await _fetch_price_series_dict(data_service, [single_t], start, end)).get(single_t)
             ann_ret = ann_vol = sharpe = None
+            measured_returns = None
             if prices is not None and len(prices) > 1:
                 rets = prices.replace([np.inf, -np.inf], np.nan).pct_change(fill_method=None).dropna()
+                measured_returns = rets
                 if len(rets) > 0:
                     ann_ret = float(rets.mean() * 252)
                     ann_vol = float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) > 1 else None
@@ -3006,6 +3511,14 @@ async def run_optimization(
                 "trades_required": {},
                 "universe_coverage": coverage,
                 "data_status": single_status,
+                # The same rule the rebalance workflow enforces, applied to the
+                # published target, plus the rate and window behind the numbers.
+                "weight_normalization": _weight_normalization_block({single_t: 1.0}),
+                "risk_free_rate": rf,
+                "latest_observation_date": _latest_observation_date(prices),
+                "history_window": _history_window(
+                    start, end, measured_returns, price_frame=prices
+                ),
                 "error": single_error,
                 "disclaimer": "Single holding portfolio: weight is 100.00%.",
             }
@@ -3030,8 +3543,12 @@ async def run_optimization(
                 "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
                 "trades_required": {},
                 "universe_coverage": coverage,
-                "data_status": "unavailable" if coverage["status"] == "unavailable" else "partial",
+                "data_status": _data_status(coverage, unavailable=not coverage["covered_tickers"]),
                 "data_unavailable_tickers": coverage["missing_tickers"],
+                "weight_normalization": _weight_normalization_block({}),
+                "risk_free_rate": rf,
+                "latest_observation_date": _latest_observation_date(returns_df),
+                "history_window": _history_window(start, end, returns_df),
                 "error": "Insufficient common return history for optimization",
             }
 
@@ -3046,7 +3563,9 @@ async def run_optimization(
 
         recommended = result["weights"]
         calculation_universe = list(returns_df.columns)
-        coverage = _universe_coverage(ticker_list, calculation_universe)
+        coverage = _universe_coverage(
+            ticker_list, calculation_universe, active=_active_weight_tickers(current_weights)
+        )
         missing_tickers = set(coverage["missing_tickers"])
         reported_recommended = {
             ticker: float(recommended.get(ticker, 0.0))
@@ -3063,7 +3582,7 @@ async def run_optimization(
                     "weight_delta": round(rec - cur, 4),
                 }
 
-        return {
+        response = {
             **result,
             "weights": reported_recommended,
             "universe": ticker_list,
@@ -3071,11 +3590,25 @@ async def run_optimization(
             "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
             "trades_required": dict(sorted(trades.items(), key=lambda kv: abs(kv[1]["weight_delta"]), reverse=True)),
             "universe_coverage": coverage,
-            "data_status": "partial" if missing_tickers or result.get("error") else coverage["status"],
+            "data_status": _data_status(
+                coverage, partial=bool(missing_tickers) or bool(result.get("error"))
+            ),
             "data_unavailable_tickers": sorted(missing_tickers),
-            "weight_basis": "available_universe_renormalized" if missing_tickers else "full_universe",
+            # The solved target is measured against the same rule the rebalance
+            # workflow enforces, so a reader can tell a normal rebalance from a
+            # target the book cannot fund. The published weights are the
+            # solver's answer and are never rewritten by the check.
+            "weight_normalization": _weight_normalization_block(reported_recommended),
+            "risk_free_rate": rf,
+            "latest_observation_date": _latest_observation_date(returns_df),
+            "history_window": _history_window(start, end, returns_df),
             "disclaimer": "Educational optimization output; not investment advice.",
         }
+        if missing_tickers:
+            # Target weights are solved over the delivered universe only; the
+            # dropped active leg means the allocation basis is not the full book.
+            response["weight_basis"] = ACTIVE_WEIGHT_BASIS
+        return response
     except HTTPException:
         raise
     except ValueError:
@@ -3164,6 +3697,7 @@ async def get_regime(
         port_ret: Optional[pd.Series] = None
         history_coverage: Optional[Dict[str, Any]] = None
         portfolio_tickers: List[str] = []
+        calculation_tickers: List[str] = []
         if with_portfolio:
             try:
                 portfolio_tickers, weights = await resolve_allocation(None, db)
@@ -3189,11 +3723,11 @@ async def get_regime(
             result["universe_coverage"] = _universe_coverage(
                 portfolio_tickers,
                 history_coverage.get("model_used_tickers", []),
+                active=calculation_tickers,
             )
-            result["data_status"] = (
-                "unavailable" if result["universe_coverage"]["status"] == "unavailable"
-                else "partial" if result["universe_coverage"]["status"] == "partial" or (0 if port_ret is None else len(port_ret)) < MIN_ANNUALIZE_DAYS
-                else "available"
+            result["data_status"] = _data_status(
+                result["universe_coverage"],
+                partial=(0 if port_ret is None else len(port_ret)) < MIN_ANNUALIZE_DAYS,
             )
         elif with_portfolio:
             result["universe_coverage"] = _universe_coverage(portfolio_tickers, [])
@@ -3294,12 +3828,21 @@ async def run_monte_carlo(
             coverage = _universe_coverage(
                 ticker_list,
                 history_coverage.get("model_used_tickers", []),
+                active=_active_weight_tickers(weights),
             )
             result["universe_coverage"] = coverage
-            result["data_status"] = (
-                "unavailable" if coverage["status"] == "unavailable"
-                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
-                else "available"
+            # `active_currencies` is a single-element set here (mixed-currency
+            # books were rejected above), so this is the unit the wealth levels
+            # are denominated in. The returns are a ratio, so the FX level
+            # cancels; the value unit and the return unit are published apart.
+            result["currency"] = next(iter(active_currencies), None)
+            result["returns_currency"] = next(iter(active_currencies), None)
+            result["value_currency_basis"] = (
+                "explicit_initial_value" if initial_value is not None else "db_native_market_value"
+            )
+            result["latest_observation_date"] = _latest_observation_date(port_ret)
+            result["data_status"] = _data_status(
+                coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
             )
         return result
     except HTTPException:
@@ -3372,16 +3915,15 @@ async def get_correlation_stability(
         coverage = _universe_coverage(
             ticker_list,
             history_coverage.get("model_used_tickers", returns_df.columns),
+            active=_active_weight_tickers(weights),
         )
         return result.model_copy(
             update={
                 "requested_tickers": coverage["requested_tickers"],
                 "available_tickers": coverage["available_tickers"],
                 "missing_tickers": coverage["missing_tickers"],
-                "data_status": (
-                    "unavailable" if coverage["status"] == "unavailable"
-                    else "partial" if coverage["status"] == "partial" or len(returns_df) < MIN_ANNUALIZE_DAYS
-                    else "available"
+                "data_status": _data_status(
+                    coverage, partial=len(returns_df) < MIN_ANNUALIZE_DAYS
                 ),
                 "universe_coverage": coverage,
             }
@@ -3415,6 +3957,7 @@ async def get_cointegration_pairs(
         if isinstance(tickers, str) and tickers.strip():
             parsed = _parse_tickers(tickers, max_items=_MAX_COINT_TICKERS)
             ticker_list = [ticker for ticker in (parsed or "").split(",") if ticker]
+            explicit_universe = True
         else:
             try:
                 ticker_list, _ = await resolve_allocation(None, db)
@@ -3422,6 +3965,7 @@ async def get_cointegration_pairs(
                 raise HTTPException(status_code=404, detail="No portfolio positions found") from exc
             if len(ticker_list) > _MAX_COINT_TICKERS:
                 raise HTTPException(status_code=422, detail=f"At most {_MAX_COINT_TICKERS} tickers are allowed")
+            explicit_universe = False
 
         if len(ticker_list) < 2:
             coverage = _universe_coverage(ticker_list, [])
@@ -3442,6 +3986,9 @@ async def get_cointegration_pairs(
                 returned_cointegrated_pairs_count=0,
                 returned_non_cointegrated_pairs_count=0,
                 data_status="unavailable",
+                universe_scope=UNIVERSE_SCOPES[1] if explicit_universe else UNIVERSE_SCOPES[0],
+                depth_status="unavailable",
+                test_roles=TEST_ROLES,
                 pairs=[],
             )
 
@@ -3470,7 +4017,10 @@ async def get_cointegration_pairs(
                 returned_cointegrated_pairs_count=0,
                 returned_non_cointegrated_pairs_count=0,
                 unpairable_tickers=[],
-                data_status=coverage["status"],
+                data_status=_data_status(coverage),
+                universe_scope=UNIVERSE_SCOPES[1] if explicit_universe else UNIVERSE_SCOPES[0],
+                depth_status="unavailable",
+                test_roles=TEST_ROLES,
                 pairs=[],
                 error="Insufficient price data available for at least 2 tickers",
             )
@@ -3485,6 +4035,22 @@ async def get_cointegration_pairs(
         )
         coverage = _universe_coverage(ticker_list, price_data_dict.keys())
         returned_cointegrated = sum(1 for pair in result.pairs if pair.is_cointegrated)
+        # Per-ticker observation depth: a pair scanned off a materially shorter
+        # history is a weaker result, so a shallow leg makes the whole scan
+        # partial instead of quietly `complete`.
+        depth_by_ticker = usable_observations_by_ticker(price_data_dict)
+        depth_status = getattr(result, "depth_status", None) or "unavailable"
+        shallow = list(getattr(result, "shallow_tickers", None) or [])
+        if depth_status != "unavailable" and not shallow and depth_by_ticker:
+            shallow = shallow_tickers(depth_by_ticker)
+            if shallow:
+                depth_status = "partial"
+        coverage = {
+            **coverage,
+            "depth_status": depth_status,
+            "shallow_tickers": shallow,
+            "usable_observations_by_ticker": depth_by_ticker,
+        }
         return result.model_copy(
             update={
                 "requested_tickers": coverage["requested_tickers"],
@@ -3495,7 +4061,17 @@ async def get_cointegration_pairs(
                 "returned_pairs_count": len(result.pairs),
                 "returned_cointegrated_pairs_count": returned_cointegrated,
                 "returned_non_cointegrated_pairs_count": len(result.pairs) - returned_cointegrated,
-                "data_status": "partial" if coverage["status"] == "partial" or result.unpairable_tickers else coverage["status"],
+                "universe_scope": UNIVERSE_SCOPES[1] if explicit_universe else UNIVERSE_SCOPES[0],
+                "depth_status": depth_status,
+                "shallow_tickers": shallow,
+                "usable_observations_by_ticker": depth_by_ticker,
+                "test_roles": TEST_ROLES,
+                # Pair scanning is weightless: it never renormalizes portfolio
+                # weights, so its coverage must not claim a weight basis.
+                "data_status": _data_status(
+                    coverage,
+                    partial=bool(result.unpairable_tickers) or depth_status == "partial",
+                ),
                 "universe_coverage": coverage,
                 "error": result.error if hasattr(result, "error") else None,
             }
@@ -3738,13 +4314,12 @@ async def get_volatility_cone(
         coverage = _universe_coverage(
             ticker_list,
             history_coverage.get("model_used_tickers", []),
+            active=_active_weight_tickers(weights),
         )
         if isinstance(cone_data, dict):
             cone_data["universe_coverage"] = coverage
-            cone_data["data_status"] = (
-                "unavailable" if coverage["status"] == "unavailable"
-                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
-                else "available"
+            cone_data["data_status"] = _data_status(
+                coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
             )
             cone_data["latest_observation_date"] = _latest_observation_date(port_ret)
         return cone_data
@@ -3839,7 +4414,9 @@ async def get_tail_risk_and_copula(
         evt_stats, tail_copula_matrix = await _run_cpu(_calculate_tail_sync)
 
         matrix_tickers = list((tail_copula_matrix or {}).get("tickers", []))
-        coverage = _universe_coverage(ticker_list, matrix_tickers)
+        coverage = _universe_coverage(
+            ticker_list, matrix_tickers, active=_active_weight_tickers(weights)
+        )
         response = {
             **evt_stats,
             "tail_dependence_matrix": tail_copula_matrix,
@@ -3847,7 +4424,7 @@ async def get_tail_risk_and_copula(
             "tickers": matrix_tickers,
             "requested_tickers": ticker_list,
             "universe_coverage": coverage,
-            "data_status": coverage["status"],
+            "data_status": _data_status(coverage),
             "observations": len(port_ret),
         }
         if cache_generation == _TAILS_CACHE_GENERATION:

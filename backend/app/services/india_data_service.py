@@ -31,6 +31,11 @@ BHAV_REQUIRED_FIELDS = (
     "avg_price", "ttl_trd_qnty", "turnover_lacs", "no_of_trades",
 )
 
+# Measured ADV window.  It is a fixed measurement basis, not a request knob:
+# the public export must name the lookback it actually used instead of letting
+# a consumer assume it matches the section's requested window.
+LIQUIDITY_ADV_LOOKBACK_SESSIONS = 30
+
 
 def compute_amihud_illiquidity(returns: pd.Series, rupee_volume: pd.Series) -> Optional[float]:
     """Return measured Amihud illiquidity, or ``None`` without valid history."""
@@ -355,6 +360,9 @@ class IndiaDataService:
             "flows": ordered,
             "count": len(ordered),
             "as_of": ordered[-1].get("date") if ordered else None,
+            "lookback_days": lookback_days,
+            "lookback_basis": "stored_trading_sessions",
+            "scope": "market_wide",
             "available_categories": available_categories,
             "missing_categories": missing_categories,
             "incomplete_dates": sorted(incomplete_dates),
@@ -418,6 +426,9 @@ class IndiaDataService:
                 "requested_symbols": sorted(requested),
                 "covered_symbols": sorted(covered_symbols),
                 "missing_symbols": missing,
+                "lookback_days": lookback_days,
+                "sigma_threshold": sigma_threshold,
+                "scope": "symbol_scoped",
                 "as_of": latest_date,
                 "data_status": "available" if requested and not missing else "partial" if covered_symbols else "unavailable",
             }
@@ -515,8 +526,8 @@ class IndiaDataService:
                 measured_volume = volume_series.replace([np.inf, -np.inf], np.nan).dropna()
                 measured_rupee = rupee_volume.replace([np.inf, -np.inf], np.nan).dropna()
                 if not measured_volume.empty and not measured_rupee.empty:
-                    candidate_adv_shares = float(measured_volume.tail(30).mean())
-                    candidate_adv_rupees = float(measured_rupee.tail(30).mean())
+                    candidate_adv_shares = float(measured_volume.tail(LIQUIDITY_ADV_LOOKBACK_SESSIONS).mean())
+                    candidate_adv_rupees = float(measured_rupee.tail(LIQUIDITY_ADV_LOOKBACK_SESSIONS).mean())
                     if candidate_adv_shares > 0 and candidate_adv_rupees > 0:
                         adv_shares = candidate_adv_shares
                         adv_rupees = candidate_adv_rupees
@@ -568,6 +579,8 @@ class IndiaDataService:
             "currency": base_currency,
             "base_currency": base_currency,
             "currency_provenance": currency_provenance,
+            "adv_lookback_sessions": LIQUIDITY_ADV_LOOKBACK_SESSIONS,
+            "adv_participation_rates": [0.10, 0.20],
             "portfolio_weighted_days_to_liquidate_10pct": None if not all_available else round(weighted_days_10 or 0.0, 2),
             "portfolio_weighted_days_to_liquidate_20pct": None if not all_available else round(weighted_days_20 or 0.0, 2),
             "portfolio_amihud_score": None if not all_available else round(weighted_amihud or 0.0, 6),

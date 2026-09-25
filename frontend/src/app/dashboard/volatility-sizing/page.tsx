@@ -4,12 +4,18 @@
 
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
-import { escapeCsvCell } from '@/lib/utils';
+import { escapeCsvCell, formatCurrency as formatAmount } from '@/lib/utils';
+import type {
+  VolatilitySizingResponse,
+  VolSizingExecutionBlock,
+  VolSizingTrade,
+  VolSizingTradeStatus,
+} from '@/types';
 import {
   Zap,
   Target,
@@ -24,7 +30,8 @@ import {
   Info,
   CheckCircle2,
   ArrowRight,
-  ShieldCheck
+  ShieldCheck,
+  Lock
 } from 'lucide-react';
 
 interface ExplainerContent {
@@ -129,6 +136,27 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     howInferred: 'Buy if Δw > +0.5%; Sell if Δw < -0.5%; Hold if |Δw| ≤ 0.5%.',
     whyImportant: 'Prevents micro-churn by ignoring negligible drift (< 0.5%) while enforcing rebalancing on major divergences.',
     howToInfer: 'Follow the directive during tactical portfolio rebalancing.'
+  },
+  notional_col: {
+    title: 'Trade Notional',
+    what: 'The rupee amount the weight delta implies for this leg: Δw × portfolio value.',
+    howInferred: 'Reported by the engine alongside the sizing price it was measured against, so amount and share count reconcile exactly.',
+    whyImportant: 'A notional is the money actually at stake; a share count is only a rounding of it.',
+    howToInfer: 'N/A means no notional was computable (no portfolio value) — it is never a zero.'
+  },
+  shares_delta_col: {
+    title: 'Whole-Share Delta',
+    what: 'The integer share count the notional buys or sells, rounded half away from zero.',
+    howInferred: 'shares_delta = half_up(notional ÷ sizing_price), where the sizing price is one aligned snapshot date shared by every leg.',
+    whyImportant: 'A material notional that rounds to zero shares is reported as below minimum lot, not silently as zero.',
+    howToInfer: 'N/A means no whole-share instruction exists (no sizing price); a below-minimum-lot leg shows its notional instead.'
+  },
+  trade_status_col: {
+    title: 'Instruction Status',
+    what: 'Whether the leg has an expressible order: executable, below minimum lot, immaterial, no trade required, or not executable.',
+    howInferred: 'Published by the engine per leg with the reason attached (e.g. sizing_price_unavailable).',
+    whyImportant: 'It separates "do not trade" from "cannot trade", which a 0-share cell cannot.',
+    howToInfer: 'Hover any status for its reason. "No sizing instruction" means the leg left the sizing universe.'
   }
 };
 
@@ -244,18 +272,8 @@ function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
   );
 }
 
-interface VolatilitySizingData {
-  current_weights: Record<string, number>;
-  recommended_weights: Record<string, number>;
-  trades: Record<string, {
-    shares_delta: number;
-    amount: number;
-  }>;
-  target_volatility: number;
-  current_volatility?: number;
-  volatilities?: Record<string, number>;
+interface VolatilitySizingData extends VolatilitySizingResponse {
   model_params?: Record<string, any>;
-  methodology?: string;
 }
 
 const MODELS = [
@@ -264,15 +282,341 @@ const MODELS = [
   { id: 'EGARCH', name: 'EGARCH', description: 'Exponential GARCH with asymmetric market downturn leverage effects' },
 ];
 
+/** One value an absent measurement must never borrow from: `null` is N/A. */
+const NOT_AVAILABLE = 'N/A';
+
+/**
+ * Mirrors `GROSS_EXPOSURE_TOLERANCE` in `backend/app/utils/allocations.py`.
+ * A target is financed only above this distance from 1.0.
+ */
+const GROSS_EXPOSURE_TOLERANCE = 1e-6;
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** Weight / exposure as a percentage of NAV. `null` renders N/A, never 0%. */
+function formatWeight(value: number | null | undefined, decimals = 2): string {
+  const numeric = finiteOrNull(value);
+  return numeric === null ? NOT_AVAILABLE : `${(numeric * 100).toFixed(decimals)}%`;
+}
+
+function formatShares(value: number | null | undefined): string {
+  const numeric = finiteOrNull(value);
+  return numeric === null ? NOT_AVAILABLE : `${numeric > 0 ? '+' : ''}${numeric}`;
+}
+
+// ---------------------------------------------------------------------------
+// execution eligibility
+// ---------------------------------------------------------------------------
+type FinancingView = {
+  /** Borrowed fraction of NAV (`gross - 1`). */
+  weight: number | null;
+  /** Quantified borrowing. `null` when no portfolio value made it computable. */
+  amount: number | null;
+  currency: string | null;
+};
+
+type ExecutionView = {
+  /** `reported` = the engine's own block; `derived` = computed from weights. */
+  source: 'reported' | 'derived';
+  rule: string | null;
+  mode: string | null;
+  grossExposure: number | null;
+  netCashWeight: number | null;
+  financing: FinancingView;
+  financingRequired: boolean;
+  eligible: boolean;
+  blockReason: string | null;
+};
+
+function financingView(raw: unknown, currency: string | null): FinancingView {
+  const numeric = finiteOrNull(raw);
+  if (numeric !== null) return { weight: null, amount: numeric, currency };
+  if (raw && typeof raw === 'object') {
+    const block = raw as { weight?: unknown; amount?: unknown; currency?: unknown };
+    return {
+      weight: finiteOrNull(block.weight),
+      amount: finiteOrNull(block.amount),
+      currency: typeof block.currency === 'string' ? block.currency : currency,
+    };
+  }
+  return { weight: null, amount: null, currency };
+}
+
+function grossExposureOf(weights: Record<string, number> | undefined): number {
+  return Object.values(weights ?? {}).reduce((sum, weight) => {
+    const numeric = finiteOrNull(weight);
+    return numeric === null ? sum : sum + Math.abs(numeric);
+  }, 0);
+}
+
+/**
+ * Borrowed fraction of NAV. The engine publishes `net_cash_weight` (its
+ * negative), so `gross - 1` is a restatement of a reported number, not a new
+ * measurement; it is only used when the block omits an explicit weight.
+ */
+function financingWeightOf(execution: ExecutionView): number | null {
+  if (execution.financing.weight !== null) return execution.financing.weight;
+  const gross = finiteOrNull(execution.grossExposure);
+  return gross === null ? null : gross - 1;
+}
+
+/**
+ * One gate for both rebalance buttons: may these weights be applied as a plain
+ * rebalance? The engine answers it in `execution`; a pre-contract payload is
+ * measured with the SAME published rule so a leveraged target can never slip
+ * into the rebalance call. Only the borrowed *weight* is derived there — a rupee
+ * amount stays N/A because no backend figure exists to quote.
+ */
+function resolveExecution(data: VolatilitySizingData | null | undefined): ExecutionView | null {
+  if (!data) return null;
+  const reported = data.execution as VolSizingExecutionBlock | undefined;
+  if (reported) {
+    return {
+      source: 'reported',
+      rule: reported.normalization_rule ?? null,
+      mode: reported.normalization_mode ?? null,
+      grossExposure: finiteOrNull(reported.gross_exposure),
+      netCashWeight: finiteOrNull(reported.net_cash_weight),
+      financing: financingView(
+        reported.financing_requirement,
+        reported.financing_requirement_currency ?? data.sizing_price_currency ?? data.currency ?? null
+      ),
+      financingRequired: reported.financing_required === true,
+      eligible: reported.execution_eligible === true,
+      blockReason: reported.block_reason ?? null,
+    };
+  }
+
+  const tickers = Object.keys(data.recommended_weights ?? {});
+  if (tickers.length === 0) return null;
+  const gross = grossExposureOf(data.recommended_weights);
+  const financed = gross > 1 + GROSS_EXPOSURE_TOLERANCE;
+  return {
+    source: 'derived',
+    rule: null,
+    mode: null,
+    grossExposure: gross,
+    netCashWeight: 1 - gross,
+    financing: { weight: financed ? gross - 1 : null, amount: null, currency: null },
+    financingRequired: financed,
+    eligible: !financed,
+    blockReason: financed
+      ? `Gross exposure ${gross.toFixed(6)} exceeds 1.0; the target borrows ${(gross - 1).toFixed(6)} of the portfolio value and is not a normal rebalance`
+      : null,
+  };
+}
+
+/** Why the target cannot be pushed as a normal rebalance, in plain words. */
+function executionBlockText(
+  execution: ExecutionView | null,
+  hasTarget: boolean,
+  unavailableReason: string | null
+): string | null {
+  if (unavailableReason) {
+    return `The sizing result is unavailable, so it is not an executable target: ${unavailableReason}`;
+  }
+  if (!hasTarget) {
+    return 'No rebalance target is available, so there is nothing to execute.';
+  }
+  if (!execution) return null;
+  if (execution.eligible) return null;
+  if (!execution.financingRequired) {
+    return execution.blockReason || 'This target cannot be applied as a normal rebalance.';
+  }
+  const currency = execution.financing.currency;
+  const borrowing =
+    execution.financing.amount !== null
+      ? `Target requires ${formatAmount(execution.financing.amount, currency ?? 'INR')} of financing`
+      : execution.financing.weight !== null
+        ? `Target requires ${formatWeight(execution.financing.weight)} financing (amount not quantified: no portfolio value)`
+        : 'Target requires financing';
+  const rule = execution.rule
+    ? ` Normalization rule '${execution.rule}' does not create financing.`
+    : '';
+  const reason = execution.blockReason ? ` ${execution.blockReason}.` : '';
+  return `${borrowing}; a normal rebalance cannot express gross > 100%.${rule}${reason}`;
+}
+
+// ---------------------------------------------------------------------------
+// per-leg rows
+// ---------------------------------------------------------------------------
+type TradeView = {
+  status: VolSizingTradeStatus | 'no_instruction';
+  label: string;
+  detail: string;
+  tone: 'ok' | 'warn' | 'muted' | 'bad';
+};
+
 type PositionSizing = {
   ticker: string;
-  current_weight: number;
-  target_weight: number;
-  recommended_weight: number;
+  current_weight: number | null;
+  recommended_weight: number | null;
   volatility: number | null;
-  weight_change: number;
-  shares_delta: number;
-  amount_delta: number;
+  weight_change: number | null;
+  shares_delta: number | null;
+  amount_delta: number | null;
+  sizing_price: number | null;
+  rounding_residual: number | null;
+  trade: TradeView;
+}
+
+const TRADE_TONES: Record<TradeView['tone'], string> = {
+  ok: 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40',
+  warn: 'bg-amber-500/20 text-amber-300 border border-amber-500/40',
+  bad: 'bg-rose-500/20 text-rose-300 border border-rose-500/40',
+  muted: 'bg-slate-700/40 text-slate-300 border border-slate-600/40',
+};
+
+const TRADE_REASON_TEXT: Record<string, string> = {
+  sizing_price_unavailable: 'No aligned sizing price: the notional is known, the share count is N/A.',
+  portfolio_value_unavailable: 'No portfolio value: the notional and the share count are N/A.',
+  no_aligned_price_snapshot: 'No aligned sizing price: the notional is known, the share count is N/A.',
+};
+
+function tradeView(
+  trade: VolSizingTrade | undefined,
+  currency: string,
+  notionalFloor: number | null
+): TradeView {
+  if (!trade) {
+    return {
+      status: 'no_instruction',
+      label: 'No sizing instruction',
+      detail:
+        'No usable return history for this leg: it was dropped from the sizing universe, so it has no target weight, notional, or share count.',
+      tone: 'muted',
+    };
+  }
+  const money = (value: number | null) => formatAmount(value, currency);
+  const amount = finiteOrNull(trade.amount);
+  const price = finiteOrNull(trade.sizing_price);
+  const shares = finiteOrNull(trade.shares_delta);
+  const residual = finiteOrNull(trade.rounding_residual);
+  // A pre-contract entry carries no `status`; treat it as unproven rather than
+  // trusting a bare 0 shares / 0 amount.
+  const status: VolSizingTradeStatus = trade.status ?? 'unavailable';
+  switch (status) {
+    case 'executable':
+      return {
+        status,
+        label: 'Executable',
+        detail: `${formatShares(shares)} sh @ ${money(price)}`,
+        tone: 'ok',
+      };
+    case 'below_minimum_notional':
+      return {
+        status,
+        label: 'Below minimum lot',
+        detail: `${money(amount)} notional cannot buy a whole share at ${money(price)}; ${money(residual)} left untraded. No order is expressible.`,
+        tone: 'warn',
+      };
+    case 'immaterial_no_op':
+      return {
+        status,
+        label: 'Immaterial — no order',
+        detail: `${money(amount)} is below the ${money(notionalFloor)} minimum notional floor.`,
+        tone: 'muted',
+      };
+    case 'no_trade_required':
+      return { status, label: 'No trade required', detail: money(amount), tone: 'muted' };
+    default:
+      return {
+        status: 'unavailable',
+        label: 'Not executable',
+        detail:
+          TRADE_REASON_TEXT[trade.reason ?? ''] ??
+          (trade.reason
+            ? `Not executable (${trade.reason}).`
+            : 'Not executable: the notional and the share count are N/A.'),
+        tone: 'bad',
+      };
+  }
+}
+
+/**
+ * Rows follow the universe the request actually covered, not the local roster:
+ * a leg that lost its history stays visible as an explicit row with no target
+ * weight and `shares_delta: null` instead of silently disappearing.
+ */
+function requestedUniverse(data: VolatilitySizingData): string[] {
+  const coverage = data.universe_coverage;
+  // A declared coverage report is authoritative even when it is empty: an empty
+  // requested universe is a measured "no positions", not a reason to fall back
+  // to whatever weights the response happens to carry.
+  if (coverage) {
+    return Array.isArray(coverage.requested_tickers) ? coverage.requested_tickers : [];
+  }
+  return Array.from(
+    new Set([
+      ...Object.keys(data.current_weights ?? {}),
+      ...Object.keys(data.recommended_weights ?? {}),
+      ...Object.keys(data.trades ?? {}),
+    ])
+  );
+}
+
+function buildRows(data: VolatilitySizingData): PositionSizing[] {
+  const universe = requestedUniverse(data);
+  const tickers = [
+    ...universe,
+    // A priced leg the universe report omitted must not vanish either.
+    ...Object.keys(data.trades ?? {}).filter((ticker) => !universe.includes(ticker)),
+  ];
+  const defaultCurrency = data.sizing_price_currency ?? data.portfolio_value_currency ?? data.currency ?? 'INR';
+  const notionalFloor = finiteOrNull(data.trade_reconciliation?.notional_floor);
+
+  return tickers.map((ticker) => {
+    const current = finiteOrNull(data.current_weights?.[ticker]);
+    const recommended = finiteOrNull(data.recommended_weights?.[ticker]);
+    const trade = data.trades?.[ticker];
+    return {
+      ticker,
+      current_weight: current,
+      recommended_weight: recommended,
+      volatility: finiteOrNull(data.volatilities?.[ticker]),
+      weight_change: current !== null && recommended !== null ? recommended - current : null,
+      // A material notional that rounds to zero shares has no expressible
+      // order: its notional is the fact worth showing, so the share cell is
+      // N/A rather than a bare "0" that reads as "do nothing".
+      shares_delta:
+        trade && trade.status !== 'below_minimum_notional' ? finiteOrNull(trade.shares_delta) : null,
+      amount_delta: trade ? finiteOrNull(trade.amount) : null,
+      sizing_price: trade ? finiteOrNull(trade.sizing_price) : null,
+      rounding_residual: trade ? finiteOrNull(trade.rounding_residual) : null,
+      trade: tradeView(trade, trade?.amount_currency ?? defaultCurrency, notionalFloor),
+    };
+  });
+}
+
+/** Measured current weight first (descending); unmeasured legs last. */
+function sortRows(rows: PositionSizing[]): PositionSizing[] {
+  return [...rows].sort((a, b) => {
+    if (a.current_weight === null && b.current_weight === null) return a.ticker.localeCompare(b.ticker);
+    if (a.current_weight === null) return 1;
+    if (b.current_weight === null) return -1;
+    if (b.current_weight !== a.current_weight) return b.current_weight - a.current_weight;
+    return a.ticker.localeCompare(b.ticker);
+  });
+}
+
+type ActionView = { label: string; colorClass: string };
+
+function actionOf(change: number | null): ActionView {
+  if (change === null) {
+    return {
+      label: 'No target',
+      colorClass: 'bg-slate-700/40 text-slate-400 border border-slate-600/40',
+    };
+  }
+  if (change > 0.005) {
+    return { label: 'Buy', colorClass: 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' };
+  }
+  if (change < -0.005) {
+    return { label: 'Sell', colorClass: 'bg-rose-500/20 text-rose-300 border border-rose-500/40' };
+  }
+  return { label: 'Hold', colorClass: 'bg-slate-700/40 text-slate-300 border border-slate-600/40' };
 }
 
 export default function VolatilitySizingPage() {
@@ -280,7 +624,6 @@ export default function VolatilitySizingPage() {
   const [selectedModel, setSelectedModel] = useState('EWMA');
   const [targetVolatility, setTargetVolatility] = useState(0.15);
   const [loading, setLoading] = useState(false);
-  const [positionData, setPositionData] = useState<PositionSizing[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
   const [showRebalanceModal, setShowRebalanceModal] = useState(false);
   const [rebalancingInProgress, setRebalancingInProgress] = useState(false);
@@ -290,7 +633,7 @@ export default function VolatilitySizingPage() {
   const inited = useRef(false);
   const rebalanceCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const { positions, fetchPortfolio } = usePortfolioStore();
+  const { fetchPortfolio } = usePortfolioStore();
 
   useEffect(() => {
     return () => {
@@ -308,41 +651,10 @@ export default function VolatilitySizingPage() {
       });
       if (seq !== fetchSeq.current) return;
       setSizingData(data);
-      
-      const currentWeights = data.current_weights || {};
-      const recommendedWeights = data.recommended_weights || {};
-      const allTickers = Array.from(new Set([
-        ...positions.map(p => p.ticker),
-        ...Object.keys(currentWeights),
-        ...Object.keys(recommendedWeights)
-      ]));
-
-      // Convert data for table and charts
-      const positionsList = allTickers.map(ticker => {
-        const pos = positions.find(p => p.ticker === ticker);
-        const currentWeight = pos ? pos.weight : (currentWeights[ticker] ?? 0.0);
-        const recommendedWeight = recommendedWeights[ticker] ?? currentWeight;
-        const weightChange = recommendedWeight - currentWeight;
-        const sharesDelta = data.trades?.[ticker]?.shares_delta || 0;
-        const amountDelta = data.trades?.[ticker]?.amount || 0;
-        const rawVol = data.volatilities?.[ticker] ?? null;
-        
-        return {
-          ticker,
-          current_weight: currentWeight,
-          target_weight: recommendedWeight,
-          recommended_weight: recommendedWeight,
-          volatility: rawVol,
-          weight_change: weightChange,
-          shares_delta: sharesDelta,
-          amount_delta: amountDelta,
-        };
-      });
-      
-      setPositionData(positionsList.sort((a, b) => b.current_weight - a.current_weight));
     } catch (error) {
       if (seq !== fetchSeq.current) return;
       console.error('Failed to fetch volatility sizing data:', error);
+      setSizingData(null);
     } finally {
       if (seq === fetchSeq.current) setLoading(false);
     }
@@ -395,6 +707,37 @@ export default function VolatilitySizingPage() {
   const [rebalanceMode, setRebalanceMode] = useState<'simulate' | 'live'>('simulate');
   const [simulationData, setSimulationData] = useState<any | null>(null);
 
+  // Rows are derived from the response, never from a separate state copy, so a
+  // refetch can never leave a stale leg on screen.
+  const positionData = useMemo(
+    () => (sizingData ? sortRows(buildRows(sizingData)) : []),
+    [sizingData]
+  );
+  const execution = useMemo(() => resolveExecution(sizingData), [sizingData]);
+  const hasTarget = Object.keys(sizingData?.recommended_weights ?? {}).length > 0;
+  // A response the engine could not measure is not an execution-grade target,
+  // whatever weights it echoes back: no instruction exists to execute.
+  const unavailableReason =
+    sizingData?.data_status === 'unavailable'
+      ? sizingData.error || 'the engine reported no measured sizing result'
+      : sizingData?.error
+        ? sizingData.error
+        : null;
+  const executionEligible =
+    execution?.eligible === true && hasTarget && unavailableReason === null;
+  const executionBlockReason = useMemo(
+    () => executionBlockText(execution, hasTarget, unavailableReason),
+    [execution, hasTarget, unavailableReason]
+  );
+  const universeCount = sizingData
+    ? sizingData.universe_coverage?.requested_count ?? requestedUniverse(sizingData).length
+    : 0;
+  // One aligned price date backs every share count; it is never per-ticker.
+  const sizingPriceAsOf =
+    sizingData?.sizing_basis?.sizing_price_as_of ?? sizingData?.sizing_price_as_of ?? null;
+  const sizingCurrency =
+    sizingData?.sizing_basis?.price_currency ?? sizingData?.sizing_price_currency ?? null;
+
   const closeRebalanceModal = () => {
     setShowRebalanceModal(false);
     setSimulationData(null);
@@ -413,6 +756,11 @@ export default function VolatilitySizingPage() {
 
   const handleRunSimulation = async () => {
     if (!sizingData?.recommended_weights) return;
+    // Fail closed: a leveraged target is not a rebalance, so it is never sent.
+    if (!executionEligible) {
+      setRebalanceErrorMsg(executionBlockReason || 'This target is not eligible for a normal rebalance.');
+      return;
+    }
     setRebalancingInProgress(true);
     setRebalanceErrorMsg(null);
     try {
@@ -428,6 +776,10 @@ export default function VolatilitySizingPage() {
 
   const handleConfirmRebalance = async () => {
     if (!sizingData?.recommended_weights) return;
+    if (!executionEligible) {
+      setRebalanceErrorMsg(executionBlockReason || 'This target is not eligible for a normal rebalance.');
+      return;
+    }
     setRebalancingInProgress(true);
     setRebalanceErrorMsg(null);
     try {
@@ -468,7 +820,8 @@ export default function VolatilitySizingPage() {
     return `₹${value.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
   };
 
-  const getChangeColor = (change: number): string => {
+  const getChangeColor = (change: number | null): string => {
+    if (change === null) return 'text-slate-400 font-medium';
     if (change > 0.005) return 'text-emerald-400 font-bold';
     if (change < -0.005) return 'text-rose-400 font-bold';
     return 'text-slate-400 font-medium';
@@ -484,20 +837,33 @@ export default function VolatilitySizingPage() {
   // CSV Export
   const handleExportCSV = () => {
     if (!positionData.length) return;
-    const headers = ['Ticker', 'Current Weight (%)', 'Recommended Weight (%)', 'Annualized Volatility (%)', 'Weight Delta (%)', 'Shares Delta', 'Cash Delta (INR)', 'Action'];
-    const rows = positionData.map(p => {
-      const action = Math.abs(p.weight_change) < 0.005 ? 'Hold' : p.weight_change > 0 ? 'Buy' : 'Sell';
-      return [
-        escapeCsvCell(p.ticker),
-        (p.current_weight * 100).toFixed(2) + '%',
-        (p.recommended_weight * 100).toFixed(2) + '%',
-        p.volatility == null ? 'N/A' : (p.volatility * 100).toFixed(2) + '%',
-        (p.weight_change * 100).toFixed(2) + '%',
-        p.shares_delta,
-        p.amount_delta.toFixed(2),
-        action
-      ];
-    });
+    const currency = sizingData?.sizing_price_currency ?? sizingData?.portfolio_value_currency ?? 'INR';
+    const headers = [
+      'Ticker',
+      'Current Weight (%)',
+      'Recommended Weight (%)',
+      'Annualized Volatility (%)',
+      'Weight Delta (%)',
+      'Shares Delta',
+      `Notional (${currency})`,
+      'Sizing Price',
+      'Trade Status',
+      'Action',
+    ];
+    const pct = (value: number | null) => (value === null ? NOT_AVAILABLE : `${(value * 100).toFixed(2)}%`);
+    const rows = positionData.map((p) => [
+      escapeCsvCell(p.ticker),
+      escapeCsvCell(pct(p.current_weight)),
+      escapeCsvCell(pct(p.recommended_weight)),
+      escapeCsvCell(pct(p.volatility)),
+      escapeCsvCell(pct(p.weight_change)),
+      // N/A, never 0: a leg with no whole-share instruction has no share count.
+      escapeCsvCell(p.shares_delta === null ? NOT_AVAILABLE : String(p.shares_delta)),
+      escapeCsvCell(p.amount_delta === null ? NOT_AVAILABLE : p.amount_delta.toFixed(2)),
+      escapeCsvCell(p.sizing_price === null ? NOT_AVAILABLE : p.sizing_price.toFixed(4)),
+      escapeCsvCell(p.trade.label),
+      escapeCsvCell(actionOf(p.weight_change).label),
+    ]);
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
@@ -594,11 +960,67 @@ export default function VolatilitySizingPage() {
       accessorKey: 'weight_change',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const change = data.weight_change ?? 0;
+        const change = data.weight_change ?? null;
         return (
           <div className={`font-mono ${getChangeColor(change)}`}>
-            {change > 0 ? '+' : ''}{formatPercentage(change)}
+            {change !== null && change > 0 ? '+' : ''}{formatPercentage(change)}
           </div>
+        );
+      },
+    },
+    {
+      header: () => (
+        <div className="flex items-center">
+          <span>Notional</span>
+          <HelpBtn onClick={() => setActiveExplainer('notional_col')} />
+        </div>
+      ),
+      accessorKey: 'amount_delta',
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        return (
+          <div className="text-slate-200 font-mono">
+            {formatAmount(data.amount_delta, sizingCurrency ?? 'INR')}
+          </div>
+        );
+      },
+    },
+    {
+      header: () => (
+        <div className="flex items-center">
+          <span>Shares Δ</span>
+          <HelpBtn onClick={() => setActiveExplainer('shares_delta_col')} />
+        </div>
+      ),
+      accessorKey: 'shares_delta',
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        // N/A, never 0: a leg without a whole-share instruction has no count.
+        return (
+          <div className="text-slate-200 font-mono">
+            {data.shares_delta === null ? NOT_AVAILABLE : formatShares(data.shares_delta)}
+          </div>
+        );
+      },
+    },
+    {
+      header: () => (
+        <div className="flex items-center">
+          <span>Trade Status</span>
+          <HelpBtn onClick={() => setActiveExplainer('trade_status_col')} />
+        </div>
+      ),
+      accessorKey: 'trade',
+      cell: ({ row }: any) => {
+        const data = row.original || row;
+        const trade: TradeView = data.trade;
+        return (
+          <span
+            className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${TRADE_TONES[trade.tone]}`}
+            title={trade.detail}
+          >
+            {trade.label}
+          </span>
         );
       },
     },
@@ -612,14 +1034,10 @@ export default function VolatilitySizingPage() {
       accessorKey: 'action',
       cell: ({ row }: any) => {
         const data = row.original || row;
-        const change = data.weight_change ?? 0;
-        const action = Math.abs(change) < 0.005 ? 'Hold' : change > 0 ? 'Buy' : 'Sell';
-        const colorClass = action === 'Buy' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' :
-                          action === 'Sell' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40' :
-                          'bg-slate-700/40 text-slate-300 border border-slate-600/40';
+        const action = actionOf(data.weight_change ?? null);
         return (
-          <span className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${colorClass}`}>
-            {action}
+          <span className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${action.colorClass}`}>
+            {action.label}
           </span>
         );
       },
@@ -627,10 +1045,20 @@ export default function VolatilitySizingPage() {
   ];
 
   // Calculate summary metrics
-  const totalWeightChange = positionData.reduce((sum, pos) => sum + Math.abs(pos.weight_change), 0);
-  const buyCount = positionData.filter(pos => pos.weight_change > 0.005).length;
-  const sellCount = positionData.filter(pos => pos.weight_change < -0.005).length;
-  const holdCount = positionData.filter(pos => Math.abs(pos.weight_change) <= 0.005).length;
+  const totalWeightChange = positionData.reduce(
+    (sum, pos) => sum + Math.abs(pos.weight_change ?? 0),
+    0
+  );
+  const buyCount = positionData.filter(pos => (pos.weight_change ?? 0) > 0.005).length;
+  const sellCount = positionData.filter(pos => (pos.weight_change ?? 0) < -0.005).length;
+  const holdCount = positionData.filter(
+    pos => pos.weight_change !== null && Math.abs(pos.weight_change) <= 0.005
+  ).length;
+  // A dropped leg has no target weight; it is neither a buy, a sell, nor a hold.
+  const noTargetCount = positionData.filter(pos => pos.weight_change === null).length;
+  const belowLotCount = positionData.filter(
+    pos => pos.trade.status === 'below_minimum_notional'
+  ).length;
 
   return (
     <div className="space-y-6">
@@ -639,8 +1067,135 @@ export default function VolatilitySizingPage() {
         <HelpExplainerModal
           itemKey={activeExplainer}
           onClose={() => setActiveExplainer(null)}
-          positionCount={positions.length}
+          positionCount={universeCount}
         />
+      )}
+
+      {/* Sizing response unavailable / errored: never render a zero-filled book */}
+      {sizingData && (sizingData.error || sizingData.data_status === 'unavailable') && (
+        <div
+          data-testid="sizing-error-banner"
+          className="bg-amber-950/30 border border-amber-800/50 rounded-xl p-4 text-xs text-amber-200 flex items-start space-x-2"
+        >
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-400" />
+          <div>
+            <span className="font-bold">Volatility sizing unavailable: </span>
+            {sizingData.error || 'The engine reported no measured sizing result.'}
+            <span className="block mt-1 text-amber-300/80">
+              Weights, notionals, and share counts below are N/A — no value was inferred.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Execution basis: gross exposure, cash residue, and any financing */}
+      {execution && (
+        <div
+          data-testid="exposure-banner"
+          className={`rounded-xl p-4 text-xs border ${
+            execution.financingRequired
+              ? 'bg-rose-950/30 border-rose-800/50 text-rose-200'
+              : 'bg-slate-900 border-slate-800 text-slate-300'
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
+            <span>
+              <span className="text-slate-400">Gross exposure: </span>
+              <span className="font-mono font-bold text-white">{formatWeight(execution.grossExposure)}</span>
+            </span>
+            <span>
+              <span className="text-slate-400">Net cash: </span>
+              <span className={`font-mono font-bold ${(execution.netCashWeight ?? 0) < 0 ? 'text-rose-300' : 'text-emerald-300'}`}>
+                {formatWeight(execution.netCashWeight)}
+              </span>
+            </span>
+            <span>
+              <span className="text-slate-400">Financing: </span>
+              <span className="font-mono font-bold text-white">
+                {execution.financingRequired
+                  ? `${formatAmount(execution.financing.amount, execution.financing.currency ?? 'INR')} (${formatWeight(financingWeightOf(execution))})`
+                  : 'none'}
+              </span>
+            </span>
+            <span>
+              <span className="text-slate-400">Portfolio value: </span>
+              <span className="font-mono font-bold text-white">
+                {formatAmount(finiteOrNull(sizingData?.exposure?.portfolio_value ?? sizingData?.portfolio_value), sizingData?.exposure?.currency ?? sizingData?.portfolio_value_currency ?? 'INR')}
+              </span>
+            </span>
+            {execution.mode && (
+              <span>
+                <span className="text-slate-400">Mode: </span>
+                <span className="font-mono text-white">{execution.mode}</span>
+              </span>
+            )}
+            {execution.source === 'derived' && (
+              <span className="text-slate-400">
+                Gross exposure derived from the delivered weights (no execution block reported).
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Sizing basis: model, measured window, sample size, price date, currency */}
+      {sizingData && (
+        <div
+          data-testid="sizing-basis"
+          className="rounded-xl border border-slate-800 bg-slate-900 p-3.5 text-[11px] text-slate-300 flex flex-wrap items-center gap-x-4 gap-y-1.5"
+        >
+          <span>
+            <span className="text-slate-500">Model: </span>
+            <span className="font-mono text-teal-300">{sizingData.sizing_history?.model ?? selectedModel}</span>
+          </span>
+          <span>
+            <span className="text-slate-500">Window: </span>
+            <span className="font-mono">
+              {sizingData.sizing_history?.window_start && sizingData.sizing_history?.window_end
+                ? `${sizingData.sizing_history.window_start} → ${sizingData.sizing_history.window_end}`
+                : 'not reported'}
+            </span>
+          </span>
+          <span>
+            <span className="text-slate-500">Return observations: </span>
+            <span className="font-mono">
+              {sizingData.sizing_history
+                ? `${sizingData.sizing_history.return_observations} (min ${sizingData.sizing_history.min_return_observations} · ${sizingData.sizing_history.minimum_observations_required} required)`
+                : 'not reported'}
+            </span>
+          </span>
+          <span>
+            <span className="text-slate-500">Latest observation: </span>
+            <span className="font-mono">{sizingData.sizing_history?.latest_observation ?? 'not reported'}</span>
+          </span>
+          <span>
+            <span className="text-slate-500">Sizing price as of: </span>
+            <span className="font-mono">{sizingPriceAsOf ?? 'unavailable'}</span>
+          </span>
+          <span>
+            <span className="text-slate-500">Currency: </span>
+            <span className="font-mono">{sizingCurrency ?? 'not reported'}</span>
+          </span>
+          {sizingData.sizing_history ? (
+            <span
+              data-testid="sizing-sample-status"
+              className={`px-2 py-0.5 rounded-full font-semibold border ${
+                sizingData.sizing_history.meets_minimum_sample
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                  : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+              }`}
+            >
+              {sizingData.sizing_history.meets_minimum_sample
+                ? 'Sufficient sample'
+                : `Insufficient sample: ${sizingData.sizing_history.return_observations} of ${sizingData.sizing_history.minimum_observations_required} observations`}
+              {sizingData.sizing_history.tickers_below_minimum_sample.length > 0
+                ? ` — below minimum: ${sizingData.sizing_history.tickers_below_minimum_sample.join(', ')}`
+                : ''}
+            </span>
+          ) : (
+            <span className="text-slate-500">Minimum-sample status: not reported</span>
+          )}
+        </div>
       )}
 
       {/* Rebalance Confirmation & Simulation Modal */}
@@ -715,6 +1270,20 @@ export default function VolatilitySizingPage() {
               </div>
             )}
 
+            {/* Fail-closed gate: an ineligible target never reaches the API */}
+            {!executionEligible && (
+              <div
+                data-testid="execution-blocked"
+                className="bg-rose-950/30 border border-rose-800/50 p-3 rounded-lg text-xs text-rose-200 mb-4 flex items-start space-x-2"
+              >
+                <Lock className="w-4 h-4 mt-0.5 shrink-0 text-rose-400" />
+                <div>
+                  <span className="font-bold">Rebalance blocked: </span>
+                  {executionBlockReason || 'This target cannot be applied as a normal rebalance.'}
+                </div>
+              </div>
+            )}
+
             {rebalanceSuccessMsg ? (
               <div className="bg-emerald-950/40 border border-emerald-800/60 p-6 rounded-xl text-center space-y-3 my-4">
                 <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto" />
@@ -756,6 +1325,19 @@ export default function VolatilitySizingPage() {
                         <p className="font-mono font-bold text-rose-400">{formatCurrency(simulationData.total_sell_inr)}</p>
                       </div>
                     </div>
+                    {simulationData.weight_normalization && (
+                      <p
+                        data-testid="simulation-normalization"
+                        className="pt-1 text-[11px] text-teal-200/80 font-mono"
+                      >
+                        Normalization rule: {simulationData.weight_normalization.normalization_rule} · mode{' '}
+                        {simulationData.weight_normalization.normalization_mode} · submitted gross exposure{' '}
+                        {formatWeight(simulationData.weight_normalization.submitted_gross_exposure)}
+                        {simulationData.weight_normalization.weights_normalized
+                          ? ' (legs divided by gross exposure)'
+                          : ' (legs already sum to 100%)'}
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -764,7 +1346,7 @@ export default function VolatilitySizingPage() {
                     {rebalanceMode === 'simulate' ? 'Simulated Order Ticket:' : 'Proposed Live Allocation Changes:'}
                   </h4>
                   {positionData.map((p) => {
-                    const action = Math.abs(p.weight_change) < 0.005 ? 'Hold' : p.weight_change > 0 ? 'Buy' : 'Sell';
+                    const action = actionOf(p.weight_change);
                     return (
                       <div key={p.ticker} className="flex items-center justify-between p-2.5 rounded bg-slate-800/50 border border-slate-700/40 text-xs">
                         <div className="flex items-center space-x-2">
@@ -774,19 +1356,24 @@ export default function VolatilitySizingPage() {
                           <span className="text-teal-300 font-mono font-bold">{formatPercentage(p.recommended_weight)}</span>
                         </div>
                         <div className="flex items-center space-x-3">
-                          {p.shares_delta !== 0 && (
-                            <span className="text-slate-400 font-mono text-[11px]">
-                              {p.shares_delta > 0 ? `+${p.shares_delta}` : p.shares_delta} shs
-                            </span>
-                          )}
+                          <span
+                            className="text-slate-400 font-mono text-[11px]"
+                            title={p.trade.detail}
+                          >
+                            {p.shares_delta === null
+                              ? NOT_AVAILABLE
+                              : `${formatShares(p.shares_delta)} shs`}
+                            {p.amount_delta !== null &&
+                              ` · ${formatAmount(p.amount_delta, sizingCurrency ?? 'INR')}`}
+                          </span>
                           <span className={`font-mono ${getChangeColor(p.weight_change)}`}>
-                            {p.weight_change > 0 ? '+' : ''}{formatPercentage(p.weight_change)}
+                            {p.weight_change !== null && p.weight_change > 0 ? '+' : ''}{formatPercentage(p.weight_change)}
                           </span>
                           <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            action === 'Buy' ? 'bg-emerald-500/20 text-emerald-300' :
-                            action === 'Sell' ? 'bg-rose-500/20 text-rose-300' : 'bg-slate-700 text-slate-400'
+                            action.label === 'Buy' ? 'bg-emerald-500/20 text-emerald-300' :
+                            action.label === 'Sell' ? 'bg-rose-500/20 text-rose-300' : 'bg-slate-700 text-slate-400'
                           }`}>
-                            {action}
+                            {action.label}
                           </span>
                         </div>
                       </div>
@@ -815,8 +1402,8 @@ export default function VolatilitySizingPage() {
                   {rebalanceMode === 'simulate' ? (
                     <button
                       onClick={handleRunSimulation}
-                      disabled={rebalancingInProgress}
-                      className="px-5 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center"
+                      disabled={rebalancingInProgress || !executionEligible}
+                      className="px-5 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-teal-600"
                     >
                       {rebalancingInProgress ? (
                         <>
@@ -830,8 +1417,8 @@ export default function VolatilitySizingPage() {
                   ) : (
                     <button
                       onClick={handleConfirmRebalance}
-                      disabled={rebalancingInProgress}
-                      className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center"
+                      disabled={rebalancingInProgress || !executionEligible}
+                      className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-sm transition-colors shadow-lg flex items-center disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-amber-500"
                     >
                       {rebalancingInProgress ? (
                         <>
@@ -862,7 +1449,7 @@ export default function VolatilitySizingPage() {
               </span>
             </div>
             <p className="text-teal-100 max-w-2xl text-sm leading-relaxed">
-              Volatility-adjusted position sizing, risk budget scaling, and inverse-volatility parity recommendations across all {positions.length} active positions.
+              Volatility-adjusted position sizing, risk budget scaling, and inverse-volatility parity recommendations across all {universeCount || 'N/A'} positions in the requested universe.
             </p>
             <div className="flex flex-wrap items-center mt-4 gap-3">
               <div className="bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-lg text-teal-100 text-xs font-medium border border-white/10">
@@ -938,7 +1525,7 @@ export default function VolatilitySizingPage() {
         <div className="relative group">
           <MetricCard
             title="Total Positions"
-            value={String(positions.length)}
+            value={sizingData ? String(universeCount) : 'N/A'}
             icon={Zap}
             loading={loading}
           />
@@ -1073,9 +1660,10 @@ export default function VolatilitySizingPage() {
                 <div className="flex items-center space-x-2">
                   <span className="text-[11px] text-slate-400 w-14">Current</span>
                   <div className="flex-1 bg-slate-800 rounded-full h-2 overflow-hidden">
+                    {/* An unknown weight draws no bar; the label beside it says N/A. */}
                     <div
                       className="h-full rounded-full bg-blue-500 transition-all duration-500"
-                      style={{ width: `${Math.min(100, position.current_weight * 500)}%` }}
+                      style={{ width: `${Math.min(100, (position.current_weight ?? 0) * 500)}%` }}
                     />
                   </div>
                   <span className="text-xs font-mono text-slate-300 w-12 text-right">
@@ -1087,10 +1675,10 @@ export default function VolatilitySizingPage() {
                   <div className="flex-1 bg-slate-800 rounded-full h-2 overflow-hidden">
                     <div
                       className={`h-full rounded-full transition-all duration-500 ${
-                        position.weight_change > 0.005 ? 'bg-emerald-500' :
-                        position.weight_change < -0.005 ? 'bg-rose-500' : 'bg-slate-500'
+                        (position.weight_change ?? 0) > 0.005 ? 'bg-emerald-500' :
+                        (position.weight_change ?? 0) < -0.005 ? 'bg-rose-500' : 'bg-slate-500'
                       }`}
-                      style={{ width: `${Math.min(100, position.recommended_weight * 500)}%` }}
+                      style={{ width: `${Math.min(100, (position.recommended_weight ?? 0) * 500)}%` }}
                     />
                   </div>
                   <span className={`text-xs font-mono w-12 text-right ${getChangeColor(position.weight_change)}`}>
@@ -1174,13 +1762,39 @@ export default function VolatilitySizingPage() {
                   setRebalanceSuccessMsg(null);
                   setShowRebalanceModal(true);
                 }}
-                className="flex items-center px-4 py-1.5 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors shadow-md"
+                disabled={!executionEligible}
+                title={executionEligible ? 'Open the rebalance ticket' : executionBlockReason || undefined}
+                className="flex items-center px-4 py-1.5 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-amber-500"
               >
-                <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
+                {executionEligible ? (
+                  <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
+                ) : (
+                  <Lock className="w-3.5 h-3.5 mr-1.5" />
+                )}
                 Execute Rebalance
               </button>
             </div>
           </div>
+
+          {/* Ineligible target: say so here, not only inside the ticket */}
+          {executionBlockReason && (
+            <div
+              data-testid="execution-blocked"
+              className="px-5 py-3 bg-rose-950/20 border-b border-rose-900/40 text-xs text-rose-200 flex items-start space-x-2"
+            >
+              <Lock className="w-4 h-4 mt-0.5 shrink-0 text-rose-400" />
+              <div>
+                <span className="font-bold">Rebalance blocked: </span>
+                {executionBlockReason}
+                {belowLotCount > 0 && (
+                  <span className="block mt-1 text-rose-300/80">
+                    {belowLotCount} leg{belowLotCount === 1 ? '' : 's'} carry a notional below the minimum
+                    lot and cannot be expressed as an order.
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
 
           <DataTable
             data={positionData}
@@ -1202,7 +1816,7 @@ export default function VolatilitySizingPage() {
           <Zap className="w-5 h-5 text-slate-400" />
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
           <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-800/40 text-center">
             <p className="text-2xl font-bold text-emerald-400">{buyCount}</p>
             <p className="text-xs text-emerald-300 font-semibold mt-1">Buy / Increase Positions</p>
@@ -1215,11 +1829,15 @@ export default function VolatilitySizingPage() {
             <p className="text-2xl font-bold text-slate-300">{holdCount}</p>
             <p className="text-xs text-slate-400 font-semibold mt-1">Hold / Unchanged Positions</p>
           </div>
+          <div className="p-4 rounded-xl bg-slate-800/40 border border-slate-700/60 text-center">
+            <p className="text-2xl font-bold text-slate-400">{noTargetCount}</p>
+            <p className="text-xs text-slate-400 font-semibold mt-1">Dropped From Sizing (No Target)</p>
+          </div>
         </div>
 
         <div className="space-y-2">
-          {positionData.filter(p => Math.abs(p.weight_change) > 0.005).slice(0, 6).map((p) => {
-            const isBuy = p.weight_change > 0;
+          {positionData.filter(p => Math.abs(p.weight_change ?? 0) > 0.005).slice(0, 6).map((p) => {
+            const isBuy = (p.weight_change ?? 0) > 0;
             return (
               <div key={p.ticker} className={`flex items-center justify-between p-3 rounded-lg border text-xs ${
                 isBuy ? 'bg-emerald-950/20 border-emerald-800/30 text-emerald-200' : 'bg-rose-950/20 border-rose-800/30 text-rose-200'
@@ -1229,12 +1847,33 @@ export default function VolatilitySizingPage() {
                   <span className="font-semibold">{isBuy ? 'Increase' : 'Decrease'} {p.ticker}</span>
                 </div>
                 <span className="font-mono font-bold">
-                  {p.weight_change > 0 ? '+' : ''}{formatPercentage(p.weight_change)}
+                  {(p.weight_change ?? 0) > 0 ? '+' : ''}{formatPercentage(p.weight_change)}
                 </span>
               </div>
             );
           })}
         </div>
+
+        {/* Dropped legs stay visible instead of vanishing from the roster */}
+        {noTargetCount > 0 && (
+          <div
+            data-testid="dropped-legs"
+            className="mt-3 space-y-2"
+          >
+            {positionData.filter(p => p.weight_change === null).map((p) => (
+              <div
+                key={p.ticker}
+                className="flex items-center justify-between p-3 rounded-lg border border-slate-700/60 bg-slate-800/40 text-xs text-slate-300"
+              >
+                <div className="flex items-center space-x-2">
+                  <span className="w-2 h-2 rounded-full bg-slate-500" />
+                  <span className="font-semibold">{p.ticker} — no sizing instruction</span>
+                </div>
+                <span className="font-mono">{p.trade.label}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Volatility Sizing Insights */}
@@ -1247,7 +1886,7 @@ export default function VolatilitySizingPage() {
               <div>
                 <h4 className="text-xs font-bold text-amber-300 uppercase tracking-wider">Significant Rebalancing Opportunity</h4>
                 <p className="text-xs text-slate-300 mt-0.5 leading-relaxed">
-                  Total weight adjustment of {(totalWeightChange * 100).toFixed(1)}% will balance marginal risk contribution across all {positions.length} holdings.
+                  Total weight adjustment of {(totalWeightChange * 100).toFixed(1)}% will balance marginal risk contribution across all {universeCount || 'N/A'} holdings.
                 </p>
               </div>
             </div>

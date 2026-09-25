@@ -1,13 +1,14 @@
 """AI-ready portfolio context export endpoints."""
 
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+from pydantic import model_serializer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db_session
-from app.models.schemas import AIContextResponse
+from app.models.schemas import AIContextResponse, AIContextSection
 from app.services.ai_context_service import (
     ContextOptions,
     PortfolioContextService,
@@ -18,9 +19,32 @@ from app.services.ai_context_service import (
 router = APIRouter()
 
 
+class AIContextSectionExport(AIContextSection):
+    """Public section shape: a successful section carries no `error` field.
+
+    The exporter already omits the key for successful sections. The shared
+    response model would otherwise re-publish `error: null` as a misleading
+    sentinel, so the boundary drops only that inapplicable field while every
+    other documented key (including `data: null` and `coverage: null`) is kept.
+    """
+
+    @model_serializer(mode="wrap")
+    def _drop_inapplicable_error(self, handler) -> Dict[str, Any]:
+        payload = handler(self)
+        if isinstance(payload, dict) and payload.get("error") is None:
+            payload.pop("error", None)
+        return payload
+
+
+class AIContextExport(AIContextResponse):
+    """Envelope whose sections use the public section shape above."""
+
+    sections: Dict[str, AIContextSectionExport]
+
+
 @router.get(
     "/context",
-    response_model=AIContextResponse,
+    response_model=AIContextExport,
     summary="Export all portfolio analytics as AI-ready JSON or Markdown",
 )
 async def get_portfolio_context(
@@ -35,7 +59,7 @@ async def get_portfolio_context(
     monte_carlo_method: str = Query(default="student_t"),
     monte_carlo_horizon_years: float = Query(default=5.0, ge=1.0, le=40.0),
     monte_carlo_target_value: Optional[float] = Query(default=None, gt=0.0),
-    monte_carlo_seed: int = Query(default=42, ge=0, le=2**32 - 1),
+    monte_carlo_seed: int = Query(default=42, ge=0, le=4294967295),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Return one canonical snapshot; Markdown is rendered from that JSON."""

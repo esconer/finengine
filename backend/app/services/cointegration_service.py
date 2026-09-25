@@ -37,6 +37,180 @@ CACHE_TTL_HOURS = 24
 # so each write evicted all other pairs of the day (last-write-wins).
 COINT_DB_TICKER = "COINT"
 
+# ---------------------------------------------------------------------------
+# Pairs depth + dual-test contract (V3-14)
+# ---------------------------------------------------------------------------
+# Two cointegration tests run on every pair but only ONE of them decides.
+# `is_cointegrated` is the Engle-Granger verdict; the Johansen rank test is a
+# diagnostic cross-check whose disagreement is reported, never acted on.
+DECISION_TEST = "engle_granger"
+DIAGNOSTIC_TEST = "johansen"
+JOHANSEN_ROLE = "diagnostic_only"
+
+# The engine's own minimum usable-observation gate. `analyze_pair_cointegration`
+# returns None below it, so the route and the engine can share this number
+# instead of each keeping its own idea of "enough history".
+MIN_PAIR_OBSERVATIONS = 30
+
+# Depth ratio against the deepest pair of the same scan below which a pair is
+# materially under-sampled. Engle-Granger p-values and OU half-lives both lose
+# power as the sample shrinks, so a pair that clears the absolute gate but only
+# covers, say, 106 of a possible 174 sessions is `partial`, not `complete`.
+MIN_PAIR_DEPTH_RATIO = 0.75
+
+# `universe_scope` is set by the route (only the caller knows whether the
+# universe came from holdings alone or from holdings + watchlist).
+UNIVERSE_SCOPES = ("holdings_only", "holdings_and_watchlist")
+
+# One place for a consumer to learn which test decided and which one only
+# cross-checks; published on the scanner response.
+TEST_ROLES = {
+    DECISION_TEST: "published_decision",
+    DIAGNOSTIC_TEST: JOHANSEN_ROLE,
+}
+
+
+def _count_usable(series: Any) -> int:
+    """Finite, non-null observations in a price series.
+
+    0 is a measured count here, not a missing value: the series WAS inspected
+    and contained no usable observation. Callers that need to distinguish
+    "empty" from "not inspected" must handle None themselves.
+    """
+    if series is None:
+        return 0
+    try:
+        values = pd.Series(series)
+    except (TypeError, ValueError):
+        return 0
+    try:
+        return int(values.replace([np.inf, -np.inf], np.nan).dropna().size)
+    except (TypeError, ValueError):
+        return 0
+
+
+def usable_observations_by_ticker(price_data: Optional[Dict[str, pd.Series]]) -> Dict[str, int]:
+    """Usable price observations per ticker, for per-ticker depth disclosure.
+
+    ETFs and recent listings routinely have far less history than their peers
+    (NIFTYIETF ~106-109 usable sessions against 168-174 for its peers over the
+    same window), so an aggregate "how much data did this scan use" figure
+    hides a materially thinner pair. The route publishes this map so the
+    asymmetry is visible instead of implied.
+    """
+    if not price_data:
+        return {}
+    return {ticker: _count_usable(series) for ticker, series in price_data.items()}
+
+
+def pair_depth_ratio(
+    overlap_observations: Optional[int],
+    reference_observations: Optional[int],
+) -> Optional[float]:
+    """Overlap as a fraction of the deepest pair in the same scan.
+
+    None whenever either count is unknown or the reference is not positive: a
+    ratio against a missing or zero reference would be invented.
+    """
+    if overlap_observations is None or reference_observations is None:
+        return None
+    if isinstance(overlap_observations, bool) or isinstance(reference_observations, bool):
+        return None
+    try:
+        overlap = float(overlap_observations)
+        reference = float(reference_observations)
+    except (TypeError, ValueError):
+        return None
+    if overlap < 0 or reference <= 0:
+        return None
+    return round(overlap / reference, 4)
+
+
+def assess_pair_depth(
+    overlap_observations: Optional[int],
+    reference_observations: Optional[int],
+) -> Dict[str, Any]:
+    """Depth verdict for one pair of a scan.
+
+    ``status`` uses the shared public vocabulary:
+    ``available``  - the pair ran on at least MIN_PAIR_DEPTH_RATIO of the
+      deepest pair's history;
+    ``partial``    - the pair ran, but on materially less history;
+    ``unavailable``- the overlap was never measured, so completeness cannot be
+      claimed in either direction.
+    """
+    ratio = pair_depth_ratio(overlap_observations, reference_observations)
+    if ratio is None:
+        return {"status": "unavailable", "depth_ratio": None, "depth_limited": None}
+    return {
+        "status": "partial" if ratio < MIN_PAIR_DEPTH_RATIO else "available",
+        "depth_ratio": ratio,
+        "depth_limited": ratio < MIN_PAIR_DEPTH_RATIO,
+    }
+
+
+def summarize_pair_depth(depths: List[Dict[str, Any]]) -> Tuple[str, int]:
+    """Roll per-pair depth verdicts up to (response status, limited count).
+
+    ``unavailable`` dominates ``partial`` dominates ``available``: a single
+    unmeasured pair already means the section cannot be called complete.
+    """
+    statuses = {depth.get("status") for depth in depths}
+    if not statuses:
+        return "available", 0
+    limited = sum(1 for depth in depths if depth.get("depth_limited") is True)
+    if "unavailable" in statuses:
+        return "unavailable", limited
+    if "partial" in statuses:
+        return "partial", limited
+    return "available", limited
+
+
+def shallow_tickers(
+    counts: Dict[str, int],
+    minimum_ratio: float = MIN_PAIR_DEPTH_RATIO,
+) -> List[str]:
+    """Tickers whose own history is materially thinner than the deepest one.
+
+    Per-ticker version of the pair depth rule: a ticker listed halfway through
+    the window drags every pair it enters down with it.
+    """
+    if not counts:
+        return []
+    deepest = max(counts.values())
+    if deepest <= 0:
+        # Nothing was measured anywhere; no ticker can be singled out.
+        return []
+    return sorted(
+        ticker
+        for ticker, count in counts.items()
+        if count / deepest < minimum_ratio
+    )
+
+
+def with_test_role_metadata(pair: CointPairResult) -> CointPairResult:
+    """Fill the dual-test role fields on a (possibly legacy) pair result.
+
+    Cache rows written before these fields existed load fine because every one
+    of them is Optional; this upgrades them from the engine's own constants
+    instead of leaving the contract hole open. Nothing here is measured data
+    beyond `johansen_agrees_with_decision`, which is a comparison of two
+    booleans the row already carries.
+    """
+    if (
+        pair.decision_test == DECISION_TEST
+        and pair.johansen_role == JOHANSEN_ROLE
+        and pair.johansen_agrees_with_decision is not None
+    ):
+        return pair
+    return pair.model_copy(
+        update={
+            "decision_test": DECISION_TEST,
+            "johansen_role": JOHANSEN_ROLE,
+            "johansen_agrees_with_decision": pair.johansen_cointegrated == pair.is_cointegrated,
+        }
+    )
+
 
 def _utcnow() -> datetime:
     """Naive UTC now: datetime.utcnow() replacement (DeprecationWarning on
@@ -207,7 +381,7 @@ def analyze_pair_cointegration(
     """
     # Synchronize price series
     df = pd.DataFrame({"a": series_a, "b": series_b}).dropna()
-    if len(df) < 30:
+    if len(df) < MIN_PAIR_OBSERVATIONS:
         return None
 
     p_a = df["a"].values.astype(float)
@@ -317,6 +491,11 @@ def analyze_pair_cointegration(
         price_basis="adjusted_close_when_available",
         signal=signal,
         spread_series=spread_points,
+        # Engle-Granger decided `is_cointegrated`; Johansen is diagnostic only,
+        # so a disagreement is reported rather than acted on.
+        decision_test=DECISION_TEST,
+        johansen_role=JOHANSEN_ROLE,
+        johansen_agrees_with_decision=bool(johansen_coint == is_coint),
     )
 
 
@@ -364,7 +543,7 @@ class CointegrationService:
             ts, data = _IN_MEMORY_COINT_CACHE[cache_key]
             if _utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS):
                 try:
-                    return CointPairResult(**data)
+                    return with_test_role_metadata(CointPairResult(**data))
                 except Exception:
                     pass
 
@@ -387,7 +566,11 @@ class CointegrationService:
                 if cached and cached.get("model_params"):
                     pair_data = cached["model_params"]
                     if pair_data.get("ticker_a") == ticker_a and pair_data.get("ticker_b") == ticker_b:
-                        res = CointPairResult(**pair_data)
+                        # Rows written by older builds carry none of the
+                        # role/depth fields; every one of them is Optional, so
+                        # the load still succeeds and the roles are backfilled
+                        # from the engine constants.
+                        res = with_test_role_metadata(CointPairResult(**pair_data))
                         if cache_generation is not None and not cache_generation_is_current(cache_generation):
                             return None
                         _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_data)
@@ -488,6 +671,11 @@ class CointegrationService:
         """
         tickers = sorted([t for t in price_data.keys() if price_data[t] is not None and not price_data[t].empty])
         n = len(tickers)
+        # Per-ticker depth, measured once and published so an uneven universe
+        # (young ETF next to decade-old stocks) is visible in the contract
+        # rather than hidden behind a single "how much data" impression.
+        ticker_observations = usable_observations_by_ticker(price_data)
+        thin_tickers = shallow_tickers(ticker_observations)
 
         if n < 2:
             return CointScannerResponse(
@@ -502,6 +690,13 @@ class CointegrationService:
                 returned_cointegrated_pairs_count=0,
                 returned_non_cointegrated_pairs_count=0,
                 data_status="unavailable",
+                test_roles=dict(TEST_ROLES),
+                usable_observations_by_ticker=ticker_observations,
+                minimum_pair_observations=MIN_PAIR_OBSERVATIONS,
+                minimum_depth_ratio=MIN_PAIR_DEPTH_RATIO,
+                depth_status="unavailable",
+                depth_limited_pair_count=0,
+                shallow_tickers=thin_tickers,
                 pairs=[],
             )
 
@@ -596,6 +791,35 @@ class CointegrationService:
             for pair in kept_pairs
             for ticker in (pair.ticker_a, pair.ticker_b)
         }
+
+        # Pair depth: the reference is the deepest OVERLAP actually analyzed in
+        # this scan (a cached pair reports the same overlap it was computed
+        # on, so fresh and cached results are treated identically). A pair that
+        # clears the absolute gate but covers materially less of that window
+        # is published as `partial` instead of silently passing as complete.
+        measured_overlaps = [
+            int(pair.overlap_observations)
+            for pair in kept_pairs
+            if isinstance(pair.overlap_observations, int)
+            and not isinstance(pair.overlap_observations, bool)
+        ]
+        reference_overlap = max(measured_overlaps) if measured_overlaps else None
+        depths = [
+            assess_pair_depth(pair.overlap_observations, reference_overlap)
+            for pair in kept_pairs
+        ]
+        depth_status, depth_limited_count = summarize_pair_depth(depths)
+        pairs_with_depth = [
+            pair.model_copy(
+                update={
+                    "depth_ratio": depths[index]["depth_ratio"],
+                    "depth_status": depths[index]["status"],
+                }
+            )
+            for index, pair in enumerate(kept_pairs)
+        ]
+
+        unpairable = sorted(set(tickers) - returned_universe)
         return CointScannerResponse(
             as_of=as_of_date,
             latest_observation_date=as_of_date,
@@ -605,10 +829,24 @@ class CointegrationService:
             scanned_pairs_count=scanned_count,
             analyzed_pairs_count=scanned_count,
             cointegrated_pairs_count=cointegrated_count,
-            returned_pairs_count=len(kept_pairs),
+            returned_pairs_count=len(pairs_with_depth),
             returned_cointegrated_pairs_count=returned_cointegrated,
-            returned_non_cointegrated_pairs_count=len(kept_pairs) - returned_cointegrated,
-            unpairable_tickers=sorted(set(tickers) - returned_universe),
-            data_status="partial" if set(tickers) - returned_universe else "available",
-            pairs=kept_pairs,
+            returned_non_cointegrated_pairs_count=len(pairs_with_depth) - returned_cointegrated,
+            unpairable_tickers=unpairable,
+            # Depth-limited pairs are real results on thin history, so the
+            # section reports `partial` rather than `complete`.
+            data_status=(
+                "partial"
+                if (unpairable or depth_status != "available")
+                else "available"
+            ),
+            usable_observations_by_ticker=ticker_observations,
+            minimum_pair_observations=MIN_PAIR_OBSERVATIONS,
+            minimum_depth_ratio=MIN_PAIR_DEPTH_RATIO,
+            reference_pair_observations=reference_overlap,
+            depth_status=depth_status,
+            depth_limited_pair_count=depth_limited_count,
+            shallow_tickers=thin_tickers,
+            test_roles=dict(TEST_ROLES),
+            pairs=pairs_with_depth,
         )

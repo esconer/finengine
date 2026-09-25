@@ -27,13 +27,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api import analytics as analytics_api
 from app.api import data as data_api
 from app.api import portfolio as portfolio_api
+from app.api.analytics import (
+    ACTIVE_WEIGHT_BASIS,
+    DATA_STATUS_VOCABULARY,
+    # Shared deterministic ticker ordering (request order first, extras sorted).
+    _ordered_universe as _order_universe,
+)
 from app.models.schemas import StressTestRequest
+from app.services.ai_context_india import compose_india_composite
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "2.0"
+# Public section-status vocabulary, mirrored by AIContextSection.status.
+# A section that was not requested is absent from the export; it is never
+# serialized as a `not_requested` placeholder row.
+SECTION_STATUS_VOCABULARY: Tuple[str, ...] = (
+    "available",
+    "partial",
+    "unavailable",
+)
 DEFAULT_SECTIONS: Tuple[str, ...] = (
     "portfolio",
     "dashboard",
@@ -344,9 +359,9 @@ def _payload_status(value: Any) -> str:
             for component in components.values()
         ):
             return _group_status(components)
-        data_status = value.get("data_status")
-        if data_status in {"unavailable", "partial"}:
-            return str(data_status)
+        declared = _normalize_data_status(value.get("data_status"))
+        if declared in {"unavailable", "partial"}:
+            return declared
         if value.get("zero_metrics") is True:
             return "unavailable"
         if value.get("error") and not _has_material_data(value):
@@ -372,25 +387,137 @@ def _group_status(components: Any) -> str:
     return "available"
 
 
-def _as_of(value: Any) -> Optional[str]:
-    if not isinstance(value, Mapping):
+# Declared statuses mapped onto the public data_status vocabulary.  Endpoints
+# that already publish `available|partial|unavailable` pass straight through;
+# anything else is normalized here so no section can leak a coverage word such
+# as `complete` or `unknown` into a documented field.
+_DATA_STATUS_ALIASES: Dict[str, str] = {
+    "available": "available",
+    "complete": "available",
+    "ok": "available",
+    "success": "available",
+    "partial": "partial",
+    "degraded": "partial",
+    "limited": "partial",
+    "unavailable": "unavailable",
+    "unknown": "unavailable",
+    "error": "unavailable",
+    "failed": "unavailable",
+    "not_available": "unavailable",
+}
+
+
+def _normalize_data_status(value: Any) -> Optional[str]:
+    """Map a declared status onto the public data_status vocabulary.
+
+    Returns None when nothing recognizable was declared so the caller can fall
+    back to its own material-data/error rules instead of guessing.
+    """
+    if not isinstance(value, str):
         return None
-    for key in ("latest_observation_date", "as_of", "last_updated", "generated_at", "updated_at"):
-        candidate = value.get(key)
-        if isinstance(candidate, (str, datetime, date)) and str(candidate).strip():
-            return candidate.isoformat() if isinstance(candidate, (datetime, date)) else str(candidate)
+    return _DATA_STATUS_ALIASES.get(value.strip().lower())
+
+
+def _normalize_public_data_status(value: Any) -> Any:
+    """Rewrite every published data_status in a payload to the vocabulary.
+
+    Undocumented values are dropped (they are not translatable into an honest
+    status) instead of being published as-is.
+    """
+    if isinstance(value, Mapping):
+        for key, item in list(value.items()):
+            if key == "data_status":
+                if isinstance(item, str):
+                    normalized = _normalize_data_status(item)
+                    if normalized is None:
+                        value.pop(key, None)
+                    elif normalized != item:
+                        value[key] = normalized
+                continue
+            _normalize_public_data_status(item)
+    elif isinstance(value, list):
+        for item in value:
+            _normalize_public_data_status(item)
+    return value
+
+
+def _as_of_text(value: Any) -> Optional[str]:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+# Freshness keys, best-first.  An actual observation date always outranks a
+# cache/update timestamp, and `generated_at` is only used when the payload
+# declared nothing better.
+_AS_OF_KEYS = (
+    "latest_observation_date",
+    "as_of",
+    "last_updated",
+    "updated_at",
+    "generated_at",
+)
+# A dated record inside a series (e.g. one performance-history row) publishes its
+# own freshness; payload-level `date` is treated as a request echo instead.
+_SERIES_AS_OF_KEYS = _AS_OF_KEYS + ("date",)
+
+
+def _declared_as_of(value: Any, keys: Tuple[str, ...] = _AS_OF_KEYS) -> Optional[str]:
+    """First declared timestamp of one payload, or the freshest series record."""
+    if isinstance(value, Mapping):
+        for key in keys:
+            candidate = _as_of_text(value.get(key))
+            if candidate:
+                return candidate
+        return None
+    if isinstance(value, (list, tuple)):
+        stamps = [
+            text
+            for text in (_declared_as_of(item, _SERIES_AS_OF_KEYS) for item in value)
+            if text
+        ]
+        return max(stamps) if stamps else None
+    return None
+
+
+def _as_of(value: Any) -> Optional[str]:
+    """Resolve one section's freshness with explicit, testable rules.
+
+    1. a timestamp the payload declares itself (observation date first);
+    2. the same lookup inside a nested `data` payload;
+    3. for a composite, the OLDEST component timestamp - a composite section is
+       only as fresh as its stalest leg, so an unrelated newer quote (for
+       example a portfolio snapshot beside a year-old return series) can never
+       become the section's `as_of`.
+
+    Nothing is invented: a payload that declares no freshness stays None rather
+    than falling back to the export's own `generated_at` or the requested
+    window end.
+    """
+    if not isinstance(value, Mapping):
+        return _declared_as_of(value)
+    own = _declared_as_of(value)
+    if own:
+        return own
     nested = value.get("data")
     if isinstance(nested, Mapping):
-        candidate = _as_of(nested)
+        candidate = _declared_as_of(nested)
         if candidate:
             return candidate
     components = value.get("components")
     if isinstance(components, Mapping):
+        stamps = []
         for component in components.values():
-            component_data = component.get("data") if isinstance(component, Mapping) else component
-            candidate = _as_of(component_data)
+            component_data = (
+                component.get("data") if isinstance(component, Mapping) else component
+            )
+            candidate = _declared_as_of(component_data)
             if candidate:
-                return candidate
+                stamps.append(candidate)
+        if stamps:
+            return min(stamps)
     return None
 
 
@@ -398,30 +525,74 @@ def _component_status(value: Any) -> str:
     return _payload_status(value)
 
 
-def _infer_currency(data: Any, inputs: Mapping[str, Any]) -> Optional[str]:
-    sources = [inputs]
-    if isinstance(data, Mapping):
-        sources.append(data)
-        nested_data = data.get("data")
-        if isinstance(nested_data, Mapping):
-            sources.append(nested_data)
-        components = data.get("components")
-        if isinstance(components, Mapping):
-            for component in components.values():
-                component_data = component.get("data") if isinstance(component, Mapping) else component
-                if isinstance(component_data, Mapping):
-                    sources.append(component_data)
-    for source in sources:
-        for key in (
-            "currency",
-            "base_currency",
-            "portfolio_value_currency",
-            "value_currency",
-        ):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip().upper()
+_CURRENCY_KEYS = ("currency", "base_currency", "portfolio_value_currency", "value_currency")
+
+
+def _declared_currency(source: Any) -> Optional[str]:
+    if not isinstance(source, Mapping):
+        return None
+    for key in _CURRENCY_KEYS:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
     return None
+
+
+def _component_currencies(data: Any) -> List[str]:
+    """Monetary units declared by a composite payload's components."""
+    components = data.get("components") if isinstance(data, Mapping) else None
+    if not isinstance(components, Mapping):
+        return []
+    found: List[str] = []
+    for component in components.values():
+        component_data = component.get("data") if isinstance(component, Mapping) else component
+        if isinstance(component_data, Mapping):
+            candidate = _declared_currency(component_data)
+            if candidate:
+                found.append(candidate)
+        elif isinstance(component_data, (list, tuple)):
+            for row in component_data:
+                candidate = _declared_currency(row)
+                if candidate:
+                    found.append(candidate)
+    return found
+
+
+def _infer_currency(data: Any, inputs: Mapping[str, Any]) -> Optional[str]:
+    """Resolve one section's monetary unit with explicit precedence.
+
+    1. the unit the section payload declares (analytics sections keep their own
+       endpoint-declared monetary unit);
+    2. a nested `data` payload that declares one;
+    3. a composite payload, only when every measured component agrees;
+    4. the requested unit recorded in the section inputs (for example the
+       portfolio snapshot's `base_currency` request).
+
+    Conflicting components, or a payload that declares nothing, resolve to None
+    and are reported as a warning by the caller: a mixed-unit section must not
+    be labelled with one arbitrary component's currency or with the requested
+    unit the components contradict.
+    """
+    own = _declared_currency(data)
+    if own:
+        return own
+    nested = data.get("data") if isinstance(data, Mapping) else None
+    nested_currency = _declared_currency(nested)
+    if nested_currency:
+        return nested_currency
+    component_currencies = _component_currencies(data)
+    if component_currencies:
+        distinct = set(component_currencies)
+        # A conflict is terminal: the requested input unit must not paper over a
+        # composite that genuinely mixes monetary units.
+        return distinct.pop() if len(distinct) == 1 else None
+    return _declared_currency(inputs)
+
+
+def _mixed_currency_units(data: Any) -> List[str]:
+    """Distinct component currencies of a composite, sorted, when mixed."""
+    units = sorted(set(_component_currencies(data)))
+    return units if len(units) > 1 else []
 
 
 def _collect_warnings(value: Any) -> List[str]:
@@ -536,6 +707,15 @@ def _available_tickers_for_section(key: str, data: Any) -> Optional[List[str]]:
 
 
 def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optional[Dict[str, Any]]:
+    """Resolve one section's universe coverage from the canonical result.
+
+    The endpoint's own `universe_coverage` block stays authoritative, including
+    a conditional `weight_basis`: the exporter never invents an allocation basis
+    for a section it cannot prove was renormalized, and weightless analyses stay
+    basis-free. Requested order drives every list so a repeated universe exports
+    identically, and the coverage vocabulary (complete | partial | unavailable |
+    unknown) is kept separate from the public `data_status` vocabulary.
+    """
     requested = _ticker_list(inputs.get("tickers"))
     explicit: Optional[Dict[str, Any]] = None
     if isinstance(data, Mapping) and isinstance(data.get("universe_coverage"), Mapping):
@@ -546,23 +726,25 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
     if explicit is not None:
         declared_requested = _ticker_list(explicit.get("requested_tickers"))
         requested = list(dict.fromkeys(requested + declared_requested))
-        available = _ticker_list(explicit.get("available_tickers"))
+        raw_available = _ticker_list(explicit.get("available_tickers"))
         declared_missing = _ticker_list(explicit.get("missing_tickers"))
         if key == "risk_contribution":
             excluded = data.get("excluded_assets")
             if isinstance(excluded, Mapping):
                 for values in excluded.values():
                     declared_missing.extend(_ticker_list(values))
-        available_set = set(available)
         declared_missing_set = set(declared_missing)
-        effective_available = [ticker for ticker in available if ticker not in declared_missing_set]
+        effective_available = _order_universe(
+            requested, set(raw_available) - declared_missing_set
+        )
         effective_available_set = set(effective_available)
         covered = [ticker for ticker in requested if ticker in effective_available_set]
-        missing = list(dict.fromkeys(declared_missing + [
-            ticker for ticker in requested if ticker not in effective_available_set
-        ]))
-        if effective_available != available:
-            explicit["raw_available_tickers"] = available
+        # Requested order first, then any endpoint-declared extra, so the same
+        # universe always renders the same list.
+        missing = [ticker for ticker in requested if ticker not in effective_available_set]
+        missing += sorted(declared_missing_set - effective_available_set - set(requested))
+        if set(raw_available) - effective_available_set:
+            explicit["raw_available_tickers"] = raw_available
         if not requested:
             coverage_status = "unknown"
         elif not covered:
@@ -582,12 +764,16 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
             "complete": not missing if requested else None,
             "status": coverage_status,
         })
+        if explicit.get("weight_basis") is not None:
+            explicit["weight_basis"] = str(explicit["weight_basis"])
         return explicit
 
     available = _available_tickers_for_section(key, data)
     if not requested:
         return None
     if available is None:
+        # Coverage is unmeasured: counts are omitted rather than published as
+        # null sentinels, matching the documented optional coverage fields.
         return {
             "requested_tickers": requested,
             "available_tickers": None,
@@ -595,9 +781,9 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
             "coverage_ratio": None,
             "complete": None,
             "status": "unknown",
-            "weight_basis": "active_weights_renormalized_to_100_percent",
         }
     available_set = set(available)
+    ordered_available = _order_universe(requested, available_set)
     covered = [ticker for ticker in requested if ticker in available_set]
     missing = [ticker for ticker in requested if ticker not in available_set]
     if not requested:
@@ -610,7 +796,7 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
         status = "complete"
     return {
         "requested_tickers": requested,
-        "available_tickers": available,
+        "available_tickers": ordered_available,
         "covered_tickers": covered,
         "missing_tickers": missing,
         "requested_count": len(requested),
@@ -618,7 +804,6 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
         "coverage_ratio": round(len(covered) / len(requested), 6) if requested else None,
         "complete": not missing,
         "status": status,
-        "weight_basis": "active_weights_renormalized_to_100_percent",
     }
 
 
@@ -667,11 +852,13 @@ class PortfolioContextService:
 
         portfolio_json = _jsonable(portfolio_data)
         positions = portfolio_json.get("positions", []) if isinstance(portfolio_json, Mapping) else []
-        tickers = [
-            str(position.get("ticker"))
+        # Normalize the roster once so the requested universe, the section
+        # inputs and every coverage list share one order and one spelling.
+        tickers = _ticker_list(
+            position.get("ticker")
             for position in positions
             if isinstance(position, Mapping) and position.get("ticker")
-        ]
+        )
         active_tickers: List[str] = []
         for position in positions:
             if not isinstance(position, Mapping) or not position.get("ticker"):
@@ -681,7 +868,7 @@ class PortfolioContextService:
                 raw_value = position.get("market_value")
             try:
                 if math.isfinite(float(raw_value or 0.0)) and float(raw_value or 0.0) > 0:
-                    active_tickers.append(str(position["ticker"]))
+                    active_tickers.append(str(position["ticker"]).strip().upper())
             except (TypeError, ValueError):
                 continue
         if tickers and not active_tickers and not any(
@@ -854,12 +1041,15 @@ class PortfolioContextService:
         status: Optional[str] = None,
     ) -> Dict[str, Any]:
         compact_data, omitted = _compact_detail(key, _jsonable(data), detail)
+        compact_data = _normalize_public_data_status(compact_data)
         resolved_status = status or _payload_status(compact_data)
         if error is None and isinstance(compact_data, Mapping) and compact_data.get("error"):
             error = str(compact_data["error"])
         coverage = _section_coverage(key, inputs, compact_data)
         if error and resolved_status == "available":
             resolved_status = "partial"
+        currency = _infer_currency(compact_data, inputs)
+        mixed_units = _mixed_currency_units(compact_data)
         section_warnings = list(warnings or [])
         section_warnings.extend(_collect_warnings(compact_data))
         if coverage:
@@ -872,6 +1062,12 @@ class PortfolioContextService:
                 section_warnings.append(
                     f"Result coverage is missing requested ticker(s): {missing}"
                 )
+        if mixed_units:
+            section_warnings.append(
+                "Section mixes monetary units ("
+                + ", ".join(mixed_units)
+                + "); no single currency is declared for the composite"
+            )
         section_warnings = list(dict.fromkeys(section_warnings))
         section = {
             "key": key,
@@ -881,7 +1077,7 @@ class PortfolioContextService:
             "detail": detail,
             "generated_at": _now(),
             "as_of": _as_of(compact_data),
-            "currency": _infer_currency(compact_data, inputs),
+            "currency": currency,
             "inputs": _jsonable(inputs),
             "coverage": coverage,
             "data": compact_data,
@@ -889,6 +1085,8 @@ class PortfolioContextService:
             "warnings": section_warnings,
         }
         if error:
+            # A successful section carries no error field at all; the API
+            # boundary drops the response model's null error sentinel.
             section["error"] = error
         return section
 
@@ -1473,10 +1671,23 @@ class PortfolioContextService:
                 ),
             ),
         }
+        composite = compose_india_composite(
+            tickers=context.tickers,
+            flows=components["institutional_flows"].get("data"),
+            delivery=components["delivery_anomalies"].get("data"),
+            liquidity=components["liquidity_limits"].get("data"),
+            flow_lookback_days=30,
+            delivery_lookback_days=20,
+            delivery_sigma_threshold=2.0,
+            components=components,
+        )
         return _Collected(
-            data={"components": components},
-            inputs={"tickers": context.tickers, "flow_lookback_days": 30},
-            status=_group_status(components),
+            data=composite,
+            inputs={
+                "tickers": context.tickers,
+                "component_inputs": composite["component_inputs"],
+            },
+            status=composite["data_status"],
         )
 
 
@@ -1559,6 +1770,20 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
         lines.extend(["## Environment", "", "```json", _pretty(environment), "```", ""])
 
     sections = safe_payload.get("sections", {})
+    lines.extend(
+        [
+            "## Contract",
+            "",
+            f"- Section status: `{'`, `'.join(SECTION_STATUS_VOCABULARY)}`",
+            f"- Data status: `{'`, `'.join(DATA_STATUS_VOCABULARY)}` (was there measured data?)",
+            "- Universe completeness stays in `coverage.status`: `complete`, `partial`, `unavailable`, `unknown`",
+            f"- `coverage.weight_basis` appears only when an active leg was dropped and the surviving weights were renormalized (`{ACTIVE_WEIGHT_BASIS}`)",
+            "- `currency` follows the section payload's declared unit, then its inputs; a mixed-unit composite declares no currency",
+            "- `as_of` is a declared observation date, or the oldest component date for a composite; it is never the request window end",
+            "- Ticker lists follow request order, so repeated universes export identically",
+            "",
+        ]
+    )
     if isinstance(sections, Mapping):
         for key, section in sections.items():
             if not isinstance(section, Mapping):
@@ -1577,12 +1802,17 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
             if section.get("currency"):
                 lines.append(f"- Monetary unit: `{section['currency']}`")
             coverage = section.get("coverage")
-            if isinstance(coverage, Mapping) and coverage.get("missing_tickers"):
-                lines.append(
-                    "- Missing result tickers: `"
-                    + ", ".join(coverage["missing_tickers"])
-                    + "`"
-                )
+            if isinstance(coverage, Mapping):
+                if coverage.get("status"):
+                    lines.append(f"- Coverage: `{coverage['status']}`")
+                if coverage.get("missing_tickers"):
+                    lines.append(
+                        "- Missing result tickers: `"
+                        + ", ".join(coverage["missing_tickers"])
+                        + "`"
+                    )
+                if coverage.get("weight_basis"):
+                    lines.append(f"- Weight basis: `{coverage['weight_basis']}`")
             if section.get("inputs"):
                 lines.extend(["", "### Inputs", "", "```json", _pretty(section["inputs"]), "```"])
             if section.get("error"):

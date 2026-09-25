@@ -315,8 +315,85 @@ export interface AnalyticsStore {
   clearCache: () => void;
 }
 
-export type AIContextStatus = 'available' | 'partial' | 'unavailable' | 'not_requested';
+/**
+ * Did the section produce a usable result at all?
+ *
+ * A section that was not requested is simply absent from `sections`; it is
+ * never serialized as a `not_requested` row, so this union has no such member.
+ */
+export type AIContextStatus = 'available' | 'partial' | 'unavailable';
+
+/** `summary` shortens bulky chart/history series; `full` retains them. */
 export type AIContextDetail = 'summary' | 'full';
+
+/**
+ * How much of the requested universe reached the result. A separate axis from
+ * `AIContextStatus` and from {@link AIDataStatus}:
+ *
+ * - `complete`    — every requested ticker is in the result.
+ * - `partial`     — some requested tickers are measurably missing.
+ * - `unavailable` — the requested universe produced no measurable result.
+ * - `unknown`     — the endpoint does not report its result universe, so
+ *                   coverage is unmeasured. Not the same as `unavailable`.
+ */
+export type AIContextCoverageStatus = 'complete' | 'partial' | 'unavailable' | 'unknown';
+
+/**
+ * Normalized public `data_status` vocabulary for component payloads. Reports
+ * whether measured data exists; it is never `complete`/`unknown`, and the
+ * requested-vs-measured universe question stays in `coverage.status`.
+ */
+export type AIDataStatus = 'available' | 'partial' | 'unavailable';
+
+/**
+ * Present ONLY when a weighting calculation actually dropped an unavailable
+ * active leg and renormalized the surviving weights to 100%. Omission is
+ * meaningful: weightless analyses (correlation/tail matrices, pair scans,
+ * regime, calendar-series sections) have no allocation basis and must not
+ * claim one. Absence means "not renormalized or not weight-bearing" — never
+ * assume the full book was measured.
+ */
+export type AIContextWeightBasis = 'active_weights_renormalized_to_100_percent';
+
+export interface AIContextCoverage {
+  /**
+   * Full persisted/request universe, uppercased, de-duplicated, and kept in
+   * stable request order. Never sorted, never truncated.
+   */
+  requested_tickers: string[];
+  /**
+   * Universe that actually produced the result, or `null` when the endpoint
+   * does not report one (status `unknown`). Sections that union several result
+   * maps or pair rows (risk contribution, pairs, stress testing) may emit this
+   * sorted, so consumers must derive ordering from `requested_tickers`.
+   */
+  available_tickers: string[] | null;
+  /**
+   * Requested tickers present in `available_tickers`, in requested order.
+   * Omitted when coverage is `unknown`.
+   */
+  covered_tickers?: string[];
+  /** Requested tickers absent from `available_tickers`, in requested order. */
+  missing_tickers: string[] | null;
+  /**
+   * The endpoint's own wider `available_tickers` claim, preserved when the
+   * exporter had to subtract declared-missing tickers. Audit trail only.
+   */
+  raw_available_tickers?: string[];
+  /** Size of `requested_tickers`; omitted when coverage is `unknown`. */
+  requested_count?: number;
+  /**
+   * Count of covered tickers, which is not necessarily the length of
+   * `available_tickers`. Omitted when coverage is `unknown`.
+   */
+  available_count?: number;
+  /** covered / requested, or `null` when there is no requested universe. */
+  coverage_ratio: number | null;
+  /** `true` only when nothing is missing; `null` when coverage is unmeasured. */
+  complete: boolean | null;
+  status: AIContextCoverageStatus;
+  weight_basis?: AIContextWeightBasis;
+}
 
 export interface AIContextSection {
   key: string;
@@ -324,21 +401,41 @@ export interface AIContextSection {
   route: string;
   status: AIContextStatus;
   detail: AIContextDetail;
+  /** Collection time for this section — never a substitute for `as_of`. */
   generated_at: string;
+  /**
+   * Freshness anchor, or `null` when the endpoint supplied no observation date
+   * (unknown freshness, not "fresh"). Inference precedence in the payload:
+   * `latest_observation_date`, `as_of`, `last_updated`, `updated_at`; then the
+   * same search under a nested `data`; then — for a composite — the OLDEST
+   * component timestamp, because a composite is only as fresh as its stalest
+   * leg. A composite can therefore be older than its portfolio snapshot.
+   * Requested window end dates stay in `inputs` and are never substituted here.
+   */
   as_of: string | null;
+  /**
+   * Explicitly declared monetary unit, uppercased, or `null` when nothing
+   * declared one. Precedence: the section payload's own declaration, then a
+   * nested `data` declaration, then component payloads ONLY when every measured
+   * component agrees, then the unit recorded in `inputs`. Conflicting component
+   * units resolve to `null` and raise a "mixes monetary units" warning, so a
+   * composite is never labelled with one arbitrary leg's currency.
+   * The envelope `base_currency` is not an implicit fallback: an analytics
+   * section reporting `null` has an unknown unit, not INR.
+   */
   currency: string | null;
   inputs: Record<string, unknown>;
-  coverage: {
-    requested_tickers: string[];
-    available_tickers: string[] | null;
-    missing_tickers: string[] | null;
-    coverage_ratio: number | null;
-    complete: boolean | null;
-    status: 'complete' | 'partial' | 'unknown';
-  } | null;
+  /** `null` for sections with no ticker universe. */
+  coverage: AIContextCoverage | null;
   data: unknown;
   omitted_fields: string[];
   warnings: string[];
+  /**
+   * OMITTED ENTIRELY when the section succeeded — the key is absent, never
+   * `null`. A successful section must not publish a null-error sentinel, so
+   * consumers check `section.error === undefined` (or `'error' in section`)
+   * rather than comparing against `null`.
+   */
   error?: string;
 }
 
@@ -351,8 +448,15 @@ export interface AIContextResponse {
   base_currency: 'INR' | 'USD';
   currency_policy: string;
   detail: AIContextDetail;
+  /** Resolved section keys, in request/catalog order. */
   scope: string[];
   environment: Record<string, unknown>;
+  /**
+   * Keyed by section key, in `scope` order, so a repeated universe yields a
+   * stable request order across exports. A section that was not requested is
+   * absent from both `scope` and `sections`; a requested section that failed is
+   * present and carries its reason.
+   */
   sections: Record<string, AIContextSection>;
   warnings: string[];
 }
@@ -477,18 +581,186 @@ export interface StressTestResponse {
   error?: string;
 }
 
+/**
+ * Where the one weight-normalization rule (`divide_all_legs_by_gross_exposure`,
+ * shared by volatility sizing and rebalance) places a target.
+ *
+ * - `fully_funded` — gross == 1.0: a normal rebalance, no financing.
+ * - `financed_gross_exposure_exceeds_100_percent` — gross > 1.0: borrows
+ *   `gross - 1`, NOT executable as a normal rebalance.
+ * - `unlevered_long_only_plus_cash` — gross < 1.0: the remainder is cash.
+ * - `empty_target` — gross == 0.0: a full exit, not an allocation.
+ */
+export type VolSizingNormalizationMode =
+  | 'fully_funded'
+  | 'financed_gross_exposure_exceeds_100_percent'
+  | 'unlevered_long_only_plus_cash'
+  | 'empty_target';
+
+/**
+ * Per-leg instruction status.
+ *
+ * `below_minimum_notional` is a MATERIAL notional that rounds below one whole
+ * share: its amount and `rounding_residual` are published and its
+ * `shares_delta` is `0`, so consumers must report the notional rather than
+ * render a fabricated "no trade". `unavailable` means the instruction could
+ * not be computed (no sizing price, or no portfolio value) — `amount` and
+ * `shares_delta` are then `null`, never `0`.
+ */
+export type VolSizingTradeStatus =
+  | 'executable'
+  | 'below_minimum_notional'
+  | 'immaterial_no_op'
+  | 'no_trade_required'
+  | 'unavailable';
+
+/** Minimum-sample gate for the history the sizing actually measured. */
+export type VolSizingSampleStatus = 'sufficient' | 'insufficient';
+
+/**
+ * Financing need of a target. The engine publishes the quantified amount as a
+ * scalar and `null` when no portfolio value makes it computable; a richer
+ * `{weight, amount, currency}` form is accepted. `null` is never a zero.
+ */
+export interface VolSizingFinancingRequirement {
+  weight?: number | null;
+  amount?: number | null;
+  currency?: string | null;
+}
+
+export interface VolSizingExecutionBlock {
+  /** The documented rule both consumers apply. */
+  normalization_rule: string;
+  normalization_mode: VolSizingNormalizationMode;
+  /** False for the analytical sizing target: it keeps its gross exposure. */
+  weights_normalized: boolean;
+  /** Sum of absolute legs. May exceed 1.0. */
+  gross_exposure: number;
+  /** `1 - gross_exposure`; negative for a borrowed book. */
+  net_cash_weight: number;
+  financing_required: boolean;
+  financing_requirement: number | VolSizingFinancingRequirement | null;
+  financing_requirement_currency: string | null;
+  /**
+   * The single question this answers: may these weights be applied as a plain
+   * rebalance? False whenever gross exposure exceeds 100 %.
+   */
+  execution_eligible: boolean;
+  block_reasons: string[];
+  block_reason: string | null;
+}
+
+/** Additive exposure roll-up; falls back to `execution` when absent. */
+export interface VolSizingExposureBlock {
+  gross_exposure: number | null;
+  net_exposure: number | null;
+  cash_weight: number | null;
+  financing_weight: number | null;
+  financing_amount: number | null;
+  currency: string | null;
+  portfolio_value: number | null;
+}
+
+/**
+ * Additive sizing-basis block. `sizing_price_as_of` is a SINGLE aligned
+ * snapshot date, not a per-ticker map: mixing per-ticker "last known" prices
+ * would let one leg trade at a stale date behind one freshness claim.
+ */
+export interface VolSizingBasisBlock {
+  sizing_price: Record<string, number> | null;
+  sizing_price_as_of: string | null;
+  price_currency: string | null;
+  price_currency_provenance: string | null;
+  status: string;
+}
+
+export interface VolSizingHistoryBlock {
+  model: string | null;
+  window_start: string | null;
+  window_end: string | null;
+  price_window_start: string | null;
+  price_window_end: string | null;
+  return_observations: number;
+  per_ticker_return_observations: Record<string, number>;
+  min_return_observations: number;
+  max_return_observations: number;
+  latest_observation: string | null;
+  minimum_observations_required: number;
+  meets_minimum_sample: boolean;
+  minimum_sample_status: VolSizingSampleStatus;
+  tickers_below_minimum_sample: string[];
+}
+
+export interface VolSizingTrade {
+  /** `null` when no whole-share instruction exists (V3-04). */
+  shares_delta: number | null;
+  /** `null` only when no portfolio value made a notional computable. */
+  amount: number | null;
+  amount_currency: string | null;
+  sizing_price: number | null;
+  rounding_residual: number | null;
+  rounding_tolerance?: number | null;
+  below_minimum_notional: boolean;
+  status: VolSizingTradeStatus;
+  reason: string | null;
+}
+
+export interface VolSizingReconciliationBlock {
+  rule: string;
+  share_rounding_rule: string;
+  amount_decimals: number;
+  amount_rounding_quantum: number;
+  notional_floor: number;
+  notional_floor_currency: string | null;
+  sizing_price_as_of: string | null;
+  sizing_price_provenance: string;
+  reconciled: boolean;
+  priced_trades: number;
+  max_abs_rounding_residual: number | null;
+  max_rounding_tolerance: number | null;
+  below_minimum_notional_tickers: string[];
+  immaterial_no_op_tickers: string[];
+  unavailable_tickers: string[];
+}
+
 export interface VolatilitySizingResponse {
   current_weights: Record<string, number>;
   recommended_weights: Record<string, number>;
-  trades: Record<string, {
-    shares_delta: number;
-    amount: number;
-  }>;
+  trades: Record<string, VolSizingTrade>;
   target_volatility: number;
-  current_volatility?: number;
+  current_volatility?: number | null;
   volatilities?: Record<string, number>;
+  volatility_sources?: Record<string, string>;
   model_params?: Record<string, any>;
   methodology?: string;
+  scale_factor?: number;
+  /** Signed net cash weight: negative for a borrowed book, never a flat 0. */
+  cash_weight?: number;
+  leveraged?: boolean;
+  achieved_volatility?: number;
+  execution?: VolSizingExecutionBlock;
+  exposure?: VolSizingExposureBlock;
+  sizing_basis?: VolSizingBasisBlock;
+  sizing_history?: VolSizingHistoryBlock;
+  trade_instructions_status?: 'reconciled' | 'not_reconciled' | 'unavailable';
+  trade_reconciliation?: VolSizingReconciliationBlock;
+  sizing_price?: Record<string, number>;
+  sizing_price_as_of?: string | null;
+  sizing_price_currency?: string | null;
+  sizing_price_provenance?: string;
+  sizing_price_unavailable_reason?: string | null;
+  sizing_price_missing_tickers?: string[];
+  sizing_price_unpriced_tickers?: string[];
+  price_currency_provenance?: string;
+  portfolio_value?: number;
+  portfolio_value_currency?: string | null;
+  currency?: string;
+  base_currency?: string;
+  universe_coverage?: AIContextCoverage;
+  data_status?: AIDataStatus;
+  data_unavailable_tickers?: string[];
+  weight_basis?: AIContextWeightBasis;
+  error?: string;
 }
 
 export interface TearSheetResponse {
@@ -547,7 +819,9 @@ export interface CointegrationResponse {
     z_score: number;
     is_cointegrated: boolean;
   }>;
-  data_status?: 'available' | 'partial' | 'unavailable';
+  // Normalized public vocabulary. Requested-vs-measured universe size is
+  // reported by the export's `coverage` object, not by this flag.
+  data_status?: AIDataStatus;
   error?: string | null;
 }
 
@@ -555,7 +829,8 @@ export interface IndiaFlowsResponse {
   delivery_spikes: Array<{ ticker: string; delivery_pct: number; avg_delivery_pct: number; spike: boolean }>;
   institutional_flows: { fii_net_cr: number | null; dii_net_cr: number | null; date: string };
   adv_liquidity: Record<string, { adv_shares: number; days_to_liquidate_10pct: number; days_to_liquidate_20pct: number }>;
-  data_status?: 'available' | 'partial' | 'unavailable';
+  data_status?: AIDataStatus;
+  /** Measured institutional-flow legs; an absent leg is never a measured zero. */
   available_categories?: string[];
   missing_categories?: string[];
 }

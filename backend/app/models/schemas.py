@@ -133,7 +133,7 @@ class AIContextSection(BaseModel):
     key: str
     title: str
     route: str
-    status: Literal["available", "partial", "unavailable", "not_requested"]
+    status: Literal["available", "partial", "unavailable"]
     detail: Literal["summary", "full"]
     generated_at: datetime
     as_of: Optional[str] = None
@@ -412,7 +412,14 @@ class CorrelationStabilityResponse(BaseModel):
 
 # Cointegration Scanner Schemas
 class CointPairResult(BaseModel):
-    """Schema for a single cointegrated pair analysis result"""
+    """Schema for a single cointegrated pair analysis result.
+
+    Every field added after the original contract is ``Optional[...] = None``
+    on purpose: ``CointegrationService._get_cached_pair`` reconstructs this
+    model from DB cache rows written by older builds, and a required or
+    defaulted (non-None) field would either fail that load or silently publish
+    a value the row never carried. Absent means "not recorded", not "zero".
+    """
     ticker_a: str
     ticker_b: str
     engle_granger_pvalue: float
@@ -434,6 +441,16 @@ class CointPairResult(BaseModel):
     price_basis: str = "adjusted_close_when_available"
     signal: str
     spread_series: Optional[List[Dict[str, Any]]] = None
+    # Dual-test roles: `is_cointegrated` is the published decision and comes
+    # from Engle-Granger; Johansen is a diagnostic cross-check that never
+    # changes the decision.
+    decision_test: Optional[str] = None
+    johansen_role: Optional[str] = None
+    johansen_agrees_with_decision: Optional[bool] = None
+    # Depth bookkeeping, filled by the scan (not by the single-pair analysis)
+    # because the reference is the deepest pair of the same scan.
+    depth_ratio: Optional[float] = None
+    depth_status: Optional[str] = None
 
 
 class CointScannerResponse(BaseModel):
@@ -457,6 +474,19 @@ class CointScannerResponse(BaseModel):
     data_status: str = "available"
     universe_coverage: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # --- Pairs depth + universe semantics (V3-14) ----------------------
+    # `universe_scope` is route-owned: only the caller knows whether the
+    # universe was the holdings alone or holdings plus watchlist. It stays
+    # None until the route declares it.
+    universe_scope: Optional[str] = None
+    test_roles: Optional[Dict[str, str]] = None
+    usable_observations_by_ticker: Optional[Dict[str, int]] = None
+    minimum_pair_observations: Optional[int] = None
+    minimum_depth_ratio: Optional[float] = None
+    reference_pair_observations: Optional[int] = None
+    depth_status: Optional[str] = None
+    depth_limited_pair_count: Optional[int] = None
+    shallow_tickers: Optional[List[str]] = None
 
 
 # Volatility Term Structure & Cone Schemas

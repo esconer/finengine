@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from app.services.benchmark_service import BenchmarkService
+from app.services.benchmark_service import BENCHMARK_SYMBOL, BenchmarkService
 from app.utils.holdings import portfolio_regime_summary
 from app.utils.logger import setup_logger
 
@@ -23,6 +23,17 @@ logger = setup_logger(__name__)
 
 REGIME_LABELS_WORST_TO_BEST = ["crisis", "calm", "bull"]
 MIN_OBSERVATIONS = 200
+
+# Fit configuration of the Gaussian HMM. These are the literals `classify`
+# actually fits with; naming them here keeps `detect_regime`'s model metadata
+# block from drifting away from the fit that produced the numbers.
+REGIME_STATES = 3
+HMM_COVARIANCE_TYPE = "full"
+HMM_N_ITER = 200
+HMM_TOL = 1e-4
+HMM_RANDOM_STATE = 100
+REGIME_FEATURE_WINDOW_DAYS = 21
+TRADING_DAYS_PER_YEAR = 252
 
 # Crash veto: a day whose trailing 21-day log-return is worse than this is
 # never displayed as calm/bull, no matter which HMM state claimed it.
@@ -127,8 +138,10 @@ def classify(
     # The sticky init matrices and crisis/calm/bull labeling are defined for
     # exactly 3 states; any other value would be rejected by hmmlearn's fit
     # anyway (after accepting the wrong-shaped setters), so fail fast here.
-    if n_components != 3:
-        raise ValueError(f"n_components must be 3 (crisis/calm/bull), got {n_components}")
+    if n_components != REGIME_STATES:
+        raise ValueError(
+            f"n_components must be {REGIME_STATES} (crisis/calm/bull), got {n_components}"
+        )
 
     if bench_data is None or len(bench_data) < MIN_OBSERVATIONS:
         return None
@@ -146,7 +159,7 @@ def classify(
         ret_1d = close.pct_change().dropna()
 
         # Real-time diagnostic overlays
-        ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
+        ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).iloc[-1]) if len(ret_1d) > 10 else None
         if high_col and low_col:
             high = df[high_col].astype(float).replace(0, np.nan)
             low = df[low_col].astype(float).replace(0, np.nan)
@@ -157,7 +170,7 @@ def classify(
                 # (Jensen-correct); annualizing each observation first and
                 # averaging the sigmas would bias the result downward.
                 pooled_var = (log_hl ** 2).rolling(10, min_periods=3).mean() / (4 * np.log(2))
-                parkinson_vol = float((np.sqrt(pooled_var) * np.sqrt(252)).iloc[-1])
+                parkinson_vol = float((np.sqrt(pooled_var) * np.sqrt(TRADING_DAYS_PER_YEAR)).iloc[-1])
             else:
                 parkinson_vol = None
         else:
@@ -172,12 +185,12 @@ def classify(
         else:
             close = raw
             ret_1d = close.pct_change().dropna()
-        ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(252)).iloc[-1]) if len(ret_1d) > 10 else None
+        ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).iloc[-1]) if len(ret_1d) > 10 else None
         parkinson_vol = None
 
     # Macroeconomic continuous features: 21-day holding return and 21-day realized volatility
-    ret21 = np.log(close / close.shift(21)).dropna()
-    vol21 = (ret_1d.rolling(21).std() * np.sqrt(252)).dropna()
+    ret21 = np.log(close / close.shift(REGIME_FEATURE_WINDOW_DAYS)).dropna()
+    vol21 = (ret_1d.rolling(REGIME_FEATURE_WINDOW_DAYS).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).dropna()
 
     common = ret21.index.intersection(vol21.index)
     feats = pd.concat([ret21.loc[common].rename("ret21"), vol21.loc[common].rename("vol21")], axis=1).dropna()
@@ -197,12 +210,12 @@ def classify(
 
     hmm = GaussianHMM(
         n_components=n_components,
-        covariance_type="full",
+        covariance_type=HMM_COVARIANCE_TYPE,
         init_params="mc",
         params="mc",
-        random_state=100,
-        n_iter=200,
-        tol=1e-4,
+        random_state=HMM_RANDOM_STATE,
+        n_iter=HMM_N_ITER,
+        tol=HMM_TOL,
     )
     hmm.startprob_ = np.array([0.33, 0.34, 0.33])
     hmm.transmat_ = sticky_trans.copy()
@@ -301,7 +314,15 @@ async def detect_regime(
     lookback_days: int = 1100,
     portfolio_returns: Optional[pd.Series] = None,
 ) -> Dict[str, Any]:
-    """Fetch benchmark history through the shared cache and classify regimes."""
+    """Fetch benchmark history through the shared cache and classify regimes.
+
+    Besides the classification, this returns the interpretation metadata a
+    consumer needs to read the numbers correctly: the benchmark series, the
+    price input that was actually used, the model configuration and the unit
+    of every percentage and annualized fraction. It lives here (not in
+    ``classify``) because the model window is a request parameter that
+    ``classify`` never sees.
+    """
     bench = BenchmarkService(db_session)
     bench_df = await bench.get_benchmark_df(days=lookback_days)
     use_returns = False
@@ -348,6 +369,110 @@ async def detect_regime(
     elif "all_regimes" in result:
         result.pop("all_regimes")
 
+    result.update(_regime_metadata(result, use_returns=use_returns, lookback_days=lookback_days))
     result["generated_at"] = datetime.now(timezone.utc).isoformat()
     return result
+
+
+def _regime_metadata(
+    result: Dict[str, Any],
+    *,
+    use_returns: bool,
+    lookback_days: int,
+) -> Dict[str, Any]:
+    """Interpretation metadata for a `classify` payload.
+
+    Pure function over the classification result so it is testable without a
+    benchmark fetch. Three gaps it closes:
+
+    1. `regime_probabilities` / `transition_matrix` are percentage points
+       (0-100, each row summing to 100) and nothing said so, so a reader
+       could read `62.0` as 6200% or as 0.62.
+    2. `regime_probabilities` is the FILTERED posterior of the final
+       observation while `current_regime` is the VITERBI-decoded path (which
+       additionally carries the crash-veto relabel). The two can disagree;
+       that disagreement was previously invisible.
+    3. The benchmark series, the price input that was used and the model
+       configuration were undeclared.
+    """
+    observations = result.get("observations")
+    if isinstance(observations, bool) or not isinstance(observations, int):
+        observations = None
+
+    probabilities = result.get("regime_probabilities")
+    posterior_argmax: Optional[str] = None
+    if isinstance(probabilities, dict) and probabilities:
+        try:
+            posterior_argmax = max(probabilities, key=probabilities.get)
+        except TypeError:  # non-numeric posterior payload
+            posterior_argmax = None
+    current_regime = result.get("current_regime")
+
+    return {
+        # Percentage-point declarations (V3-13).
+        "probability_unit": "percent_0_to_100",
+        "transition_unit": "percent_0_to_100",
+        "posterior_type": "filtered_final_observation",
+        "current_regime_source": "viterbi_decoded_path",
+        "posterior_argmax_regime": posterior_argmax,
+        "current_regime_matches_posterior_argmax": (
+            bool(posterior_argmax is not None and posterior_argmax == current_regime)
+        ),
+        "benchmark": {
+            "symbol": BENCHMARK_SYMBOL,
+            "name": "NIFTY 50",
+            # Both paths are market observations, but the returns view is
+            # derived from measured closes rather than being a price series.
+            "price_input": "daily_returns_series" if use_returns else "daily_ohlcv_price_frame",
+            "price_input_provenance": "derived" if use_returns else "measured",
+            "price_input_reason": (
+                "benchmark price frame unavailable for the requested window; "
+                "daily returns series used instead"
+                if use_returns
+                else None
+            ),
+            "lookback_days_requested": int(lookback_days),
+            "data_status": "available",
+        },
+        "model": {
+            "type": "gaussian_hmm",
+            "architecture": "hamilton_1989",
+            "states": REGIME_STATES,
+            "state_labels": list(REGIME_LABELS_WORST_TO_BEST),
+            "features": [
+                f"ret{REGIME_FEATURE_WINDOW_DAYS}_log_holding_return_{REGIME_FEATURE_WINDOW_DAYS}d",
+                f"vol{REGIME_FEATURE_WINDOW_DAYS}_realized_vol_{REGIME_FEATURE_WINDOW_DAYS}d_annualized",
+            ],
+            "covariance_type": HMM_COVARIANCE_TYPE,
+            "scaler": "standard_scaler_fitted_on_requested_window",
+            "n_iter": HMM_N_ITER,
+            "tolerance": HMM_TOL,
+            "random_state": HMM_RANDOM_STATE,
+            "lookback_days": int(lookback_days),
+            "observations": observations,
+            "minimum_observations": MIN_OBSERVATIONS,
+            "training_window_status": "available" if observations else "unavailable",
+            "decoding": "viterbi",
+            "posterior": "filtering",
+        },
+        "units": {
+            "regime_probabilities": "percent_0_to_100",
+            "transition_matrix": "percent_0_to_100",
+            "stability_pct": "percent_0_to_100",
+            "states[].historical_days_pct": "percent_0_to_100",
+            "label_overrides.crash_veto_days": "count_trading_days",
+            "label_overrides.crash_veto_threshold": "fraction_log_return_21d",
+            "states[].ann_ret": "annualized_fraction_geometric_cagr",
+            "states[].ann_vol": "annualized_fraction",
+            "realtime_ewma_vol": "annualized_fraction",
+            "realtime_parkinson_vol": "annualized_fraction",
+            "portfolio_in_current_regime.ann_ret": "annualized_fraction_geometric_cagr",
+            "portfolio_in_current_regime.ann_vol": "annualized_fraction",
+            "portfolio_in_current_regime.total_ret": "holding_period_fraction",
+            "portfolio_in_current_regime.days": "count_trading_days",
+            "portfolio_in_current_regime.annualized": "boolean_flag",
+            "observations": "count_trading_days",
+            "as_of": "date",
+        },
+    }
 

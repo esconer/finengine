@@ -21,6 +21,7 @@ No new dependencies: numpy / scipy / arch only. Seeded for determinism in tests.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Dict, Any, Optional
 
 import numpy as np
@@ -75,6 +76,32 @@ def _calibrate(portfolio_returns: pd.Series) -> tuple[float, float, np.ndarray]:
     mu_annual = float(r.mean() * TRADING_DAYS)
     sigma_annual = float(r.std(ddof=1) * np.sqrt(TRADING_DAYS))
     return mu_annual, sigma_annual, r.to_numpy(dtype=float)
+
+
+def _model_window(portfolio_returns: pd.Series) -> tuple[Optional[str], Optional[str]]:
+    """(first, last) date-like labels of the USED calibration history.
+
+    Only a DatetimeIndex (or an index whose labels are actual date objects)
+    is accepted: a RangeIndex would otherwise be reinterpreted as
+    nanoseconds since the epoch and publish a fabricated 1970 window. A
+    non-date index is honestly reported as unavailable (None, None) rather
+    than substituted with today's date. NaN rows are dropped first so the
+    window matches the observations the model was actually calibrated on.
+    """
+    usable = pd.Series(portfolio_returns).replace([np.inf, -np.inf], np.nan).dropna()
+    index = usable.index
+    if len(index) == 0:
+        return None, None
+    labels = (index[0], index[-1])
+    if not all(isinstance(label, (pd.Timestamp, np.datetime64, datetime, date)) for label in labels):
+        return None, None
+    try:
+        parsed = [pd.Timestamp(label) for label in labels]
+    except (TypeError, ValueError):
+        return None, None
+    if any(pd.isna(stamp) for stamp in parsed):
+        return None, None
+    return parsed[0].strftime("%Y-%m-%d"), parsed[1].strftime("%Y-%m-%d")
 
 
 def _simulate_gbm(
@@ -355,6 +382,7 @@ def simulate_goal(
         round(float(failing.mean() - target_value), 2) if len(failing) else 0.0
     )
     p5, p25, p50, p75, p95 = np.percentile(terminal, [5, 25, 50, 75, 95])
+    model_window_start, model_window_end = _model_window(portfolio_returns)
 
     return {
         "method": method,
@@ -363,6 +391,32 @@ def simulate_goal(
         "horizon_years": horizon_years,
         "num_paths": num_paths,
         "prob_success": round(prob_success, 4),
+        # --- Success semantics (V3-11) ---------------------------------
+        # `prob_success` is a TERMINAL statistic: the share of paths whose
+        # last value clears the target. It is NOT the probability of touching
+        # the target at any point along the path, which is a strictly larger
+        # number for an unconstrained path set.
+        "success_definition": "terminal_wealth_above_target",
+        "success_definition_detail": (
+            "prob_success is the fraction of simulated paths whose TERMINAL "
+            f"value at the end of the {horizon_years}-year horizon is greater "
+            "than or equal to target_value. It is NOT the probability of "
+            "touching the target at any point along the path: a path that "
+            "crosses the target mid-horizon and finishes below it is counted "
+            "as a failure here, so this figure is a lower bound on any "
+            "path-touch probability."
+        ),
+        "prob_success_units": "fraction_of_paths_0_to_1",
+        # `annualized` describes the calibrated inputs only; the simulated
+        # wealth levels are nominal currency amounts, not annualized rates.
+        "annualized": True,
+        "annualization_basis": "trading_days_per_year_252",
+        "annualized_fields": ["historical_mu_annual", "historical_sigma_annual"],
+        # --- Model provenance -------------------------------------------
+        "model_observations": int(len(daily)),
+        "model_minimum_observations": MIN_HIST_OBS,
+        "model_window_start": model_window_start,
+        "model_as_of": model_window_end,
         "terminal_percentiles": {
             "p5": round(float(p5), 2),
             "p25": round(float(p25), 2),

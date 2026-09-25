@@ -14,6 +14,38 @@
 
 **Status:** claimed
 
+## Comments
+
+### Contract wave landed and verified (integrator)
+
+Backend contract helpers are in place and verified: `data_status` normalized to
+`available|partial|unavailable` with coverage status kept separate, conditional
+`weight_basis` (all five blanket claims removed), deterministic request-order
+ticker lists, `as_of` resolved as the oldest component observation date, currency
+conflict detection, and `error` dropped at the API boundary by a serializer
+subclass on `AIContextSectionExport`.
+
+**Integrator fixes applied on review:**
+
+1. `_ticker_sequence` used `value or ()`, which raises on a pandas `Index`
+   (`test_coverage_direct_unit_routes` 500'd). Now short-circuits on `None`.
+2. `not_requested` was documented and typed but never emitted. Removed from
+   `AIContextSection.status`, the Pydantic schema, the service vocabulary
+   constant, the TS union, the AI-context page badge maps, and the docs. An
+   unrequested section is absent, not serialized as a placeholder row.
+
+**Verification:** 32/32 export-contract + AI-context tests, 170-test focused
+regression set green (1 known pre-existing baseline failure), frontend 203/203,
+`tsc` exit 0, `ruff check app tests` clean.
+
+**Still outstanding for this ticket:**
+
+- Bump `SCHEMA_VERSION` to `2.0` (breaking contract revision) and update the
+  docs/`schema_version` references. Deferred to avoid a mid-wave edit of a file
+  the contract agent still owned.
+- Ticket 02 must add explicit `as_of_semantics` to the section model once the
+  dashboard/India components publish one.
+
 - [ ] `weight_basis` is emitted only when an active leg was actually dropped and weights were renormalized; weightless analyses do not claim an allocation basis.
 - [ ] Public `data_status` values are normalized to `available|partial|unavailable`; coverage keeps `complete|partial|unavailable|unknown`; coverage values never leak into `data_status`.
 - [ ] `not_requested` is removed from the documented/type vocabulary because unselected sections are omitted rather than serialized.

@@ -4,6 +4,35 @@ import { portfolioApi, analyticsApi, dataApi } from './api';
 import { WebSocketClient } from './websocket';
 import { escapeCsvCell } from './utils';
 import { PortfolioCreateRequest, PortfolioUpdateRequest } from '@/types';
+import type { HistoryCoverage, HistoryWarning } from './historyFormat';
+
+// Holding-window disclosure vocabulary lives in one place so every consumer
+// (pages, AI-context composition) reads the same provenance fields. Re-exported
+// here because the analytics store is the app-wide import site for analytics
+// payload shapes.
+export type {
+    AnalyticsStartSource,
+    HistoryCoverage,
+    HistoryWarning,
+    TickerHistoryCoverage,
+} from './historyFormat';
+export {
+    ANALYTICS_START_SOURCES,
+    MIN_ANNUALIZE_OBSERVATIONS,
+} from './historyFormat';
+
+/**
+ * The disclosure slice every analytics payload may carry. Payload fields the
+ * app does not type yet stay reachable through the index signature.
+ */
+export interface AnalyticsDisclosurePayload {
+    realizedRisk?: {
+        history_coverage?: HistoryCoverage | null;
+        positions?: Record<string, Record<string, unknown>> | null;
+        warnings?: HistoryWarning[] | null;
+    } | null;
+    [key: string]: any;
+}
 
 // Types
 export interface PortfolioPosition {
@@ -94,7 +123,7 @@ export interface AnalyticsStore {
     cache: Map<string, any>;
     isCalculating: boolean;
     realTimeData: {
-        analyticsData: any;
+        analyticsData: AnalyticsDisclosurePayload;
         marketData: any;
         portfolioData: any;
         lastUpdate: string | null;
