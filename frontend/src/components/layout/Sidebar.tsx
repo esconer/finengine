@@ -26,6 +26,7 @@ import {
     Radar,
     BookOpen,
     Filter,
+    FileText,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -175,6 +176,13 @@ export const navigation: NavigationItem[] = [
         href: '/portfolio/manage',
         icon: BarChart3,
         description: 'Manage your investment portfolio'
+    },
+    {
+        name: 'AI Context',
+        href: '/dashboard/ai-context',
+        icon: FileText,
+        description: 'Export portfolio analytics for AI',
+        subtitle: 'Generate a JSON or Markdown snapshot of your portfolio analytics'
     },
     {
         name: 'Settings',

@@ -30,6 +30,8 @@ import {
   CustomRatiosDataResponse,
   ScreenerStrategyResponse,
   ScreenerStrategyMeta,
+  AIContextResponse,
+  AIContextDetail,
 } from '@/types';
 
 // Create axios instance
@@ -461,6 +463,44 @@ export const analyticsApi = {
     seed?: number;
   }): Promise<MonteCarloResponse> {
     const response = await apiClient.post('/analytics/monte-carlo', data);
+    return response.data;
+  },
+};
+
+// AI context API
+export const aiContextApi = {
+  async getContext(params: {
+    format?: 'json' | 'markdown';
+    detail?: AIContextDetail;
+    include?: string[];
+    baseCurrency?: 'INR' | 'USD';
+    forecastModel?: 'GARCH' | 'EGARCH' | 'EWMA';
+    forecastHorizon?: number;
+    factorLookbackDays?: number;
+    optimizationStrategy?: 'hrp' | 'min_vol' | 'max_sharpe' | 'min_cvar' | 'black_litterman';
+    monteCarloMethod?: 'gbm' | 'student_t' | 'bootstrap';
+    monteCarloHorizonYears?: number;
+    monteCarloTargetValue?: number;
+    monteCarloSeed?: number;
+  } = {}): Promise<AIContextResponse | string> {
+    const response = await apiClient.get('/ai/context', {
+      timeout: 600000,
+      responseType: params.format === 'markdown' ? 'text' : 'json',
+      params: {
+        format: params.format ?? 'json',
+        detail: params.detail ?? 'summary',
+        include: params.include?.join(','),
+        base_currency: params.baseCurrency,
+        forecast_model: params.forecastModel,
+        forecast_horizon: params.forecastHorizon,
+        factor_lookback_days: params.factorLookbackDays,
+        optimization_strategy: params.optimizationStrategy,
+        monte_carlo_method: params.monteCarloMethod,
+        monte_carlo_horizon_years: params.monteCarloHorizonYears,
+        monte_carlo_target_value: params.monteCarloTargetValue,
+        monte_carlo_seed: params.monteCarloSeed,
+      },
+    });
     return response.data;
   },
 };

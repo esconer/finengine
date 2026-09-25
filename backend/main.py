@@ -20,7 +20,7 @@ from typing import Callable, Any
 
 from app.config import settings
 from app.db.database import init_db, close_db_connections
-from app.api import portfolio, data, analytics, websocket, equity_research
+from app.api import portfolio, data, analytics, websocket, equity_research, ai_context
 from app.utils.logger import setup_logger
 
 
@@ -166,6 +166,12 @@ app.include_router(
     equity_research.router,
     prefix="/api/v1",
     tags=["equity_research"]
+)
+
+app.include_router(
+    ai_context.router,
+    prefix="/api/v1/ai",
+    tags=["ai_context"]
 )
 
 # Health check endpoint

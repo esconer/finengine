@@ -315,6 +315,38 @@ export interface AnalyticsStore {
   clearCache: () => void;
 }
 
+export type AIContextStatus = 'available' | 'partial' | 'unavailable' | 'not_requested';
+export type AIContextDetail = 'summary' | 'full';
+
+export interface AIContextSection {
+  key: string;
+  title: string;
+  route: string;
+  status: AIContextStatus;
+  detail: AIContextDetail;
+  generated_at: string;
+  as_of: string | null;
+  currency: string | null;
+  inputs: Record<string, unknown>;
+  data: unknown;
+  omitted_fields: string[];
+  warnings: string[];
+  error?: string;
+}
+
+export interface AIContextResponse {
+  schema_version: string;
+  export_id: string;
+  generated_at: string;
+  base_currency: 'INR' | 'USD';
+  currency_policy: string;
+  detail: AIContextDetail;
+  scope: string[];
+  environment: Record<string, unknown>;
+  sections: Record<string, AIContextSection>;
+  warnings: string[];
+}
+
 // Quantitative Analytics Response Types
 export interface ForecastRiskResponse {
   model: string;

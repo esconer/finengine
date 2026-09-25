@@ -147,6 +147,7 @@ finengine/
 - **Backend Test Suite Hardening (80%+ Gate Reached)**: 267/267 tests passing (0 failures), 81.90% total line coverage across the entire backend.
 - **Frontend Test Suite (Vitest Foundation)**: 62/62 unit and component tests passing with zero TypeScript errors.
 - **Production Hardening (QH-01 to QH-13)**: Native SQLite upserts, concurrent batch fetching, frontend memoization, type-safe API responses, structured error handling, and robust GitHub Actions CI workflow.
+- **Portfolio AI Context Export**: `/api/v1/ai/context` emits a canonical JSON or Markdown snapshot for portfolio management, dashboard, risk, performance, optimization, simulation, pairs, regime, and India market-context pages; Equity Research and Screener Studio are intentionally excluded. The `/dashboard/ai-context` page provides summary/full generation, copy, and download controls.
 
 ---
 

@@ -3,7 +3,7 @@ Pydantic schemas for Daisy Risk Engine
 """
 
 from datetime import date, datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 import math
 from pydantic import BaseModel, Field, validator
 
@@ -126,6 +126,37 @@ class PortfolioSummaryResponse(BaseModel):
     total_positions: int
     total_weight: float
     sectors: Dict[str, float]
+
+
+class AIContextSection(BaseModel):
+    """One page-level result in the portfolio AI context export."""
+    key: str
+    title: str
+    route: str
+    status: Literal["available", "partial", "unavailable", "not_requested"]
+    detail: Literal["summary", "full"]
+    generated_at: datetime
+    as_of: Optional[str] = None
+    currency: Optional[str] = None
+    inputs: Dict[str, Any] = Field(default_factory=dict)
+    data: Optional[Any] = None
+    omitted_fields: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class AIContextResponse(BaseModel):
+    """Stable JSON envelope consumed by AI clients."""
+    schema_version: str
+    export_id: str
+    generated_at: datetime
+    base_currency: Literal["INR", "USD"]
+    currency_policy: str
+    detail: Literal["summary", "full"]
+    scope: List[str]
+    environment: Dict[str, Any] = Field(default_factory=dict)
+    sections: Dict[str, AIContextSection]
+    warnings: List[str] = Field(default_factory=list)
 
 
 # Stock Data Schemas
