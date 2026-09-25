@@ -182,11 +182,15 @@ def holding_coverage(
     tickers: Dict[str, Any] = {}
     for t in sorted(set((active_from or {}).keys()) | set(counts.keys())):
         c = counts.get(t) or {}
-        tickers[t] = {
+        entry = {
             "effective_start": (active_from or {}).get(t),
             "raw_days": c.get("raw_days"),
             "masked_days": c.get("masked_days"),
         }
+        for key in ("return_observations", "limited_history", "coverage_reason"):
+            if key in c:
+                entry[key] = c[key]
+        tickers[t] = entry
     return {
         "requested_start": start_s,
         "effective_start": eff,

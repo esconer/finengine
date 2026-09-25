@@ -62,7 +62,9 @@ The dashboard section composes the same canonical results used by its visible ca
 
 `as_of` prefers an actual latest observation date where the endpoint supplies one. Portfolio `as_of` comes from the newest persisted quote timestamp, while `holding_date_provenance` distinguishes stored `added_on`/quote `updated_on` fields from the effective holding start used by holding-window analytics. Requested window end dates are retained separately in inputs/data-range fields and are not substituted for an observation date.
 
-India market components expose `data_status`: `available` means measured data exists, `partial` means only some symbols/legs are measurable, and `unavailable` means no usable stored/provider history exists. An empty anomaly list can therefore be a real zero-finding result or an unavailable result; consumers must inspect `data_status` and coverage.
+India market components expose `data_status`: `available` means measured data exists, `partial` means only some symbols/legs are measurable, and `unavailable` means no usable stored/provider history exists. Institutional-flow metadata also reports `available_categories` and `missing_categories`; an absent FII/DII leg is never rendered as a measured zero. An empty anomaly list can therefore be a real zero-finding result or an unavailable result; consumers must inspect `data_status` and coverage.
+
+Active calculations use positive finite portfolio weights; zero-value persisted rows remain in the requested coverage universe but do not change portfolio scores. Solvers and simulation routes return explicit unavailable/partial results below their minimum measured return sample rather than annualizing or solving a short/noisy history. Dashboard collection reuses request-scoped canonical section results, including Risk Contribution collected through Risk Studio.
 
 Pairs responses distinguish requested/available universe size, analyzed combinations, returned rows, returned cointegrated/non-cointegrated rows, and tickers with insufficient pair overlap. Tail-dependence keeps the parent `tickers` list aligned with the nested matrix universe and stores the full requested list separately.
 

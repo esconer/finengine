@@ -277,9 +277,14 @@ def analyze_pair_cointegration(
             })
 
     def _date_text(value: Any) -> Optional[str]:
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return None
         try:
-            return pd.Timestamp(value).strftime("%Y-%m-%d")
-        except (TypeError, ValueError):
+            parsed = pd.Timestamp(value)
+            if pd.isna(parsed):
+                return None
+            return parsed.strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError):
             return None
 
     overlap_start = _date_text(df.index[0])

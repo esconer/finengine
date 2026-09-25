@@ -81,6 +81,12 @@ class TestIndiaDataService:
         assert flows[0]["fii_net_crores"] == 1300.0
         assert flows[0]["dii_net_crores"] == 1000.0
 
+        flow_metadata = await service.get_institutional_flows(
+            lookback_days=10, return_metadata=True
+        )
+        assert flow_metadata["data_status"] == "available"
+        assert flow_metadata["missing_categories"] == []
+
         # Add historical bhavcopy for anomaly test
         for i in range(1, 10):
             d = today - timedelta(days=i)

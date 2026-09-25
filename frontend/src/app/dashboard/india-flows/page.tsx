@@ -10,6 +10,9 @@ export default function IndiaFlowsPage() {
     const [flows, setFlows] = useState<any[]>([]);
     const [anomalies, setAnomalies] = useState<any[]>([]);
     const [liquidity, setLiquidity] = useState<any>(null);
+    const [flowStatus, setFlowStatus] = useState<string | null>(null);
+    const [deliveryStatus, setDeliveryStatus] = useState<string | null>(null);
+    const [liquidityStatus, setLiquidityStatus] = useState<string | null>(null);
     const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
     const fetchData = async () => {
@@ -24,8 +27,11 @@ export default function IndiaFlowsPage() {
                 api.get('/analytics/liquidity-limits')
             ]);
             setFlows(flowRes.data.flows || []);
+            setFlowStatus(flowRes.data.data_status || null);
             setAnomalies(anomalyRes.data.anomalies || []);
+            setDeliveryStatus(anomalyRes.data.data_status || null);
             setLiquidity(liqRes.data);
+            setLiquidityStatus(liqRes.data?.data_status || null);
             setLastUpdated(new Date().toISOString());
         } catch (err) {
             console.error('Error fetching India microstructure data', err);
@@ -79,7 +85,11 @@ export default function IndiaFlowsPage() {
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
                         FII/DII Institutional Net Flows (30D)
                     </h3>
-                    {flows.length === 0 ? (
+                    {flowStatus === 'unavailable' ? (
+                        <div className="py-8 text-center text-gray-500">Institutional flow data is unavailable; no zero-flow result is being shown.</div>
+                    ) : flowStatus === 'partial' ? (
+                        <div className="py-8 text-center text-amber-600 dark:text-amber-400">Institutional flow coverage is partial; missing FII/DII legs are not treated as zero.</div>
+                    ) : flows.length === 0 ? (
                         <div className="py-8 text-center text-gray-500">No institutional flow records available for the last 30 sessions.</div>
                     ) : (
                         <div className="overflow-x-auto">
@@ -121,6 +131,10 @@ export default function IndiaFlowsPage() {
                 </h3>
                 {loading ? (
                     <div className="py-8 text-center text-gray-500">Loading delivery anomalies…</div>
+                ) : !error && deliveryStatus === 'unavailable' ? (
+                    <div className="py-8 text-center text-gray-500">Delivery data is unavailable; no anomaly result is being shown.</div>
+                ) : !error && deliveryStatus === 'partial' ? (
+                    <div className="py-8 text-center text-amber-600 dark:text-amber-400">Delivery coverage is partial; the displayed alerts cover only available holdings.</div>
                 ) : !error && anomalies.length === 0 ? (
                     <div className="py-8 text-center text-gray-500">No &gt;2σ delivery spikes detected in portfolio holdings today.</div>
                 ) : anomalies.length > 0 ? (
@@ -158,6 +172,14 @@ export default function IndiaFlowsPage() {
             </div>
 
             {/* ADV Liquidity Limits */}
+            {!loading && !error && liquidityStatus === 'unavailable' && (
+                <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 shadow-sm">
+                    <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                        Participation-Based Liquidity & Days-to-Liquidate
+                    </h3>
+                    <div className="py-8 text-center text-gray-500">Liquidity data is unavailable for the current portfolio.</div>
+                </div>
+            )}
             {liquidity && liquidity.positions && liquidity.positions.length > 0 && (
                 <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 shadow-sm">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">

@@ -560,6 +560,14 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
         ]))
         if effective_available != available:
             explicit["raw_available_tickers"] = available
+        if not requested:
+            coverage_status = "unknown"
+        elif not covered:
+            coverage_status = "unavailable"
+        elif missing:
+            coverage_status = "partial"
+        else:
+            coverage_status = "complete"
         explicit.update({
             "requested_tickers": requested,
             "available_tickers": effective_available,
@@ -569,7 +577,7 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
             "available_count": len(covered),
             "coverage_ratio": round(len(covered) / len(requested), 6) if requested else None,
             "complete": not missing if requested else None,
-            "status": "partial" if missing else "complete" if requested else "unknown",
+            "status": coverage_status,
         })
         return explicit
 
@@ -589,6 +597,14 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
     available_set = set(available)
     covered = [ticker for ticker in requested if ticker in available_set]
     missing = [ticker for ticker in requested if ticker not in available_set]
+    if not requested:
+        status = "unknown"
+    elif not covered:
+        status = "unavailable"
+    elif missing:
+        status = "partial"
+    else:
+        status = "complete"
     return {
         "requested_tickers": requested,
         "available_tickers": available,
@@ -598,7 +614,7 @@ def _section_coverage(key: str, inputs: Mapping[str, Any], data: Any) -> Optiona
         "available_count": len(covered),
         "coverage_ratio": round(len(covered) / len(requested), 6) if requested else None,
         "complete": not missing,
-        "status": "complete" if not missing else "partial",
+        "status": status,
         "weight_basis": "active_weights_renormalized_to_100_percent",
     }
 
@@ -865,8 +881,11 @@ class PortfolioContextService:
             json_value = _jsonable(value)
             status = _component_status(json_value)
             coverage = json_value.get("universe_coverage") if isinstance(json_value, Mapping) else None
-            if isinstance(coverage, Mapping) and coverage.get("missing_tickers") and status == "available":
-                status = "partial"
+            if isinstance(coverage, Mapping) and status == "available":
+                if coverage.get("status") in {"partial", "unavailable"}:
+                    status = str(coverage["status"])
+                elif coverage.get("missing_tickers"):
+                    status = "partial"
             result: Dict[str, Any] = {"status": status, "data": json_value}
             if status != "available" and isinstance(json_value, Mapping) and json_value.get("error"):
                 result["error"] = str(json_value["error"])
@@ -899,6 +918,23 @@ class PortfolioContextService:
                 if section.get("error"):
                     result["error"] = section["error"]
                 return result
+            if section_key and section_key in context.cached:
+                cached_data = _jsonable(context.cached[section_key])
+                cached_status = _component_status(cached_data)
+                coverage = (
+                    cached_data.get("universe_coverage")
+                    if isinstance(cached_data, Mapping)
+                    else None
+                )
+                if isinstance(coverage, Mapping):
+                    if coverage.get("status") in {"partial", "unavailable"} and cached_status == "available":
+                        cached_status = str(coverage["status"])
+                    if coverage.get("missing_tickers") and cached_status == "available":
+                        cached_status = "partial"
+                result = {"status": cached_status, "data": cached_data}
+                if cached_status != "available" and isinstance(cached_data, Mapping) and cached_data.get("error"):
+                    result["error"] = str(cached_data["error"])
+                return result
             result = await self._component(name, callback)
             # Dashboard-only calls are not standalone sections, but retaining
             # them makes a second dashboard assembly deterministic and cheap.
@@ -917,6 +953,7 @@ class PortfolioContextService:
                 db=self.db,
                 data_service=self.data_service,
                 analytics_engine=self.analytics_engine,
+                benchmark_service=self.benchmark_service,
             ),
         )
         components["performance_history"] = await cached_or_fetch(
@@ -1127,9 +1164,14 @@ class PortfolioContextService:
                 "available_count": len(available),
                 "coverage_ratio": round(len(available) / len(context.tickers), 6) if context.tickers else None,
                 "complete": not missing if context.tickers else None,
-                "status": "partial" if missing else "complete" if context.tickers else "unknown",
+                "status": "unavailable" if context.tickers and not available else "partial" if missing else "complete" if context.tickers else "unknown",
             }
-        status = "available" if results and not failures and not data.get("universe_coverage", {}).get("missing_tickers") else "partial" if results else "unavailable"
+        coverage = data.get("universe_coverage", {}) if isinstance(data, Mapping) else {}
+        status = (
+            "unavailable" if results and coverage.get("status") == "unavailable"
+            else "available" if results and not failures and not coverage.get("missing_tickers")
+            else "partial" if results else "unavailable"
+        )
         return _Collected(
             data=data,
             inputs={"tickers": context.tickers, "scenarios": list(_STRESS_SCENARIOS)},
@@ -1184,8 +1226,11 @@ class PortfolioContextService:
             cached = _jsonable(context.cached["risk_contribution"])
             cached_status = _component_status(cached)
             cached_coverage = cached.get("universe_coverage") if isinstance(cached, Mapping) else None
-            if isinstance(cached_coverage, Mapping) and cached_coverage.get("missing_tickers") and cached_status == "available":
-                cached_status = "partial"
+            if isinstance(cached_coverage, Mapping) and cached_status == "available":
+                if cached_coverage.get("status") in {"partial", "unavailable"}:
+                    cached_status = str(cached_coverage["status"])
+                elif cached_coverage.get("missing_tickers"):
+                    cached_status = "partial"
             components["risk_contribution"] = {
                 "status": cached_status,
                 "data": cached,
@@ -1253,7 +1298,7 @@ class PortfolioContextService:
                 "available_count": len(available),
                 "coverage_ratio": round(len(available) / len(requested), 6) if requested else None,
                 "complete": not missing if requested else None,
-                "status": "partial" if missing else "complete" if requested else "unknown",
+                "status": "unavailable" if requested and not available else "partial" if missing else "complete" if requested else "unknown",
             }
         return _Collected(
             data=data,

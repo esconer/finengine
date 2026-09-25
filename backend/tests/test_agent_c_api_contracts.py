@@ -36,7 +36,9 @@ from app.api.analytics import (
     get_volatility_sizing,
     run_optimization,
     _build_wide_returns,
+    _latest_observation_date,
     _load_portfolio_allocation,
+    _universe_coverage,
 )
 from app.api.data import get_batch_stock_data
 from app.services.cache_service import ProviderUnavailableError
@@ -406,6 +408,24 @@ async def test_realized_risk_gates_limited_position_metrics_by_own_sample():
     assert limited["sharpe_ratio"] is None
 
 
+def test_zero_usable_universe_is_unavailable_not_partial():
+    coverage = _universe_coverage(["A", "B"], [])
+    assert coverage["status"] == "unavailable"
+    assert coverage["available_count"] == 0
+    assert coverage["missing_tickers"] == ["A", "B"]
+
+
+def test_latest_observation_reads_dataframe_mapping_with_date_column():
+    frames = {
+        "A": pd.DataFrame({"close": [1.0, 2.0]}, index=pd.RangeIndex(2)),
+        "B": pd.DataFrame({
+            "date": ["2025-01-02", "2025-01-06"],
+            "close": [1.0, 2.0],
+        }),
+    }
+    assert _latest_observation_date(frames) == "2025-01-06"
+
+
 @pytest.mark.asyncio
 async def test_c01_mixed_fx_outage_maps_to_503_for_analytics_routes():
     positions = [
@@ -730,8 +750,10 @@ async def test_c02_single_holding_optimizer_preserves_price_gap():
             body={"strategy": "hrp"}, db=Mock(), data_service=Market()
         )
     assert result["weights"] == {"A": 1.0}
-    assert result["expected_annual_return"] == pytest.approx(0.10 * 252.0)
+    assert result["expected_annual_return"] is None
     assert result["expected_annual_volatility"] is None
+    assert result["data_status"] == "unavailable"
+    assert "Insufficient return history" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -1050,6 +1072,37 @@ async def test_c05_tail_memo_key_includes_normalized_weights():
 
 
 @pytest.mark.asyncio
+async def test_tail_cache_does_not_reuse_request_order_metadata():
+    analytics_mod._TAILS_RESPONSE_CACHE.clear()
+    ret = pd.DataFrame({"A": [0.01, -0.02] * 40, "B": [-0.01, 0.02] * 40})
+    calls = []
+
+    async def allocation(tickers, _db):
+        order = ["A", "B"] if tickers is None else tickers.split(",")
+        return order, {ticker: 0.5 for ticker in order}
+
+    def matrix(*_args, **_kwargs):
+        calls.append("matrix")
+        return {"tickers": ["A", "B"], "matrix": [[1.0, 0.1], [0.1, 1.0]], "high_tail_risk_pairs": []}
+
+    with patch.object(analytics_mod, "resolve_allocation", side_effect=allocation), \
+         patch.object(analytics_mod, "_build_wide_returns", new=AsyncMock(return_value=(ret, ret.mean(axis=1), {}))), \
+         patch("app.services.tail_risk_service.TailRiskService.calculate_evt_pot_var_es", return_value={"total_observations": 80}), \
+         patch("app.services.tail_risk_service.TailRiskService.calculate_tail_dependence_matrix", side_effect=matrix):
+        first = await get_tail_risk_and_copula(
+            tickers="A,B", lookback_days=756, db=Mock(), data_service=Mock(),
+        )
+        second = await get_tail_risk_and_copula(
+            tickers="B,A", lookback_days=756, db=Mock(), data_service=Mock(),
+        )
+
+    assert calls == ["matrix", "matrix"]
+    assert first["requested_tickers"] == ["A", "B"]
+    assert second["requested_tickers"] == ["B", "A"]
+    analytics_mod._TAILS_RESPONSE_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_tail_parent_ticker_list_matches_matrix_universe():
     analytics_mod._TAILS_RESPONSE_CACHE.clear()
     returns = pd.DataFrame({
@@ -1272,6 +1325,23 @@ async def test_c02_wide_return_builder_preserves_prelisting_mask():
     assert coverage["covered_days"] == len(portfolio)
 
 
+@pytest.mark.asyncio
+async def test_wide_return_builder_excludes_all_nan_legs_from_model_universe():
+    dates = pd.date_range("2025-01-01", periods=4, freq="D")
+    service = SimpleNamespace()
+
+    async def fetch(ticker, start, end):
+        values = [100.0, 101.0, 102.0, 103.0] if ticker == "A" else [np.nan] * 4
+        return pd.DataFrame({"close": values}, index=dates)
+
+    service.fetch_historical_data = fetch
+    returns_df, _portfolio, coverage = await _build_wide_returns(
+        ["A", "B"], {"A": 1.0, "B": 0.5}, "2025-01-01", "2025-01-04", service
+    )
+    assert list(returns_df.columns) == ["A"]
+    assert coverage["model_used_tickers"] == ["A"]
+
+
 def test_c11_tail_schema_accepts_confidence_neutral_fields():
     metrics = EVTPOTVarMetrics(
         confidence_level=0.95,
@@ -1334,4 +1404,27 @@ async def test_c13_coint_route_threads_requested_lookback_identity():
             db=Mock(), data_service=market, cache_service=Mock(),
         )
     assert captured["lookback_days"] == 60
+
+
+@pytest.mark.asyncio
+async def test_coint_route_preserves_coverage_when_one_leg_is_missing():
+    class Market:
+        async def fetch_historical_data(self, ticker, start, end):
+            if ticker == "A":
+                return pd.DataFrame(
+                    {"close": [100.0, 101.0]},
+                    index=pd.to_datetime(["2025-01-01", "2025-01-02"]),
+                )
+            return None
+
+    result = await get_cointegration_pairs(
+        tickers="A,B", lookback_days=60, p_value_threshold=0.05,
+        max_half_life=None, include_spread_series=False,
+        db=Mock(), data_service=Market(), cache_service=Mock(),
+    )
+    assert result.data_status == "partial"
+    assert result.requested_tickers == ["A", "B"]
+    assert result.available_tickers == ["A"]
+    assert result.missing_tickers == ["B"]
+    assert result.error
 

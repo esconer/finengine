@@ -172,6 +172,58 @@ def test_numeric_risk_score_components_are_not_mistaken_for_group_envelopes():
 
 
 @pytest.mark.asyncio
+async def test_dashboard_reuses_risk_contribution_cached_by_risk_studio():
+    from app.services.ai_context_service import (
+        ContextOptions,
+        PortfolioContextService,
+        _BuildContext,
+    )
+
+    service = PortfolioContextService(
+        db=Mock(), data_service=Mock(), analytics_engine=Mock(),
+        benchmark_service=Mock(), cache_service=Mock(),
+    )
+    context = _BuildContext(
+        options=ContextOptions(include=("dashboard",)),
+        base_currency="INR",
+        portfolio={"positions": [{"ticker": "A"}], "total_value": 100.0},
+        tickers=["A"], ticker_csv="A", total_value=100.0,
+        cached={
+            "risk_contribution": {
+                "positions": {"volatility": {"A": 0.5}, "cvar_tail": {"A": 0.5}},
+                "universe_coverage": {
+                    "requested_tickers": ["A"], "available_tickers": ["A"],
+                    "missing_tickers": [], "status": "complete",
+                },
+            }
+        },
+    )
+    section_data = {
+        key: {"data": {"value": 1}, "status": "available"}
+        for key in ("realized_risk", "forecast_risk", "factor_exposure", "concentration", "liquidity", "regime")
+    }
+    context.cached_sections.update(section_data)
+
+    with patch(
+        "app.services.ai_context_service.analytics_api.get_analytics_summary",
+        new=AsyncMock(return_value={"value": 1}),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_performance_history",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_risk_score",
+        new=AsyncMock(return_value={"overall_score": 1}),
+    ), patch(
+        "app.services.ai_context_service.analytics_api.get_risk_contribution",
+        new=AsyncMock(return_value={"unexpected": True}),
+    ) as rc:
+        result = await service._collect_dashboard(context)
+
+    assert result.data["components"]["risk_contribution"]["data"]["positions"]
+    rc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_contains_visible_component_contract():
     from app.services.ai_context_service import ContextOptions, PortfolioContextService
 

@@ -704,6 +704,10 @@ class DataService:
                 if not served.empty:
                     served.attrs["source"] = actual_source
                     served.attrs["requested_ticker"] = normalized_ticker
+                    served.attrs["coverage_reason"] = valid_acceptance.reason
+                    served.attrs["limited_history"] = valid_acceptance.reason == "accepted_late_listing"
+                    served.attrs["accepted_frame_start"] = valid_acceptance.frame_start.isoformat() if valid_acceptance.frame_start else None
+                    served.attrs["accepted_frame_end"] = valid_acceptance.frame_end.isoformat() if valid_acceptance.frame_end else None
                     self.last_fetch_metadata.update({
                         "source": actual_source,
                         "coverage_reason": valid_acceptance.reason,
@@ -768,6 +772,10 @@ class DataService:
                             if not served.empty:
                                 served.attrs["source"] = "alphavantage"
                                 served.attrs["requested_ticker"] = normalized_ticker
+                                served.attrs["coverage_reason"] = valid_acceptance.reason
+                                served.attrs["limited_history"] = valid_acceptance.reason == "accepted_late_listing"
+                                served.attrs["accepted_frame_start"] = valid_acceptance.frame_start.isoformat() if valid_acceptance.frame_start else None
+                                served.attrs["accepted_frame_end"] = valid_acceptance.frame_end.isoformat() if valid_acceptance.frame_end else None
                                 self.last_fetch_metadata.update({
                                     "source": "alphavantage",
                                     "coverage_reason": valid_acceptance.reason,

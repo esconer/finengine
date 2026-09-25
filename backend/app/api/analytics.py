@@ -214,6 +214,14 @@ def _universe_coverage(requested: Iterable[str], available: Iterable[str]) -> Di
     available_set = set(available_list)
     covered = [ticker for ticker in requested_list if ticker in available_set]
     missing = [ticker for ticker in requested_list if ticker not in available_set]
+    if not requested_list:
+        status = "unknown"
+    elif not covered:
+        status = "unavailable"
+    elif missing:
+        status = "partial"
+    else:
+        status = "complete"
     return {
         "requested_tickers": requested_list,
         "available_tickers": available_list,
@@ -223,9 +231,22 @@ def _universe_coverage(requested: Iterable[str], available: Iterable[str]) -> Di
         "available_count": len(covered),
         "coverage_ratio": round(len(covered) / len(requested_list), 6) if requested_list else None,
         "complete": not missing if requested_list else None,
-        "status": "complete" if requested_list and not missing else "partial" if requested_list else "unknown",
+        "status": status,
         "weight_basis": "active_weights_renormalized_to_100_percent",
     }
+
+
+def _active_weight_tickers(weights: Mapping[str, Any]) -> List[str]:
+    """Calculation universe: only positive, finite portfolio weights."""
+    active: List[str] = []
+    for ticker, weight in weights.items():
+        try:
+            numeric = float(weight or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric) and numeric > 0.0:
+            active.append(str(ticker).upper())
+    return active
 
 
 def _coerce_date(value: Any, field_name: str) -> Optional[date]:
@@ -379,12 +400,17 @@ def _price_series(df: pd.DataFrame) -> Optional[pd.Series]:
     for dcol in ("date", "Date"):
         if dcol in df.columns:
             idx = pd.to_datetime(df[dcol], errors="coerce")
-            return pd.Series(values.values, index=idx, name=price_col).dropna()
+            out = pd.Series(values.values, index=idx, name=price_col).dropna()
+            out.attrs.update(df.attrs)
+            return out
     if isinstance(df.index, pd.DatetimeIndex):
         out = values.copy()
         out.index = pd.to_datetime(df.index)
+        out.attrs.update(df.attrs)
         return out
-    return pd.Series(values.values, index=pd.RangeIndex(len(values)), name=price_col)
+    out = pd.Series(values.values, index=pd.RangeIndex(len(values)), name=price_col)
+    out.attrs.update(df.attrs)
+    return out
 
 
 def _assign_price(store: Dict[str, pd.Series], ticker: str, df: pd.DataFrame) -> None:
@@ -427,26 +453,43 @@ def _latest_observation_date(price_data: Any) -> Optional[str]:
     """Return the newest actual price observation, never the requested end."""
     if price_data is None:
         return None
-    if isinstance(price_data, pd.Series):
-        series_values = [price_data]
-    elif isinstance(price_data, pd.DataFrame):
-        series_values = [price_data[col] for col in price_data.columns]
-    elif isinstance(price_data, Mapping):
-        series_values = [value for value in price_data.values() if isinstance(value, pd.Series)]
-    else:
+
+    def _frame_date(frame: pd.DataFrame) -> Optional[str]:
+        for column in ("date", "Date", "datetime", "Datetime", "timestamp"):
+            if column in frame.columns:
+                parsed = pd.to_datetime(frame[column], errors="coerce").dropna()
+                if not parsed.empty:
+                    return pd.Timestamp(parsed.max()).strftime("%Y-%m-%d")
+        if isinstance(frame.index, pd.DatetimeIndex):
+            values = frame.index.dropna()
+            return pd.Timestamp(values.max()).strftime("%Y-%m-%d") if len(values) else None
         return None
-    dates: List[str] = []
-    for series in series_values:
-        if series is None or series.empty:
-            continue
-        try:
-            last_index = series.index[-1]
-            if isinstance(last_index, (int, float)):
-                continue
-            dates.append(pd.Timestamp(last_index).strftime("%Y-%m-%d"))
-        except (TypeError, ValueError):
-            continue
-    return max(dates) if dates else None
+
+    if isinstance(price_data, pd.DataFrame):
+        latest = _frame_date(price_data)
+        return latest
+    if isinstance(price_data, pd.Series):
+        if isinstance(price_data.index, pd.DatetimeIndex):
+            values = price_data.index.dropna()
+            return pd.Timestamp(values.max()).strftime("%Y-%m-%d") if len(values) else None
+        return None
+    if isinstance(price_data, Mapping):
+        dates: List[str] = []
+        for value in price_data.values():
+            if isinstance(value, pd.DataFrame):
+                latest = _frame_date(value)
+            elif isinstance(value, pd.Series):
+                if isinstance(value.index, pd.DatetimeIndex):
+                    valid = value.index.dropna()
+                    latest = pd.Timestamp(valid.max()).strftime("%Y-%m-%d") if len(valid) else None
+                else:
+                    latest = None
+            else:
+                latest = None
+            if latest:
+                dates.append(latest)
+        return max(dates) if dates else None
+    return None
 
 
 def _analytics_position_currency(position: Any) -> str:
@@ -593,6 +636,20 @@ async def _load_portfolio_allocation(db: AsyncSession) -> Optional[Dict[str, flo
     return {pos.ticker: 1.0 / n for pos in positions}
 
 
+async def _has_positive_portfolio_value(db: AsyncSession) -> bool:
+    result = await db.execute(select(PortfolioPosition))
+    for position in result.scalars().all():
+        try:
+            value = float(getattr(position, "market_value", 0.0) or 0.0)
+            if not math.isfinite(value) or value <= 0:
+                value = float(getattr(position, "quantity", 0.0) or 0.0) * float(getattr(position, "last_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return True
+    return False
+
+
 @router.get("/realized-risk")
 async def get_realized_risk(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or 'portfolio'"),
@@ -630,8 +687,30 @@ async def get_realized_risk(
                 "error": "No portfolio positions found"
             }
 
-        # Fetch price data for all tickers concurrently
-        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
+        calculation_tickers = _active_weight_tickers(weights)
+        if not calculation_tickers:
+            return {
+                "portfolio": {
+                    "annual_return": None,
+                    "annual_volatility": None,
+                    "sharpe_ratio": None,
+                    "sortino_ratio": None,
+                    "skewness": None,
+                    "kurtosis": None,
+                    "max_drawdown": None,
+                    "var_95": None,
+                    "cvar_95": None,
+                    "hit_ratio": None
+                },
+                "positions": {},
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
+                "error": "No active portfolio weights available for realized risk",
+            }
+
+        # Fetch price data for active weights only; the full persisted roster
+        # remains the requested coverage universe.
+        price_data_dict = await _fetch_price_series_dict(data_service, calculation_tickers, start, end)
 
         if not price_data_dict:
             logger.warning("No price data available for tickers")
@@ -649,20 +728,43 @@ async def get_realized_risk(
                     "hit_ratio": None
                 },
                 "positions": {},
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
                 "error": "No price data available"
             }
         
         # Combine price data, restricted to actual holding history so
         # pre-purchase price action is never attributed to the portfolio.
-        holdings = await resolve_holdings(db, ticker_list)
+        holdings = await resolve_holdings(db, calculation_tickers)
         masked_dict, effectives = holding_window(price_data_dict, holdings)
         wiped = sorted(set(price_data_dict) - set(masked_dict))
         price_data = pd.DataFrame(masked_dict)
+        if price_data.empty:
+            return {
+                "portfolio": {
+                    "annual_return": None,
+                    "annual_volatility": None,
+                    "sharpe_ratio": None,
+                    "sortino_ratio": None,
+                    "skewness": None,
+                    "kurtosis": None,
+                    "max_drawdown": None,
+                    "var_95": None,
+                    "cvar_95": None,
+                    "hit_ratio": None
+                },
+                "positions": {},
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
+                "error": "No price data within the current holding period",
+            }
         covered_days = int(len(price_data))
         per_ticker = {
             t: {
                 "raw_days": int(len(s)) if s is not None else 0,
                 "masked_days": int(len(masked_dict[t])) if t in masked_dict and masked_dict[t] is not None else 0,
+                "limited_history": bool(getattr(s, "attrs", {}).get("limited_history", False)),
+                "coverage_reason": getattr(s, "attrs", {}).get("coverage_reason"),
             }
             for t, s in price_data_dict.items()
         }
@@ -825,18 +927,29 @@ async def get_realized_risk(
                 ),
             })
 
-        coverage = _universe_coverage(ticker_list, positions.keys())
+        usable_tickers = [
+            ticker
+            for ticker, position in positions.items()
+            if int(position.get("data_points", 0) or 0) >= 2
+        ]
+        coverage = _universe_coverage(ticker_list, usable_tickers)
         limited_history = any(
             bool(position.get("is_limited_history"))
             for position in positions.values()
             if isinstance(position, Mapping)
         )
+        if coverage["status"] == "unavailable":
+            data_status = "unavailable"
+        elif coverage["status"] == "partial" or limited_history:
+            data_status = "partial"
+        else:
+            data_status = "available"
         return {
             "portfolio": portfolio_metrics,
             "positions": positions,
             "instrument_risk": instrument_risk,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] and not limited_history else "partial",
+            "data_status": data_status,
             "warnings": warnings_list,
             "data_range": {"start": start, "end": end},
             "latest_observation_date": _latest_observation_date(price_data),
@@ -884,8 +997,26 @@ async def get_forecast_risk(
                 "error": "No portfolio positions found"
             }
         
-        # Fetch price data for all tickers concurrently
-        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
+        calculation_tickers = _active_weight_tickers(allocation)
+        if not calculation_tickers:
+            return {
+                "model": model,
+                "horizon": horizon,
+                "portfolio": {
+                    "volatility_forecast": None,
+                    "var_forecast": None,
+                    "cvar_forecast": None,
+                    "confidence_interval": None
+                },
+                "positions": {},
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
+                "error": "No active portfolio weights available for forecast",
+            }
+
+        # Fetch price data for active weights only; the full persisted roster
+        # remains the requested coverage universe.
+        price_data_dict = await _fetch_price_series_dict(data_service, calculation_tickers, start, end)
         
         if not price_data_dict:
             return {
@@ -899,6 +1030,8 @@ async def get_forecast_risk(
                 },
                 "positions": {},
                 "model_params": {"p": 1, "q": 1, "type": model},
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
                 "error": "No price data available for forecast"
             }
         
@@ -960,11 +1093,23 @@ async def get_forecast_risk(
                     "data_points": 0
                 }
         
-        coverage = _universe_coverage(ticker_list, positions.keys())
+        usable_positions = [
+            ticker for ticker, position in positions.items()
+            if int(position.get("data_points", 0) or 0) >= 2
+            and (
+                position.get("volatility_forecast") is not None
+                or position.get("var_forecast") is not None
+            )
+        ]
+        coverage = _universe_coverage(ticker_list, usable_positions)
         limited_history = any(
             bool(position.get("is_limited_history"))
             for position in positions.values()
             if isinstance(position, Mapping)
+        )
+        portfolio_forecast_usable = any(
+            forecast_result.get(field) is not None
+            for field in ("volatility_forecast", "var_forecast", "cvar_forecast")
         )
         response = {
             "model": model,
@@ -978,7 +1123,11 @@ async def get_forecast_risk(
             },
             "positions": positions,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] and not limited_history else "partial",
+            "data_status": (
+                "unavailable" if coverage["status"] == "unavailable"
+                else "partial" if coverage["status"] == "partial" or limited_history or forecast_result.get("error") or not portfolio_forecast_usable
+                else "available"
+            ),
             "warnings": warnings_list,
             "model_params": forecast_result.get("model_params", {"p": 1, "q": 1, "type": model}),
             "data_range": {"start": start, "end": end},
@@ -1019,17 +1168,32 @@ async def get_factor_exposure(
                     "market": None
                 },
                 "positions": {},
-                "r_squared": 0.0,
-                "adjusted_r_squared": 0.0,
+                "r_squared": None,
+                "adjusted_r_squared": None,
+                "universe_coverage": _universe_coverage([], []),
+                "data_status": "unavailable",
                 "error": "No portfolio positions found"
             }
         
+        calculation_tickers = _active_weight_tickers(allocation)
+        if not calculation_tickers:
+            return {
+                "portfolio": {"alpha": None, "market": None},
+                "positions": {},
+                "r_squared": None,
+                "adjusted_r_squared": None,
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
+                "error": "No active portfolio weights available for factor analysis",
+            }
+
         # Calculate date range
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
         
-        # Fetch price data for all tickers concurrently
-        price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
+        # Fetch price data for active weights only; the full persisted roster
+        # remains the requested coverage universe.
+        price_data_dict = await _fetch_price_series_dict(data_service, calculation_tickers, start, end)
         
         if not price_data_dict:
             return {
@@ -1038,8 +1202,10 @@ async def get_factor_exposure(
                     "market": None
                 },
                 "positions": {},
-                "r_squared": 0.0,
-                "adjusted_r_squared": 0.0,
+                "r_squared": None,
+                "adjusted_r_squared": None,
+                "universe_coverage": _universe_coverage(ticker_list, []),
+                "data_status": "unavailable",
                 "error": "No price data available for factor analysis"
             }
         
@@ -1050,9 +1216,20 @@ async def get_factor_exposure(
         # degenerate fallback (beta exactly 1.0, R² 0.0) rendered as
         # "Market-Like" for every position. Compute on full history; the
         # holding window stays disclosed via history_coverage.
-        holdings = await resolve_holdings(db, ticker_list)
+        holdings = await resolve_holdings(db, calculation_tickers)
         _, effectives = holding_window(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
+        factor_weights = {
+            ticker: float(weight)
+            for ticker, weight in allocation.items()
+            if ticker in price_data.columns
+        }
+        factor_weight_total = sum(factor_weights.values())
+        if factor_weight_total > 0:
+            factor_weights = {
+                ticker: weight / factor_weight_total
+                for ticker, weight in factor_weights.items()
+            }
         per_ticker = {
             ticker: {
                 "raw_days": int(len(series)) if series is not None else 0,
@@ -1087,7 +1264,7 @@ async def get_factor_exposure(
         factor_result = await analytics_engine.factor_exposure_analysis(
             price_data, 
             benchmark_data=benchmark_returns,
-            weights=allocation
+            weights=factor_weights
         )
 
         # Collect warnings for assets with limited history
@@ -1101,20 +1278,40 @@ async def get_factor_exposure(
             if p.get("is_limited_history")
         ]
         
-        coverage = _universe_coverage(
-            ticker_list,
-            factor_result.get("positions", {}).keys(),
-        )
+        factor_positions = factor_result.get("positions", {}) or {}
+        usable_positions = {
+            ticker: position
+            for ticker, position in factor_positions.items()
+            if isinstance(position, Mapping)
+            and int(position.get("data_points", 0) or 0) > 0
+            and not position.get("error")
+            and any(
+                position.get(field) is not None
+                for field in ("alpha", "beta", "market", "r_squared")
+            )
+        }
+        coverage = _universe_coverage(ticker_list, usable_positions.keys())
         limited_history = any(
             bool(position.get("is_limited_history"))
-            for position in factor_result.get("positions", {}).values()
+            for position in factor_positions.values()
             if isinstance(position, Mapping)
         )
+        portfolio_factor = factor_result.get("portfolio", {})
+        portfolio_factor_usable = isinstance(portfolio_factor, Mapping) and any(
+            portfolio_factor.get(field) is not None
+            for field in ("alpha", "market", "beta", "r_squared")
+        )
+        if coverage["status"] == "unavailable":
+            data_status = "unavailable"
+        elif coverage["status"] == "partial" or limited_history or not portfolio_factor_usable or factor_result.get("error"):
+            data_status = "partial"
+        else:
+            data_status = "available"
         return {
             "portfolio": factor_result.get("portfolio", {}),
             "positions": factor_result.get("positions", {}),
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] and not limited_history else "partial",
+            "data_status": data_status,
             "warnings": warnings_list,
             "r_squared": factor_result.get("r_squared", 0.0),
             "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
@@ -1193,7 +1390,7 @@ async def get_concentration_metrics(
             "by_weight": concentration_result.get("by_weight", {}),
             "by_sector": by_sector,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] else "partial",
+            "data_status": coverage["status"],
             "methodology": "Concentration analysis using Herfindahl-Hirschman Index (HHI), Effective Positions (N_eff), and Lorenz Gini Coefficient"
         }
         
@@ -1231,7 +1428,19 @@ async def get_liquidity_metrics(
                 "universe_coverage": _universe_coverage(requested_tickers, []),
                 "zero_metrics": True
             }
-        tickers = requested_tickers
+        if not await _has_positive_portfolio_value(db):
+            return {
+                "overall_score": None,
+                "liquidation_time_days": None,
+                "risk_level": None,
+                "by_position": {},
+                "volume_stats": {},
+                "error": "No positive portfolio market value available for liquidity analysis",
+                "data_status": "unavailable",
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "zero_metrics": True,
+            }
+        tickers = _active_weight_tickers(allocation)
         
         # Fetch price and volume data + market caps for liquidity analysis concurrently
         end = datetime.now().strftime('%Y-%m-%d')
@@ -1279,13 +1488,13 @@ async def get_liquidity_metrics(
                 "volume_stats": {"avg_volume": 0, "total_portfolio_volume": 0, "high_volume_pct": 0, "medium_volume_pct": 0, "low_volume_pct": 100},
                 "error": "No price data available for liquidity analysis",
                 "data_status": "unavailable",
-                "universe_coverage": _universe_coverage(tickers, []),
+                "universe_coverage": _universe_coverage(requested_tickers, []),
                 "zero_metrics": True
             }
         
         # Calculate liquidity metrics using analytics engine
         liquidity_result = await analytics_engine.liquidity_analysis(price_data_dict, market_caps=market_caps_dict)
-        coverage = _universe_coverage(tickers, liquidity_result.get("by_position", {}).keys())
+        coverage = _universe_coverage(requested_tickers, liquidity_result.get("by_position", {}).keys())
 
         return {
             "overall_score": liquidity_result.get("overall_score"),
@@ -1294,7 +1503,7 @@ async def get_liquidity_metrics(
             "by_position": liquidity_result.get("by_position", {}),
             "volume_stats": liquidity_result.get("volume_stats", {}),
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] else "partial",
+            "data_status": coverage["status"],
             "methodology": "Liquidity scoring based on trading volume and market capitalization"
         }
         
@@ -1494,7 +1703,8 @@ async def get_volatility_sizing(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')  # 1 year
         
-        price_data_dict = await _fetch_price_series_dict(data_service, requested_tickers, start, end)
+        calculation_tickers = _active_weight_tickers(weights)
+        price_data_dict = await _fetch_price_series_dict(data_service, calculation_tickers, start, end)
         
         if not price_data_dict:
             return {
@@ -1511,13 +1721,45 @@ async def get_volatility_sizing(
                 "error": "No price data available for volatility sizing"
             }
         
-        # Combine price data
+        # Combine price data and remove legs with no measured return.
         price_data = pd.DataFrame(price_data_dict)
+        sizing_returns = price_data.pct_change(fill_method=None).iloc[1:]
+        return_observations = {
+            ticker: int(sizing_returns[ticker].notna().sum())
+            for ticker in price_data.columns
+        }
+        usable_tickers = [ticker for ticker, count in return_observations.items() if count >= 2]
+        if not usable_tickers:
+            return {
+                "current_weights": weights,
+                "recommended_weights": weights,
+                "trades": {ticker: {"shares_delta": 0, "amount": 0} for ticker in weights.keys()},
+                "target_volatility": target_volatility,
+                "currency": "INR",
+                "base_currency": "INR",
+                "currency_provenance": currency_provenance,
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "data_unavailable_tickers": list(requested_tickers),
+                "error": "No finite return observations for volatility sizing",
+            }
+        price_data = price_data.loc[:, usable_tickers]
+        sizing_weights = {
+            ticker: float(weights[ticker])
+            for ticker in usable_tickers
+            if ticker in weights
+        }
+        sizing_weight_total = sum(sizing_weights.values())
+        if sizing_weight_total > 0:
+            sizing_weights = {
+                ticker: weight / sizing_weight_total
+                for ticker, weight in sizing_weights.items()
+            }
         
         # Calculate volatility sizing using analytics engine
         sizing_result = await analytics_engine.volatility_sizing(
             price_data, 
-            weights, 
+            sizing_weights,
             model, 
             target_volatility, 
             portfolio_value=resolved_pv
@@ -1525,15 +1767,24 @@ async def get_volatility_sizing(
         if not isinstance(sizing_result, dict):
             raise RuntimeError("Volatility sizing result unavailable")
         response = dict(sizing_result)
-        source_tickers = list((sizing_result.get("volatility_sources") or {}).keys())
         recommended_tickers = list((sizing_result.get("recommended_weights") or {}).keys())
         available_tickers = [
-            ticker for ticker in source_tickers
+            ticker for ticker in usable_tickers
             if not recommended_tickers or ticker in recommended_tickers
         ]
         if not available_tickers:
-            available_tickers = recommended_tickers
+            available_tickers = [
+                ticker for ticker in recommended_tickers if ticker in usable_tickers
+            ]
         coverage = _universe_coverage(requested_tickers, available_tickers)
+        limited_history = any(
+            count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
+        )
+        sizing_status = (
+            "unavailable" if coverage["status"] == "unavailable"
+            else "partial" if coverage["status"] == "partial" or limited_history or sizing_result.get("error")
+            else "available"
+        )
         response.update({
             "portfolio_value": round(float(resolved_pv), 2),
             "portfolio_value_currency": "INR",
@@ -1541,7 +1792,7 @@ async def get_volatility_sizing(
             "base_currency": "INR",
             "currency_provenance": currency_provenance,
             "universe_coverage": coverage,
-            "data_status": "partial" if coverage["missing_tickers"] else "available",
+            "data_status": sizing_status,
             "data_unavailable_tickers": coverage["missing_tickers"],
             "weight_basis": "available_universe_renormalized" if coverage["missing_tickers"] else "full_universe",
         })
@@ -1581,13 +1832,25 @@ async def get_risk_score(
                 "data_status": "unavailable",
                 "error": "No portfolio positions found"
             }
+        if not await _has_positive_portfolio_value(db):
+            return {
+                "overall_score": None,
+                "risk_level": None,
+                "change": 0,
+                "components": {},
+                "alerts": ["No positive portfolio market value available for risk scoring"],
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "error": "No positive portfolio market value available for risk scoring",
+            }
         
         # Fetch price data for risk scoring
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')  # 1 year
         
         price_data_dict = {}
-        for ticker in requested_tickers:
+        calculation_tickers = _active_weight_tickers(weights)
+        for ticker in calculation_tickers:
             try:
                 df = await data_service.fetch_historical_data(ticker, start, end)
             except Exception:
@@ -1610,16 +1873,50 @@ async def get_risk_score(
         
         # Combine price data, restricted to actual holding history.
         raw_price_data_dict = dict(price_data_dict)
-        holdings = await resolve_holdings(db, requested_tickers)
+        holdings = await resolve_holdings(db, calculation_tickers)
         price_data_dict, effectives = holding_window(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
+        if price_data.empty:
+            return {
+                "overall_score": None,
+                "risk_level": None,
+                "change": 0,
+                "components": {},
+                "alerts": ["Insufficient data for comprehensive risk analysis"],
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "error": "No usable price data within the holding window for risk scoring",
+            }
         per_ticker = {
             ticker: {
-                "raw_days": int(len(raw_price_data_dict.get(ticker))) if ticker in raw_price_data_dict else 0,
-                "masked_days": int(len(price_data_dict.get(ticker))) if ticker in price_data_dict else 0,
+                "raw_days": int(len(raw_price_data_dict.get(ticker))) if ticker in raw_price_data_dict and raw_price_data_dict.get(ticker) is not None else 0,
+                "masked_days": int(len(price_data_dict.get(ticker))) if ticker in price_data_dict and price_data_dict.get(ticker) is not None else 0,
+                "limited_history": bool(getattr(raw_price_data_dict.get(ticker), "attrs", {}).get("limited_history", False)),
+                "coverage_reason": getattr(raw_price_data_dict.get(ticker), "attrs", {}).get("coverage_reason"),
             }
             for ticker in requested_tickers
         }
+        risk_returns = price_data.pct_change(fill_method=None).iloc[1:]
+        return_observations = {
+            ticker: int(risk_returns[ticker].notna().sum())
+            for ticker in requested_tickers
+            if ticker in risk_returns.columns
+        }
+        usable_tickers = [ticker for ticker, count in return_observations.items() if count >= 2]
+        if not usable_tickers:
+            return {
+                "overall_score": None,
+                "risk_level": None,
+                "change": 0,
+                "components": {},
+                "alerts": ["Insufficient data for comprehensive risk analysis"],
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "error": "No finite return observations for risk scoring",
+            }
+        price_data = price_data.loc[:, usable_tickers]
+        for ticker, count in return_observations.items():
+            per_ticker.setdefault(ticker, {})["return_observations"] = count
         history_coverage = holding_coverage(
             effectives, start, end, int(len(price_data)), per_ticker
         )
@@ -1633,9 +1930,40 @@ async def get_risk_score(
             logger.warning("Benchmark data unavailable")
 
         # Calculate risk score using analytics engine
-        risk_result = await analytics_engine.risk_scoring(price_data, weights, benchmark_data=benchmark_returns)
+        risk_weights = {
+            ticker: float(weight)
+            for ticker, weight in weights.items()
+            if ticker in usable_tickers
+        }
+        risk_weight_total = sum(risk_weights.values())
+        if risk_weight_total > 0:
+            risk_weights = {
+                ticker: weight / risk_weight_total
+                for ticker, weight in risk_weights.items()
+            }
+        risk_result = await analytics_engine.risk_scoring(price_data, risk_weights, benchmark_data=benchmark_returns)
+        if not isinstance(risk_result, Mapping) or risk_result.get("overall_score") is None:
+            return {
+                "overall_score": None,
+                "risk_level": None,
+                "change": 0,
+                "components": {},
+                "alerts": ["Insufficient data for comprehensive risk analysis"],
+                "universe_coverage": _universe_coverage(requested_tickers, usable_tickers),
+                "data_status": "partial" if usable_tickers else "unavailable",
+                "error": "Risk score unavailable for the measured return sample",
+            }
         risk_result["history_coverage"] = history_coverage
-        risk_result["universe_coverage"] = _universe_coverage(requested_tickers, price_data.columns)
+        coverage = _universe_coverage(requested_tickers, usable_tickers)
+        limited_history = any(
+            count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
+        )
+        risk_result["universe_coverage"] = coverage
+        risk_result["data_status"] = (
+            "unavailable" if coverage["status"] == "unavailable"
+            else "partial" if coverage["status"] == "partial" or limited_history or risk_result.get("error")
+            else "available"
+        )
 
         return risk_result
         
@@ -1652,7 +1980,8 @@ async def get_risk_score(
 async def get_analytics_summary(
     db: AsyncSession = Depends(get_db_session),
     data_service: DataService = Depends(get_data_service),
-    analytics_engine: AnalyticsEngine = Depends(get_analytics_engine)
+    analytics_engine: AnalyticsEngine = Depends(get_analytics_engine),
+    benchmark_service: BenchmarkService = Depends(get_benchmark_service),
 ) -> Dict:
     """
     Get analytics summary for dashboard
@@ -1692,7 +2021,8 @@ async def get_analytics_summary(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=252)).strftime('%Y-%m-%d')  # 1 year
         
-        price_data_dict = await _fetch_price_series_dict(data_service, requested_tickers, start, end)
+        calculation_tickers = _active_weight_tickers(weights)
+        price_data_dict = await _fetch_price_series_dict(data_service, calculation_tickers, start, end)
         
         # Compute real portfolio value from DB positions
         pos_result = await db.execute(select(PortfolioPosition))
@@ -1701,6 +2031,28 @@ async def get_analytics_summary(
             positions_list, target_currency="INR"
         )
         portfolio_value = sum(converted_values.values())
+        if not math.isfinite(float(portfolio_value)) or portfolio_value <= 0:
+            return {
+                "portfolio_value": 0.0,
+                "portfolio_value_currency": "INR",
+                "currency": "INR",
+                "base_currency": "INR",
+                "currency_provenance": currency_provenance,
+                "total_positions": len(weights),
+                "realized_volatility": None,
+                "instrument_volatility": None,
+                "forecast_volatility": None,
+                "sharpe_ratio": None,
+                "max_drawdown": None,
+                "risk_score": None,
+                "risk_level": None,
+                "liquidity_score": None,
+                "concentration_score": None,
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "error": "No positive portfolio market value available for summary",
+            }
         
         if not price_data_dict:
             return {
@@ -1726,12 +2078,43 @@ async def get_analytics_summary(
         
         # Combine price data, restricted to actual holding history. The
         # unmasked dict is kept for instrument (asset) volatility below.
-        holdings = await resolve_holdings(db, requested_tickers)
+        holdings = await resolve_holdings(db, calculation_tickers)
         unmasked_dict = price_data_dict
         price_data_dict, effectives = holding_window(price_data_dict, holdings)
         price_data = pd.DataFrame(price_data_dict)
+        if price_data.empty:
+            return {
+                "portfolio_value": round(portfolio_value, 2),
+                "portfolio_value_currency": "INR",
+                "currency": "INR",
+                "base_currency": "INR",
+                "currency_provenance": currency_provenance,
+                "total_positions": len(weights),
+                "realized_volatility": None,
+                "instrument_volatility": None,
+                "forecast_volatility": None,
+                "sharpe_ratio": None,
+                "max_drawdown": None,
+                "risk_score": None,
+                "risk_level": None,
+                "liquidity_score": None,
+                "concentration_score": None,
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "universe_coverage": _universe_coverage(requested_tickers, []),
+                "data_status": "unavailable",
+                "error": "No usable price data within the holding window for summary",
+            }
         covered_days = int(len(price_data))
-        history_coverage = holding_coverage(effectives, start, end, covered_days)
+        per_ticker = {
+            ticker: {
+                "raw_days": int(len(unmasked_dict.get(ticker))) if ticker in unmasked_dict and unmasked_dict[ticker] is not None else 0,
+                "masked_days": int(len(price_data_dict.get(ticker))) if ticker in price_data_dict and price_data_dict[ticker] is not None else 0,
+                "limited_history": bool(getattr(unmasked_dict.get(ticker), "attrs", {}).get("limited_history", False)),
+                "coverage_reason": getattr(unmasked_dict.get(ticker), "attrs", {}).get("coverage_reason"),
+            }
+            for ticker in requested_tickers
+        }
+        history_coverage = holding_coverage(effectives, start, end, covered_days, per_ticker)
 
         # Calculate portfolio metrics for summary
         metrics = await analytics_engine.calculate_portfolio_metrics(price_data, weights)
@@ -1744,10 +2127,25 @@ async def get_analytics_summary(
         # Same best-effort benchmark leg as /risk-score so scores agree.
         benchmark_returns = None
         try:
-            benchmark_returns = await get_benchmark_service(db).get_returns(start=start, end=end)
+            benchmark_returns = await benchmark_service.get_returns(start=start, end=end)
         except Exception:
             logger.warning("Benchmark data unavailable")
-        risk_result = await analytics_engine.risk_scoring(price_data, weights, benchmark_data=benchmark_returns)
+        summary_return_counts = price_data.pct_change(fill_method=None).iloc[1:].notna().sum()
+        summary_usable_tickers = [
+            ticker for ticker in weights
+            if ticker in summary_return_counts.index and int(summary_return_counts[ticker]) > 0
+        ]
+        summary_weights = {
+            ticker: float(weights[ticker])
+            for ticker in summary_usable_tickers
+        }
+        summary_weight_total = sum(summary_weights.values())
+        if summary_weight_total > 0:
+            summary_weights = {
+                ticker: weight / summary_weight_total
+                for ticker, weight in summary_weights.items()
+            }
+        risk_result = await analytics_engine.risk_scoring(price_data, summary_weights, benchmark_data=benchmark_returns)
 
         # Instrument volatility on the UNMASKED window (same asset-risk logic
         # as realized-risk): never N/A-gated by intersection length.
@@ -1764,7 +2162,34 @@ async def get_analytics_summary(
             instrument_volatility = iv_payload["instrument_volatility"]
 
         # Generate summary (annualized ratios suppressed on short history).
-        coverage = _universe_coverage(requested_tickers, price_data.columns)
+        return_frame = price_data.pct_change(fill_method=None).iloc[1:]
+        return_observations = {
+            ticker: int(return_frame[ticker].notna().sum())
+            for ticker in requested_tickers
+            if ticker in return_frame.columns
+        }
+        for ticker, count in return_observations.items():
+            per_ticker.setdefault(ticker, {})["return_observations"] = count
+        history_coverage["tickers"].update({
+            ticker: {
+                **history_coverage["tickers"].get(ticker, {}),
+                "return_observations": count,
+            }
+            for ticker, count in return_observations.items()
+        })
+        available_tickers = [
+            ticker for ticker, count in return_observations.items() if count >= 2
+        ]
+        limited_history = any(
+            count < MIN_ANNUALIZE_DAYS for count in return_observations.values()
+        )
+        coverage = _universe_coverage(requested_tickers, available_tickers)
+        if coverage["status"] == "unavailable":
+            summary_status = "unavailable"
+        elif coverage["status"] == "partial" or limited_history or risk_result.get("error") or risk_result.get("overall_score") is None:
+            summary_status = "partial"
+        else:
+            summary_status = "available"
         summary = {
             "portfolio_value": round(portfolio_value, 2),
             "portfolio_value_currency": "INR",
@@ -1789,7 +2214,7 @@ async def get_analytics_summary(
             "latest_observation_date": _latest_observation_date(price_data),
             "history_coverage": history_coverage,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] else "partial",
+            "data_status": summary_status,
             "methodology": "Real-time portfolio analytics summary with multi-factor risk assessment"
         }
         apply_annualization_gate(summary, ["realized_volatility", "sharpe_ratio"], covered_days)
@@ -2013,6 +2438,17 @@ async def _build_wide_returns(
     realized analytics never attribute pre-purchase price action.
     Hypothetical tools (optimize/backtest/monte-carlo) omit it on purpose.
     """
+    requested_ticker_list = list(dict.fromkeys(ticker_list))
+    if weights:
+        active_set = set(_active_weight_tickers(weights))
+        if active_set:
+            requested_ticker_list = [
+                ticker for ticker in requested_ticker_list
+                if str(ticker).upper() in active_set
+            ]
+    if not requested_ticker_list:
+        raise ValueError("No active portfolio weights available for the requested window")
+    ticker_list = requested_ticker_list
     price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
     if not price_data_dict:
         raise ValueError("No price data available for the requested window")
@@ -2028,6 +2464,13 @@ async def _build_wide_returns(
     returns_df = prices.pct_change(fill_method=None)
     if len(returns_df) > 1:
         returns_df = returns_df.iloc[1:]
+    finite_columns = [
+        ticker for ticker in returns_df.columns
+        if returns_df[ticker].notna().any()
+    ]
+    if not finite_columns:
+        raise ValueError("No finite return observations for the requested window")
+    returns_df = returns_df.loc[:, finite_columns]
     portfolio_returns = aggregate_active_returns(returns_df, weights)
     if portfolio_returns.empty:
         raise ValueError("No active return observations for the requested window")
@@ -2038,6 +2481,9 @@ async def _build_wide_returns(
         ticker: {
             "raw_days": int(len(raw_price_data_dict[ticker])) if ticker in raw_price_data_dict and raw_price_data_dict[ticker] is not None else 0,
             "masked_days": int(len(masked_dict[ticker])) if ticker in masked_dict and masked_dict[ticker] is not None else 0,
+            "return_observations": int(returns_df[ticker].notna().sum()) if ticker in returns_df.columns else 0,
+            "limited_history": bool(getattr(raw_price_data_dict.get(ticker), "attrs", {}).get("limited_history", False)),
+            "coverage_reason": getattr(raw_price_data_dict.get(ticker), "attrs", {}).get("coverage_reason"),
         }
         for ticker in ticker_list
     }
@@ -2239,11 +2685,16 @@ async def get_tear_sheet(
 
         coverage = _universe_coverage(ticker_list, returns_df.columns)
         full_coverage = _universe_coverage(ticker_list, full_returns_df.columns)
+        tear_sheet_status = (
+            "unavailable" if coverage["status"] == "unavailable"
+            else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
+            else "available"
+        )
         return {
             "window": {"start": start, "end": end},
             "holdings": weights,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] else "partial",
+            "data_status": tear_sheet_status,
             "latest_observation_date": _latest_observation_date(port_ret),
             "calculation_basis": {
                 "realized": "holding_truthed_current_composition",
@@ -2438,7 +2889,11 @@ async def get_risk_contribution(
             },
             "sector_rollup": sector_rollup,
             "universe_coverage": coverage,
-            "data_status": "available" if not coverage["missing_tickers"] else "partial",
+            "data_status": (
+                "unavailable" if coverage["status"] == "unavailable"
+                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
+                else "available"
+            ),
             "latest_observation_date": _latest_observation_date(port_ret),
             "calculation_window": {"start": start, "end": end, "days": len(port_ret)},
             # A leg can support one model while its history is underdetermined for the other.
@@ -2503,7 +2958,15 @@ async def run_optimization(
                     ann_vol = float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) > 1 else None
                     if ann_vol and ann_vol > 0:
                         sharpe = float((ann_ret - rf) / ann_vol)
-            coverage = _universe_coverage(ticker_list, [single_t] if prices is not None and len(prices) > 1 else [])
+            single_usable = prices is not None and len(prices) > 1 and len(rets) >= MIN_ANNUALIZE_DAYS
+            coverage = _universe_coverage(ticker_list, [single_t] if single_usable else [])
+            if single_usable:
+                single_status = "available"
+                single_error = None
+            else:
+                ann_ret = ann_vol = sharpe = None
+                single_status = "unavailable" if coverage["status"] == "unavailable" else "partial"
+                single_error = "Insufficient return history for optimization"
             return {
                 "strategy": strategy,
                 "weights": {single_t: 1.0},
@@ -2515,6 +2978,8 @@ async def run_optimization(
                 "current_weights": {single_t: 1.0},
                 "trades_required": {},
                 "universe_coverage": coverage,
+                "data_status": single_status,
+                "error": single_error,
                 "disclaimer": "Single holding portfolio: weight is 100.00%.",
             }
 
@@ -2524,8 +2989,24 @@ async def run_optimization(
         # Optimizers require a finite common sample.  Dropping incomplete
         # observations is explicit; never impute a pre-listing return.
         returns_df = returns_df.dropna(how="any")
-        if returns_df.empty:
-            raise HTTPException(status_code=422, detail="Insufficient common return history for optimization")
+        if returns_df.empty or len(returns_df) < MIN_ANNUALIZE_DAYS:
+            coverage = _universe_coverage(ticker_list, [])
+            return {
+                "strategy": strategy,
+                "weights": {},
+                "expected_annual_return": None,
+                "expected_annual_volatility": None,
+                "expected_sharpe": None,
+                "solver": None,
+                "universe": ticker_list,
+                "calculation_universe": [],
+                "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
+                "trades_required": {},
+                "universe_coverage": coverage,
+                "data_status": "unavailable" if coverage["status"] == "unavailable" else "partial",
+                "data_unavailable_tickers": coverage["missing_tickers"],
+                "error": "Insufficient common return history for optimization",
+            }
 
         result = await _run_cpu(
             optimize,
@@ -2563,7 +3044,7 @@ async def run_optimization(
             "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
             "trades_required": dict(sorted(trades.items(), key=lambda kv: abs(kv[1]["weight_delta"]), reverse=True)),
             "universe_coverage": coverage,
-            "data_status": "partial" if missing_tickers else "available",
+            "data_status": "partial" if missing_tickers or result.get("error") else coverage["status"],
             "data_unavailable_tickers": sorted(missing_tickers),
             "weight_basis": "available_universe_renormalized" if missing_tickers else "full_universe",
             "disclaimer": "Educational optimization output; not investment advice.",
@@ -2613,7 +3094,7 @@ async def run_backtest(
         start = (datetime.now() - timedelta(days=total_history_days)).strftime("%Y-%m-%d")
         returns_df, _, _ = await _build_wide_returns(ticker_list, current_weights, start, end, data_service)
         returns_df = returns_df.dropna(how="any")
-        if returns_df.empty:
+        if returns_df.empty or len(returns_df) < MIN_ANNUALIZE_DAYS:
             raise HTTPException(status_code=422, detail="Insufficient common return history for backtest")
 
         res = await _run_cpu(
@@ -2659,12 +3140,14 @@ async def get_regime(
         if with_portfolio:
             try:
                 portfolio_tickers, weights = await resolve_allocation(None, db)
-                end = datetime.now().strftime("%Y-%m-%d")
-                start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-                _, port_ret, history_coverage = await _build_wide_returns(
-                    portfolio_tickers, weights, start, end, data_service,
-                    holdings=await resolve_holdings(db, portfolio_tickers),
-                )
+                calculation_tickers = _active_weight_tickers(weights)
+                if calculation_tickers:
+                    end = datetime.now().strftime("%Y-%m-%d")
+                    start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+                    _, port_ret, history_coverage = await _build_wide_returns(
+                        calculation_tickers, weights, start, end, data_service,
+                        holdings=await resolve_holdings(db, calculation_tickers),
+                    )
             except (ValueError, HTTPException):
                 logger.debug("Regime portfolio leg unavailable")
                 port_ret = None
@@ -2681,15 +3164,14 @@ async def get_regime(
                 history_coverage.get("model_used_tickers", []),
             )
             result["data_status"] = (
-                "available"
-                if not result["universe_coverage"]["missing_tickers"]
-                else "partial"
+                "unavailable" if result["universe_coverage"]["status"] == "unavailable"
+                else "partial" if result["universe_coverage"]["status"] == "partial" or (0 if port_ret is None else len(port_ret)) < MIN_ANNUALIZE_DAYS
+                else "available"
             )
         elif with_portfolio:
             result["universe_coverage"] = _universe_coverage(portfolio_tickers, [])
             result["portfolio_data_status"] = "unavailable"
-            if portfolio_tickers:
-                result["data_status"] = "partial"
+            result["data_status"] = "unavailable"
         return result
     except ValueError:
         raise HTTPException(status_code=409, detail="Analytics request could not be completed")
@@ -2753,6 +3235,11 @@ async def run_monte_carlo(
         _, port_ret, history_coverage = await _build_wide_returns(
             ticker_list, weights, start, end, data_service
         )
+        if len(port_ret) < MIN_ANNUALIZE_DAYS:
+            raise HTTPException(
+                status_code=422,
+                detail="Insufficient common return history for Monte Carlo simulation",
+            )
 
         result = await _run_cpu(
             simulate_goal,
@@ -2772,7 +3259,11 @@ async def run_monte_carlo(
                 history_coverage.get("model_used_tickers", []),
             )
             result["universe_coverage"] = coverage
-            result["data_status"] = "available" if not coverage["missing_tickers"] else "partial"
+            result["data_status"] = (
+                "unavailable" if coverage["status"] == "unavailable"
+                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
+                else "available"
+            )
         return result
     except HTTPException:
         raise
@@ -2850,7 +3341,11 @@ async def get_correlation_stability(
                 "requested_tickers": coverage["requested_tickers"],
                 "available_tickers": coverage["available_tickers"],
                 "missing_tickers": coverage["missing_tickers"],
-                "data_status": "available" if not coverage["missing_tickers"] else "partial",
+                "data_status": (
+                    "unavailable" if coverage["status"] == "unavailable"
+                    else "partial" if coverage["status"] == "partial" or len(returns_df) < MIN_ANNUALIZE_DAYS
+                    else "available"
+                ),
                 "universe_coverage": coverage,
             }
         )
@@ -2920,9 +3415,27 @@ async def get_cointegration_pairs(
         price_data_dict = await _fetch_price_series_dict(data_service, ticker_list, start, end)
 
         if len(price_data_dict) < 2:
-            raise HTTPException(
-                status_code=404,
-                detail="Insufficient price data available for at least 2 tickers",
+            coverage = _universe_coverage(ticker_list, price_data_dict.keys())
+            return CointScannerResponse(
+                as_of=end,
+                as_of_semantics="request_end_no_usable_price_data",
+                latest_observation_date=_latest_observation_date(price_data_dict),
+                universe_size=len(ticker_list),
+                requested_universe_size=len(ticker_list),
+                requested_tickers=coverage["requested_tickers"],
+                available_tickers=coverage["available_tickers"],
+                missing_tickers=coverage["missing_tickers"],
+                universe_coverage=coverage,
+                scanned_pairs_count=0,
+                analyzed_pairs_count=0,
+                cointegrated_pairs_count=0,
+                returned_pairs_count=0,
+                returned_cointegrated_pairs_count=0,
+                returned_non_cointegrated_pairs_count=0,
+                unpairable_tickers=[],
+                data_status=coverage["status"],
+                pairs=[],
+                error="Insufficient price data available for at least 2 tickers",
             )
 
         coint_service = CointegrationService(db_session=db, cache_service=cache_service)
@@ -2945,8 +3458,9 @@ async def get_cointegration_pairs(
                 "returned_pairs_count": len(result.pairs),
                 "returned_cointegrated_pairs_count": returned_cointegrated,
                 "returned_non_cointegrated_pairs_count": len(result.pairs) - returned_cointegrated,
-                "data_status": "partial" if coverage["missing_tickers"] or result.unpairable_tickers else "available",
+                "data_status": "partial" if coverage["status"] == "partial" or result.unpairable_tickers else coverage["status"],
                 "universe_coverage": coverage,
+                "error": result.error if hasattr(result, "error") else None,
             }
         )
     except HTTPException:
@@ -2968,13 +3482,23 @@ async def get_india_institutional_flows(
     try:
         from app.services.india_data_service import IndiaDataService
         india_svc = IndiaDataService(db=db)
-        flows = await india_svc.get_institutional_flows(lookback_days=lookback_days)
+        flow_result = await india_svc.get_institutional_flows(
+            lookback_days=lookback_days, return_metadata=True
+        )
+        if isinstance(flow_result, list):
+            # Compatibility with older injected service doubles.
+            flows = flow_result
+            flow_result = {
+                "flows": flows,
+                "count": len(flows),
+                "as_of": flows[-1].get("date") if flows else None,
+                "available_categories": [],
+                "missing_categories": ["FII", "DII"] if flows else ["FII", "DII"],
+                "data_status": "partial" if flows else "unavailable",
+            }
         return {
             "lookback_days": lookback_days,
-            "flows": flows,
-            "count": len(flows),
-            "as_of": flows[-1].get("date") if flows else None,
-            "data_status": "available" if flows else "unavailable",
+            **flow_result,
         }
     except Exception:
         logger.error("Institutional flows request failed")
@@ -2996,8 +3520,7 @@ async def get_delivery_anomalies(
             parsed = _parse_tickers(tickers)
             symbol_list = [t for t in (parsed or "").split(",") if t]
         else:
-            allocation = await _load_portfolio_allocation(db) or {}
-            symbol_list = list(allocation.keys())
+            symbol_list = await _load_portfolio_tickers(db)
 
         if not symbol_list:
             return {
@@ -3127,7 +3650,9 @@ async def get_liquidity_limits(
             result_payload.setdefault("warnings", []).append(
                 "Missing price history: " + ", ".join(sorted(fetch_failures))
             )
-        if coverage["available_tickers"] and coverage["missing_tickers"]:
+        if coverage["status"] == "unavailable":
+            result_payload["data_status"] = "unavailable"
+        elif coverage["status"] == "partial":
             result_payload["data_status"] = "partial"
         if ad_hoc:
             # Synthetic per-ticker placeholders must not masquerade as a real
@@ -3178,7 +3703,11 @@ async def get_volatility_cone(
         )
         if isinstance(cone_data, dict):
             cone_data["universe_coverage"] = coverage
-            cone_data["data_status"] = "available" if not coverage["missing_tickers"] else "partial"
+            cone_data["data_status"] = (
+                "unavailable" if coverage["status"] == "unavailable"
+                else "partial" if coverage["status"] == "partial" or len(port_ret) < MIN_ANNUALIZE_DAYS
+                else "available"
+            )
             cone_data["latest_observation_date"] = _latest_observation_date(port_ret)
         return cone_data
     except HTTPException:
@@ -3248,7 +3777,7 @@ async def get_tail_risk_and_copula(
         start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         cache_key = (
             _TAILS_RESPONSE_CONTRACT_VERSION,
-            tuple(sorted(ticker_list)), start, end, confidence_level,
+            tuple(ticker_list), start, end, confidence_level,
             threshold_quantile, _normalised_weights_key(weights),
         )
         cache_generation = _TAILS_CACHE_GENERATION
@@ -3272,14 +3801,15 @@ async def get_tail_risk_and_copula(
         evt_stats, tail_copula_matrix = await _run_cpu(_calculate_tail_sync)
 
         matrix_tickers = list((tail_copula_matrix or {}).get("tickers", []))
+        coverage = _universe_coverage(ticker_list, matrix_tickers)
         response = {
             **evt_stats,
             "tail_dependence_matrix": tail_copula_matrix,
             # Keep the legacy top-level list aligned with the matrix it describes.
             "tickers": matrix_tickers,
             "requested_tickers": ticker_list,
-            "universe_coverage": _universe_coverage(ticker_list, matrix_tickers),
-            "data_status": "available" if set(matrix_tickers) >= set(ticker_list) else "partial",
+            "universe_coverage": coverage,
+            "data_status": coverage["status"],
             "observations": len(port_ret),
         }
         if cache_generation == _TAILS_CACHE_GENERATION:

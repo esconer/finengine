@@ -451,6 +451,9 @@ async def test_b11_institutional_flow_lookback_counts_stored_sessions(test_db):
     await service.ingest_institutional_flow(datetime(2025, 1, 5), "FII", 30, 5)
     flows = await service.get_institutional_flows(lookback_days=2)
     assert [item["date"] for item in flows] == ["2025-01-02", "2025-01-05"]
+    metadata = await service.get_institutional_flows(lookback_days=2, return_metadata=True)
+    assert metadata["data_status"] == "partial"
+    assert metadata["missing_categories"] == ["DII"]
 
 
 @pytest.mark.asyncio
@@ -468,7 +471,7 @@ async def test_b11_missing_liquidity_is_null_and_valid_formula_measured(test_db)
     row = measured["positions"][0]
     assert row["adv_30d_shares"] == 1000.0
     assert row["days_to_liquidate_10pct_adv"] > 0
-    assert row["data_status"] in {"measured", "partial"}
+    assert row["data_status"] in {"available", "partial"}
     assert compute_days_to_liquidate(100, 1000, .1) == 1.0
     assert compute_amihud_illiquidity(pd.Series([.01]), pd.Series([1000.])) > 0
 

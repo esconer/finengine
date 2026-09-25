@@ -547,12 +547,17 @@ export interface CointegrationResponse {
     z_score: number;
     is_cointegrated: boolean;
   }>;
+  data_status?: 'available' | 'partial' | 'unavailable';
+  error?: string | null;
 }
 
 export interface IndiaFlowsResponse {
   delivery_spikes: Array<{ ticker: string; delivery_pct: number; avg_delivery_pct: number; spike: boolean }>;
-  institutional_flows: { fii_net_cr: number; dii_net_cr: number; date: string };
+  institutional_flows: { fii_net_cr: number | null; dii_net_cr: number | null; date: string };
   adv_liquidity: Record<string, { adv_shares: number; days_to_liquidate_10pct: number; days_to_liquidate_20pct: number }>;
+  data_status?: 'available' | 'partial' | 'unavailable';
+  available_categories?: string[];
+  missing_categories?: string[];
 }
 
 // Equity Research Types

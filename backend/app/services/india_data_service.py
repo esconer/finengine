@@ -294,8 +294,15 @@ class IndiaDataService:
             await self.db.rollback()
             raise ProviderUnavailableError("Institutional-flow persistence failed", provider="india_data") from exc
 
-    async def get_institutional_flows(self, lookback_days: int = 30) -> List[Dict[str, Any]]:
-        """Return the latest N stored trading sessions, not N calendar days."""
+    async def get_institutional_flows(
+        self, lookback_days: int = 30, return_metadata: bool = False
+    ) -> Any:
+        """Return the latest N stored trading sessions, not N calendar days.
+
+        When metadata is requested, report which institutional categories were
+        actually stored.  A missing FII/DII leg must not be rendered as a
+        measured zero flow.
+        """
         if not isinstance(lookback_days, int) or isinstance(lookback_days, bool) or lookback_days < 1:
             raise ProviderInvalidInputError("lookback_days must be a positive integer", provider="india_data")
         result = await self.db.execute(
@@ -303,19 +310,51 @@ class IndiaDataService:
         )
         flows = result.scalars().all()
         date_map: Dict[str, Dict[str, Any]] = {}
+        categories_by_day: Dict[str, set[str]] = {}
         for flow in flows:
             day = flow.date.strftime("%Y-%m-%d")
             if day not in date_map and len(date_map) >= lookback_days:
                 break
             item = date_map.setdefault(
-                day, {"date": day, "fii_net_crores": 0.0, "dii_net_crores": 0.0, "total_net_crores": 0.0}
+                day,
+                {
+                    "date": day,
+                    "fii_net_crores": None,
+                    "dii_net_crores": None,
+                    "total_net_crores": None,
+                    "available_categories": [],
+                },
             )
-            if flow.category == "FII":
-                item["fii_net_crores"] = round(flow.net_value_crores, 2)
-            elif flow.category == "DII":
-                item["dii_net_crores"] = round(flow.net_value_crores, 2)
-            item["total_net_crores"] = round(item["fii_net_crores"] + item["dii_net_crores"], 2)
-        return sorted(date_map.values(), key=lambda item: item["date"])
+            categories_by_day.setdefault(day, set())
+            if flow.category in {"FII", "DII"}:
+                categories_by_day[day].add(flow.category)
+                item[f"{flow.category.lower()}_net_crores"] = round(flow.net_value_crores, 2)
+                item["available_categories"] = sorted(categories_by_day[day])
+            if item["fii_net_crores"] is not None and item["dii_net_crores"] is not None:
+                item["total_net_crores"] = round(
+                    item["fii_net_crores"] + item["dii_net_crores"], 2
+                )
+        ordered = sorted(date_map.values(), key=lambda item: item["date"])
+        if not return_metadata:
+            return ordered
+        available_categories = sorted({
+            category for categories in categories_by_day.values() for category in categories
+        })
+        missing_categories = sorted({"FII", "DII"} - set(available_categories))
+        if not ordered:
+            status = "unavailable"
+        elif missing_categories:
+            status = "partial"
+        else:
+            status = "available"
+        return {
+            "flows": ordered,
+            "count": len(ordered),
+            "as_of": ordered[-1].get("date") if ordered else None,
+            "available_categories": available_categories,
+            "missing_categories": missing_categories,
+            "data_status": status,
+        }
 
     async def get_delivery_anomalies(
         self,
@@ -422,15 +461,39 @@ class IndiaDataService:
             } else "USD"
             return native_value, base_value, rate, native_currency
 
-        total_value = sum(position_values(position)[1] for position in positions)
+        total_value = sum(
+            value
+            for value in (position_values(position)[1] for position in positions)
+            if math.isfinite(value) and value > 0
+        )
         weighted_amihud: Optional[float] = 0.0
         weighted_days_10: Optional[float] = 0.0
         weighted_days_20: Optional[float] = 0.0
-        all_available = True
+        all_available = total_value > 0
         any_available = False
 
         for position in positions:
             native_value, position_value, fx_rate, native_currency = position_values(position)
+            if not math.isfinite(position_value) or position_value <= 0:
+                position_limits.append({
+                    "ticker": position.ticker,
+                    "position_value": 0.0,
+                    "position_value_native": round(native_value, 2),
+                    "native_currency": native_currency,
+                    "base_currency": base_currency,
+                    "fx_rate": fx_rate,
+                    "weight": 0.0,
+                    "adv_30d_shares": None,
+                    "adv_30d_rupees": None,
+                    "days_to_liquidate_10pct_adv": None,
+                    "days_to_liquidate_20pct_adv": None,
+                    "amihud_illiquidity": None,
+                    "max_sane_position_value": None,
+                    "liquidity_tier": "UNAVAILABLE",
+                    "is_oversized_vs_adv": None,
+                    "data_status": "unavailable",
+                })
+                continue
             weight = position_value / total_value if total_value > 0 else (1.0 / len(positions) if positions else 0.0)
             frame = self._find_frame(price_history, position.ticker)
             volume_col = close_col = None
@@ -456,7 +519,7 @@ class IndiaDataService:
                         amihud = compute_amihud_illiquidity(returns, rupee_volume)
                         days_10 = compute_days_to_liquidate(position_value, adv_rupees, 0.10)
                         days_20 = compute_days_to_liquidate(position_value, adv_rupees, 0.20)
-                        data_status = "measured" if amihud is not None and days_10 is not None else "partial"
+                        data_status = "available" if amihud is not None and days_10 is not None else "partial"
             if days_10 is None or adv_rupees is None:
                 all_available = False
             else:
@@ -503,6 +566,6 @@ class IndiaDataService:
             "portfolio_weighted_days_to_liquidate_10pct": None if not all_available else round(weighted_days_10 or 0.0, 2),
             "portfolio_weighted_days_to_liquidate_20pct": None if not all_available else round(weighted_days_20 or 0.0, 2),
             "portfolio_amihud_score": None if not all_available else round(weighted_amihud or 0.0, 6),
-            "data_status": "measured" if all_available else "partial" if any_available else "unavailable",
+            "data_status": "available" if all_available else "partial" if any_available else "unavailable",
             "positions": position_limits,
         }

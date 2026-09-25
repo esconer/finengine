@@ -456,6 +456,7 @@ class CointScannerResponse(BaseModel):
     unpairable_tickers: List[str] = Field(default_factory=list)
     data_status: str = "available"
     universe_coverage: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 # Volatility Term Structure & Cone Schemas

@@ -20,3 +20,8 @@ importance: medium
 - Tail-dependence parent tickers must equal the nested matrix ticker order; retain the requested superset separately. Cache keys need a response-contract version when the response shape changes.
 - A domain response may contain a numeric `components` map (risk score) without being a nested status envelope; status detection must require child objects with explicit status fields.
 - Per-position annualization gates must use that position's own `data_points`, not the portfolio's shared holding-window count; otherwise a 20-day ETF can publish annualized metrics beside `is_limited_history=true`.
+- Coverage status must be `unavailable` when a requested universe has zero usable results; `partial` is only for a non-empty covered subset. Keep the full persisted roster in requested coverage while calculating only positive finite active weights.
+- Route functions called from the AI exporter must receive injected benchmark/data dependencies explicitly; constructing a dependency inside the handler bypasses FastAPI overrides and test seams.
+- Latest-observation metadata must inspect DataFrame mappings and date columns, not only Series indexes; otherwise a valid DataFrame price frame is reported as having no observation date.
+- India flow availability must be category-aware: preserve missing FII/DII legs as null/partial metadata rather than zero-filling them; the UI must branch on `data_status` before showing an empty/no-anomaly result.
+- Ordered request metadata belongs in response-cache identity; sorting ticker order in a cache key can return the previous request's `requested_tickers` order.
