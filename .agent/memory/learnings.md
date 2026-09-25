@@ -31,3 +31,4 @@ importance: medium
 - Late-listing acceptance metadata must survive L1/L2 cache slicing; annotate every cache-hit frame, not only fresh vendor responses.
 - Empty performance/analytics collections are unavailable, not available empty successes; unavailable payloads must not retain plausible fallback score/risk constants.
 - Cointegration cache identity must include a digest of effective overlapping prices, not only dates/counts, or same-day corrections reuse stale diagnostics.
+- **bfinance approval gate:** bfinance is the user-owned India market-data source intended as a yfinance alternative. Treat its source project as read-only unless the user explicitly approves a change. Before proposing or making any bfinance modification, first create a source-specific written document explaining the evidence, issue, proposed design, compatibility impact, and verification plan, then ask the user for approval and wait.
