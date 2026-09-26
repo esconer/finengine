@@ -373,6 +373,121 @@ STRESS_CONFIDENCE_LABEL = 0.95
 RISK_CORRELATION_POINTS_PER_UNIT = 50.0
 
 # ---------------------------------------------------------------------------
+# risk-score composition disclosure (RL-3)
+# ---------------------------------------------------------------------------
+# `overall_score` is a weighted average of five 0-30 sub-scores, and the
+# arithmetic was never wrong.  What the payload did not say is how much of the
+# headline is evidence.  Two of the five legs are not independent measurements,
+# and a third is pinned at its ceiling, so a reader counting five components was
+# counting one twice and a constant once.  The constants below are what make
+# each leg recomputable from one published input, and they are the single source
+# of truth for BOTH the applied weights and the published weights, so a
+# published weight cannot drift from the applied one.
+
+#: Ceiling of every leg's 0-30 sub-score scale (higher is riskier).  Each leg is
+#: ``min(CAP, <expression of exactly one published input>)``, so a leg sitting ON
+#: this number is not a measurement of a large risk: it is the ceiling, reached
+#: by every input past that leg's own unpinning threshold.  That is why
+#: saturation has to be stated rather than left for the reader to infer from the
+#: value: 30 is a reading and a ceiling at the same time.
+RISK_SCORE_CAP = 30.0
+
+#: Rows in the market-risk leg's "recent" window.  When the delivered portfolio
+#: return series is no longer than this the window IS the whole series, so the
+#: market leg measures exactly the statistic the volatility leg already measured
+#: and the two sub-scores are the same number.  The duplication is a property of
+#: the SAMPLE LENGTH, not of the code, so it is measured from the series that was
+#: actually delivered and published either way -- it clears itself as history
+#: grows past 60 rows, and a hard-coded "these two are the same" would be wrong
+#: the moment the book is older than the window.
+RISK_MARKET_WINDOW_ROWS = 60
+
+#: Nominal leg weights, in report order.  Sums to 1.0.  A leg that could not be
+#: measured is dropped and the remainder renormalized (`excluded_components`).
+RISK_SCORE_WEIGHTS: Dict[str, float] = {
+    "concentration": 0.20,
+    "volatility": 0.25,
+    "correlation": 0.20,
+    "factor_risk": 0.25,
+    "market_risk": 0.10,
+}
+
+#: R-squared at or below which the factor leg's uncapped expression
+#: ``(1 - R^2) * 100`` has already reached :data:`RISK_SCORE_CAP`.  The leg
+#: publishes 30 for EVERY R^2 at or under this, so on a book whose benchmark
+#: explains little variance it contributes a constant.
+RISK_FACTOR_UNPIN_R_SQUARED = 1.0 - RISK_SCORE_CAP / 100.0
+
+#: One row per leg: what the leg is computed FROM, so a reader can recompute it
+#: instead of trusting it.  ``cap_binding_input`` is the input value at which the
+#: leg's uncapped expression equals :data:`RISK_SCORE_CAP`, and
+#: ``unpin_condition`` says which side of it the leg is on -- a leg at its cap
+#: can only move when its input crosses back over that threshold.
+#:
+#: ``duplication_group`` names the statistic family in which a SECOND leg would
+#: stop being independent evidence.  ``None`` means no other leg measures the
+#: same quantity, so duplication is structurally impossible for that leg; it is
+#: a claim about the table, and the table is published beside the scores.
+RISK_SCORE_LEG_SPECS: Dict[str, Dict[str, Any]] = {
+    "concentration": {
+        "input_statistic": "herfindahl_index",
+        "input_units": "sum_of_squared_active_portfolio_weights",
+        "formula": "min(30, herfindahl_index * 100)",
+        "cap_binding_input": RISK_SCORE_CAP / 100.0,
+        "cap_binds_when_input_is": ">= 0.30",
+        "unpin_condition": "herfindahl_index < 0.30",
+        "published_input_as": "score_audit.components.concentration.input_statistic_value",
+        "duplication_group": None,
+    },
+    "volatility": {
+        "input_statistic": "portfolio_return_annualized_volatility",
+        "input_units": "annualized_fraction_of_1",
+        "formula": "min(30, portfolio_returns.std() * sqrt(252) * 100)",
+        "cap_binding_input": RISK_SCORE_CAP / 100.0,
+        "cap_binds_when_input_is": ">= 0.30 (30% annualized)",
+        "unpin_condition": "annualized portfolio volatility < 0.30",
+        "published_input_as": "score_audit.components.volatility.input_statistic_value",
+        "duplication_group": "portfolio_volatility",
+    },
+    "correlation": {
+        "input_statistic": "avg_pairwise_correlation",
+        "input_units": "pearson_r_over_upper_triangle",
+        "formula": (
+            "min(30, "
+            f"{RISK_CORRELATION_POINTS_PER_UNIT:g} * max(0, avg_pairwise_correlation))"
+        ),
+        "cap_binding_input": RISK_SCORE_CAP / RISK_CORRELATION_POINTS_PER_UNIT,
+        "cap_binds_when_input_is": ">= 0.60",
+        "unpin_condition": "avg pairwise correlation < 0.60",
+        "published_input_as": "avg_pairwise_correlation",
+        "duplication_group": None,
+    },
+    "factor_risk": {
+        "input_statistic": "benchmark_regression_r_squared",
+        "input_units": "fraction_of_portfolio_return_variance_explained",
+        "formula": "min(30, (1 - r_squared) * 100)",
+        "cap_binding_input": RISK_FACTOR_UNPIN_R_SQUARED,
+        "cap_binds_when_input_is": "<= 0.70",
+        "unpin_condition": "R-squared > 0.70",
+        "published_input_as": "factor_r_squared",
+        "duplication_group": None,
+    },
+    "market_risk": {
+        "input_statistic": "recent_portfolio_return_annualized_volatility",
+        "input_units": "annualized_fraction_of_1",
+        "formula": (
+            f"min(30, portfolio_returns.tail({RISK_MARKET_WINDOW_ROWS})"
+            ".std() * sqrt(252) * 100)"
+        ),
+        "cap_binding_input": RISK_SCORE_CAP / 100.0,
+        "cap_binds_when_input_is": ">= 0.30 (30% annualized)",
+        "unpin_condition": "annualized recent portfolio volatility < 0.30",
+        "published_input_as": "score_audit.components.market_risk.input_statistic_value",
+        "duplication_group": "portfolio_volatility",
+    },
+}
+
+# ---------------------------------------------------------------------------
 # forecast tail contract (SI-3 / QM-3 / AD-2)
 # ---------------------------------------------------------------------------
 # The fitted GARCH/EGARCH models use `dist='normal'`, so their conditional
@@ -1179,6 +1294,373 @@ def _market_cap_provenance(
     if np.isfinite(implied) and implied > LIQUIDITY_MARKET_CAP_FLOOR_INR:
         return implied, "estimated", "implied_annual_turnover"
     return LIQUIDITY_MARKET_CAP_FLOOR_INR, "fallback", "fixed_floor_1e9_inr"
+
+
+def _leg_series_relation(
+    leg: Optional[pd.Series], canonical: Optional[pd.Series]
+) -> Optional[str]:
+    """How `leg`'s input rows relate to the same-statistic leg's input rows.
+
+    ``"identical"`` -- the same rows, so both legs are one measurement.
+    ``"strict_subset"`` -- `leg` is a proper suffix of `canonical`, so it
+    re-measures the same statistic over a shorter window of the same series.
+    ``None`` -- genuinely different rows, so the two legs are separate
+    measurements and neither duplicates the other.
+    """
+    if leg is None or canonical is None or len(leg) == 0:
+        return None
+    if len(leg) == len(canonical) and leg.index.equals(canonical.index):
+        return "identical"
+    if len(leg) < len(canonical) and canonical.index[-len(leg) :].equals(leg.index):
+        return "strict_subset"
+    return None
+
+
+def _risk_score_audit(
+    *,
+    scores: Mapping[str, Optional[float]],
+    inputs: Mapping[str, Optional[float]],
+    input_reasons: Mapping[str, str],
+    input_samples: Mapping[str, Dict[str, Any]],
+    input_series: Mapping[str, Optional[pd.Series]],
+    excluded: Sequence[str],
+    excluded_reasons: Mapping[str, str],
+    active_weights: Mapping[str, float],
+    overall_score: float,
+) -> Dict[str, Any]:
+    """Publish the composition of `overall_score`, leg by leg.
+
+    Everything here is derived from numbers the score itself was built from, so
+    a reader can recompute the headline instead of trusting it:
+
+      * the input statistic, its units, and the rows it was measured over,
+      * the formula, the nominal weight, the weight actually applied, the cap,
+      * whether the leg is AT that cap and the input at which it would leave it,
+      * whether the leg's input is the same rows as another leg's, and why,
+      * what share of the headline each leg is actually responsible for.
+
+    Nothing here changes a score, a weight or a cap.  If a leg's input cannot be
+    established it is published as unavailable with the reason, never inferred.
+    """
+    included = [
+        name
+        for name in RISK_SCORE_WEIGHTS
+        if name not in excluded and scores.get(name) is not None
+    ]
+    # A numpy scalar would serialise as a different JSON type, and the published
+    # share has to be a plain number a reader can divide with. The denominator is
+    # the PUBLISHED headline, not the unrounded one: a share a reader cannot
+    # reproduce from the number on the payload is a number nobody can check.
+    total = round(float(overall_score), 1)
+
+    # Which leg in a shared statistic family is credited with the independent
+    # measurement: the first measured leg of the family, in report order.
+    family_canonical: Dict[str, str] = {}
+    duplicate_of: Dict[str, Optional[str]] = {n: None for n in RISK_SCORE_WEIGHTS}
+    duplicate_relation: Dict[str, Optional[str]] = {n: None for n in RISK_SCORE_WEIGHTS}
+    for name in included:
+        group = RISK_SCORE_LEG_SPECS[name].get("duplication_group")
+        if group is None:
+            continue
+        if group not in family_canonical:
+            family_canonical[group] = name
+            continue
+        canonical = family_canonical[group]
+        relation = _leg_series_relation(
+            input_series.get(name), input_series.get(canonical)
+        )
+        if relation is None:
+            continue
+        duplicate_of[name] = canonical
+        duplicate_relation[name] = relation
+
+    # A leg is pinned when its UNROUNDED sub-score is the cap.  A leg merely
+    # near the cap has headroom and is not described as pinned.
+    def _is_saturated(name: str) -> bool:
+        score = scores.get(name)
+        return (
+            name in included
+            and score is not None
+            and float(score) >= RISK_SCORE_CAP
+        )
+
+    components: Dict[str, Any] = {}
+    contributions: Dict[str, float] = {}
+    for name, nominal_weight in RISK_SCORE_WEIGHTS.items():
+        spec = RISK_SCORE_LEG_SPECS[name]
+        score = scores.get(name)
+        measured = name in included
+        saturated = _is_saturated(name)
+        weight = active_weights.get(name)
+        sample = dict(input_samples.get(name) or {})
+        entry: Dict[str, Any] = {
+            "status": (
+                "saturated_at_cap"
+                if saturated
+                else ("measured" if measured else "unmeasured")
+            ),
+            "input_statistic": spec["input_statistic"],
+            "input_statistic_value": (
+                round(float(inputs[name]), 6)
+                if measured and inputs.get(name) is not None
+                else None
+            ),
+            "input_statistic_units": spec["input_units"],
+            "input_statistic_provenance": (
+                "measured" if measured and inputs.get(name) is not None else "unavailable"
+            ),
+            "input_statistic_unavailable_reason": (
+                None
+                if measured and inputs.get(name) is not None
+                else input_reasons.get(name) or excluded_reasons.get(name)
+            ),
+            "input_sample": sample,
+            "formula": spec["formula"],
+            "nominal_weight": nominal_weight,
+            "effective_weight": round(weight, 6) if weight is not None else None,
+            "cap": RISK_SCORE_CAP,
+            "sub_score": round(float(score), 1) if score is not None else None,
+            "headroom_to_cap": (
+                round(RISK_SCORE_CAP - float(score), 6) if score is not None else None
+            ),
+            "saturated": saturated,
+            "cap_binding_input": round(float(spec["cap_binding_input"]), 6),
+            "cap_binds_when_input_is": spec["cap_binds_when_input_is"],
+            "unpin_condition": spec["unpin_condition"],
+            "duplicate_of": duplicate_of[name],
+            "duplicate_relation": duplicate_relation[name],
+            "counts_as_independent_evidence": bool(measured and not duplicate_of[name]),
+            "exclusion_reason": excluded_reasons.get(name),
+            "published_input_as": spec["published_input_as"],
+        }
+        if duplicate_of[name] == "volatility":
+            # The one duplication this table can produce, explained by the
+            # numbers that cause it rather than by a standing claim.
+            whole_rows = sample.get("rows")
+            if duplicate_relation[name] == "identical":
+                entry["duplicate_reason"] = (
+                    f"the market leg's tail({RISK_MARKET_WINDOW_ROWS}) window is "
+                    f"not shorter than the {whole_rows}-row portfolio return series "
+                    f"it reads, so both legs are min(30, std * sqrt(252) * 100) "
+                    f"over the same rows and publish the same number"
+                )
+                entry["duplicate_is_sample_dependent"] = True
+                entry["duplicate_clears_when"] = (
+                    f"the delivered portfolio return series grows past "
+                    f"{RISK_MARKET_WINDOW_ROWS} rows, at which point the market "
+                    f"leg reads a shorter window of the same series and stops "
+                    f"being the same number"
+                )
+            else:
+                entry["duplicate_reason"] = (
+                    "both legs measure the volatility of the SAME portfolio "
+                    f"return series: the market leg reads its last {whole_rows} "
+                    "rows and volatility reads all of them, so this is one "
+                    "statistic over one series rather than two"
+                )
+                entry["duplicate_is_sample_dependent"] = False
+                entry["duplicate_clears_when"] = (
+                    "only measuring a different statistic would clear this; the "
+                    "leg is a shorter window on the same series, not a second "
+                    "measurement"
+                )
+        elif measured:
+            entry["duplicate_is_sample_dependent"] = False
+            entry["duplicate_clears_when"] = None
+        else:
+            entry["duplicate_is_sample_dependent"] = None
+            entry["duplicate_clears_when"] = None
+        if measured and weight is not None:
+            contribution = float(score) * float(weight)
+            contributions[name] = round(contribution, 6)
+            entry["headline_contribution"] = round(contribution, 6)
+            entry["headline_share"] = (
+                round(contribution / total, 6) if total else None
+            )
+            entry["headline_share_reason"] = (
+                None
+                if total
+                else "overall_score is 0, so a share of it is undefined"
+            )
+        else:
+            entry["headline_contribution"] = 0.0
+            entry["headline_share"] = 0.0 if not total else None
+            entry["headline_share_reason"] = (
+                "leg was not measured, so it contributes nothing to the headline"
+                if not total
+                else None
+            )
+        components[name] = entry
+
+    saturated_legs = [n for n in RISK_SCORE_WEIGHTS if _is_saturated(n)]
+    duplicate_legs = [n for n in RISK_SCORE_WEIGHTS if duplicate_of[n]]
+    independent_legs = [
+        n
+        for n in RISK_SCORE_WEIGHTS
+        if n in included and not duplicate_of[n]
+    ]
+    # Every leg lands in exactly ONE bucket, so the buckets partition the
+    # headline and a leg that is BOTH a duplicate and at its cap cannot inflate
+    # two of the shares at once. The raw facts (`saturated_components`,
+    # `duplicate_components`) are published beside this and do NOT partition: a
+    # saturated duplicate is reported in both and bucketed in one.
+    bucket: Dict[str, str] = {}
+    for name in RISK_SCORE_WEIGHTS:
+        if name not in included:
+            bucket[name] = "excluded"
+        elif duplicate_of[name]:
+            bucket[name] = "duplicate"
+        elif name in saturated_legs:
+            bucket[name] = "pinned"
+        else:
+            bucket[name] = "responsive"
+    for name, value in bucket.items():
+        components[name]["headline_bucket"] = value
+    bucket_legs = {
+        key: [n for n in RISK_SCORE_WEIGHTS if bucket[n] == key]
+        for key in ("responsive", "pinned", "duplicate", "excluded")
+    }
+
+    def _weight_of(names: Sequence[str]) -> float:
+        return round(
+            sum(float(active_weights.get(n) or 0.0) for n in names), 6
+        )
+
+    def _nominal_weight_of(names: Sequence[str]) -> float:
+        return round(
+            sum(float(RISK_SCORE_WEIGHTS.get(n) or 0.0) for n in names), 6
+        )
+
+    def _share(names: Sequence[str]) -> Optional[float]:
+        """Share of the headline carried by `names`, recomputable from it."""
+        if not total:
+            return None
+        return round(
+            sum(contributions.get(n, 0.0) for n in names) / total, 6
+        )
+
+    headline_weight = round(
+        _weight_of(bucket_legs["responsive"])
+        + _weight_of(bucket_legs["pinned"])
+        + _weight_of(bucket_legs["duplicate"]),
+        6,
+    )
+    effective_information: Dict[str, Any] = {
+        "measured_leg_count": len(included),
+        "independent_leg_count": len(independent_legs),
+        "responsive_leg_count": len(bucket_legs["responsive"]),
+        "responsive_legs": bucket_legs["responsive"],
+        "responsive_weight": _weight_of(bucket_legs["responsive"]),
+        "responsive_share_of_headline": _share(bucket_legs["responsive"]),
+        "pinned_legs": bucket_legs["pinned"],
+        "pinned_weight": _weight_of(bucket_legs["pinned"]),
+        "pinned_share_of_headline": _share(bucket_legs["pinned"]),
+        "duplicate_legs": bucket_legs["duplicate"],
+        "duplicate_weight": _weight_of(bucket_legs["duplicate"]),
+        "duplicate_share_of_headline": _share(bucket_legs["duplicate"]),
+        "independent_weight": _weight_of(independent_legs),
+        # The headline is the weighted average of the legs that were MEASURED,
+        # with their weights renormalized to sum to 1, so the three weights above
+        # are the whole of it and always add up to 1. A leg that was excluded
+        # carries none of the headline by construction -- which is not the same
+        # statement as being pinned, and is kept apart from it here.
+        "headline_weight_basis": (
+            "effective (renormalized) weights; each leg sits in exactly one of "
+            "headline_bucket responsive/pinned/duplicate/excluded, and the "
+            "first three sum to 1 -- the whole headline"
+        ),
+        "headline_basis_score": total,
+        "headline_weight_total": headline_weight,
+        "unmeasured_leg_count": len(excluded),
+        "unmeasured_nominal_weight": _nominal_weight_of(list(excluded)),
+        "responsive_nominal_weight": _nominal_weight_of(bucket_legs["responsive"]),
+        "pinned_nominal_weight": _nominal_weight_of(bucket_legs["pinned"]),
+        "duplicate_nominal_weight": _nominal_weight_of(bucket_legs["duplicate"]),
+        "headline_attribution": contributions,
+        "headline_attribution_note": (
+            "contribution = unrounded sub_score x effective_weight; the "
+            "contributions sum to the unrounded overall_score, which the "
+            "payload publishes rounded to 1 decimal as overall_score, so their "
+            "sum can differ from it by up to 0.05"
+        ),
+        "share_undefined_reason": (
+            None
+            if total
+            else "overall_score is 0, so no share of the headline is defined"
+        ),
+    }
+
+    return {
+        "scale": "risk_points_0_to_30_higher_is_riskier",
+        "cap": RISK_SCORE_CAP,
+        "nominal_weights": dict(RISK_SCORE_WEIGHTS),
+        "nominal_weight_total": round(sum(RISK_SCORE_WEIGHTS.values()), 6),
+        "weight_rule": (
+            "a leg that could not be measured is dropped and the remaining "
+            "weights are renormalized to sum to 1; effective_weight is the "
+            "weight actually applied"
+        ),
+        "excluded_components": list(excluded),
+        "excluded_reasons": dict(excluded_reasons),
+        "saturated_components": saturated_legs,
+        "duplicate_components": [
+            {
+                "component": n,
+                "duplicate_of": duplicate_of[n],
+                "relation": duplicate_relation[n],
+                "sample_dependent": components[n].get("duplicate_is_sample_dependent"),
+                "clears_when": components[n].get("duplicate_clears_when"),
+            }
+            for n in duplicate_legs
+        ],
+        "independent_components": independent_legs,
+        "components": components,
+        "effective_information": effective_information,
+    }
+
+
+def _risk_score_composition_alerts(audit: Mapping[str, Any]) -> List[str]:
+    """Alerts for the legs that are not what a five-component map implies.
+
+    The `components` map is read as five independent measurements; these lines
+    are where it stops being one.
+    """
+    alerts: List[str] = []
+    components = audit.get("components") or {}
+    information = audit.get("effective_information") or {}
+
+    for entry in audit.get("duplicate_components") or []:
+        leg = entry.get("component")
+        detail = components.get(leg) or {}
+        alerts.append(
+            f"{leg} is not independent evidence: on this sample it is "
+            f"{entry.get('relation')} to {entry.get('duplicate_of')} "
+            f"({detail.get('duplicate_reason')})"
+        )
+
+    for leg in audit.get("saturated_components") or []:
+        detail = components.get(leg) or {}
+        share = (
+            f"; it carries {detail.get('headline_share')} of the headline"
+            if detail.get("headline_share") is not None
+            else ""
+        )
+        alerts.append(
+            f"{leg} is pinned at the {RISK_SCORE_CAP:g}-point cap: its input "
+            f"{detail.get('input_statistic')} = {detail.get('input_statistic_value')} "
+            f"is {detail.get('cap_binds_when_input_is')}, so the leg could only "
+            f"move if that input reached {detail.get('unpin_condition')}{share}"
+        )
+
+    responsive = information.get("responsive_weight")
+    if responsive is not None and responsive < 1.0 - 1e-9:
+        alerts.append(
+            f"only {responsive:g} of the headline weight is carried by legs that "
+            f"are distinct, measured and off their cap; the remaining "
+            f"{round(1.0 - float(responsive), 6):g} is pinned, duplicated or "
+            f"unmeasured (see score_audit.effective_information)"
+        )
+    return alerts
 
 
 class AnalyticsEngine:
@@ -2308,12 +2790,34 @@ class AnalyticsEngine:
             # sub-score that was still counted would be a fabricated 0.
             excluded: list[str] = []
             excluded_reasons: dict[str, str] = {}
+            # The published input each leg was scored from, so `score_audit`
+            # can state provenance instead of asserting it. `None` + a reason is
+            # the only way a leg's input is ever absent: an input that cannot be
+            # established is published as unknown, never inferred.
+            inputs: dict[str, Optional[float]] = {}
+            input_reasons: dict[str, str] = {}
             
             # Concentration risk (20% weight in overall score)
             concentration_result = await self.concentration_analysis(weights)
-            concentration_score = min(30, concentration_result.get('herfindahl_index', 0.1) * 100)
+            # `herfindahl_index` is the whole input of this leg, and the analysis
+            # publishes 0.0 with an `error` when it measured nothing -- a 0.0
+            # Herfindahl is impossible for a non-empty book (sum(w^2) >=
+            # 1/n > 0), so a 0.0 here is an absence wearing a measurement's
+            # clothes. The sub-score below is the original expression, untouched;
+            # only the PROVENANCE of its input is published, because a reader
+            # cannot otherwise tell a real 0.0 from an unmeasured one.
+            concentration_unavailable = bool(concentration_result.get("error"))
+            hhi = concentration_result.get('herfindahl_index', 0.1)
+            concentration_score = min(30, hhi * 100)
             scores['concentration'] = concentration_score
-            
+            inputs['concentration'] = None if concentration_unavailable else float(hhi)
+            input_reasons['concentration'] = (
+                "concentration analysis published no measured Herfindahl index "
+                f"({concentration_result.get('error')})"
+                if concentration_unavailable
+                else "measured over the active portfolio weights"
+            )
+
             # Volatility risk (25% weight). An empty series is UNMEASURED, and
             # `min(30, nan * 100)` returns 30 in Python -- a fabricated maximum
             # risk score out of nothing. The coverage gate can empty the series
@@ -2334,7 +2838,22 @@ class AnalyticsEngine:
             else:
                 volatility_score = min(30, portfolio_vol * 100)
             scores['volatility'] = volatility_score
-            
+            inputs['volatility'] = (
+                float(portfolio_vol)
+                if volatility_score is not None and portfolio_vol is not None
+                and np.isfinite(portfolio_vol)
+                else None
+            )
+            input_reasons.setdefault(
+                'volatility',
+                "std of the delivered portfolio return series, annualized by "
+                "sqrt(252)",
+            )
+            if volatility_score is None:
+                input_reasons['volatility'] = excluded_reasons.get(
+                    'volatility', "not measured"
+                )
+
             # Correlation risk (20% weight)
             #
             # The sub-score is RISK POINTS on a 0-30 scale, so 0 has to mean one
@@ -2371,7 +2890,14 @@ class AnalyticsEngine:
                     30.0, max(0.0, avg_correlation) * RISK_CORRELATION_POINTS_PER_UNIT
                 )
             scores['correlation'] = correlation_score
-            
+            inputs['correlation'] = avg_correlation
+            input_reasons['correlation'] = (
+                "mean of the finite upper-triangle pairwise Pearson correlations "
+                "of the constituent return frame"
+                if correlation_score is not None
+                else excluded_reasons.get('correlation', "not measured")
+            )
+
             # Factor risk (25% weight) — only with a real benchmark. Calling
             # factor_exposure_analysis without one yields R²=0 always, which
             # would pin this leg at max risk, so exclude + renormalize instead.
@@ -2395,10 +2921,26 @@ class AnalyticsEngine:
                 excluded.append('factor_risk')
                 excluded_reasons['factor_risk'] = "no benchmark supplied"
             scores['factor_risk'] = factor_score
-            
+            inputs['factor_risk'] = (
+                float(r_squared)
+                if isinstance(r_squared, (int, float)) and not isinstance(r_squared, bool)
+                and np.isfinite(r_squared)
+                else None
+            )
+            if factor_score is None:
+                input_reasons['factor_risk'] = excluded_reasons.get(
+                    'factor_risk', "not measured"
+                )
+            else:
+                input_reasons['factor_risk'] = (
+                    "R-squared of the portfolio-vs-benchmark OLS fit; the fit's "
+                    "own row count is measured by the route and published as "
+                    "model_observation_count"
+                )
+
             # Market risk (10% weight) - based on recent volatility. Same
             # unmeasured-is-not-zero rule as the volatility leg above.
-            recent_returns = portfolio_returns.tail(60)  # Last 60 days
+            recent_returns = portfolio_returns.tail(RISK_MARKET_WINDOW_ROWS)
             recent_vol = (
                 recent_returns.std() * np.sqrt(252)
                 if len(recent_returns) > 1
@@ -2414,16 +2956,26 @@ class AnalyticsEngine:
             else:
                 market_score = min(30, recent_vol * 100)
             scores['market_risk'] = market_score
-            
+            inputs['market_risk'] = (
+                float(recent_vol)
+                if market_score is not None and recent_vol is not None
+                and np.isfinite(recent_vol)
+                else None
+            )
+            input_reasons['market_risk'] = (
+                "std of the last "
+                f"{len(recent_returns)} delivered portfolio return rows, "
+                f"annualized by sqrt(252)"
+                if market_score is not None
+                else excluded_reasons.get('market_risk', "not measured")
+            )
+
             # Calculate overall score (weighted average; excluded legs are
-            # dropped and the remaining weights renormalized to sum to 1)
-            weights_scores = {
-                'concentration': 0.20,
-                'volatility': 0.25,
-                'correlation': 0.20,
-                'factor_risk': 0.25,
-                'market_risk': 0.10
-            }
+            # dropped and the remaining weights renormalized to sum to 1).
+            # The table is the module-level RISK_SCORE_WEIGHTS, which the audit
+            # below also publishes: one source, so a published weight cannot
+            # drift from the applied one.
+            weights_scores = dict(RISK_SCORE_WEIGHTS)
             # Belt and braces: a null sub-score is never counted, whether or not
             # it reached `excluded`. `sum()` over a None would raise, and
             # treating None as 0 is the hard-zero fabrication D-04 is about.
@@ -2450,6 +3002,58 @@ class AnalyticsEngine:
             else:
                 risk_level = "HIGH"
             change = None
+
+            # What the five sub-scores are made of. The arithmetic above is
+            # unchanged; this states, from the same numbers the score was built
+            # from, which legs are measurements, which are pinned at the cap and
+            # which re-measure a statistic another leg already measured.
+            score_audit = _risk_score_audit(
+                scores=scores,
+                inputs=inputs,
+                input_reasons=input_reasons,
+                input_samples={
+                    'concentration': {
+                        'row_kind': 'active_holdings',
+                        'rows': len(
+                            [
+                                w for w in weights.values()
+                                if isinstance(w, (int, float)) and w > 0
+                            ]
+                        ),
+                    },
+                    'volatility': {
+                        'row_kind': 'portfolio_return_rows',
+                        'rows': int(len(portfolio_returns)),
+                    },
+                    'correlation': {
+                        'row_kind': 'constituent_return_rows',
+                        'rows': int(len(returns)),
+                    },
+                    'factor_risk': {
+                        'row_kind': 'regression_rows',
+                        'rows': None,
+                        'rows_reason': (
+                            "the engine fits the regression from price_data and the "
+                            "benchmark but does not count the rows the fit kept; the "
+                            "route measures it and publishes model_observation_count"
+                        ),
+                    },
+                    'market_risk': {
+                        'row_kind': (
+                            f'portfolio_return_rows_tail_{RISK_MARKET_WINDOW_ROWS}'
+                        ),
+                        'rows': int(len(recent_returns)),
+                    },
+                },
+                input_series={
+                    'volatility': portfolio_returns,
+                    'market_risk': recent_returns,
+                },
+                excluded=excluded,
+                excluded_reasons=excluded_reasons,
+                active_weights=active_weights,
+                overall_score=overall_score,
+            )
             
             # Generate alerts
             alerts = []
@@ -2470,6 +3074,13 @@ class AnalyticsEngine:
                     f"Excluded from the weighted score ({named}); "
                     "remaining legs renormalized"
                 )
+            if concentration_unavailable:
+                alerts.append(
+                    "Concentration leg input unavailable: the sub-score was "
+                    "scored from an unmeasured Herfindahl index, not a measured "
+                    "one (see score_audit.components.concentration)"
+                )
+            alerts.extend(_risk_score_composition_alerts(score_audit))
             
             return {
                 "overall_score": round(overall_score, 1),
@@ -2486,6 +3097,17 @@ class AnalyticsEngine:
                 ),
                 "alerts": alerts,
                 "excluded_components": excluded,
+                # Siblings of `excluded_components`, same level and vocabulary: a
+                # leg that is at its ceiling, and a leg whose input is the same
+                # measurement as another leg's, are as much a part of what this
+                # score is NOT as an unmeasured leg is. `score_audit` carries the
+                # per-leg detail behind both.
+                "saturated_components": score_audit["saturated_components"],
+                "duplicate_components": score_audit["duplicate_components"],
+                "independent_component_count": score_audit["effective_information"][
+                    "independent_leg_count"
+                ],
+                "score_audit": score_audit,
                 "factor_r_squared": r_squared,
                 "methodology": (
                     "Multi-factor risk scoring with weighted components, 0-30 per "
@@ -2495,7 +3117,9 @@ class AnalyticsEngine:
                     f"leg = min(30, {RISK_CORRELATION_POINTS_PER_UNIT:g} x max(0, "
                     "avg pairwise correlation) and is null + excluded when no "
                     "finite pairwise correlation exists; factor leg requires a "
-                    "benchmark, else excluded)"
+                    "benchmark, else excluded; every leg's input statistic, "
+                    "formula, weight, cap, saturation and duplication status is "
+                    "published in score_audit)"
                 )
             }
             
@@ -3470,6 +4094,15 @@ class AnalyticsEngine:
                 "factor_risk": None,
                 "market_risk": None
             },
+            # Nothing was measured, so there is no composition to describe. The
+            # absence is stated rather than left implicit, because a consumer
+            # that reads `score_audit` on every other response has to be able to
+            # tell "no legs" from "a payload shape that predates the disclosure".
+            "saturated_components": [],
+            "duplicate_components": [],
+            "independent_component_count": None,
+            "score_audit": None,
+            "score_audit_reason": "no risk sub-score was measured",
             "alerts": ["Insufficient data for comprehensive risk analysis"],
             "error": "Insufficient data for risk scoring"
         }
