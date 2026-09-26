@@ -179,17 +179,28 @@ async def test_per_ticker_warning_uses_own_observations_not_the_portfolio():
     etf = result["positions"]["NIFTYIETF.NS"]
     assert etf["return_observations"] == 19
     assert etf["is_limited_history"] is True
-    # The portfolio's own window is materially longer than the ETF's own
-    # sample, which is what made the shared-count sentence wrong.
-    assert covered >= MIN_ANNUALIZE_DAYS > etf["return_observations"]
+    # The portfolio's sample is bounded by its SHORTEST held leg, not its longest.
+    # A book containing a 19-observation instrument has 19 days of portfolio
+    # history; it does not have LONG's full history with the ETF's absent days
+    # renormalised away, which is what previously let this read >= 30 and
+    # publish an annualised figure off 19 real observations.
+    assert covered == etf["return_observations"] == 19
+    assert covered < MIN_ANNUALIZE_DAYS
+    assert result["history_coverage"]["annualized"] is False
 
     message = next(
         w["message"] for w in result["warnings"] if w["ticker"] == "NIFTYIETF.NS"
     )
     assert "19 own return observations" in message
-    # No portfolio-level count may appear inside a per-ticker line.
-    assert f"{covered} trading days" not in message
-    assert f"{covered} own return observations" not in message
+    # No portfolio-level count may appear inside a per-ticker line. This has to be
+    # asserted on the LABEL, not on the number: the portfolio sample and this
+    # position's own sample are both 19 here (the portfolio is bounded by its
+    # shortest leg), so a value-based check can no longer tell the two apart and
+    # would silently pass on any wording. The invariant is that the per-ticker
+    # line attributes the count to the position and never to the section.
+    assert "own return observations" in message
+    for portfolio_framing in ("portfolio", "covered_days", "section", "book"):
+        assert portfolio_framing not in message.lower()
     assert "realized P&L covers" not in message
     assert result["positions"]["LONG.NS"]["is_limited_history"] is False
 
@@ -276,10 +287,14 @@ async def test_summary_per_ticker_limited_flag_comes_from_own_observations():
     assert coverage["position_observations"]["LATE.NS"]["limited_history"] is True
     assert coverage["position_observations"]["LATE.NS"]["analytics_start"] == "2020-01-01"
     assert coverage["position_observations"]["LATE.NS"]["analytics_start_source"] == "stored_added_on"
-    # The portfolio-level gate is the portfolio's own measured return sample.
+    # The portfolio-level gate is the portfolio's own measured return sample, and
+    # that sample is bounded by the shortest held leg (LATE.NS, 19 observations).
+    # The gate therefore refuses to annualise, and `annualized` must agree with
+    # the count rather than being asserted True independently of it.
     assert result["portfolio_return_observations"] == coverage["covered_days"]
-    assert coverage["covered_days"] >= MIN_ANNUALIZE_DAYS
-    assert coverage["annualized"] is True
+    assert coverage["covered_days"] == 19 < MIN_ANNUALIZE_DAYS
+    assert coverage["annualized"] is (coverage["covered_days"] >= MIN_ANNUALIZE_DAYS)
+    assert coverage["annualized"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +325,13 @@ async def test_risk_score_publishes_position_own_sample_and_provenance():
     assert coverage["position_observations"]["LONG.NS"]["limited_history"] is False
     assert coverage["tickers"]["LATE.NS"]["limited_history"] is True
     assert coverage["tickers"]["LONG.NS"]["limited_history"] is False
-    # The portfolio's own sample is published, and it is not a position count.
+    # The portfolio's own sample is published, and it is a PORTFOLIO count: it is
+    # the set of dates the whole book was measurable on, which here is bounded by
+    # the late-listed leg rather than inflated by the long-history leg.
     assert coverage["portfolio_return_observations"] == coverage["covered_days"]
-    assert coverage["covered_days"] >= MIN_ANNUALIZE_DAYS
+    assert coverage["covered_days"] == 19
+    assert coverage["covered_days"] < MIN_ANNUALIZE_DAYS
+    assert coverage["annualized"] is False
     assert coverage["covered_days_scope"] == "portfolio_return_observations"
 
 

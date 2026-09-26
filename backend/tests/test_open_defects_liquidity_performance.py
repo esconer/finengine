@@ -45,13 +45,25 @@ from app.debugging import context_audit as ca
 from app.models.database import PortfolioPosition
 
 ENVELOPE_KEYS = {
-    "data", "data_status", "as_of", "as_of_semantics", "history_coverage", "warnings"
+    "data", "data_status", "as_of", "as_of_semantics", "history_coverage", "warnings",
+    # QM-1 breadth disclosure. These four are ADDITIVE: the default bare-array
+    # response is untouched, and the six original keys keep their names, types
+    # and positions. Breadth sits beside `data` because it qualifies the series
+    # rather than the window.
+    "constituent_count", "constituent_count_basis", "partial_basket_policy",
+    "refused_partial_coverage_rows",
 }
 COVERAGE_KEYS = {
     "requested_start", "requested_end", "requested_days", "delivered_start",
     "delivered_end", "observation_count", "expected_observation_count",
     "first_observation", "last_observation", "coverage_ratio", "truncated",
     "stale", "status",
+    # QM-1: a portfolio value is only emitted where every priced position has a
+    # price, so a partial basket is refused rather than renormalised. That
+    # refusal was correct but invisible, so a short series read like a thin one.
+    "constituent_count", "constituent_count_basis", "partial_basket_policy",
+    "measurable_price_rows", "complete_coverage_price_rows",
+    "refused_partial_coverage_price_rows",
 }
 
 
@@ -661,6 +673,12 @@ async def test_the_fixed_performance_payload_is_clean_for_the_whole_rule_set():
         "as_of_semantics": envelope["as_of_semantics"],
         "history_coverage": envelope["history_coverage"],
         "warnings": envelope["warnings"],
+        # Breadth travels with the series, not only inside history_coverage, so
+        # the component mirrors the envelope rather than cherry-picking keys.
+        "constituent_count": envelope["constituent_count"],
+        "constituent_count_basis": envelope["constituent_count_basis"],
+        "partial_basket_policy": envelope["partial_basket_policy"],
+        "refused_partial_coverage_rows": envelope["refused_partial_coverage_rows"],
     }
     export = _export(
         {

@@ -1139,11 +1139,25 @@ def _performance_history_component(
     if not isinstance(declared_semantics, str) or not declared_semantics.strip():
         declared_semantics = "last_delivered_observation" if as_of else None
 
+    # Breadth travels WITH the series, not only inside history_coverage. A
+    # portfolio return is only emitted on dates where every priced position has a
+    # price, so a partial basket is refused rather than renormalised -- but a
+    # reader of `data` alone cannot tell a full-basket day from a partial one
+    # unless the constituent count sits beside the rows it qualifies. Projecting
+    # it only into history_coverage put it one level too deep to be found.
+    breadth = {
+        "constituent_count": coverage.get("constituent_count"),
+        "constituent_count_basis": coverage.get("constituent_count_basis"),
+        "partial_basket_policy": coverage.get("partial_basket_policy"),
+        "refused_partial_coverage_rows": coverage.get("refused_partial_coverage_price_rows"),
+    }
+
     result: Dict[str, Any] = {
         "status": status,
         "data": rows,
         "as_of": as_of,
         "as_of_semantics": declared_semantics,
+        **breadth,
         "history_coverage": {
             "requested_start": _date_text(coverage.get("requested_start")),
             "requested_end": _date_text(coverage.get("requested_end")),
@@ -1157,6 +1171,7 @@ def _performance_history_component(
             "coverage_ratio": ratio,
             "truncated": truncated,
             "stale": stale,
+            **breadth,
             "status": "unknown" if freshness == "unknown" else freshness,
             "rule": (
                 f"partial when coverage_ratio < {PERFORMANCE_COVERAGE_FLOOR} or the endpoint "

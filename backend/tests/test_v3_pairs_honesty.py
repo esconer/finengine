@@ -106,6 +106,17 @@ def _payload(response):
     return json.loads(response.model_dump_json())
 
 
+def _all_payload_keys(node):
+    """Every mapping key anywhere in a decoded payload, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _all_payload_keys(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _all_payload_keys(item)
+
+
 def _depth_warning(payload):
     return next(
         (
@@ -131,7 +142,19 @@ class TestNoNullErrorSentinel:
         )
         # The pre-existing Python-level read stays safe and falsy.
         assert getattr(result, "error", None) is None
-        assert "error" not in json.dumps(payload)
+        # DEFECT 1 is about the KEY, so the belt-and-braces check is about
+        # keys too. It used to be `"error" not in json.dumps(payload)`, which
+        # also banned the word from every value - and the payload now has to
+        # name the multiplicity correction it applied
+        # (`bonferroni_family_wise_error`), whose canonical name contains that
+        # word. A key-wise sweep is the same invariant stated precisely, and it
+        # is strictly broader: it also catches the key at any nesting depth,
+        # which the substring check on a flat dump could not distinguish from
+        # prose.
+        assert "error" not in set(_all_payload_keys(payload)), (
+            "a clean scan must publish no `error` key at any depth; absent means "
+            "no failure"
+        )
 
     async def test_depth_limited_scan_also_publishes_no_error_key(self):
         result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())

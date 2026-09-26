@@ -1507,6 +1507,7 @@ def _performance_history_envelope(
     requested_start: Any,
     requested_end: Any,
     warnings: Optional[Iterable[str]] = None,
+    coverage_extra: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Opt-in metadata envelope for one delivered performance-history series.
 
@@ -1524,6 +1525,12 @@ def _performance_history_envelope(
 
     ``as_of`` is the last delivered observation or ``None``. The requested end
     is never substituted for it and a missing observation is never backfilled.
+
+    ``coverage_extra`` carries the caller's constituent-count disclosure. A
+    portfolio value is only emitted on dates where every priced position has a
+    price, so a partial basket is refused rather than renormalised — but a
+    shortened series is indistinguishable from a thin one unless the refusal is
+    counted and published.
     """
     rows = [row for row in (series or []) if isinstance(row, Mapping)]
     # Only a genuinely dated row is an observation. A positional label or an
@@ -1590,6 +1597,20 @@ def _performance_history_envelope(
         "stale": stale,
         "status": status,
     }
+    # The breadth keys are ALWAYS present, defaulted to None, rather than merged
+    # only when the caller supplies them. A conditional merge made the envelope's
+    # key set depend on the call path, which breaks the determinism guarantee
+    # above: the same rows and window must always produce the same shape.
+    coverage_extra = coverage_extra if isinstance(coverage_extra, Mapping) else {}
+    for key in (
+        "constituent_count",
+        "constituent_count_basis",
+        "partial_basket_policy",
+        "measurable_price_rows",
+        "complete_coverage_price_rows",
+        "refused_partial_coverage_price_rows",
+    ):
+        history[key] = coverage_extra.get(key)
 
     messages: List[str] = [str(item) for item in (warnings or []) if item]
     if not observation_count:
@@ -1624,6 +1645,19 @@ def _performance_history_envelope(
         "as_of_semantics": PERFORMANCE_AS_OF_SEMANTICS,
         "history_coverage": history,
         "warnings": messages,
+        # Breadth sits BESIDE the series, not only inside history_coverage,
+        # because it describes the series rather than the window: it is the
+        # answer to "how many positions was this number computed from?". A
+        # reader of `data` alone must be able to tell a full-basket day from a
+        # partial-basket day, and a count buried one level down is not beside
+        # the thing it qualifies. Mirrored into history_coverage as well, so a
+        # consumer reading only the coverage block still sees it.
+        "constituent_count": (coverage_extra or {}).get("constituent_count"),
+        "constituent_count_basis": (coverage_extra or {}).get("constituent_count_basis"),
+        "partial_basket_policy": (coverage_extra or {}).get("partial_basket_policy"),
+        "refused_partial_coverage_rows": (coverage_extra or {}).get(
+            "refused_partial_coverage_price_rows"
+        ),
     }
 
 
@@ -3179,6 +3213,21 @@ async def get_forecast_risk(
                 "var_forecast": forecast_result.get("var_forecast"),
                 "cvar_forecast": forecast_result.get("cvar_forecast"),
                 "confidence_interval": forecast_result.get("confidence_interval"),
+                # WHY there is no interval. A `confidence_interval: null` with no
+                # stated reason is indistinguishable from a bug, and a reader who
+                # has been burned before assumes the worse one. The engine
+                # computed no sampling distribution for a conditional-volatility
+                # point estimate, and says so rather than inventing one.
+                "confidence_interval_status": forecast_result.get(
+                    "confidence_interval_status"
+                ),
+                "confidence_interval_reason": forecast_result.get(
+                    "confidence_interval_reason"
+                ),
+                # Declares the level, units, horizon, sign convention and both
+                # z-multipliers behind var_forecast/cvar_forecast, so the ratio
+                # between them is explicable rather than a surprise.
+                "tail_measure": forecast_result.get("tail_measure"),
                 "term_structure": forecast_result.get("term_structure", []),
                 "observations": portfolio_observations,
                 "annualized": annualizable(portfolio_observations),
@@ -4922,11 +4971,19 @@ async def get_performance_history(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-        def _deliver(rows: List[Dict[str, Any]], extra: Optional[Iterable[str]] = None) -> Any:
+        def _deliver(
+            rows: List[Dict[str, Any]],
+            extra: Optional[Iterable[str]] = None,
+            coverage: Optional[Mapping[str, Any]] = None,
+        ) -> Any:
             if not include_metadata:
                 return rows
             return _performance_history_envelope(
-                rows, requested_start=start, requested_end=end, warnings=extra
+                rows,
+                requested_start=start,
+                requested_end=end,
+                warnings=extra,
+                coverage_extra=coverage,
             )
 
         if not ticker_list:
@@ -5034,7 +5091,21 @@ async def get_performance_history(
             for t in price_df.columns
         })
         portfolio_series = price_df.mul(q_series, axis=1).sum(axis=1, min_count=len(q_series))
+        # `min_count=len(q_series)` refuses any date where a priced position has
+        # no price, so a partial basket is never rescaled into a whole-book
+        # number. That refusal is correct but was invisible: a reader could not
+        # tell a short series from a thin one. Count it and publish it.
+        measurable_price_rows = int(len(price_df))
+        constituent_count = int(len(q_series))
         portfolio_series = portfolio_series.dropna()
+        coverage_disclosure = {
+            "constituent_count": constituent_count,
+            "constituent_count_basis": "priced_positions_required_for_a_portfolio_value",
+            "partial_basket_policy": "refused_not_renormalised",
+            "measurable_price_rows": measurable_price_rows,
+            "complete_coverage_price_rows": int(len(portfolio_series)),
+            "refused_partial_coverage_price_rows": measurable_price_rows - int(len(portfolio_series)),
+        }
         if portfolio_series.empty:
             return _deliver(
                 [], extra=["No date had a usable price for every priced position."]
@@ -5170,7 +5241,7 @@ async def get_performance_history(
                 "carries a benchmark value; the delivered series is the "
                 "portfolio leg only."
             )
-        return _deliver(output, extra=extra_warnings)
+        return _deliver(output, extra=extra_warnings, coverage=coverage_disclosure)
 
     except HTTPException:
         raise
@@ -5252,9 +5323,22 @@ async def _build_wide_returns(
     portfolio_returns = aggregate_active_returns(returns_df, weights)
     if portfolio_returns.empty:
         raise ValueError("No active return observations for the requested window")
-    # Return only dates that can contribute to the active portfolio rule so
-    # downstream covariance/tail consumers cannot reintroduce all-missing rows.
-    returns_df = returns_df.loc[portfolio_returns.index]
+    # Drop only rows that are ENTIRELY missing.  A row where one leg has a real
+    # return and another is NaN is a partial row, and it must survive here: the
+    # prelisting mask is published AS a NaN so a reader can see which leg was not
+    # yet held.  Slicing to `portfolio_returns.index` instead used to drop those
+    # rows as a side effect, which silently converted "this leg is absent" into
+    # "this date does not exist" and broke the absent-not-backfilled invariant.
+    #
+    # The two objects have deliberately different contracts and must not be
+    # narrowed to each other:
+    #   * `returns_df`     - per-leg truth. Every date with any measurable leg.
+    #   * `portfolio_returns` - one number per date, so a date whose surviving
+    #     weight coverage is short cannot become a portfolio return at all.
+    # Downstream covariance/tail consumers that need complete rows must read the
+    # coverage block, not a frame pre-sliced to the aggregate's index.
+    measurable_rows = returns_df.notna().any(axis=1)
+    returns_df = returns_df.loc[measurable_rows]
     per_ticker = {
         ticker: {
             "raw_days": int(len(raw_price_data_dict[ticker])) if ticker in raw_price_data_dict and raw_price_data_dict[ticker] is not None else 0,
@@ -5275,6 +5359,19 @@ async def _build_wide_returns(
     coverage["per_ticker_count_units"] = dict(PRICE_FRAME_COUNT_UNITS)
     coverage["per_ticker_count_reconciliation"] = _price_frame_count_reconciliation(
         per_ticker, own_return_observations
+    )
+    # A date whose surviving weight coverage is short produces NO portfolio
+    # return, because renormalising it would publish a half-book day as a whole
+    # book. `covered_days` above is therefore lower than the number of dates the
+    # price frame could have supported, and that difference has to be stated —
+    # otherwise a shortened series reads as a data gap rather than a refusal.
+    measurable_count = int(measurable_rows.sum())
+    coverage["measurable_return_rows"] = measurable_count
+    coverage["partial_coverage_days"] = measurable_count - int(len(portfolio_returns))
+    coverage["partial_coverage_days_reason"] = (
+        "dates where the surviving positive-weight constituents did not cover "
+        "100% of gross weight were refused rather than renormalised into a "
+        "partial-basket portfolio return"
     )
     return returns_df, portfolio_returns, coverage
 
@@ -5515,6 +5612,22 @@ async def get_tear_sheet(
         # window and its observation count are published next to it: a 365-day
         # request must never sit on 39 days of numbers unlabelled.
         measured_first, measured_last = _observation_bounds(port_ret)
+        holding_window_start = history_coverage.get("intersection_start")
+        # `start` here is the first date the WHOLE book was measurable on, which
+        # is later than the holding window's own start whenever an early session
+        # has a leg without a price. Both dates are true and they describe
+        # different things, so publishing them side by side without the gap looks
+        # like a contradiction. State the gap: it is the visible consequence of
+        # refusing to renormalise a partial basket into a portfolio return.
+        leading_gap_days = None
+        if holding_window_start and measured_first:
+            try:
+                leading_gap_days = (
+                    datetime.strptime(measured_first, "%Y-%m-%d")
+                    - datetime.strptime(str(holding_window_start)[:10], "%Y-%m-%d")
+                ).days
+            except (TypeError, ValueError):
+                leading_gap_days = None
         measured_window = {
             "start": measured_first,
             "end": measured_last or _latest_observation_date(port_ret),
@@ -5522,7 +5635,14 @@ async def get_tear_sheet(
             "observation_count": int(covered_days),
             "covered_days_scope": HOLDING_COVERED_DAYS_SCOPE,
             "truncated_to_holding_window": bool(history_coverage.get("truncated")),
-            "holding_window_start": history_coverage.get("intersection_start"),
+            "holding_window_start": holding_window_start,
+            "holding_window_to_measured_start_gap_days": leading_gap_days,
+            "measured_start_basis": (
+                "first date on which every held position had a measurable return; "
+                "earlier holding-window sessions had at least one leg without a "
+                "price and were refused rather than renormalised into a "
+                "partial-basket portfolio return"
+            ),
         }
         return {
             "window": {
@@ -6644,8 +6764,21 @@ async def get_cointegration_pairs(
     and spread z-scores.
     """
     # The shared depth threshold, so the warning below never quotes a number this
-    # route invented when the scan did not publish one.
-    from app.services.cointegration_service import MIN_PAIR_DEPTH_RATIO
+    # route invented when the scan did not publish one. The signal-policy and
+    # multiplicity constants come from the same place: a reader has to be able to
+    # find where the +/-1.5 and the correction came from, and the engine is the
+    # only thing that knows.
+    from app.services.cointegration_service import (
+        DECISION_TEST,
+        DIAGNOSTIC_TEST,
+        MULTIPLICITY_CORRECTION,
+        SIGNAL_DIRECTIVE_HEADS,
+        SIGNAL_NOTIONAL_CONVENTION,
+        SIGNAL_ZSCORE_THRESHOLD,
+        SIGNAL_ZSCORE_THRESHOLD_BASIS,
+        MIN_PAIR_DEPTH_RATIO,
+        multiplicity_report,
+    )
 
     class _PairsDisclosure(CointScannerResponse):
         """The scanner response plus the fields this route owes its consumers.
@@ -6753,6 +6886,64 @@ async def get_cointegration_pairs(
             f"full-depth pairs and the scan is reported as partial."
         )
 
+    def _signal_head(signal: Any) -> str:
+        """The classification token a `signal` string starts with.
+
+        The string is a sentence, so a consumer reads the head to sort pairs
+        and the rest to check the evidence. Splitting on the first space is
+        exact: every head is a single token, and no head contains a space.
+        """
+        text = str(signal or "").strip()
+        return text.split(" ", 1)[0] if text else ""
+
+    def _directives(
+        response: CointScannerResponse,
+        family: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Every position-naming signal, restated with the numbers it needs.
+
+        A directive is an instruction to trade, so it is the one field here a
+        downstream agent may act on. Each entry carries the whole chain that
+        allowed it - the two tests, the p-value, the corrected threshold, the
+        comparison count, the z-score, its threshold, and the hedge ratio with
+        the notional convention that gives it a size - so acting on an entry
+        does not require re-deriving anything from prose.
+        """
+        corrected = family.get("corrected_threshold")
+        published: List[Dict[str, Any]] = []
+        for pair in list(getattr(response, "pairs", None) or []):
+            if _signal_head(getattr(pair, "signal", None)) not in SIGNAL_DIRECTIVE_HEADS:
+                continue
+            published.append(
+                {
+                    "ticker_a": getattr(pair, "ticker_a", None),
+                    "ticker_b": getattr(pair, "ticker_b", None),
+                    "direction": _signal_head(getattr(pair, "signal", None)),
+                    "engle_granger_pvalue": getattr(pair, "engle_granger_pvalue", None),
+                    "decision_test": DECISION_TEST,
+                    "diagnostic_test": DIAGNOSTIC_TEST,
+                    "johansen_agrees_with_decision": getattr(
+                        pair, "johansen_agrees_with_decision", None
+                    ),
+                    "comparisons_made": family.get("comparisons_made"),
+                    "correction_applied": MULTIPLICITY_CORRECTION,
+                    "corrected_p_value_threshold": corrected,
+                    "survives_correction": True,
+                    "spread_zscore": getattr(pair, "current_spread_zscore", None),
+                    "zscore_threshold": SIGNAL_ZSCORE_THRESHOLD,
+                    "hedge_ratio_beta": getattr(pair, "hedge_ratio_beta", None),
+                    "notional_convention": (
+                        f"1 unit of currency notional in {getattr(pair, 'ticker_a', None)} "
+                        f"against {getattr(pair, 'hedge_ratio_beta', None)} units in "
+                        f"{getattr(pair, 'ticker_b', None)}"
+                    ),
+                    "overlap_observations": getattr(pair, "overlap_observations", None),
+                    "depth_status": getattr(pair, "depth_status", None),
+                    "ou_half_life_days": getattr(pair, "ou_half_life_days", None),
+                }
+            )
+        return published
+
     def _disclosure(
         response: CointScannerResponse,
         *,
@@ -6825,6 +7016,100 @@ async def get_cointegration_pairs(
             list(getattr(response, "pairs", None) or []),
             test_roles=getattr(response, "test_roles", None),
         )
+
+        # --- multiplicity + signal policy (SI-1 / AD-1) ------------------
+        # `scanned_pairs_count` is the family: the number of tests the scan
+        # ran, which is not always the number of rows delivered. Everything
+        # below is derived from that one number so the payload states its own
+        # null expectation instead of leaving the reader to guess it.
+        family = multiplicity_report(
+            pairs,
+            family_alpha=p_value_threshold,
+            comparisons_made=getattr(response, "scanned_pairs_count", None),
+        )
+        extras["multiple_testing"] = family
+        extras["signal_policy"] = {
+            "zscore_threshold": SIGNAL_ZSCORE_THRESHOLD,
+            "zscore_threshold_basis": SIGNAL_ZSCORE_THRESHOLD_BASIS,
+            "zscore_threshold_provenance": "fixed_engine_constant_not_calibrated",
+            "engle_granger_p_value_threshold": p_value_threshold,
+            "p_value_threshold_comparison": "strictly_less_than",
+            "engle_granger_role": "published_decision",
+            "johansen_role": "diagnostic_only",
+            "notional_convention": SIGNAL_NOTIONAL_CONVENTION,
+            "gate": MULTIPLICITY_CORRECTION,
+            "gate_rule": (
+                "A signal names a position only when all of: Engle-Granger "
+                "declared the pair cointegrated, the Johansen diagnostic agrees, "
+                "hedge_ratio_beta is positive, the p-value survives the "
+                f"{MULTIPLICITY_CORRECTION} correction over the whole family, and "
+                f"the spread z-score is past +/-{SIGNAL_ZSCORE_THRESHOLD:g}. "
+                "Every other state is published under its own non-action head and "
+                "carries the reason inline."
+            ),
+            "action_naming_heads": list(SIGNAL_DIRECTIVE_HEADS),
+        }
+        directives = _directives(response, family)
+        extras["directives"] = directives
+        extras["directive_count"] = len(directives)
+        withheld = [
+            pair
+            for pair in pairs
+            if _signal_head(getattr(pair, "signal", None)) not in SIGNAL_DIRECTIVE_HEADS
+        ]
+        extras["directive_withheld_count"] = len(withheld)
+        contested = sum(
+            1
+            for pair in pairs
+            if _signal_head(getattr(pair, "signal", None)) == "CONTESTED_TESTS_DISAGREE"
+        )
+        extras["contested_pair_count"] = contested
+
+        declared = family.get("declared_positive_count") or 0
+        survivors = family.get("survivor_count") or 0
+        comparisons = family.get("comparisons_made") or 0
+        # "0 survive" / "1 survives": a disclosure sentence that reads wrong
+        # is a sentence a reader discounts, and this one carries the number the
+        # whole fix turns on.
+        survive_text = (
+            f"{survivors} survive{'s' if survivors == 1 else ''}"
+        )
+        pair_text = f"{declared} pair{'' if declared == 1 else 's'}"
+        if comparisons and declared and not survivors:
+            warnings.append(
+                f"Multiple testing: {comparisons} simultaneous cointegration "
+                f"tests were run at alpha={p_value_threshold:g}, so "
+                f"{p_value_threshold * 100:g}% of them are expected to look "
+                f"significant by chance alone "
+                f"({p_value_threshold * comparisons:.2f} false positives "
+                f"expected). {pair_text} {'was' if declared == 1 else 'were'} "
+                f"declared cointegrated and {survive_text} "
+                f"{MULTIPLICITY_CORRECTION} at p < "
+                f"{family.get('corrected_threshold')}. The declared positives are "
+                f"the null expectation, not a discovery, and no spread directive "
+                f"is published for them."
+            )
+        elif comparisons and declared:
+            warnings.append(
+                f"Multiple testing: {comparisons} simultaneous cointegration "
+                f"tests were run at alpha={p_value_threshold:g}, so "
+                f"{p_value_threshold * 100:g}% of them are expected to look "
+                f"significant by chance alone "
+                f"({p_value_threshold * comparisons:.2f} false positives "
+                f"expected). {pair_text} {'was' if declared == 1 else 'were'} "
+                f"declared cointegrated and {survive_text} "
+                f"{MULTIPLICITY_CORRECTION} at p < "
+                f"{family.get('corrected_threshold')}; only the survivors may "
+                f"carry a spread directive."
+            )
+        if contested:
+            warnings.append(
+                f"Contested pairs: {contested} pair{'' if contested == 1 else 's'} "
+                f"{'is' if contested == 1 else 'are'} cointegrated under "
+                f"engle_granger but not under the johansen diagnostic, so the "
+                f"two tests disagree. A contested pair is not a trade and "
+                f"publishes no direction; see test_agreement."
+            )
         if warnings:
             extras["warnings"] = warnings
         return extras
@@ -6929,6 +7214,21 @@ async def get_cointegration_pairs(
             "shallow_tickers": shallow,
             "usable_observations_by_ticker": depth_by_ticker,
         }
+        # A scan whose declared cointegrations do not survive the family's
+        # correction has not established what it says it established, so it is
+        # `partial` on the same footing as limited depth: the numbers are real
+        # and the conclusion they support is not. Demoted only when there is
+        # something to demote (positives declared, none surviving); a clean
+        # scan of 91 negatives is not degraded.
+        family_report = multiplicity_report(
+            list(result.pairs),
+            family_alpha=p_value_threshold,
+            comparisons_made=result.scanned_pairs_count,
+        )
+        multiplicity_unconfirmed = bool(
+            (family_report.get("declared_positive_count") or 0)
+            and not (family_report.get("survivor_count") or 0)
+        )
         update: Dict[str, Any] = {
             "requested_tickers": coverage["requested_tickers"],
             "available_tickers": coverage["available_tickers"],
@@ -6947,7 +7247,11 @@ async def get_cointegration_pairs(
             # weights, so its coverage must not claim a weight basis.
             "data_status": _data_status(
                 coverage,
-                partial=bool(result.unpairable_tickers) or depth_status == "partial",
+                partial=(
+                    bool(result.unpairable_tickers)
+                    or depth_status == "partial"
+                    or multiplicity_unconfirmed
+                ),
             ),
             "universe_coverage": coverage,
         }

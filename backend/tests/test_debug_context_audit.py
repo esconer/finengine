@@ -354,6 +354,7 @@ class TestEnvelopeRules:
                     "factor_exposure",
                     {
                         "r_squared": 0.65,
+                        "r_squared_standard_error": 0.04,
                         "model_window": {"start": "2026-01-20", "end": "2026-09-25"},
                         "model_observation_count": 174,
                     },
@@ -374,6 +375,115 @@ class TestEnvelopeRules:
             {"pairs": _section("pairs", {}, status="unavailable", warnings=[])}
         )
         assert_only(export, "ENV-016")
+
+    def test_env016_available_section_with_a_block_reason_must_warn(self) -> None:
+        """AGENT-05 / ENV-016 repair.
+
+        The old rule only obliged partial/unavailable, which made ``available``
+        a promise that nothing needed saying — and ``available`` is the status
+        every P0 in the v5 review carries.  A payload that publishes
+        ``block_reasons`` is degraded whether or not the section admits it.
+        """
+        export = make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {
+                        "execution": {
+                            "execution_eligible": False,
+                            "block_reasons": ["financing_required"],
+                            "block_reason": "gross 1.295 > 1.0; not a normal rebalance",
+                        }
+                    },
+                )
+            }
+        )
+        assert_only(export, "ENV-016")
+        assert any("block_reason" in f.message for f in find_for(export, "ENV-016"))
+
+    def test_env016_available_section_with_omitted_fields_must_warn(self) -> None:
+        export = make_export({"risk_studio": _section("risk_studio", {})})
+        export["sections"]["risk_studio"]["omitted_fields"] = ["components.series"]
+        assert_only(export, "ENV-016")
+
+    def test_env016_disclosed_degradation_passes_on_an_available_section(self) -> None:
+        """The exit is a sentence an engineer can write truthfully. No value in
+        the export has to change, so this rule cannot be silenced by making a
+        number up."""
+        export = make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {"execution": {"execution_eligible": False,
+                                   "block_reasons": ["financing_required"]}},
+                    warnings=["this target borrows 29.5% and is not a normal rebalance"],
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_env016_empty_exclusion_map_is_not_a_degradation(self) -> None:
+        """``excluded_assets={"volatility": [], "cvar_tail": []}`` says two
+        exclusions were considered and neither happened. It is not a marker,
+        and flagging it would be noise on every section that publishes the
+        shape."""
+        export = make_export(
+            {
+                "risk_contribution": _section(
+                    "risk_contribution",
+                    {"excluded_assets": {"volatility": [], "cvar_tail": []}},
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_env012_as_of_five_months_in_the_future_catches(self) -> None:
+        """AGENT-03 mutation: the old rule only tested MEMBERSHIP in the
+        collector's own clock window, so a future date sailed through."""
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = "2027-03-01"
+        assert_only(export, "ENV-012")
+        assert any("AFTER completed_at" in f.message
+                   for f in find_for(export, "ENV-012"))
+
+    def test_env012_as_of_ten_years_stale_catches(self) -> None:
+        """The second half of the same mutation: a 2016 observation is not the
+        newest observation behind a 2026 export."""
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = "2016-01-01"
+        assert_only(export, "ENV-012")
+        message = find_for(export, "ENV-012")[0].message
+        assert "calendar days older" in message
+        assert "AS_OF_STALENESS_DAYS" not in message
+        assert f"{ca.AS_OF_STALENESS_DAYS:g}" in message
+
+    def test_env012_a_disclosed_stale_as_of_passes(self) -> None:
+        """Disclosed staleness is an honest exit; the section is not hiding it."""
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = "2016-01-01"
+        export["sections"]["portfolio"]["warnings"] = [
+            "the newest observation is 2016-01-01; this series is stale"
+        ]
+        assert rule_ids(export) == set()
+
+    def test_env012_a_future_refresh_clock_disclosed_passes(self) -> None:
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = "2026-09-27"
+        export["sections"]["portfolio"]["as_of_semantics"] = "quote_refresh_timestamp"
+        assert rule_ids(export) == set()
+
+    def test_env012_a_recent_observation_date_is_clean(self) -> None:
+        """Ordered before the collection started but inside the staleness bound:
+        a perfectly normal observation date."""
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = "2026-09-24"
+        assert rule_ids(export) == set()
+
+    def test_env012_a_null_as_of_is_not_this_rules_business(self) -> None:
+        export = make_export()
+        export["sections"]["portfolio"]["as_of"] = None
+        export["sections"]["portfolio"]["as_of_semantics"] = None
+        assert rule_ids(export) == set()
 
     def test_env017_nan_anywhere(self) -> None:
         export = make_export()
@@ -804,7 +914,14 @@ class TestCrossSectionRules:
             {
                 "dashboard": _section(
                     "dashboard",
-                    {"components": {"risk_score": {"factor_r_squared": 0.2391}}},
+                    {
+                        "components": {
+                            "risk_score": {
+                                "factor_r_squared": 0.2391,
+                                "factor_r_squared_standard_error": 0.05,
+                            }
+                        }
+                    },
                     status="partial",
                     warnings=["risk score component"],
                 )
@@ -819,6 +936,7 @@ class TestCrossSectionRules:
                     "factor_exposure",
                     {
                         "r_squared": 0.6511,
+                        "r_squared_standard_error": 0.03,
                         "model_window": {"start": "2026-01-20", "end": "2026-09-25"},
                         "model_observation_count": 174,
                     },
@@ -838,6 +956,7 @@ class TestCrossSectionRules:
                     "factor_exposure",
                     {
                         "r_squared": 0.6511,
+                        "r_squared_standard_error": 0.03,
                         "model_window": {"start": "2026-01-20", "end": "2026-09-25"},
                         "model_observation_count": 174,
                         "full_history": {
@@ -853,6 +972,7 @@ class TestCrossSectionRules:
                         "components": {
                             "risk_score": {
                                 "factor_r_squared": 0.2391,
+                                "factor_r_squared_standard_error": 0.05,
                                 "model_window": {
                                     "start": "2026-08-04",
                                     "end": "2026-09-25",
@@ -886,6 +1006,7 @@ class TestCrossSectionRules:
                     {
                         **shared,
                         "r_squared": 0.6511,
+                        "r_squared_standard_error": 0.03,
                         "full_history": {
                             "observation_count": 174,
                             "scope": "full_exchange_history",
@@ -895,7 +1016,15 @@ class TestCrossSectionRules:
                 ),
                 "dashboard": _section(
                     "dashboard",
-                    {"components": {"risk_score": {**shared, "factor_r_squared": 0.2391}}},
+                    {
+                        "components": {
+                            "risk_score": {
+                                **shared,
+                                "factor_r_squared": 0.2391,
+                                "factor_r_squared_standard_error": 0.05,
+                            }
+                        }
+                    },
                     status="partial",
                     warnings=["risk score component"],
                 ),
@@ -905,8 +1034,399 @@ class TestCrossSectionRules:
 
 
 # --------------------------------------------------------------------------
-# NUM-001 .. NUM-020
+# ENV-019 .. ENV-021 -- the v5-review envelope rules
 # --------------------------------------------------------------------------
+
+
+class TestV5EnvelopeRules:
+    def _gated_sizing(self, trade_status: str, **gate: Any) -> dict[str, Any]:
+        return make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {
+                        "execution": {"execution_eligible": False, **gate},
+                        "trades": {
+                            "AAA.NS": {"shares_delta": 2, "status": trade_status},
+                            "BBB.NS": {"shares_delta": -1, "status": trade_status},
+                        },
+                    },
+                )
+            }
+        )
+
+    # ---- ENV-019 (AD-5 / G3)
+
+    def test_env019_executable_record_inside_a_gated_section_catches(self) -> None:
+        export = self._gated_sizing("executable")
+        assert_only(export, "ENV-019")
+        message = find_for(export, "ENV-019")[0].message
+        assert "2 record(s)" in message
+        assert "execution_eligible is false" in message
+
+    def test_env019_the_gate_open_passes(self) -> None:
+        export = make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {
+                        "execution": {"execution_eligible": True},
+                        "trades": {"AAA.NS": {"shares_delta": 2,
+                                              "status": "executable"}},
+                    },
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_env019_a_record_carrying_its_own_gate_is_disclosing(self) -> None:
+        """A per-record ``execution_eligible: false`` alongside the section gate
+        is the honest shape: the record explains itself instead of asserting
+        against the gate."""
+        export = make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {
+                        "execution": {"execution_eligible": False},
+                        "trades": {
+                            "AAA.NS": {"shares_delta": 2, "status": "executable",
+                                       "execution_eligible": False},
+                        },
+                    },
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_env019_a_non_executable_status_passes(self) -> None:
+        export = self._gated_sizing("below_minimum_notional")
+        assert rule_ids(export) == set()
+
+    def test_env019_an_executable_record_in_an_ungated_section_passes(self) -> None:
+        """No gate means no contradiction. ``optimization`` publishes an
+        executable trade set and says nothing against it."""
+        export = make_export(
+            {
+                "optimization": _section(
+                    "optimization",
+                    {
+                        "trades_required": {
+                            "AAA.NS": {"weight_delta": 0.01, "status": "executable"}
+                        }
+                    },
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    # ---- ENV-020 (SI-5)
+
+    def _estimates(self, **extra: Any) -> dict[str, Any]:
+        return make_export(
+            {"realized_risk": _section("realized_risk",
+                                        {"sharpe_ratio": 3.49, **extra})}
+        )
+
+    def test_env020_naked_sharpe_catches(self) -> None:
+        export = self._estimates()
+        assert_only(export, "ENV-020")
+        assert "sharpe_ratio" in find_for(export, "ENV-020")[0].message
+
+    def test_env020_a_standard_error_silences_it(self) -> None:
+        """The exit is one true number, not a changed one."""
+        assert rule_ids(self._estimates(sharpe_ratio_standard_error=0.42)) == set()
+
+    def test_env020_an_interval_silences_it(self) -> None:
+        assert rule_ids(
+            self._estimates(sharpe_ratio_confidence_interval=[-9.77, 16.75])
+        ) == set()
+
+    def test_env020_an_effective_sample_size_silences_it(self) -> None:
+        """39 autocorrelated daily returns are not 39 independent observations;
+        publishing the effective n is the disclosure that makes a point estimate
+        readable."""
+        assert rule_ids(self._estimates(effective_n=11.4)) == set()
+
+    def test_env020_a_raw_observation_count_does_not_silence_it(self) -> None:
+        """Pinned deliberately.  ``covered_days: 39`` and ``observations: 174``
+        appear on every estimate-bearing section of the v5 artifact, so
+        accepting a row count as uncertainty would have made this rule green on
+        an export that discloses no uncertainty at all."""
+        export = self._estimates(observations=174)
+        assert_only(export, "ENV-020")
+
+    def test_env020_a_p_value_does_not_silence_it(self) -> None:
+        """``engle_granger_pvalue`` is a hypothesis verdict, not a statement
+        about the precision of the ``hedge_ratio_beta`` beside it."""
+        export = make_export(
+            {
+                "pairs": _section(
+                    "pairs",
+                    {"pairs": [{"hedge_ratio_beta": 0.27,
+                                "engle_granger_pvalue": 0.04}]},
+                    status="partial",
+                    warnings=["depth limited"],
+                )
+            }
+        )
+        assert_only(export, "ENV-020")
+
+    def test_env020_a_section_with_no_estimate_passes(self) -> None:
+        export = make_export(
+            {"concentration": _section("concentration",
+                                        {"portfolio_position_count": 14})}
+        )
+        assert rule_ids(export) == set()
+
+    def test_env020_the_disclosure_may_sit_anywhere_in_the_section(self) -> None:
+        """Checked over the whole subtree, not one key: a standard error nested
+        two components deep is still a disclosure for the section."""
+        export = make_export(
+            {
+                "risk_studio": _section(
+                    "risk_studio",
+                    {
+                        "components": {
+                            "a": {"metrics": {"sharpe_ratio": 2.0}},
+                            "b": {"precision": {"sharpe_ratio_standard_error": 0.8}},
+                        }
+                    },
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    # ---- ENV-021 (AD-10 / G4)
+
+    def _coverage_block(self, ratio: Any, count: Any) -> dict[str, Any]:
+        return make_export(
+            {
+                "india_flows": _section(
+                    "india_flows",
+                    {
+                        "component_coverage": {
+                            "delivery_anomalies": {
+                                "scope": "symbol_scoped",
+                                "status": "unavailable",
+                                "requested_count": 14,
+                                "covered_count": count,
+                                "coverage_ratio": ratio,
+                            }
+                        }
+                    },
+                    status="partial",
+                    warnings=["no delivery history"],
+                )
+            }
+        )
+
+    def test_env021_zero_ratio_beside_a_null_count_catches(self) -> None:
+        export = self._coverage_block(0, None)
+        assert_only(export, "ENV-021")
+        assert "covered_count" in find_for(export, "ENV-021")[0].message
+
+    def test_env021_a_measured_zero_count_silences_it(self) -> None:
+        """``covered_count: 0`` is the measurement the ratio already asserts."""
+        assert rule_ids(self._coverage_block(0, 0)) == set()
+
+    def test_env021_omitting_the_ratio_silences_it(self) -> None:
+        """The sibling ``institutional_flows`` block publishes a null count and
+        no ratio at all. That is the honest spelling and it must pass."""
+        assert rule_ids(self._coverage_block(None, None)) == set()
+
+    def test_env021_a_null_count_in_another_block_does_not_fire(self) -> None:
+        """Both keys must be in the SAME mapping: a ratio in one block and a
+        null count in a sibling is not a contradiction."""
+        export = make_export(
+            {
+                "india_flows": _section(
+                    "india_flows",
+                    {
+                        "component_coverage": {
+                            "a": {"coverage_ratio": 0, "covered_count": 0}
+                        },
+                        "summary": {"covered_count": None},
+                    },
+                    status="partial",
+                    warnings=["component unavailable"],
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_env021_a_nonzero_ratio_beside_a_null_count_passes(self) -> None:
+        assert rule_ids(self._coverage_block(0.5, None)) == set()
+
+
+# --------------------------------------------------------------------------
+# XS-010 -- MY-1
+# --------------------------------------------------------------------------
+
+
+class TestHoldingWindowStartSelfConsistency:
+    def _sizing(self, start: str, declared: str | None,
+                *, sibling: bool = True,
+                reconcile: bool | str = False) -> dict[str, Any]:
+        measured: dict[str, Any] = {
+            "start": start,
+            "end": "2026-09-25",
+            "days": 39,
+            "covered_days_scope": "holding_window_aligned_return_rows",
+        }
+        if declared is not None:
+            measured["holding_window_start"] = declared
+        if reconcile:
+            measured["holding_window_to_measured_start_gap_days"] = 22
+            if reconcile != "gap_only":
+                measured["measured_start_basis"] = (
+                    "first date on which every held position had a measurable return"
+                )
+        sections: dict[str, Any] = {
+            "tear_sheet": _section("tear_sheet", {"measured_window": measured})
+        }
+        if sibling:
+            sections["realized_risk"] = _section(
+                "realized_risk",
+                {
+                    "history_coverage": {
+                        "intersection_start": "2026-08-03",
+                        "covered_days": 39,
+                        "covered_days_scope": "holding_window_aligned_return_rows",
+                    }
+                },
+                status="partial",
+                warnings=["holding window truncated"],
+            )
+        return make_export(sections)
+
+    def test_xs010_start_contradicting_its_own_holding_window_start_catches(self) -> None:
+        """The block states the contradiction itself: it publishes
+        ``holding_window_start: 2026-08-03`` and its own ``start: 2026-08-04``.
+        With no sibling holding-window block for XS-001 to compare against, this
+        is XS-010 alone."""
+        export = self._sizing("2026-08-04", "2026-08-03", sibling=False)
+        assert_only(export, "XS-010")
+        assert "2026-08-04" in find_for(export, "XS-010")[0].message
+
+    def test_xs010_agreeing_starts_pass(self) -> None:
+        assert rule_ids(self._sizing("2026-08-03", "2026-08-03")) == set()
+
+    def test_xs010_reconciled_gap_passes(self) -> None:
+        """A block may hold both dates when they describe DIFFERENT things and it
+        reconciles them. A portfolio return is only measurable once every held leg
+        has a price, so the first measurable date is legitimately later than the
+        holding window's start. Publishing the gap and its basis resolves the
+        contradiction; publishing both dates silently does not."""
+        export = self._sizing("2026-08-25", "2026-08-03", sibling=False, reconcile=True)
+        assert rule_ids(export) == set()
+
+    def test_xs010_gap_without_a_basis_still_catches(self) -> None:
+        """Half the reconciliation is not a reconciliation: a number with no
+        explanation of what produced it is exactly the silent two-date case."""
+        export = self._sizing("2026-08-25", "2026-08-03", sibling=False, reconcile="gap_only")
+        assert_only(export, "XS-010")
+        assert "measured_start_basis" in find_for(export, "XS-010")[0].message
+
+    def test_xs010_no_declared_holding_window_start_passes(self) -> None:
+        """Without a published ``holding_window_start`` there is nothing to
+        contradict; XS-001 is the rule that compares siblings."""
+        assert rule_ids(self._sizing("2026-08-03", None)) == set()
+
+    def test_xs001_compares_a_measured_window_start_not_only_intersection_start(self) -> None:
+        """MY-1, the hole in my own rule: a block that dates its holding window
+        under any other key used to drop out of the comparison set instead of
+        contradicting it."""
+        export = self._sizing("2026-08-04", None)
+        assert_only(export, "XS-001")
+
+    def test_xs001_a_delivered_start_on_a_holding_window_block_is_compared(self) -> None:
+        export = make_export(
+            {
+                "realized_risk": _section(
+                    "realized_risk",
+                    {
+                        "history_coverage": {
+                            "intersection_start": "2026-08-03",
+                            "covered_days": 39,
+                            "covered_days_scope": "holding_window_aligned_return_rows",
+                        }
+                    },
+                    status="partial",
+                    warnings=["truncated"],
+                ),
+                "regime": _section(
+                    "regime",
+                    {
+                        "history_coverage": {
+                            "delivered_start": "2026-08-25",
+                            "covered_days": 39,
+                            "covered_days_scope": "holding_window_aligned_return_rows",
+                        }
+                    },
+                ),
+            }
+        )
+        assert_only(export, "XS-001")
+        assert "delivered_start" in find_for(export, "XS-001")[0].message
+
+    def test_xs001_a_delivered_series_with_no_holding_window_scope_is_not_compared(self) -> None:
+        """``dashboard``'s ``performance_history`` publishes
+        ``delivered_start: 2026-08-25`` for a 90-day requested DASHBOARD window
+        it already reports as partial/truncated/stale, and it publishes no
+        ``covered_days_scope``. It is a different population, not a
+        contradiction, and admitting it would be a false positive that no
+        honest fix could silence."""
+        export = make_export(
+            {
+                "realized_risk": _section(
+                    "realized_risk",
+                    {
+                        "history_coverage": {
+                            "intersection_start": "2026-08-03",
+                            "covered_days": 39,
+                            "covered_days_scope": "holding_window_aligned_return_rows",
+                        }
+                    },
+                    status="partial",
+                    warnings=["truncated"],
+                ),
+                "dashboard": _section(
+                    "dashboard",
+                    {
+                        "components": {
+                            "performance_history": {
+                                "status": "partial",
+                                "warnings": ["short window"],
+                                "history_coverage": {
+                                    "requested_days": 90,
+                                    "delivered_start": "2026-08-25",
+                                    "delivered_end": "2026-09-21",
+                                    "observation_count": 19,
+                                    "expected_observation_count": 65,
+                                    "coverage_ratio": 0.29,
+                                    "truncated": True,
+                                    "stale": True,
+                                    "status": "partial",
+                                },
+                                "data": [
+                                    {"date": "2026-08-25", "portfolio_value": 42981.74,
+                                     "return": None, "constituent_count": 14,
+                                     "warm_up": True, "benchmark_value": 40000.0},
+                                    {"date": "2026-08-26", "portfolio_value": 43000.0,
+                                     "return": 0.0004, "constituent_count": 14,
+                                     "benchmark_value": 40010.0},
+                                ],
+                            }
+                        }
+                    },
+                    status="partial",
+                    warnings=["performance window short"],
+                ),
+            }
+        )
+        assert rule_ids(export) == set()
+
 
 
 class TestNumericRules:
@@ -1545,6 +2065,7 @@ class TestNumericRules:
         data: dict[str, Any] = {
             "data_status": "available",
             "evt_pot_var_99": -0.04,
+            "evt_pot_var_99_standard_error": 0.006,
             "gpd_shape_xi": -0.7068,
             "gpd_shape_xi_raw": -0.70676185,
             "gpd_shape_xi_constrained": -0.5,
@@ -1579,6 +2100,7 @@ class TestNumericRules:
                                     "volatility": 9.8,
                                     "correlation": 0,
                                 },
+                                "avg_pairwise_correlation_standard_error": 0.02,
                                 "excluded_components": [],
                             }
                         }
@@ -1600,6 +2122,7 @@ class TestNumericRules:
                             "risk_score": {
                                 "overall_score": 12.7,
                                 "components": {"correlation": 0},
+                                "avg_pairwise_correlation_standard_error": 0.02,
                                 "excluded_components": ["correlation"],
                             }
                         }
@@ -1630,6 +2153,7 @@ class TestNumericRules:
                                     "correlation": 0,
                                 },
                                 "avg_pairwise_correlation": 0.0,
+                                "avg_pairwise_correlation_standard_error": 0.0,
                                 "excluded_components": [],
                             }
                         }
@@ -1655,7 +2179,9 @@ class TestNumericRules:
                 "stale": True,
                 "status": "partial",
             },
-            "data": rows,
+            # NUM-021 requires the basket size per observation; publish it so
+            # these fixtures test the series rules and not the breadth rule.
+            "data": [{**row, "constituent_count": 2} for row in rows],
         }
         performance.update(component)
         return make_export(
@@ -1768,6 +2294,369 @@ class TestNumericRules:
             }
         )
         assert rule_ids(export) == set()
+
+    # ---- NUM-021 (QM-1)
+
+    def _series(self, rows: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        history: dict[str, Any] = {
+            "status": "partial",
+            "warnings": ["delivered 2 of 90 expected observations"],
+            "history_coverage": {
+                "requested_days": 90,
+                "delivered_start": "2026-08-25",
+                "observation_count": len(rows),
+                "expected_observation_count": 65,
+                "coverage_ratio": 0.31,
+                "truncated": True,
+                "stale": True,
+                "status": "partial",
+            },
+            "data": rows,
+        }
+        history.update(extra)
+        return make_export(
+            {
+                "dashboard": _section(
+                    "dashboard",
+                    {"components": {"performance_history": history}},
+                    status="partial",
+                    warnings=["performance window short"],
+                )
+            }
+        )
+
+    def test_num021_a_series_with_no_breadth_catches(self) -> None:
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "warm_up": True, "benchmark_value": 99.0},
+                {"date": "2026-08-26", "portfolio_value": 101.0, "return": 0.01,
+                 "benchmark_value": 100.0},
+            ]
+        )
+        assert_only(export, "NUM-021")
+        assert "constituent count on 0 rows" in find_for(export, "NUM-021")[0].message
+
+    def test_num021_a_per_row_constituent_count_passes(self) -> None:
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "constituent_count": 14, "warm_up": True, "benchmark_value": 99.0},
+                {"date": "2026-08-26", "portfolio_value": 101.0, "return": 0.01,
+                 "constituent_count": 1, "benchmark_value": 100.0},
+            ]
+        )
+        assert rule_ids(export) == set()
+
+    def test_num021_an_aggregate_beside_the_series_passes(self) -> None:
+        """``analytics_engine`` renormalises per date, so the cheapest honest
+        disclosure is an aggregate: how many days were a partial basket."""
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "warm_up": True, "benchmark_value": 99.0},
+                {"date": "2026-08-26", "portfolio_value": 101.0, "return": 0.01,
+                 "benchmark_value": 100.0},
+            ],
+            partial_basket_days=20,
+        )
+        assert rule_ids(export) == set()
+
+    def test_num021_a_renormalisation_declaration_passes(self) -> None:
+        """An engineer who genuinely stops renormalising says so in one line."""
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "warm_up": True, "benchmark_value": 99.0},
+                {"date": "2026-08-26", "portfolio_value": 101.0, "return": 0.01,
+                 "benchmark_value": 100.0},
+            ],
+            renormalization="not_applied_every_observation_used_the_full_universe",
+        )
+        assert rule_ids(export) == set()
+
+    def test_num021_a_universe_size_is_not_a_breadth_disclosure(self) -> None:
+        """``portfolio_position_count: 14`` says how many legs COULD have been
+        in the basket, which is not the number the defect is about."""
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "warm_up": True, "benchmark_value": 99.0},
+                {"date": "2026-08-26", "portfolio_value": 101.0, "return": 0.01,
+                 "benchmark_value": 100.0},
+            ],
+            portfolio_position_count=14,
+        )
+        assert_only(export, "NUM-021")
+
+    def test_num021_a_series_with_no_measured_return_passes(self) -> None:
+        export = self._series(
+            [
+                {"date": "2026-08-25", "portfolio_value": 100.0, "return": None,
+                 "warm_up": True, "benchmark_value": 99.0},
+            ]
+        )
+        assert rule_ids(export) == set()
+
+    # ---- NUM-022 (SI-3 / QM-3)
+
+    def _forecast(self, interval: Any) -> dict[str, Any]:
+        return make_export(
+            {
+                "forecast_risk": _section(
+                    "forecast_risk",
+                    {
+                        "portfolio": {
+                            "volatility_forecast": 0.13767283267201857,
+                            "var_forecast": -0.014266383036982124,
+                            "cvar_forecast": -0.01786550094600801,
+                            "confidence_interval": interval,
+                            "observations": 174,
+                            "annualized": True,
+                        }
+                    },
+                )
+            }
+        )
+
+    def test_num022_the_exact_v5_band_catches(self) -> None:
+        """The reproduced defect: ``midpoint*0.8`` and ``midpoint*1.2`` hold to
+        exact float equality, so no sample produced this interval."""
+        export = self._forecast([0.11013826613761486, 0.16520739920642227])
+        assert_only(export, "NUM-022")
+        message = find_for(export, "NUM-022")[0].message
+        assert "[0.8, 1.2]" in message
+
+    def test_num022_a_computed_symmetric_interval_passes(self) -> None:
+        """Symmetry alone is NOT the finding. This is a real Sharpe 95% CI that
+        is symmetric and NOT a round multiple, and it must pass — otherwise the
+        only way to silence the rule would be to break the symmetry of a
+        correctly computed interval."""
+        export = self._forecast([0.0952, 0.2146])
+        assert rule_ids(export) == set()
+
+    def test_num022_an_asymmetric_interval_passes(self) -> None:
+        assert rule_ids(self._forecast([0.0901, 0.2408])) == set()
+
+    def test_num022_a_non_round_symmetric_interval_passes(self) -> None:
+        """Endpoints at 0.6429x and 1.3571x the centre: symmetric, off-grid, and
+        exactly what a computed interval looks like."""
+        centre = 0.14
+        export = self._forecast([round(centre * 0.6429, 12),
+                                 round(centre * 1.3571, 12)])
+        assert rule_ids(export) == set()
+
+    def test_num022_an_interval_containing_zero_passes(self) -> None:
+        """A VaR or Sharpe interval may straddle zero; a negative endpoint is
+        not a positive round multiple and the rule stays out of the way."""
+        assert rule_ids(self._forecast([-9.77, 16.75])) == set()
+
+    def test_num022_a_two_element_list_that_is_not_an_interval_passes(self) -> None:
+        export = make_export(
+            {
+                "regime": _section(
+                    "regime", {"term_structure": [0.1, 0.2]}
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_num022_the_estimate_itself_is_not_an_interval(self) -> None:
+        """``[x, x]`` would be a 1.0 multiple; a degenerate list must not be
+        read as a fabricated band."""
+        assert rule_ids(self._forecast([0.1377, 0.1377])) == set()
+
+    # ---- NUM-023 (QM-4)
+
+    def _vol_sizing(self, **extra: Any) -> dict[str, Any]:
+        return make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {
+                        "target_volatility": 0.15,
+                        "current_volatility": 0.145465131056991,
+                        "scale_factor": 1.295309,
+                        "achieved_volatility": 0.15,
+                        **extra,
+                    },
+                )
+            }
+        )
+
+    def test_num023_achieved_equal_to_target_catches(self) -> None:
+        export = self._vol_sizing()
+        assert_only(export, "NUM-023")
+        assert "restatement" in find_for(export, "NUM-023")[0].message
+
+    def test_num023_a_genuinely_achieved_value_passes(self) -> None:
+        """0.1158 is what rec_vol x scale actually is, and publishing THAT next
+        to a 0.15 target is the honest version of the same section."""
+        export = self._vol_sizing(achieved_volatility=0.11580248)
+        assert rule_ids(export) == set()
+
+    def test_num023_no_scale_factor_means_no_identity_is_claimed(self) -> None:
+        """Without a published scaling step the equality could be a real
+        coincidence of a re-measurement, and the rule stays quiet."""
+        export = make_export(
+            {
+                "volatility_sizing": _section(
+                    "volatility_sizing",
+                    {"target_volatility": 0.15, "achieved_volatility": 0.15},
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_num023_a_tautology_on_another_quantity_catches(self) -> None:
+        """Not special-cased to volatility: any ``achieved_<x>`` beside its own
+        ``target_<x>`` with a scale factor is the same restatement."""
+        export = make_export(
+            {
+                "sizing": _section(
+                    "sizing",
+                    {
+                        "target_beta": 0.8,
+                        "achieved_beta": 0.8,
+                        "scale_factor": 1.1,
+                        "beta_standard_error": 0.2,
+                    },
+                )
+            }
+        )
+        assert_only(export, "NUM-023")
+
+    def test_num023_near_miss_is_not_a_tautology(self) -> None:
+        """A real re-measurement differs in the ninth decimal, which is six
+        orders of magnitude outside the 1e-12 identity band. Publishing
+        ``rec_vol * scale`` to that precision is a measurement."""
+        assert rule_ids(
+            self._vol_sizing(achieved_volatility=0.15 + 1e-9)
+        ) == set()
+
+    def test_num023_inside_the_identity_band_is_still_the_identity(self) -> None:
+        """Pinned so the tolerance is a stated choice rather than an accident.
+        1e-12 absolute on a 0.15 volatility is ~7e-12 relative, far tighter than
+        any rounding the exporter actually applies, so it can only ever match an
+        algebraic identity and never a measurement."""
+        assert_only(self._vol_sizing(achieved_volatility=0.15 + 1e-13), "NUM-023")
+
+    # ---- NUM-024 (SI-1 / G9)
+
+    def _signal_scan(self, signal: str, **record: Any) -> dict[str, Any]:
+        return make_export(
+            {
+                "pairs": _section(
+                    "pairs",
+                    {
+                        "universe_size": 14,
+                        "scanned_pairs_count": 91,
+                        "test_agreement": {
+                            "decision_test": "engle_granger",
+                            "counted_pairs": 91,
+                            "agreement_count": 83,
+                            "disagreement_count": 8,
+                        },
+                        "pairs": [
+                            {
+                                "ticker_a": "AAA.NS",
+                                "ticker_b": "BBB.NS",
+                                "engle_granger_pvalue": 0.042,
+                                "hedge_ratio_beta": 0.008606,
+                                "hedge_ratio_beta_standard_error": 0.0021,
+                                "signal": signal,
+                                **record,
+                            }
+                        ],
+                    },
+                    status="partial",
+                    warnings=["depth limited"],
+                )
+            }
+        )
+
+    def test_num024_a_directive_without_its_basis_catches(self) -> None:
+        export = self._signal_scan("LONG_SPREAD (Long AAA.NS, Short BBB.NS)")
+        assert_only(export, "NUM-024")
+        message = find_for(export, "NUM-024")[0].message
+        assert "decision threshold" in message
+        assert "multiplicity correction" in message
+        # These two ARE published, and the message must not claim otherwise.
+        assert "size ratio" not in message
+        assert "number of comparisons" not in message
+
+    def test_num024_a_directive_with_its_full_basis_passes(self) -> None:
+        export = self._signal_scan(
+            "SHORT_SPREAD (Short AAA.NS, Long BBB.NS)",
+            johansen_agrees_with_decision=True,
+            entry_z_threshold=1.5,
+        )
+        export["sections"]["pairs"]["data"]["bonferroni_alpha"] = 0.00054945
+        export["sections"]["pairs"]["data"]["comparisons_made"] = 91
+        assert rule_ids(export) == set()
+
+    def test_num024_a_scan_level_basis_is_not_duplicated_per_record(self) -> None:
+        """One honest constant beside the record list is enough for every record
+        in it; the rule must not demand 91 copies."""
+        export = self._signal_scan(
+            "LONG_SPREAD (Long AAA.NS, Short BBB.NS)",
+            johansen_agrees_with_decision=False,
+        )
+        data = export["sections"]["pairs"]["data"]
+        data["entry_z_threshold"] = 1.5
+        data["bonferroni_alpha"] = 0.00054945
+        data["comparisons_made"] = 91
+        data["hedge_ratio"] = {"AAA.NS/BBB.NS": 0.008606}
+        assert rule_ids(export) == set()
+
+    def test_num024_a_neutral_label_is_not_a_directive(self) -> None:
+        """``NOT_COINTEGRATED`` and ``NEUTRAL`` say nothing actionable, and 89 of
+        the 91 v5 records read that way. Flagging them would be noise on the
+        overwhelming majority of the scan."""
+        for label in ("NEUTRAL", "NOT_COINTEGRATED", "COINTEGRATED", "HOLD"):
+            assert rule_ids(self._signal_scan(label)) == set()
+
+    def test_num024_prose_mentioning_a_verb_is_not_a_directive(self) -> None:
+        """Only directive-NAMED keys are read, so a ``methodology`` sentence
+        that happens to contain "buy" cannot trip this rule."""
+        export = make_export(
+            {
+                "pairs": _section(
+                    "pairs",
+                    {
+                        "methodology": "buy_price_inferred starts shift the window",
+                        "universe_size": 14,
+                        "scanned_pairs_count": 91,
+                        "test_agreement": {
+                            "decision_test": "engle_granger",
+                            "counted_pairs": 91,
+                            "agreement_count": 83,
+                            "disagreement_count": 8,
+                        },
+                        "pairs": [{"ticker_a": "AAA.NS", "ticker_b": "BBB.NS",
+                                   "hedge_ratio_beta": 0.27,
+                                   "hedge_ratio_beta_standard_error": 0.06,
+                                   "signal": "NEUTRAL"}],
+                    },
+                    status="partial",
+                    warnings=["depth limited"],
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_num024_a_directive_field_naming_the_action_is_caught_too(self) -> None:
+        export = make_export(
+            {
+                "pairs": _section(
+                    "pairs",
+                    {"directive": "Short AAA.NS against BBB.NS"},
+                    status="partial",
+                    warnings=["depth limited"],
+                )
+            }
+        )
+        assert_only(export, "NUM-024")
 
 
 # --------------------------------------------------------------------------
@@ -2148,7 +3037,7 @@ class TestCheckCommand:
         path = _write(tmp_path / "ok.json", make_export())
         ca.main(["check", "--export", str(path)])
         out = capsys.readouterr().out
-        assert out.index("ENVELOPE  (18 rules)") < out.index("CROSS-SECTION")
+        assert out.index("ENVELOPE  (21 rules)") < out.index("CROSS-SECTION")
         assert out.index("CROSS-SECTION") < out.index("NUMERIC")
         assert "PER-SECTION VERDICT" in out
         assert "SUMMARY" in out
@@ -2165,12 +3054,13 @@ EXERCISED_RULE_IDS: set[str] = {
     "ENV-001", "ENV-002", "ENV-003", "ENV-004", "ENV-005", "ENV-006",
     "ENV-007", "ENV-008", "ENV-009", "ENV-010", "ENV-011", "ENV-012",
     "ENV-013", "ENV-014", "ENV-015", "ENV-016", "ENV-017", "ENV-018",
+    "ENV-019", "ENV-020", "ENV-021",
     # cross-section
     "XS-001", "XS-002", "XS-003", "XS-004", "XS-005", "XS-006", "XS-007",
-    "XS-008", "XS-009",
+    "XS-008", "XS-009", "XS-010",
     # numeric
     "NUM-001", "NUM-002", "NUM-003", "NUM-004", "NUM-005", "NUM-006",
     "NUM-007", "NUM-008", "NUM-009", "NUM-010", "NUM-011", "NUM-012",
     "NUM-013", "NUM-014", "NUM-015", "NUM-016", "NUM-017", "NUM-018",
-    "NUM-019", "NUM-020",
+    "NUM-019", "NUM-020", "NUM-021", "NUM-022", "NUM-023", "NUM-024",
 }

@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Sequence
 import warnings
 
 # Financial analytics libraries
@@ -44,21 +44,26 @@ def _finite_weight(weights: Optional[Dict[str, Any]], ticker: str) -> float:
     return value if np.isfinite(value) else 0.0
 
 
-def aggregate_active_returns(
-    returns: pd.DataFrame, weights: Dict[str, float]
-) -> pd.Series:
-    """Aggregate returns using the shared active positive-weight contract.
+#: Minimum fraction of gross positive weight a date must cover before it is
+#: published as a PORTFOLIO return.  The previous contract kept any date with
+#: one live constituent and renormalised the survivors to 1.0, so a date on
+#: which a single 3.3 % leg traded was published as if the whole book had
+#: moved, with that leg's weight inflated by 1/0.033 = 30x.  A partial basket
+#: is not the portfolio; it is a different, smaller portfolio whose identity
+#: changes from day to day.  Below the threshold the date is DROPPED (never
+#: zero-filled, never renormalised) so the published series only ever contains
+#: dates on which the whole declared book was measurable.
+PORTFOLIO_RETURN_MIN_COVERAGE = 1.0
 
-    A date is usable only when at least one positive-weight constituent has a
-    finite return.  On that date, the available positive weights are
-    renormalised; dates with no active exposure are omitted rather than
-    converted into synthetic zero returns.  Keeping this helper at module
-    scope lets API orchestration use exactly the same rule as the service.
-    """
-    if not isinstance(returns, pd.DataFrame) or returns.empty:
-        return pd.Series(dtype=float)
+#: Relative tolerance for the coverage comparison.  ``covered == gross`` must
+#: not be rejected because the two sums were accumulated in a different order.
+COVERAGE_TOLERANCE = 1e-12
 
-    clean = returns.replace([np.inf, -np.inf], np.nan)
+
+def _active_weight_frame(
+    clean: pd.DataFrame, weights: Dict[str, float]
+) -> Optional[pd.Series]:
+    """Positive, finite weights aligned to `clean`'s columns, else ``None``."""
     usable_weights: Dict[str, float] = {}
     for column in clean.columns:
         try:
@@ -68,13 +73,223 @@ def aggregate_active_returns(
         if np.isfinite(weight) and weight > 0.0:
             usable_weights[column] = weight
     if not usable_weights:
+        return None
+    return pd.Series(usable_weights, dtype=float).reindex(
+        clean.columns, fill_value=0.0
+    )
+
+
+def active_return_coverage(
+    returns: pd.DataFrame,
+    weights: Dict[str, float],
+    min_coverage: Optional[float] = None,
+) -> pd.DataFrame:
+    """Per-date constituent count and covered weight fraction.
+
+    One row per date in `returns`, in the caller's index order:
+
+    ``constituent_count``
+        How many positive-weight legs had a finite return that date.
+    ``covered_weight`` / ``gross_weight``
+        The weight that traded, and the weight that was declared.
+    ``covered_weight_fraction``
+        ``covered_weight / gross_weight`` -- 1.0 means the whole book traded.
+    ``renormalization_uplift``
+        ``gross_weight / covered_weight``.  The factor by which the OLD
+        contract inflated the surviving legs' weights.  Always 1.0 on a
+        published date; the value it reaches on a dropped date is exactly the
+        size of the distortion that used to ship silently.
+    ``published``
+        Whether the date clears `min_coverage` and carries any weight at all.
+    """
+    columns = [
+        "constituent_count",
+        "covered_weight",
+        "gross_weight",
+        "covered_weight_fraction",
+        "renormalization_uplift",
+        "published",
+    ]
+    threshold = (
+        PORTFOLIO_RETURN_MIN_COVERAGE if min_coverage is None else float(min_coverage)
+    )
+    empty = pd.DataFrame(columns=columns)
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
+        return empty
+
+    clean = returns.replace([np.inf, -np.inf], np.nan)
+    weight_frame = _active_weight_frame(clean, weights)
+    if weight_frame is None:
+        return empty
+
+    gross_weight = float(weight_frame.sum())
+    active = clean.notna() & (weight_frame > 0.0)
+    covered_weight = active.mul(weight_frame, axis=1).sum(axis=1)
+    fraction = (
+        covered_weight / gross_weight if gross_weight > 0.0 else covered_weight * 0.0
+    )
+    covered_values = covered_weight.to_numpy(dtype=float)
+    safe_covered = np.where(covered_values > 0.0, covered_values, 1.0)
+    frame = pd.DataFrame(
+        {
+            "constituent_count": active.sum(axis=1).astype(int),
+            "covered_weight": covered_weight.astype(float),
+            "gross_weight": float(gross_weight),
+            "covered_weight_fraction": fraction.astype(float),
+            # The factor by which the old contract inflated the survivors.
+            # Infinite when a date had no live weight at all -- exactly the
+            # dates the old contract omitted outright.
+            "renormalization_uplift": np.where(
+                covered_values > 0.0, gross_weight / safe_covered, np.inf
+            ),
+        },
+        index=clean.index,
+    )
+    frame["published"] = (
+        (frame["covered_weight_fraction"] >= threshold - COVERAGE_TOLERANCE)
+        & (frame["covered_weight"] > 0.0)
+    )
+    return frame[columns]
+
+
+def _iso_date(index: Any) -> Optional[str]:
+    """`index` as an ISO date string, or None when it is not a real date."""
+    try:
+        return pd.Timestamp(index).date().isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def portfolio_return_coverage_block(
+    returns: pd.DataFrame,
+    weights: Dict[str, float],
+    min_coverage: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Publishable audit trail for the portfolio-return coverage rule.
+
+    The gate drops dates silently from the metric series; this block is how a
+    reader finds out which dates went, how thin they were, and how far the old
+    renormalisation would have inflated them.
+    """
+    threshold = (
+        PORTFOLIO_RETURN_MIN_COVERAGE if min_coverage is None else float(min_coverage)
+    )
+    frame = active_return_coverage(returns, weights, threshold)
+    if frame.empty:
+        return {
+            "basis": (
+                "per-date fraction of gross positive weight with a finite "
+                "constituent return"
+            ),
+            "min_covered_weight_fraction": float(threshold),
+            "coverage_rule": (
+                "a date is published as a portfolio return only when its "
+                "covered weight fraction reaches the minimum; short dates are "
+                "dropped, never zero-filled and never renormalised"
+            ),
+            "total_dates": 0,
+            "published_dates": 0,
+            "dropped_dates": 0,
+            "dates": [],
+            "error": "no positive-weight constituents with return history",
+        }
+
+    published = frame[frame["published"]]
+    dropped = frame[~frame["published"]]
+
+    def _finite_max(source: pd.DataFrame, column: str) -> Optional[float]:
+        """Largest finite value in `column`, or None.
+
+        A date with no covered weight at all has an infinite uplift, and
+        `Infinity` is not valid JSON -- the old rule omitted those dates
+        outright, so there is no distortion to report for them.
+        """
+        values = source[column].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        return float(values.max()) if values.size else None
+
+    return {
+        "basis": (
+            "per-date fraction of gross positive weight with a finite "
+            "constituent return"
+        ),
+        "min_covered_weight_fraction": float(threshold),
+        "coverage_rule": (
+            "a date is published as a portfolio return only when its covered "
+            "weight fraction reaches the minimum; short dates are dropped, "
+            "never zero-filled and never renormalised"
+        ),
+        "total_dates": int(len(frame)),
+        "published_dates": int(len(published)),
+        "dropped_dates": int(len(dropped)),
+        # Spelled out for a reader (and an audit rule) that greps for the
+        # defect by name. Both are exact counts, not claims.
+        "renorm": "not_applied",
+        "partial_basket_days": int(len(dropped)),
+        "min_published_constituent_count": (
+            int(published["constituent_count"].min()) if not published.empty else None
+        ),
+        "max_published_renormalization_uplift": _finite_max(
+            published, "renormalization_uplift"
+        ),
+        "max_dropped_renormalization_uplift": _finite_max(
+            dropped, "renormalization_uplift"
+        ),
+        "max_dropped_covered_weight_fraction": _finite_max(
+            dropped, "covered_weight_fraction"
+        ),
+        "dates": [
+            {
+                "date": _iso_date(index),
+                "constituent_count": int(row["constituent_count"]),
+                "covered_weight_fraction": round(
+                    float(row["covered_weight_fraction"]), 6
+                ),
+                "published": bool(row["published"]),
+            }
+            for index, row in frame.iterrows()
+        ],
+    }
+
+
+def aggregate_active_returns(
+    returns: pd.DataFrame,
+    weights: Dict[str, float],
+    min_coverage: Optional[float] = None,
+) -> pd.Series:
+    """Aggregate returns using the shared active positive-weight contract.
+
+    A date is published only when at least one positive-weight constituent has
+    a finite return AND the covered weight fraction reaches `min_coverage`
+    (default :data:`PORTFOLIO_RETURN_MIN_COVERAGE` = 1.0, i.e. the whole
+    declared book traded).  Dates that fall short are DROPPED.  They are not
+    zero-filled -- that would assert a flat day for a leg that did not trade --
+    and they are not renormalised, because renormalisation republishes a
+    partial basket under the portfolio's name: on a day where one 3.3 % leg is
+    the only live constituent, renormalising hands that leg 100 % of the
+    portfolio's return and 30x its weight.  Such a day is a *different*
+    portfolio, and the resulting series is not the one the reader is holding.
+
+    Keeping this helper at module scope lets API orchestration use exactly the
+    same rule as the service.
+    """
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
         return pd.Series(dtype=float)
 
-    weight_frame = pd.Series(usable_weights).reindex(clean.columns, fill_value=0.0)
+    clean = returns.replace([np.inf, -np.inf], np.nan)
+    weight_frame = _active_weight_frame(clean, weights)
+    if weight_frame is None:
+        return pd.Series(dtype=float)
+
+    coverage = active_return_coverage(clean, weights, min_coverage)
+    keep = coverage.index[coverage["published"]]
+    if len(keep) == 0:
+        return pd.Series(dtype=float)
+
     active = clean.notna() & (weight_frame > 0.0)
-    active_weight = active.mul(weight_frame, axis=1).sum(axis=1)
     numerator = clean.where(active, 0.0).mul(weight_frame, axis=1).sum(axis=1)
-    portfolio = numerator.loc[active_weight > 0.0] / active_weight.loc[active_weight > 0.0]
+    covered_weight = coverage["covered_weight"]
+    portfolio = (numerator.loc[keep] / covered_weight.loc[keep]).astype(float)
     return portfolio.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
 
 
@@ -157,6 +372,40 @@ STRESS_CONFIDENCE_LABEL = 0.95
 #: indistinguishable hard zero and dragged `overall_score` down (D-04).
 RISK_CORRELATION_POINTS_PER_UNIT = 50.0
 
+# ---------------------------------------------------------------------------
+# forecast tail contract (SI-3 / QM-3 / AD-2)
+# ---------------------------------------------------------------------------
+# The fitted GARCH/EGARCH models use `dist='normal'`, so their conditional
+# distribution is N(0, sigma_t^2) and the two numbers below ARE the correct
+# quantiles of THAT distribution -- a 95% VaR is -1.645 * sigma_t and a 95%
+# expected shortfall is -2.06 * sigma_t.  They are constants because the
+# normal distribution's quantiles are constants, not because the risk was
+# faked.  What was indefensible is that NONE of this was published: no level,
+# no units, no sign convention, and a "confidence interval" that was a fixed
+# +/-20 % haircut on the point forecast.  The values below are therefore
+# published as the declared contract they always were.
+TAIL_CONFIDENCE_LEVEL = 0.95
+TAIL_Z_MULTIPLIER = 1.645
+TAIL_ES_MULTIPLIER = 2.06
+#: Tail losses are published as negative returns, floored so a "loss" can
+#: never round to a gain and can never reach -100 % of capital.
+TAIL_CLIP_LOW = -0.99
+TAIL_CLIP_HIGH = -0.001
+
+#: Why `confidence_interval` is null.  Published rather than left implicit so
+#: a consumer reading the absence learns the reason instead of assuming a bug.
+FORECAST_NO_INTERVAL_REASON = (
+    "not computed: this forecast publishes a point estimate of conditional "
+    "volatility from a fitted model and derives no sampling distribution for "
+    "that estimate. The field previously carried a fixed +/-20% band around "
+    "the point forecast, which is not an interval at any confidence level. "
+    "It is null rather than a plausible-looking band because a band with no "
+    "level, no degrees of freedom and no sampling error is worse than an "
+    "explicit absence: a reader takes 'confidence interval' as a statement "
+    "about estimator uncertainty and concludes the forecast is well "
+    "identified."
+)
+
 
 def _liquidity_band(published_score: float) -> tuple[str, str]:
     """Band label and liquidation window for an ALREADY-ROUNDED published score."""
@@ -229,9 +478,10 @@ class AnalyticsEngine:
                 return self._empty_metrics()
             returns = returns.iloc[1:]
 
-            # Handle only finite, strictly positive weights.  The active-mask
-            # aggregation below renormalises the positive weights on each date
-            # for which at least one constituent has a real return.
+            # Handle only finite, strictly positive weights.  A date becomes a
+            # portfolio return only when the whole declared book traded that
+            # day; short dates are dropped rather than renormalised, so the
+            # series is never a moving basket published under one name.
             if weights is None:
                 weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
             else:
@@ -247,6 +497,7 @@ class AnalyticsEngine:
                     return self._empty_metrics()
                 weights = {key: value / weight_sum for key, value in weights.items()}
 
+            coverage = portfolio_return_coverage_block(returns, weights)
             portfolio_returns = self._calculate_portfolio_returns(returns, weights)
             if portfolio_returns.empty:
                 return self._empty_metrics()
@@ -254,6 +505,7 @@ class AnalyticsEngine:
             metrics = {
                 "observations": int(len(portfolio_returns)),
                 "active_observations": int(len(portfolio_returns)),
+                "portfolio_return_coverage": coverage,
             }
             metrics.update(self._calculate_basic_metrics(portfolio_returns))
             metrics.update(self._calculate_risk_metrics(portfolio_returns))
@@ -854,6 +1106,47 @@ class AnalyticsEngine:
             logger.error(f"Error in stress test: {e}")
             return self._empty_stress_test()
     
+    @staticmethod
+    def _sample_covariance_volatility(
+        returns: pd.DataFrame,
+        tickers: Sequence[str],
+        weight_values: Sequence[float],
+    ) -> tuple[Optional[float], Optional[str]]:
+        """Annualised volatility of a weighted book on the SAMPLE covariance.
+
+        Returns `(value, unavailable_reason)`; exactly one is not None.  The
+        modelling covariance used for inverse-volatility sizing is a
+        correlation matrix times recency-weighted marginal volatilities, which
+        is a deliberate, smoothable convention -- but it is not the only
+        number that can be called "this book's volatility", and publishing one
+        of them as a *measurement* while deriving the scale from another is
+        how a 15 % target was published beside a realised 22 %.  This is the
+        convention that reconciles with the rest of the artifact (it is the one
+        `risk_contribution` and `realized_risk` use), so it is what
+        `achieved_volatility` now reports.
+        """
+        if not isinstance(returns, pd.DataFrame) or returns.empty:
+            return None, "no return history for the measured legs"
+        available = [t for t in tickers if t in returns.columns]
+        if not available:
+            return None, "no measured leg is present in the return frame"
+        vector = np.asarray(
+            [float(w) for w, t in zip(weight_values, tickers) if t in returns.columns],
+            dtype=float,
+        )
+        if vector.size == 0 or not np.isfinite(vector).all() or vector.sum() <= 0.0:
+            return None, "no positive finite weight on the measured legs"
+        sample = returns[available].dropna(how="all")
+        if len(sample) < 2:
+            return None, "fewer than two dates with any measured leg return"
+        covariance = sample.cov().to_numpy(dtype=float)
+        if not np.isfinite(covariance).all():
+            return None, "sample covariance is not finite for these legs"
+        variance = float(vector @ covariance @ vector)
+        if not np.isfinite(variance) or variance < 0.0:
+            return None, "sample-covariance quadratic form is not a finite variance"
+        return float(np.sqrt(variance) * np.sqrt(252.0)), None
+
     async def volatility_sizing(
         self, 
         price_data: pd.DataFrame, 
@@ -877,6 +1170,25 @@ class AnalyticsEngine:
         Trade instructions are pinned to ONE aligned sizing price date and
         whole shares are derived from the reported notional with a documented
         half-up rule, so amount, `shares_delta`, and `sizing_price` reconcile.
+
+        Three volatilities describe this one book and each is published under
+        the convention that produced it, because publishing one of them as
+        "the" volatility is what made a 15 % target look verified:
+
+        * `sizing_volatility` -- the modelled volatility of the parity book
+          (correlation x EWMA marginals).  The scale is DEFINED as
+          `target / sizing_volatility`, so this is the number the sizing
+          actually used and it used to be discarded.
+        * `achieved_volatility` -- a MEASUREMENT: the recommended, scaled
+          book's volatility on the sample covariance of the measured returns.
+          It is not `sizing_volatility * scale`, because that product is the
+          target identically.
+        * `current_volatility_sample_covariance` -- the same measurement for
+          the book as it stands, so the target, the current book and the
+          recommendation are comparable in one convention.
+
+        `imposed_target_volatility` publishes the algebraic identity openly
+        instead of passing it off as an achievement.
 
         Args:
             price_data: Historical price data
@@ -983,6 +1295,17 @@ class AnalyticsEngine:
                 variance = float(current_vec @ current_cov @ current_vec)
                 if np.isfinite(variance):
                     current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
+            # The same book measured on the sample covariance.  Published
+            # because `current_volatility` above is a MODEL quantity
+            # (correlation x EWMA marginals) and the artifact used to carry it
+            # with no label, beside a realised figure ~36 % away and with no
+            # reconciliation note.  Three volatilities for one book is a defect
+            # whichever one is right; naming the convention of each is the fix.
+            current_volatility_sample, current_volatility_sample_reason = (
+                self._sample_covariance_volatility(
+                    returns, current_tickers, current_weight_values
+                )
+            )
 
             # Calculate true inverse-volatility risk parity weights for
             # positive, finite target holdings: w_i \propto 1 / \sigma_i.
@@ -1034,6 +1357,35 @@ class AnalyticsEngine:
             scale = float(target_volatility / rec_vol_ann)
             scaled_weights = {k: round(v * scale, 6) for k, v in recommended_weights.items()}
 
+            # `rec_vol_ann` is the volatility the scale was built from.  It
+            # used to be discarded, which is how a third, unpublished number
+            # ended up driving the recommendation: the published
+            # `current_volatility` was 0.145, the vol the scale used was
+            # 0.1158, and neither was named.  It is now published under its own
+            # key with its own basis.
+            sizing_volatility = float(rec_vol_ann)
+            sizing_volatility_basis = (
+                "single_leg_ewma_volatility"
+                if len(rec_tickers) == 1
+                else "correlation_x_ewma_volatility"
+            )
+            # `rec_vol_ann * scale` is the target, identically, for every input:
+            # `scale` was DEFINED as target / rec_vol_ann.  Publishing that
+            # product as `achieved_volatility` published the target's own
+            # restatement and labelled it a measurement.  What a reader needs
+            # is the volatility the recommended book actually carries on the
+            # measured returns, so that is what the field now holds.
+            imposed_target_volatility = float(rec_vol_ann * scale)
+            scaled_vector = [
+                scaled_weights.get(ticker, 0.0) for ticker in rec_tickers
+            ]
+            achieved_vol, achieved_vol_reason = self._sample_covariance_volatility(
+                returns, rec_tickers, scaled_vector
+            )
+            parity_vol, parity_vol_reason = self._sample_covariance_volatility(
+                returns, rec_tickers, [recommended_weights[t] for t in rec_tickers]
+            )
+
             # One documented normalization rule, shared with the rebalance
             # workflow.  The analytical target keeps its gross exposure and
             # reports the financing that exposure requires; `cash_weight` is the
@@ -1050,7 +1402,6 @@ class AnalyticsEngine:
             # `execution.net_cash_weight` is the same quantity derived from the
             # rounded published legs; the two agree to the published precision.
             cash_weight = round(1.0 - scale, 6)
-            achieved_vol = float(rec_vol_ann * scale)
 
             history = sizing_history_block(
                 returns, price_frame=cleaned_prices, model=model_type
@@ -1077,11 +1428,18 @@ class AnalyticsEngine:
                 if execution["financing_requirement"] is not None
                 else "financing required (unquantified: no portfolio value)"
             )
+            achieved_text = (
+                f"achieved_vol={round(achieved_vol, 4)} on the sample covariance"
+                if achieved_vol is not None
+                else f"achieved_vol=unavailable ({achieved_vol_reason})"
+            )
             methodology = (
                 f"{model} inverse-volatility risk parity scaled to target volatility "
                 f"{target_volatility} (scale={round(scale, 4)}, "
                 f"gross_exposure={execution['gross_exposure']}, cash={cash_weight}, "
-                f"achieved_vol={round(achieved_vol, 4)}"
+                f"sizing_vol={round(sizing_volatility, 4)} on "
+                f"{sizing_volatility_basis}, {achieved_text}; the target is "
+                f"imposed algebraically by scale, not verified against the data"
                 + (
                     f", {financing_text}; not executable as a normal rebalance"
                     if leveraged
@@ -1095,12 +1453,46 @@ class AnalyticsEngine:
                 "trades": trades,
                 "target_volatility": target_volatility,
                 "current_volatility": current_volatility,
+                "current_volatility_basis": (
+                    "correlation_x_ewma_volatility" if current_tickers else None
+                ),
+                "current_volatility_sample_covariance": (
+                    round(current_volatility_sample, 6)
+                    if current_volatility_sample is not None
+                    else None
+                ),
+                "current_volatility_sample_covariance_reason": (
+                    current_volatility_sample_reason
+                ),
                 "volatilities": annualized_vols,
                 "volatility_sources": volatility_sources,
                 "scale_factor": round(scale, 6),
                 "cash_weight": cash_weight,
                 "leveraged": leveraged,
-                "achieved_volatility": round(achieved_vol, 6),
+                # A MEASUREMENT: the volatility of the recommended, scaled book
+                # on the sample covariance of the measured returns.  It is
+                # deliberately NOT `sizing_volatility * scale`, which is the
+                # target restated.
+                "achieved_volatility": (
+                    round(achieved_vol, 6) if achieved_vol is not None else None
+                ),
+                "achieved_volatility_basis": "sample_covariance_of_measured_returns",
+                "achieved_volatility_reason": achieved_vol_reason,
+                # The vol the scale was actually built from, which used to be
+                # computed and thrown away.
+                "sizing_volatility": round(sizing_volatility, 6),
+                "sizing_volatility_basis": sizing_volatility_basis,
+                # What the target becomes under the sizing covariance. An
+                # identity, published as one so it is never mistaken for a
+                # second, independent measurement.
+                "imposed_target_volatility": round(imposed_target_volatility, 6),
+                "imposed_target_volatility_basis": (
+                    "sizing_volatility_times_scale_equals_target_by_construction"
+                ),
+                "recommended_volatility_sample_covariance": (
+                    round(parity_vol, 6) if parity_vol is not None else None
+                ),
+                "recommended_volatility_sample_covariance_reason": parity_vol_reason,
                 "methodology": methodology,
                 "execution": execution,
                 "sizing_history": history,
@@ -1167,9 +1559,25 @@ class AnalyticsEngine:
             concentration_score = min(30, concentration_result.get('herfindahl_index', 0.1) * 100)
             scores['concentration'] = concentration_score
             
-            # Volatility risk (25% weight)
-            portfolio_vol = portfolio_returns.std() * np.sqrt(252)  # Annualized
-            volatility_score = min(30, portfolio_vol * 100)
+            # Volatility risk (25% weight). An empty series is UNMEASURED, and
+            # `min(30, nan * 100)` returns 30 in Python -- a fabricated maximum
+            # risk score out of nothing. The coverage gate can empty the series
+            # (a book with a never-listed leg has no full-basket day at all), so
+            # null + exclude, exactly as the correlation leg below does.
+            portfolio_vol = (
+                portfolio_returns.std() * np.sqrt(252)  # Annualized
+                if not portfolio_returns.empty
+                else None
+            )
+            if portfolio_vol is None or not np.isfinite(portfolio_vol):
+                volatility_score = None
+                excluded.append('volatility')
+                excluded_reasons['volatility'] = (
+                    "no date carried a return for the whole book, so there is "
+                    "no portfolio volatility to measure"
+                )
+            else:
+                volatility_score = min(30, portfolio_vol * 100)
             scores['volatility'] = volatility_score
             
             # Correlation risk (20% weight)
@@ -1233,10 +1641,23 @@ class AnalyticsEngine:
                 excluded_reasons['factor_risk'] = "no benchmark supplied"
             scores['factor_risk'] = factor_score
             
-            # Market risk (10% weight) - based on recent volatility
+            # Market risk (10% weight) - based on recent volatility. Same
+            # unmeasured-is-not-zero rule as the volatility leg above.
             recent_returns = portfolio_returns.tail(60)  # Last 60 days
-            recent_vol = recent_returns.std() * np.sqrt(252)
-            market_score = min(30, recent_vol * 100)
+            recent_vol = (
+                recent_returns.std() * np.sqrt(252)
+                if len(recent_returns) > 1
+                else None
+            )
+            if recent_vol is None or not np.isfinite(recent_vol):
+                market_score = None
+                excluded.append('market_risk')
+                excluded_reasons['market_risk'] = (
+                    "fewer than two published portfolio return rows in the "
+                    "recent window, so there is no recent volatility to measure"
+                )
+            else:
+                market_score = min(30, recent_vol * 100)
             scores['market_risk'] = market_score
             
             # Calculate overall score (weighted average; excluded legs are
@@ -1279,7 +1700,7 @@ class AnalyticsEngine:
             alerts = []
             if concentration_score > 20:
                 alerts.append(f"High concentration risk (HHI: {concentration_result.get('herfindahl_index', 0):.3f})")
-            if volatility_score > 20:
+            if volatility_score is not None and volatility_score > 20:
                 alerts.append(f"High volatility risk ({portfolio_vol:.1%} annualized)")
             if correlation_score is not None and correlation_score > 15:
                 alerts.append(f"High correlation risk (avg correlation: {avg_correlation:.2f})")
@@ -1527,6 +1948,68 @@ class AnalyticsEngine:
         return_space = np.sqrt(cumulative) / 100.0
         return annualized, return_space
 
+    @staticmethod
+    def _tail_measure_disclosure(
+        horizon: int,
+        return_space_vol: float,
+        var_forecast: float,
+        cvar_forecast: float,
+        var_clip_high: float = TAIL_CLIP_HIGH,
+    ) -> Dict[str, Any]:
+        """Declare what `var_forecast` / `cvar_forecast` are, in the units they are in.
+
+        The two multipliers are the quantiles of the fitted models' OWN normal
+        innovation distribution, so the numbers are defensible; what was not
+        published was anything that let a reader know that.  Every field below
+        exists because its absence produced a wrong inference:
+
+        * `var_confidence_level` -- 1.645/2.06 are 95 % normal multipliers;
+          undeclared, a reader could not tell 95 % from 99 %.
+        * `var_units` / `volatility_forecast_units` -- the volatility is
+          ANNUALIZED and the tail is an h-DAY RETURN.  They differ by
+          sqrt(252 / h); treating a `annualized: true` object as if its VaR
+          were annualized is wrong by 15.87x at h=1.
+        * `var_sign_convention` -- the field is negative because a loss is
+          negative, not because the sign is a forecast.
+        * `cvar_to_var_ratio_fixed_by_construction` -- CVaR is the normal
+          expected-shortfall multiple of the same sigma, so the ratio is
+          2.06 / 1.645 for every input.  Publishing it as a measurement would
+          be false; publishing it as an identity is true and lets a reader
+          stop treating CVaR as independent information.
+        """
+        ratio = (
+            TAIL_ES_MULTIPLIER / TAIL_Z_MULTIPLIER
+            if TAIL_Z_MULTIPLIER
+            else None
+        )
+        return {
+            "var_confidence_level": TAIL_CONFIDENCE_LEVEL,
+            "var_horizon_days": int(horizon),
+            "var_units": f"{int(horizon)}_day_cumulative_return_decimal",
+            "var_sign_convention": "negative_is_loss",
+            "var_distribution": "normal",
+            "var_method": "fitted_conditional_sigma_x_normal_quantile",
+            "var_z_multiplier": TAIL_Z_MULTIPLIER,
+            "cvar_method": "fitted_conditional_sigma_x_normal_expected_shortfall",
+            "cvar_es_multiplier": TAIL_ES_MULTIPLIER,
+            "cvar_to_var_ratio": ratio,
+            "cvar_to_var_ratio_fixed_by_construction": True,
+            "var_clip_bounds": [TAIL_CLIP_LOW, float(var_clip_high)],
+            "var_clipped_by_bounds": bool(
+                abs(var_forecast - float(np.clip(
+                    -return_space_vol * TAIL_Z_MULTIPLIER, TAIL_CLIP_LOW, var_clip_high
+                ))) > 1e-15
+            ),
+            "cvar_clip_bounds": [TAIL_CLIP_LOW, float(var_clip_high)],
+            "volatility_forecast_units": "annualized",
+            "annualization_note": (
+                "`annualized` on the enclosing payload describes "
+                "volatility_forecast ONLY. var_forecast and cvar_forecast are "
+                f"{int(horizon)}-day returns and must NOT be annualized again."
+            ),
+            "return_space_volatility": float(return_space_vol),
+        }
+
     async def _garch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
         """GARCH volatility forecast with cumulative-horizon tail units.
 
@@ -1564,8 +2047,15 @@ class AnalyticsEngine:
             raw_vol_final = float(volatility_path[-1])
             vol_final = float(np.clip(raw_vol_final, 0.05, 1.20))
             return_space_vol = float(return_space_path[-1])
-            var_forecast = float(np.clip(-return_space_vol * 1.645, -0.99, -0.001))
-            cvar_forecast = float(np.clip(-return_space_vol * 2.06, -0.99, -0.001))
+            var_forecast = float(
+                np.clip(-return_space_vol * TAIL_Z_MULTIPLIER, TAIL_CLIP_LOW, TAIL_CLIP_HIGH)
+            )
+            cvar_forecast = float(
+                np.clip(-return_space_vol * TAIL_ES_MULTIPLIER, TAIL_CLIP_LOW, TAIL_CLIP_HIGH)
+            )
+            tail = self._tail_measure_disclosure(
+                h, return_space_vol, var_forecast, cvar_forecast
+            )
 
             return {
                 "model": "GARCH",
@@ -1574,16 +2064,28 @@ class AnalyticsEngine:
                 "raw_volatility_forecast": raw_vol_final,
                 "var_forecast": var_forecast,
                 "cvar_forecast": cvar_forecast,
-                "confidence_interval": [
-                    max(0.0, float(vol_final * 0.8)),
-                    float(vol_final * 1.2)
-                ],
+                # No interval.  The previous value was `vol * [0.8, 1.2]` --
+                # a fixed +/-20 % haircut, exact to the last bit, carrying no
+                # level and no sampling error.  A null plus a reason is the
+                # only honest value; inventing a band is what created the
+                # defect.
+                "confidence_interval": None,
+                "confidence_interval_status": "not_computed",
+                "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
+                "tail_measure": tail,
                 "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_path],
                 "model_params": {
                     "p": 1,
                     "q": 1,
                     "type": "GARCH",
                     "forecast_method": "analytic",
+                    "innovation_distribution": "normal",
+                    "volatility_units": "annualized",
+                    # Mirrored so the declaration actually reaches the artifact:
+                    # the forecast route forwards `model_params` verbatim and
+                    # nothing else from this dict.
+                    "tail_measure": tail,
+                    "confidence_interval_status": "not_computed",
                 },
             }
         except Exception as e:
@@ -1638,18 +2140,40 @@ class AnalyticsEngine:
             raw_vol_final = float(volatility_path[-1])
             vol_final = float(np.clip(raw_vol_final, 0.0, 1.20))
             return_space_vol = float(return_space_path[-1])
+            # EGARCH's tail is clipped at 0.0 on the loss side, not at the
+            # -0.001 floor GARCH/EWMA use; the bound travels with the number.
+            egarch_clip_high = 0.0
+            var_forecast = float(
+                np.clip(
+                    -return_space_vol * TAIL_Z_MULTIPLIER,
+                    TAIL_CLIP_LOW,
+                    egarch_clip_high,
+                )
+            )
+            cvar_forecast = float(
+                np.clip(
+                    -return_space_vol * TAIL_ES_MULTIPLIER,
+                    TAIL_CLIP_LOW,
+                    egarch_clip_high,
+                )
+            )
+            tail = self._tail_measure_disclosure(
+                h, return_space_vol, var_forecast, cvar_forecast,
+                var_clip_high=egarch_clip_high,
+            )
 
             return {
                 "model": "EGARCH",
                 "horizon": h,
                 "volatility_forecast": vol_final,
                 "raw_volatility_forecast": raw_vol_final,
-                "var_forecast": float(np.clip(-return_space_vol * 1.645, -0.99, 0.0)),
-                "cvar_forecast": float(np.clip(-return_space_vol * 2.06, -0.99, 0.0)),
-                "confidence_interval": [
-                    max(0.0, float(vol_final * 0.8)),
-                    float(vol_final * 1.2)
-                ],
+                "var_forecast": var_forecast,
+                "cvar_forecast": cvar_forecast,
+                # See `_garch_forecast`: null + reason, never a fabricated band.
+                "confidence_interval": None,
+                "confidence_interval_status": "not_computed",
+                "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
+                "tail_measure": tail,
                 "term_structure": [float(np.clip(v, 0.0, 1.20)) for v in volatility_path],
                 "model_params": {
                     "p": 1,
@@ -1658,6 +2182,10 @@ class AnalyticsEngine:
                     "forecast_method": method,
                     "simulations": 2000 if simulated else None,
                     "random_state": 100 if simulated else None,
+                    "innovation_distribution": "normal",
+                    "volatility_units": "annualized",
+                    "tail_measure": tail,
+                    "confidence_interval_status": "not_computed",
                 },
             }
         except Exception as e:
@@ -1685,25 +2213,91 @@ class AnalyticsEngine:
             # RiskMetrics has no mean reversion: flat h-step term structure
             term_structure = [forecast_volatility] * h
             h_factor = np.sqrt(h / 252.0)
-            
+            # RiskMetrics has no distribution, so the normal quantiles below are
+            # a STATED assumption, not a property of the fitted model.  The
+            # disclosure says so rather than letting `model: EWMA` imply a
+            # parametric tail it does not have.
+            return_space_vol = float(forecast_volatility * h_factor)
+            var_forecast = float(
+                np.clip(
+                    -forecast_volatility * TAIL_Z_MULTIPLIER * h_factor,
+                    TAIL_CLIP_LOW,
+                    TAIL_CLIP_HIGH,
+                )
+            )
+            cvar_forecast = float(
+                np.clip(
+                    -forecast_volatility * TAIL_ES_MULTIPLIER * h_factor,
+                    TAIL_CLIP_LOW,
+                    TAIL_CLIP_HIGH,
+                )
+            )
+            tail = self._tail_measure_disclosure(
+                h, return_space_vol, var_forecast, cvar_forecast
+            )
+            tail["var_method"] = "ewma_sigma_x_normal_quantile"
+            tail["var_distribution"] = "normal_assumed_no_parametric_fit"
+            tail["var_distribution_note"] = (
+                "RiskMetrics EWMA estimates variance only; it fits no "
+                "distribution. The normal quantiles are a declared assumption, "
+                "not a property of the model."
+            )
+
             return {
                 "model": "EWMA",
                 "horizon": h,
                 "volatility_forecast": forecast_volatility,
                 "raw_volatility_forecast": raw_forecast_volatility,
-                "var_forecast": float(np.clip(-forecast_volatility * 1.645 * h_factor, -0.99, -0.001)),
-                "cvar_forecast": float(np.clip(-forecast_volatility * 2.06 * h_factor, -0.99, -0.001)),
-                "confidence_interval": [
-                    max(0.0, float(forecast_volatility * 0.8)),
-                    float(forecast_volatility * 1.2)
-                ],
+                "var_forecast": var_forecast,
+                "cvar_forecast": cvar_forecast,
+                # See `_garch_forecast`: null + reason, never a fabricated band.
+                "confidence_interval": None,
+                "confidence_interval_status": "not_computed",
+                "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
+                "tail_measure": tail,
                 "term_structure": term_structure,
-                "model_params": {"lambda": lambda_val, "type": "EWMA"}
+                "model_params": {
+                    "lambda": lambda_val,
+                    "type": "EWMA",
+                    "innovation_distribution": "none_normal_assumed",
+                    "volatility_units": "annualized",
+                    "tail_measure": tail,
+                    "confidence_interval_status": "not_computed",
+                },
             }
         except Exception as e:
             logger.error(f"EWMA forecast error: {e}")
             return self._empty_forecast(h, "EWMA")
     
+    @staticmethod
+    def _ols_with_published_se(
+        y: Any, X: Any, maxlags: int = 5
+    ) -> tuple[Any, str, bool]:
+        """OLS with a Newey-West (HAC) covariance, and the SE basis as a label.
+
+        Returning the basis with the fit is the point.  A regression whose
+        autocorrelation-corrected standard errors are computed and then
+        discarded has paid for a correction no reader can see, and the
+        uncorrected alternative must never be published as if it were robust.
+        """
+        try:
+            model = sm.OLS(y, X).fit(
+                cov_type="HAC", cov_kwds={"maxlags": maxlags}
+            )
+            return model, f"newey_west_hac_maxlags_{maxlags}", True
+        except Exception:
+            model = sm.OLS(y, X).fit()
+            return model, "ols_uncorrected_hac_unavailable", False
+
+    @staticmethod
+    def _finite_param(series: Any, position: int) -> Optional[float]:
+        """`series[position]` as a finite float, else ``None`` (never 0.0)."""
+        try:
+            value = float(series.iloc[position])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
     def _calculate_factor_exposures(
         self, 
         returns: pd.DataFrame, 
@@ -1713,8 +2307,11 @@ class AnalyticsEngine:
         """Calculate factor exposures using OLS regression against market benchmark"""
         err_portfolio = {
             'alpha': None, 'annualized_alpha': None, 'market': None,
+            'alpha_std_error': None, 'market_std_error': None,
+            'std_error_basis': None, 'std_error_robust': None,
             'is_limited_history': False, 'history_warning': None,
-            'data_points': 0, 'error': 'insufficient data for factor regression'
+            'data_points': 0, 'observations': 0,
+            'error': 'insufficient data for factor regression'
         }
         try:
             if returns.empty:
@@ -1746,20 +2343,37 @@ class AnalyticsEngine:
                                 # attenuate beta toward 0). HAC SEs, statsmodels-local.
                                 X = sm.add_constant(aligned_benchmark.loc[active])
                                 y = s.loc[active]
-                                try:
-                                    model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-                                except Exception:
-                                    model = sm.OLS(y, X).fit()
+                                # The autocorrelation correction is only worth
+                                # paying for if it is published: `cov_bse` is
+                                # the SE the fit actually used, and a failed
+                                # HAC fit is labelled uncorrected rather than
+                                # silently passing off OLS errors as robust.
+                                model, se_basis, se_robust = self._ols_with_published_se(
+                                    y, X
+                                )
                                 alpha = float(model.params.iloc[0]) if len(model.params) > 0 else None
                                 beta = float(model.params.iloc[1]) if len(model.params) > 1 else None
+                                alpha_se = self._finite_param(model.bse, 0)
+                                beta_se = self._finite_param(model.bse, 1)
                             else:
                                 alpha = None
                                 beta = None
+                                se_basis = None
+                                se_robust = False
+                                alpha_se = None
+                                beta_se = None
 
                             positions_exp[ticker] = {
                                 'alpha': round(alpha, 6) if alpha is not None else None,
                                 'annualized_alpha': round(alpha * 252.0, 4) if alpha is not None else None,
                                 'market': round(beta, 4) if beta is not None else None,
+                                # The correction that was computed and dropped
+                                # is now the published uncertainty on the two
+                                # coefficients above.
+                                'alpha_std_error': round(alpha_se, 6) if alpha_se is not None else None,
+                                'market_std_error': round(beta_se, 6) if beta_se is not None else None,
+                                'std_error_basis': se_basis,
+                                'std_error_robust': se_robust,
                                 'is_limited_history': is_limited,
                                 'history_warning': f"Only {data_pts} active trading days in the analyzed window" if is_limited else None,
                                 'data_points': data_pts,
@@ -1768,6 +2382,8 @@ class AnalyticsEngine:
                         except Exception:
                             positions_exp[ticker] = {
                                 'alpha': None, 'annualized_alpha': None, 'market': None,
+                                'alpha_std_error': None, 'market_std_error': None,
+                                'std_error_basis': None, 'std_error_robust': None,
                                 'is_limited_history': False, 'history_warning': None,
                                 'data_points': 0, 'error': 'factor regression failed'
                             }
@@ -1775,26 +2391,42 @@ class AnalyticsEngine:
                     port_returns = self._calculate_portfolio_returns(aligned_returns, weights).dropna()
                     if not port_returns.empty:
                         try:
-                            # Portfolio is active when any constituent has a real
-                            # (non-NaN) return that day; 0% is a valid observation
-                            traded = aligned_returns.notna().any(axis=1)
-                            port_active = traded[traded].index.intersection(aligned_benchmark.index)
+                            # The regression must run on the dates the published
+                            # portfolio series actually contains.  The old mask
+                            # ("any constituent traded") was wider than the
+                            # series, so on a coverage-gated series
+                            # `.loc[port_active]` could miss labels entirely.
+                            port_coverage = active_return_coverage(
+                                aligned_returns, weights
+                            )
+                            port_active = port_coverage.index[
+                                port_coverage["published"]
+                            ].intersection(aligned_benchmark.index)
+                            port_active = port_active.intersection(port_returns.index)
                             if len(port_active) < 10:
                                 raise ValueError("insufficient active portfolio history")
                             X_port = sm.add_constant(aligned_benchmark.loc[port_active])
-                            try:
-                                port_model = sm.OLS(port_returns.loc[port_active], X_port).fit(cov_type="HAC", cov_kwds={"maxlags": 5})
-                            except Exception:
-                                port_model = sm.OLS(port_returns.loc[port_active], X_port).fit()
+                            port_model, port_se_basis, port_se_robust = (
+                                self._ols_with_published_se(
+                                    port_returns.loc[port_active], X_port
+                                )
+                            )
                             port_alpha = float(port_model.params.iloc[0]) if len(port_model.params) > 0 else None
                             port_beta = float(port_model.params.iloc[1]) if len(port_model.params) > 1 else None
+                            port_alpha_se = self._finite_param(port_model.bse, 0)
+                            port_beta_se = self._finite_param(port_model.bse, 1)
                             r_squared = round(float(port_model.rsquared), 4)
                             adj_r_squared = round(float(max(0.0, port_model.rsquared_adj)), 4)
                             return {
                                 'portfolio': {
                                     'alpha': round(port_alpha, 6) if port_alpha is not None else None,
                                     'annualized_alpha': round(port_alpha * 252.0, 4) if port_alpha is not None else None,
-                                    'market': round(port_beta, 4) if port_beta is not None else None
+                                    'market': round(port_beta, 4) if port_beta is not None else None,
+                                    'alpha_std_error': round(port_alpha_se, 6) if port_alpha_se is not None else None,
+                                    'market_std_error': round(port_beta_se, 6) if port_beta_se is not None else None,
+                                    'std_error_basis': port_se_basis,
+                                    'std_error_robust': port_se_robust,
+                                    'observations': int(len(port_active)),
                                 },
                                 'positions': positions_exp,
                                 'r_squared': r_squared,
@@ -1864,7 +2496,13 @@ class AnalyticsEngine:
             "volatility_forecast": None,
             "var_forecast": None,
             "cvar_forecast": None,
+            # An unavailable forecast has no point estimate, so it has no band
+            # either -- and the reason travels with the null so a consumer
+            # never reads the absence as a transport failure.
             "confidence_interval": None,
+            "confidence_interval_status": "not_computed",
+            "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
+            "tail_measure": None,
             "term_structure": None,
             "model_params": None,
             "error": error
@@ -1952,6 +2590,23 @@ class AnalyticsEngine:
             "trades": {},
             "target_volatility": 0.15,
             "current_volatility": None,
+            "current_volatility_basis": None,
+            "current_volatility_sample_covariance": None,
+            "current_volatility_sample_covariance_reason": (
+                "sizing unavailable: no measured return history"
+            ),
+            # Absent, not zero and not the target: nothing was measured.
+            "achieved_volatility": None,
+            "achieved_volatility_basis": "sample_covariance_of_measured_returns",
+            "achieved_volatility_reason": "sizing unavailable: no measured return history",
+            "sizing_volatility": None,
+            "sizing_volatility_basis": None,
+            "imposed_target_volatility": None,
+            "imposed_target_volatility_basis": None,
+            "recommended_volatility_sample_covariance": None,
+            "recommended_volatility_sample_covariance_reason": (
+                "sizing unavailable: no measured return history"
+            ),
             "error": "Insufficient data for volatility sizing"
         }
     

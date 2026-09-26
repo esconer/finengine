@@ -134,4 +134,23 @@ async def test_cointegration_scanner_engle_granger():
     pair = res.pairs[0]
     assert {pair.ticker_a, pair.ticker_b} == {"INFY.NS", "HDFCBANK.NS"}
     assert pair.ou_half_life_days > 0
-    assert pair.signal in ["LONG_SPREAD", "SHORT_SPREAD", "NEUTRAL"]
+    # A published signal is a classified sentence, not a bare token: a
+    # position-naming head is only reachable when both cointegration tests
+    # agree, the hedge ratio is positive, the p-value survives the family
+    # correction and the z-score is past its threshold - and when it is
+    # published it carries the ratio and the threshold. The gated heads
+    # (contested, non-directional, uncorrected) are legal outcomes too, so the
+    # assertion is on the contract rather than on one sampled verdict.
+    head = pair.signal.split(" ", 1)[0]
+    assert head in (
+        "LONG_SPREAD",
+        "SHORT_SPREAD",
+        "NEUTRAL",
+        "CONTESTED_TESTS_DISAGREE",
+        "NON_DIRECTIONAL_HEDGE_RATIO",
+        "UNCONFIRMED_AFTER_MULTIPLE_TESTING_CORRECTION",
+        "DIRECTIVE_WITHHELD_PENDING_MULTIPLE_TESTING_CORRECTION",
+    ), pair.signal
+    if head in ("LONG_SPREAD", "SHORT_SPREAD"):
+        assert f"hedge_ratio_beta={pair.hedge_ratio_beta:.6f}" in pair.signal
+        assert "threshold +/-1.5" in pair.signal

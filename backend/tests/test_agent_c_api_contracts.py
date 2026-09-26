@@ -1331,11 +1331,24 @@ async def test_c02_wide_return_builder_preserves_prelisting_mask():
     returns_df, portfolio, coverage = await _build_wide_returns(
         ["A", "B"], {"A": 0.5, "B": 0.5}, "2025-01-01", "2025-01-04", service
     )
+    # The prelisting mask is published AS a NaN on a row that is still present.
+    # This is the invariant this test exists for: absent, not backfilled, and not
+    # silently converted into "this date does not exist".
     assert pd.isna(returns_df.loc[dates[1], "B"])
     assert not np.isclose(returns_df.loc[dates[1], "A"], 0.0)
-    expected = [0.10, 120.0 / 110.0 - 1.0, (0.5 * (121.0 / 120.0 - 1.0) + 0.5 * 0.10)]
+    assert pd.isna(returns_df.loc[dates[2], "B"])
+    assert dates[1] in returns_df.index and dates[2] in returns_df.index
+
+    # The PORTFOLIO series is a different object with a stricter contract. B is
+    # unheld on dates[1] and has no prior price on dates[2], so those dates carry
+    # only 50% of gross weight. Renormalising them published a half-book day as a
+    # whole-book day, so they are refused instead of rescaled. Only dates[3] has
+    # both legs measurable.
+    expected = [0.5 * (121.0 / 120.0 - 1.0) + 0.5 * 0.10]
     assert portfolio.tolist() == pytest.approx(expected)
     assert coverage["covered_days"] == len(portfolio)
+    # And the drop must be visible, not silent.
+    assert coverage["partial_coverage_days"] == 2
 
 
 @pytest.mark.asyncio

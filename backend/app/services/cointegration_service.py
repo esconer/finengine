@@ -69,6 +69,64 @@ TEST_ROLES = {
     DIAGNOSTIC_TEST: JOHANSEN_ROLE,
 }
 
+# ---------------------------------------------------------------------------
+# Directive gate + multiplicity (SI-1 / AD-1)
+# ---------------------------------------------------------------------------
+# `signal` used to name a trade - `LONG_SPREAD (Long A, Short B)` - from two
+# facts the payload itself contradicted. It fired on an Engle-Granger p-value
+# below the threshold and a spread z-score past a hardcoded +/-1.5, and it
+# never consulted the diagnostic test: on the audited 14-name book all four
+# decision-positive pairs carried `johansen_agrees_with_decision: false` and
+# two of them still shipped a directive. The +/-1.5 appeared nowhere in the
+# export, and neither directive published the hedge ratio that sizes it, so
+# "Long A, Short B" read 1:1 mis-sized a 0.0086-beta spread by ~116x and a
+# 33.64-beta spread by ~34x.
+#
+# A directive is now published only when ALL of these hold, and the string
+# carries the evidence that allowed it:
+#   1. Engle-Granger declared the pair cointegrated (the decision rule is
+#      unchanged: `p_value < p_value_threshold`),
+#   2. the Johansen diagnostic AGREES - a pair whose two tests conflict is a
+#      contested result, not a trade,
+#   3. `hedge_ratio_beta` is positive, so "Long A, Short B" is even the right
+#      sign of position,
+#   4. the p-value survives the family-wise correction over the whole scan,
+#   5. the spread z-score is past the published threshold.
+SIGNAL_ZSCORE_THRESHOLD = 1.5
+SIGNAL_ZSCORE_THRESHOLD_BASIS = (
+    "Absolute spread z-score at which a directive may be published. The spread "
+    "is P_A - (alpha + beta * P_B) with alpha/beta the pair's OLS hedge-ratio "
+    "fit, standardised by that pair's own sample mean and sample standard "
+    "deviation (ddof=1), so the number is a departure from this pair's own "
+    "average spread and is unitless. 1.5 is a fixed engineering constant, not "
+    "a calibrated level: no power, false-rate or backtest is published for it, "
+    "so it means 'unusually wide for this pair' and nothing stronger."
+)
+
+SIGNAL_NOTIONAL_CONVENTION = (
+    "hedge_ratio_beta is the OLS slope of P_A on P_B, so the hedge-neutral "
+    "position is 1 unit of notional in A against hedge_ratio_beta units of "
+    "notional in B. 'One unit' is currency value, not share count, and no FX "
+    "conversion is applied."
+)
+
+# The correction that gates a directive. Bonferroni, not Benjamini-Hochberg:
+# a directive is an instruction to place a position, so the family-wise error
+# rate is the error that matters - a BH threshold would control the expected
+# *proportion* of false discoveries and let one false trade through one time
+# in twenty. The BH count is still published beside it, because on a family
+# this size the two can disagree and the reader is entitled to see both.
+MULTIPLICITY_CORRECTION = "bonferroni_family_wise_error"
+
+# Head of every `signal` string, so a consumer can classify without parsing.
+SIGNAL_NOT_COINTEGRATED = "NOT_COINTEGRATED"
+SIGNAL_NEUTRAL = "NEUTRAL"
+SIGNAL_CONTESTED = "CONTESTED_TESTS_DISAGREE"
+SIGNAL_NON_DIRECTIONAL = "NON_DIRECTIONAL_HEDGE_RATIO"
+SIGNAL_UNCONFIRMED = "UNCONFIRMED_AFTER_MULTIPLE_TESTING_CORRECTION"
+SIGNAL_CORRECTION_PENDING = "DIRECTIVE_WITHHELD_PENDING_MULTIPLE_TESTING_CORRECTION"
+SIGNAL_DIRECTIVE_HEADS = ("LONG_SPREAD", "SHORT_SPREAD")
+
 
 def _count_usable(series: Any) -> int:
     """Finite, non-null observations in a price series.
@@ -210,6 +268,334 @@ def with_test_role_metadata(pair: CointPairResult) -> CointPairResult:
             "johansen_agrees_with_decision": pair.johansen_cointegrated == pair.is_cointegrated,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Multiplicity: the correction over the whole family of pair tests
+# ---------------------------------------------------------------------------
+
+
+def _is_real(value: Any) -> bool:
+    """True for a finite real number (bools are not measurements)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    return bool(np.isfinite(float(value)))
+
+
+def _pvalue_of(value: Any) -> Optional[float]:
+    """A p-value clamped into [0, 1], or None when it is not one.
+
+    Out-of-range values are clamped rather than dropped so the family size
+    still counts the test that produced them; a p-value is a probability and
+    cannot be outside the unit interval.
+    """
+    if not _is_real(value):
+        return None
+    return float(min(1.0, max(0.0, float(value))))
+
+
+def bonferroni_threshold(family_alpha: float, comparisons: int) -> Optional[float]:
+    """`alpha / comparisons`, or None when the family is empty.
+
+    None rather than a number is the honest answer for a scan that ran no
+    test: "the corrected threshold" of zero tests is not 0.0 (which would
+    read as an infinitely strict gate) and not 1.0 (which would read as no
+    gate at all).
+    """
+    if not _is_real(family_alpha):
+        return None
+    if isinstance(comparisons, bool) or not isinstance(comparisons, (int, np.integer)):
+        return None
+    if int(comparisons) <= 0:
+        return None
+    return float(family_alpha) / int(comparisons)
+
+
+def benjamini_hochberg_threshold(
+    p_values: List[Optional[float]],
+    q: float,
+) -> Optional[float]:
+    """The largest BH critical value any p-value clears, or None.
+
+    Step-up: sort ascending, take the largest k with `p_(k) <= k * q / m`, and
+    reject the first k. The published number is `k*q/m` at that k, so a reader
+    can re-derive the rejection set from the payload alone. None means no
+    p-value cleared the first step, i.e. zero discoveries.
+    """
+    usable = [p for p in p_values if p is not None]
+    m = len(usable)
+    if m == 0 or not _is_real(q):
+        return None
+    ordered = sorted(usable)
+    best: Optional[Tuple[int, float]] = None
+    for index, p_value in enumerate(ordered, start=1):
+        if p_value <= index * float(q) / m:
+            best = (index, index * float(q) / m)
+    if best is None:
+        return None
+    return best[1]
+
+
+def multiplicity_report(
+    pairs: List[CointPairResult],
+    *,
+    family_alpha: float = 0.05,
+    comparisons_made: Optional[int] = None,
+) -> Dict[str, Any]:
+    """What survives the correction over this scan's whole family of tests.
+
+    `comparisons_made` is the number of tests the scan actually ran, which is
+    NOT always the number of rows it delivered: `max_half_life` drops rows
+    after the test. The family size is the number of *tests*, so a Bonferroni
+    threshold computed from delivered rows alone would be anti-conservative
+    and would silently shrink as rows were filtered.
+
+    Nothing here decides anything - it is the measurement `build_pair_signal`
+    gates on, and the block the payload publishes so a reader can check the
+    arithmetic. `benjamini_hochberg_fdr` is computed over delivered rows only
+    and says so; that is why it is not the gate.
+    """
+    rows = list(pairs or [])
+    alpha = float(family_alpha) if _is_real(family_alpha) else 0.05
+    if isinstance(comparisons_made, bool) or not isinstance(
+        comparisons_made, (int, np.integer)
+    ):
+        comparisons_made = len(rows)
+    comparisons = int(comparisons_made)
+
+    p_values: List[Optional[float]] = [_pvalue_of(getattr(p, "engle_granger_pvalue", None)) for p in rows]
+    keys = [
+        f"{getattr(p, 'ticker_a', None)}/{getattr(p, 'ticker_b', None)}"
+        for p in rows
+    ]
+    delivered = [(key, p) for key, p in zip(keys, p_values) if p is not None]
+    uncorrected = [(key, p) for key, p in delivered if p < alpha]
+    corrected = bonferroni_threshold(alpha, comparisons)
+    surviving = (
+        [(key, p) for key, p in uncorrected if p < corrected]
+        if corrected is not None
+        else []
+    )
+    bh_threshold = benjamini_hochberg_threshold([p for _, p in delivered], alpha)
+    bh_surviving = (
+        [(key, p) for key, p in delivered if p <= bh_threshold]
+        if bh_threshold is not None
+        else []
+    )
+
+    return {
+        "gate": MULTIPLICITY_CORRECTION,
+        "gate_basis": (
+            "A published signal is a position instruction, so the family-wise "
+            "error rate is the error that matters and Bonferroni is the gate. "
+            "The Benjamini-Hochberg count is published beside it for "
+            "comparison; it is computed on delivered rows only and therefore "
+            "is not the gate."
+        ),
+        "comparisons_made": comparisons,
+        "delivered_pvalue_count": len(delivered),
+        "family_alpha": alpha,
+        "corrected_threshold": round(corrected, 12) if corrected is not None else None,
+        "declared_positive_count": len(uncorrected),
+        "expected_false_positives_uncorrected": round(alpha * comparisons, 6),
+        "survivor_count": len(surviving),
+        "declared_positive_pairs": sorted(key for key, _ in uncorrected),
+        "surviving_pairs": sorted(key for key, _ in surviving),
+        "bonferroni": {
+            "correction": "bonferroni",
+            "controls": "family_wise_error_rate",
+            "alpha": alpha,
+            "comparisons": comparisons,
+            "corrected_threshold": round(corrected, 12) if corrected is not None else None,
+            "survivor_count": len(surviving),
+        },
+        "benjamini_hochberg_fdr": {
+            "correction": "benjamini_hochberg_fdr",
+            "controls": "false_discovery_rate",
+            "q": alpha,
+            "comparisons_used": len(delivered),
+            "scope": "delivered_rows_only",
+            "corrected_threshold": round(bh_threshold, 12) if bh_threshold is not None else None,
+            "survivor_count": len(bh_surviving),
+        },
+        "note": (
+            f"{comparisons} simultaneous cointegration tests were run at "
+            f"alpha={alpha:g}, so {alpha * 100:g}% of them are expected to look "
+            f"significant by chance alone "
+            f"({alpha * comparisons:.2f} false positives expected); "
+            f"{len(uncorrected)} were declared positive and "
+            f"{len(surviving)} survive {MULTIPLICITY_CORRECTION} at "
+            + (
+                f"p < {corrected:.6g}."
+                if corrected is not None
+                else "a threshold that does not exist (no test was run)."
+            )
+            + (
+                ""
+                if len(delivered) == comparisons
+                else (
+                    f" The correction is computed over all {comparisons} tests "
+                    f"run, of which {len(delivered)} rows were delivered; "
+                    f"counting delivered rows instead would understate the "
+                    f"family and loosen the threshold."
+                )
+            )
+        ),
+    }
+
+
+def _size_ratio_error(beta: Any) -> Optional[float]:
+    """How badly a 1:1 read of a `beta`-hedge mis-sizes it.
+
+    `1 unit of A : beta units of B` read as `1 : 1` is off by `beta` when
+    `beta > 1` and by `1 / beta` when `beta < 1`. Returns None for a
+    non-positive or non-finite beta, which is not a spread at all and is
+    gated out earlier.
+    """
+    if not _is_real(beta) or float(beta) <= 0.0:
+        return None
+    value = float(beta)
+    return max(value, 1.0 / value)
+
+
+def _finite_text(value: Optional[float], digits: int = 6) -> str:
+    if value is None:
+        return "unknown"
+    return f"{float(value):.{digits}f}"
+
+
+def build_pair_signal(
+    pair: CointPairResult,
+    *,
+    family_alpha: float = 0.05,
+    comparisons_made: Optional[int] = None,
+    corrected_threshold: Optional[float] = None,
+) -> str:
+    """The published `signal` for one pair, gated and self-describing.
+
+    The gate chain, in order, and the head each rung emits:
+
+    | rung                                    | head                            |
+    |-----------------------------------------|---------------------------------|
+    | Engle-Granger said not cointegrated     | `NOT_COINTEGRATED`              |
+    | Johansen disagrees with the decision     | `CONTESTED_TESTS_DISAGREE`      |
+    | `hedge_ratio_beta <= 0`                   | `NON_DIRECTIONAL_HEDGE_RATIO`   |
+    | p-value fails the family correction       | `UNCONFIRMED_AFTER_...`         |
+    | no z-score extreme past the threshold     | `NEUTRAL`                       |
+    | all of the above                          | `LONG_SPREAD` / `SHORT_SPREAD`  |
+
+    Only the last rung names a position, and it carries the threshold, the
+    hedge ratio, the notional convention, the comparison count and the
+    corrected p-value it was allowed by. No rung ever names a direction it
+    cannot size.
+    """
+    p_value = _pvalue_of(getattr(pair, "engle_granger_pvalue", None))
+    alpha = float(family_alpha) if _is_real(family_alpha) else 0.05
+    if isinstance(comparisons_made, bool) or not isinstance(
+        comparisons_made, (int, np.integer)
+    ):
+        comparisons_made = 1
+    comparisons = max(1, int(comparisons_made))
+    if corrected_threshold is None:
+        corrected_threshold = bonferroni_threshold(alpha, comparisons)
+    p_text = "unknown" if p_value is None else f"{p_value:.6f}"
+
+    if not bool(getattr(pair, "is_cointegrated", False)):
+        return SIGNAL_NOT_COINTEGRATED
+
+    johansen = bool(getattr(pair, "johansen_cointegrated", False))
+    if not johansen:
+        return (
+            f"{SIGNAL_CONTESTED} (engle_granger p={p_text} < {alpha:g} declared "
+            f"this pair cointegrated, johansen_cointegrated={johansen}, so the "
+            f"two tests conflict; a contested pair is not a trade and no "
+            f"direction is published. See test_agreement.)"
+        )
+
+    beta = getattr(pair, "hedge_ratio_beta", None)
+    if not _is_real(beta) or float(beta) <= 0.0:
+        # No leg names here: a consumer that greps for a position-naming token
+        # must not find one in a string whose whole point is that it names
+        # nothing.
+        return (
+            f"{SIGNAL_NON_DIRECTIONAL} (hedge_ratio_beta="
+            f"{_finite_text(beta if _is_real(beta) else None)} is not positive, "
+            f"so a long/short position on these two legs would be the wrong "
+            f"sign of position rather than the wrong size; no direction is "
+            f"published.)"
+        )
+
+    if corrected_threshold is None or p_value is None or p_value >= corrected_threshold:
+        return (
+            f"{SIGNAL_UNCONFIRMED} (engle_granger p={p_text} and johansen agree, "
+            f"but the declared cointegration does not survive "
+            f"{MULTIPLICITY_CORRECTION}: it needs p < {alpha:g}/{comparisons} = "
+            f"{corrected_threshold:.6g} and this p-value is {p_text}."
+            + (
+                ""
+                if corrected_threshold is not None
+                else " No test was run, so no corrected threshold exists."
+            )
+            + " No direction is published.)"
+        )
+
+    zscore = getattr(pair, "current_spread_zscore", None)
+    if not _is_real(zscore) or abs(float(zscore)) < SIGNAL_ZSCORE_THRESHOLD:
+        return SIGNAL_NEUTRAL
+
+    ticker_a = getattr(pair, "ticker_a", None)
+    ticker_b = getattr(pair, "ticker_b", None)
+    head = (
+        "SHORT_SPREAD" if float(zscore) >= SIGNAL_ZSCORE_THRESHOLD else "LONG_SPREAD"
+    )
+    verb = "Short" if head == "SHORT_SPREAD" else "Long"
+    size_error = _size_ratio_error(beta)
+    return (
+        f"{head} ({verb} {ticker_a} 1.0 : {ticker_b} {_finite_text(beta)}; "
+        f"hedge_ratio_beta={_finite_text(beta)} units of {ticker_b} per 1 unit "
+        f"of {ticker_a} currency notional - read 1:1 this mis-sizes by "
+        f"{size_error:.1f}x; spread z={float(zscore):+.4f} past the published "
+        f"threshold +/-{SIGNAL_ZSCORE_THRESHOLD:g}; engle_granger "
+        f"p={p_text} < corrected {corrected_threshold:.6g} = {alpha:g}/"
+        f"{comparisons} ({MULTIPLICITY_CORRECTION}); "
+        f"johansen_agrees_with_decision=true)"
+    )
+
+
+def apply_signal_directives(
+    pairs: List[CointPairResult],
+    *,
+    family_alpha: float = 0.05,
+    comparisons_made: Optional[int] = None,
+) -> List[CointPairResult]:
+    """Re-derive every `signal` with the family correction attached.
+
+    `analyze_pair_cointegration` analyses one pair and cannot know how many
+    tests the scan ran, so it stops at the withheld state. The scan is the only
+    place that knows the family size, so it re-derives the strings here. This
+    runs on cached rows too, which is why it is idempotent: the input is
+    recomputed from the measured fields, never from the previous string.
+    """
+    rows = list(pairs or [])
+    if isinstance(comparisons_made, bool) or not isinstance(
+        comparisons_made, (int, np.integer)
+    ):
+        comparisons_made = len(rows)
+    comparisons = int(comparisons_made)
+    corrected = bonferroni_threshold(family_alpha, comparisons)
+    return [
+        pair.model_copy(
+            update={
+                "signal": build_pair_signal(
+                    pair,
+                    family_alpha=family_alpha,
+                    comparisons_made=comparisons,
+                    corrected_threshold=corrected,
+                )
+            }
+        )
+        for pair in rows
+    ]
 
 
 def _utcnow() -> datetime:
@@ -427,20 +813,47 @@ def analyze_pair_cointegration(
     # 7. Trading Signal — gated on cointegration: a z-score extreme on a
     # non-cointegrated pair (p >= threshold) is spurious mean-reversion, not
     # a trade. Such pairs render "Not cointegrated" downstream.
+    #
+    # A single pair is not a trade either. This function cannot see how many
+    # tests the surrounding scan ran, so it stops at the rungs it has the
+    # evidence for and never names a position; `scan_pairs` re-derives the
+    # string through `apply_signal_directives` once the family size is known.
     last_p_a = float(p_a[-1])
     last_p_b = float(p_b[-1])
 
     if not is_coint:
-        signal = "NOT_COINTEGRATED"
-    elif current_zscore is not None:
-        if current_zscore >= 1.5:
-            signal = f"SHORT_SPREAD (Short {ticker_a}, Long {ticker_b})"
-        elif current_zscore <= -1.5:
-            signal = f"LONG_SPREAD (Long {ticker_a}, Short {ticker_b})"
-        else:
-            signal = "NEUTRAL"
+        signal = SIGNAL_NOT_COINTEGRATED
+    elif not johansen_coint:
+        # The diagnostic contradicts the decision. Publishing a direction here
+        # is the SI-1 defect: two tests of different nulls disagreeing is a
+        # contested result, and the payload already carries the flag that says
+        # so. Naming a trade anyway is what the gate removes.
+        signal = (
+            f"{SIGNAL_CONTESTED} (engle_granger p="
+            f"{engle_granger_pvalue:.6f} < {p_value_threshold:g} declared this "
+            f"pair cointegrated, johansen_cointegrated={johansen_coint}, so the "
+            f"two tests conflict; a contested pair is not a trade and no "
+            f"direction is published.)"
+        )
+    elif beta <= 0.0:
+        # No leg names in a withheld string: a consumer that greps for a
+        # position-naming token must not find one here.
+        signal = (
+            f"{SIGNAL_NON_DIRECTIONAL} (hedge_ratio_beta={beta:.6f} is not "
+            f"positive, so a long/short position on these two legs would be "
+            f"the wrong sign of position rather than the wrong size; no "
+            f"direction is published.)"
+        )
+    elif current_zscore is None or abs(current_zscore) < SIGNAL_ZSCORE_THRESHOLD:
+        signal = SIGNAL_NEUTRAL
     else:
-        signal = "NEUTRAL"
+        signal = (
+            f"{SIGNAL_CORRECTION_PENDING} (spread z={current_zscore:+.4f} is "
+            f"past +/-{SIGNAL_ZSCORE_THRESHOLD:g} and both tests agree, but a "
+            f"single pair analysis cannot apply the {MULTIPLICITY_CORRECTION} "
+            f"correction for the scan it belongs to, so no direction is "
+            f"published here.)"
+        )
 
     # 8. Optional Spread Series
     spread_points = None
@@ -818,6 +1231,18 @@ class CointegrationService:
             )
             for index, pair in enumerate(kept_pairs)
         ]
+
+        # The family is every test the scan RAN, not every row it delivered:
+        # `max_half_life` and the depth gates can drop rows after the test, and
+        # a correction computed from the survivors would loosen as rows are
+        # filtered. Re-derive every `signal` with that family attached so a
+        # directive can only be published on a pair whose p-value survives the
+        # correction over all `scanned_count` simultaneous tests.
+        pairs_with_depth = apply_signal_directives(
+            pairs_with_depth,
+            family_alpha=p_value_threshold,
+            comparisons_made=scanned_count,
+        )
 
         unpairable = sorted(set(tickers) - returned_universe)
         return CointScannerResponse(

@@ -91,12 +91,21 @@ async def test_a02_active_weights_are_renormalized_without_prelisting_zeroes():
         prices, {"A": 0.5, "B": 0.5}
     )
     raw = prices.pct_change(fill_method=None).iloc[1:]
-    active_weight = raw.notna().mul({"A": 0.5, "B": 0.5}, axis=1).sum(axis=1)
-    reference = raw.fillna(0).mul({"A": 0.5, "B": 0.5}, axis=1).sum(axis=1)
-    reference = reference.loc[active_weight > 0] / active_weight.loc[active_weight > 0]
+    # The honest portfolio sample is the dates the WHOLE book was measurable on.
+    # This test used to divide by the surviving weight instead, which rescaled
+    # B's 60 absent days into A-only days and published them as a 50/50 book —
+    # the defect this assertion was written to lock in. It also `fillna(0)`d,
+    # inventing zero returns for the unheld leg, so the old reference encoded
+    # both halves of it.
+    full = raw.dropna()
+    reference = full.mul({"A": 0.5, "B": 0.5}, axis=1).sum(axis=1)
     assert result["annual_return"] == pytest.approx(reference.mean() * 252)
     assert result["annual_volatility"] == pytest.approx(reference.std(ddof=1) * math.sqrt(252))
     assert result["active_observations"] == int(reference.size)
+    # The book's history is bounded by its shorter leg, not its longer one, and
+    # B's prelisting gap is never counted as a portfolio observation.
+    assert result["active_observations"] == len(raw) - 60
+    assert result["active_observations"] < raw["A"].notna().sum()
 
 
 def test_a03_drawdown_includes_initial_wealth_in_engine_and_backtest():
@@ -418,7 +427,22 @@ async def test_a13_zero_variance_excluded_leg_does_not_poison_sizing():
         prices, {"FLAT": 0.1, "VAR": 0.9}, model="EWMA", target_volatility=0.1
     )
     assert "FLAT" not in result["recommended_weights"]
-    assert result["achieved_volatility"] == pytest.approx(0.1, rel=1e-9)
+    # `achieved_volatility` used to be asserted == the 0.1 target, which is the
+    # QM-4 tautology: scale = target/rec_vol then achieved = rec_vol*scale makes
+    # it a restatement of the target wearing a measurement's name. It is now the
+    # sample-covariance volatility of the recommended book, and the target it was
+    # aiming at is published separately as `imposed_target_volatility`.
+    assert result["achieved_volatility"] == pytest.approx(0.109663, rel=1e-4)
+    assert result["achieved_volatility"] != pytest.approx(0.1, rel=1e-9)
+    assert result["achieved_volatility_basis"] == "sample_covariance_of_measured_returns"
+    assert result["imposed_target_volatility"] == pytest.approx(0.1, rel=1e-9)
+    assert result["imposed_target_volatility_basis"] == (
+        "sizing_volatility_times_scale_equals_target_by_construction"
+    )
+    # The volatility the scale was actually built from must be visible; it used
+    # to be computed and discarded, which is how three different "current"
+    # volatilities ended up circulating for one book.
+    assert result["sizing_volatility"] is not None
     assert result["current_volatility"] is not None
     assert np.isfinite(result["scale_factor"])
     assert result["cash_weight"] > 0.0

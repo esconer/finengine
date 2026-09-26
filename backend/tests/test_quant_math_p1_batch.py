@@ -324,5 +324,15 @@ class TestTargetVolatilityScaling:
         assert sum(rec.values()) == pytest.approx(scale, abs=1e-4)
         assert res["cash_weight"] == pytest.approx(max(0.0, 1.0 - scale))
         assert scale < 1.0 and res["leveraged"] is False
-        assert res["achieved_volatility"] == pytest.approx(0.10, rel=1e-6)
+        # The 0.10 target is met BY CONSTRUCTION once the inverse-vol weights are
+        # scaled, so asserting `achieved_volatility == 0.10` was asserting the
+        # identity, not a result. What is published now is the measured
+        # sample-covariance volatility of the scaled book, and it disagrees with
+        # the target by ~9% because the EWMA leg and the sample covariance are
+        # different estimators. Both are published with their basis so the gap is
+        # explicable rather than hidden.
+        assert res["achieved_volatility"] == pytest.approx(0.109099, rel=1e-4)
+        assert res["achieved_volatility"] != pytest.approx(0.10, rel=1e-6)
+        assert res["achieved_volatility_basis"] == "sample_covariance_of_measured_returns"
+        assert res["imposed_target_volatility"] == pytest.approx(0.10, rel=1e-6)
         assert "cash" in res["methodology"] and "scale" in res["methodology"]

@@ -77,8 +77,26 @@ section's mask-derived start is 2026-08-03 (`buy_price_inferred`).
 | `tear_sheet`, `realized_risk`, `regime`, `risk_contribution`, `factor_exposure` | 2026-08-03 | `buy_price_inferred` |
 | `performance_history` | 2026-08-25 | undeclared |
 
-Both are labelled `covered_days_scope: holding_window_aligned_return_rows`, so
-the existing unit label actively conceals that they are different windows.
+> **CORRECTION (2026-09-26, found by the gate-hardening agent).** I originally
+> wrote here: *"Both are labelled `covered_days_scope:
+> holding_window_aligned_return_rows`, so the existing unit label actively
+> conceals that they are different windows."* **That is false.**
+> `performance_history.history_coverage` publishes **no `covered_days_scope` at
+> all** — verified directly:
+> `history_coverage keys: [requested_start, requested_end, requested_days,
+> delivered_start, delivered_end, observation_count, expected_observation_count,
+> first_observation, last_observation, coverage_ratio, truncated, stale, status,
+> rule]`.
+>
+> The finding survives intact — two different starts for one portfolio, 16
+> sessions apart, neither reconciled — but my characterisation of the mechanism
+> was wrong. Nothing conceals it; the section simply **omits the declaration
+> entirely**, which is a *worse* defect, not a subtler one: a reader has no
+> label to mislead them, and no way to know a second window exists. I asserted a
+> label was present without checking that section's keys, having read the label
+> off a *different* section. I have passed the corrected fact to the audit agent,
+> who gated the new `XS-001` comparison on the block actually claiming a
+> holding-window scope so the rule does not fire on this false positive.
 
 **Root cause:** not yet localised. `_fetch_price_series_dict`
 (`analytics.py:542-569`) passes `start`/`end` straight to

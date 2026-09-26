@@ -138,6 +138,175 @@ WEIGHT_DELTA_TOLERANCE = 1e-4
 
 PERCENT_TOTAL_TOLERANCE = 0.5
 
+#: How old a section ``as_of`` may be before ENV-012 calls it STALE.
+#:
+#: Seven calendar days, and not a smaller number, because the question is not
+#: "is this date old" but "could this still be the newest observation behind an
+#: export collected today".  One calendar week is the smallest window that
+#: reliably contains a full set of NSE sessions, so an ``as_of`` a week or more
+#: behind ``generated_at`` means at least one complete trading week closed with
+#: nothing delivered, whatever the section's status says.  A tighter threshold
+#: (3 days) would be defensible on a book with no weekend or holiday gaps and
+#: would be noise on one with them; a looser one (14) would let a two-week-old
+#: quote through.  The threshold is a judgement call and it is stated here so
+#: that a future disagreement is an edit to this constant, not a re-derivation.
+AS_OF_STALENESS_DAYS = 7.0
+
+#: Statuses on the data-existence axis that mean "degraded".  ENV-016 treats
+#: these as a self-disclosure the section owes a warning for.
+DEGRADED_STATUSES = frozenset({"partial", "unavailable"})
+
+#: Keys whose presence, with a USABLE value, is the payload telling a reader
+#: that something was blocked, withheld, refused, suppressed or excluded.  These
+#: are what makes a section's own ``status`` irrelevant to ENV-016: a payload
+#: that publishes ``block_reasons`` is degraded whether or not the section
+#: bothered to say so, and the fix is a warning, never a changed number.
+DEGRADATION_MARKER_TOKENS = (
+    "block_reason",
+    "block_reasons",
+    "omitted_field",
+    "withheld",
+    "refused",
+    "refusal",
+    "suppressed",
+    "excluded",
+)
+
+#: Record ``status`` values that assert the record can be acted on.  ENV-019
+#: fires when one of these appears inside a section whose own gate says the
+#: opposite.
+EXECUTABLE_STATUSES = frozenset(
+    {"executable", "execute", "ready", "actionable", "tradable", "tradeable"}
+)
+
+#: Keys whose presence (with a usable value) is a statement about the PRECISION
+#: of an estimate: a standard error, an interval, or an effective-sample-size
+#: adjustment that acknowledges serial correlation.  ENV-020 is satisfied by any
+#: one of them.
+#:
+#: A p-value is deliberately NOT in this set.  ``engle_granger_pvalue`` says the
+#: cointegration test rejected stationarity of the price pair; it says nothing
+#: about the precision of the ``hedge_ratio_beta`` published beside it, and
+#: admitting p-values here would let a section pass on a significance flag while
+#: every number it publishes stays a naked point estimate.
+UNCERTAINTY_KEY_TOKENS = (
+    "standard_error",
+    "standarderror",
+    "stderr",
+    "conf_int",
+    "confidence_interval",
+    "confidence_band",
+    "interval",
+    "ci_low",
+    "ci_high",
+    "effective_n",
+    "effective_observation",
+    "effective_sample",
+    "autocorrel",
+    "hac_",
+    "newey",
+    "bootstrap",
+    "degrees_of_freedom",
+    "t_critical",
+)
+
+#: Key fragments that make a numeric field an ESTIMATED quantity (a fitted
+#: parameter or a ratio) rather than a measured level.  Deliberately excludes
+#: z-scores and p-values: a z-score is a measured level put on a scale, and a
+#: p-value is a hypothesis verdict, not a parameter.
+ESTIMATE_KEY_TOKENS = (
+    "alpha",
+    "beta",
+    "sharpe",
+    "sortino",
+    "calmar",
+    "omega",
+    "information_ratio",
+    "tracking_error",
+    "treynor",
+    "r_squared",
+    "correlation",
+    "var_",
+    "cvar_",
+    "expected_annual",
+    "expected_sharpe",
+    "expected_volatility",
+)
+
+#: Key fragments that constitute a per-observation BREADTH disclosure: how many
+#: constituents were actually in the basket on a given date.  The universe-size
+#: family (``*_position_count``, ``*_asset_count``, ``*_holding_count``) is
+#: deliberately NOT here, because those name how many legs COULD have been in
+#: the basket, which is the number the defect is not about.
+BREADTH_KEY_TOKENS = (
+    "constituent",
+    "breadth",
+    "basket",
+    "renorm",
+    "legs_active",
+    "active_leg",
+    "active_count",
+    "active_position",
+    "observed_position",
+    "held_count",
+)
+
+#: Key fragments that name a two-element INTERVAL.
+INTERVAL_KEY_TOKENS = ("confidence_interval", "interval", "_ci", "ci_")
+
+#: A fabricated band is a round multiple of the estimate.  Multiples are
+#: accepted only on a 0.05 grid inside [0.5, 2.0], so a computed interval whose
+#: endpoints happen to be 0.643x and 1.357x the centre is not mistaken for one.
+ROUND_INTERVAL_STEP = 0.05
+MIN_INTERVAL_MULTIPLE = 0.5
+MAX_INTERVAL_MULTIPLE = 2.0
+
+#: Key fragments that name a TRADE DIRECTIVE field, and the directional verbs
+#: that turn such a field's value into an instruction rather than a label.
+DIRECTIVE_KEY_TOKENS = ("signal", "directive", "recommendation", "trade_instruction")
+DIRECTIVE_ACTION_RE = re.compile(
+    r"\b(LONG|SHORT|SELL|BUY|COVER|EXIT|ENTER|ADD|REDUCE|OVERWEIGHT|UNDERWEIGHT|"
+    r"GO_LONG|GO_SHORT|SQUARE)\b",
+    re.IGNORECASE,
+)
+
+#: The five things a directive has to publish for a reader to be able to check
+#: it.  Each is satisfied by a key fragment appearing on the record itself or on
+#: any mapping that encloses it, so a scan-level constant does not have to be
+#: duplicated onto all 91 records to pass.
+DIRECTIVE_BASIS_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("decision threshold", ("threshold", "entry_z", "z_entry", "cutoff")),
+    ("diagnostic test agreement", ("agrees_with", "agreement", "diagnostic")),
+    ("number of comparisons", ("scanned_pairs", "comparisons", "pairs_tested",
+                               "tests_run", "n_pairs", "hypotheses", "tests_performed")),
+    ("multiplicity correction", ("bonferroni", "fdr", "multiplicity",
+                                 "multiple_testing", "false_discovery", "holm",
+                                 "benjamini")),
+    ("size ratio", ("hedge_ratio", "size_ratio", "hedge_beta", "notional_ratio")),
+)
+
+#: Prefixes that mark a number as the thing an ``achieved_*`` field is claiming
+#: to have hit.  ``achieved_volatility`` is compared against ``target_volatility``
+#: because both name the same quantity and the first is prefixed with the word
+#: that claims it was measured.
+TARGET_KEY_PREFIXES = ("target_", "input_", "desired_", "requested_", "goal_")
+
+#: Keys a holding-window block may publish its window START under.  ``XS-001``
+#: used to read only ``intersection_start``, so a block that named its start any
+#: other way dropped out of the comparison set instead of contradicting it.
+WINDOW_START_KEYS = ("intersection_start", "delivered_start")
+MEASURED_WINDOW_KEY = "measured_window"
+
+#: Counts that mean "how many of the requested X were actually measured".  A
+#: null beside a published ratio is ENV-021's defect.
+COVERAGE_COUNT_KEYS = (
+    "covered_count",
+    "available_count",
+    "delivered_count",
+    "observed_count",
+    "measured_count",
+)
+
 CATEGORY_ENVELOPE = "envelope"
 CATEGORY_CROSS_SECTION = "cross-section"
 CATEGORY_NUMERIC = "numeric"
@@ -372,6 +541,41 @@ def _numbers_in(mapping: Any) -> dict[str, float]:
         for key, value in mapping.items()
         if _finite(value)
     }
+
+
+def _publishes_something(value: Any) -> bool:
+    """Is this value an actual disclosure rather than an empty placeholder?
+
+    ``0`` and ``False`` count (they are statements); ``None``, ``""``, ``[]`` and
+    ``{}`` do not.  A dict is judged by its values, so
+    ``excluded_assets={"volatility": [], "cvar_tail": []}`` is NOT a disclosure:
+    it says two exclusions were considered and neither happened.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, dict):
+        return any(_publishes_something(inner) for inner in value.values())
+    if isinstance(value, (list, tuple, set, str)):
+        return len(value) > 0
+    return True
+
+
+def _keys_matching(node: dict[str, Any], tokens: tuple[str, ...]) -> set[str]:
+    """Keys of ``node`` whose name contains a token AND whose value is a disclosure."""
+    return {
+        key
+        for key, value in node.items()
+        if any(token in key.lower() for token in tokens) and _publishes_something(value)
+    }
+
+
+def _ancestor_paths(export: Export, path: str) -> list[str]:
+    """Mapping paths that strictly enclose ``path``, outermost last."""
+    out = [candidate for candidate, _ in export.dicts
+           if candidate != path and (path.startswith(f"{candidate}.")
+                                     or path.startswith(f"{candidate}["))]
+    out.sort(key=len)
+    return out
 
 
 def _truncate(text: str, limit: int | None) -> str:
@@ -720,10 +924,26 @@ def env_011_available_within_requested(export: Export) -> list[Finding]:
 
 
 def env_012_as_of_outside_collection_window(export: Export) -> list[Finding]:
-    """A section ``as_of`` is an OBSERVATION date, not a refresh timestamp.
+    """A section ``as_of`` is ORDERED against the collection clock.
 
-    If one lands inside [generated_at, completed_at] it is quoting the
-    collector's own clock, and a warning has to say so.
+    The previous version tested MEMBERSHIP in the collector's own clock window
+    and did nothing else, so it was blind in both directions that matter: an
+    ``as_of`` five months in the future and an ``as_of`` ten years stale both
+    sailed through, while the one case it did catch (a date inside the window)
+    was the one that already had a legitimate explanation.  Three arms now:
+
+    ``as_of > completed_at``
+        An observation cannot be dated after the export that contains it.  Hard
+        fail unless the section discloses a quote-refresh clock, which is the
+        one honest reading of a future date.
+    ``generated_at - as_of`` > :data:`AS_OF_STALENESS_DAYS`
+        Stale.  Fails and publishes the age in days, because a reader who does
+        not know the age cannot weigh the section.  Disclosed staleness (a
+        warning naming it) passes: the fix is a sentence, not a number.
+    ``generated_at <= as_of <= completed_at``
+        The date is quoting the collector's own clock, so it is a refresh
+        timestamp and has to say so.  This arm is unchanged in strength — the
+        ``portfolio`` section legitimately discloses one and still passes.
     """
     generated = _parse_ts(export.doc.get("generated_at"))
     completed = _parse_ts(export.doc.get("completed_at"))
@@ -736,14 +956,54 @@ def env_012_as_of_outside_collection_window(export: Export) -> list[Finding]:
         if as_of is None:
             continue
         as_of = _as_utc(as_of)
-        if not (generated <= as_of <= completed):
-            continue
         warnings = section.get("warnings") or []
-        semantics = str(section.get("as_of_semantics") or "")
-        disclosed = "refresh" in semantics or any(
+        semantics = str(section.get("as_of_semantics") or "").lower()
+        disclosed_refresh = "refresh" in semantics or any(
             "refresh" in str(w).lower() for w in warnings
         )
-        if not disclosed:
+
+        if as_of > completed:
+            if not disclosed_refresh:
+                findings.append(
+                    Finding(
+                        "ENV-012",
+                        name,
+                        f"sections.{name}.as_of",
+                        f"as_of {as_of.isoformat()} is AFTER completed_at "
+                        f"{completed.isoformat()}: an observation cannot be "
+                        "dated in the future, and only a disclosed quote-refresh "
+                        "clock legitimately sits there",
+                    )
+                )
+            continue
+
+        age_days = (generated - as_of).total_seconds() / 86400.0
+        if age_days > AS_OF_STALENESS_DAYS:
+            disclosed_stale = "stale" in semantics or any(
+                token in str(w).lower() for w in warnings
+                for token in ("stale", "outdated", "not current")
+            )
+            if not disclosed_stale:
+                findings.append(
+                    Finding(
+                        "ENV-012",
+                        name,
+                        f"sections.{name}.as_of",
+                        f"as_of {as_of.isoformat()} is {age_days:.2f} calendar "
+                        f"days older than generated_at {generated.isoformat()}; "
+                        f"an observation more than {AS_OF_STALENESS_DAYS:g} days "
+                        "old cannot be the newest one behind this export, and no "
+                        "warning says the section is stale",
+                    )
+                )
+            continue
+
+        if as_of < generated:
+            # Older than the collection started but inside the staleness bound:
+            # a plausible observation date.  Nothing to say.
+            continue
+
+        if not disclosed_refresh:
             findings.append(
                 Finding(
                     "ENV-012",
@@ -864,24 +1124,225 @@ def env_015_monetary_sections_declare_currency(export: Export) -> list[Finding]:
     return findings
 
 
+def _degradation_markers(section: dict[str, Any], prefix: str) -> list[str]:
+    """Where this section's own payload says something was not done."""
+    return [
+        f"{path}.{key}"
+        for path, node in _walk(section, prefix)
+        if isinstance(node, dict)
+        for key in _keys_matching(node, DEGRADATION_MARKER_TOKENS)
+    ]
+
+
 def env_016_degraded_sections_warn(export: Export) -> list[Finding]:
+    """A section that publishes a degradation must name it in ``warnings``.
+
+    The old version read ``status in {partial, unavailable}`` and stopped there,
+    which made ``available`` a promise that nothing needed saying.  That is the
+    status every P0 in the v5 review carries: ``volatility_sizing`` reads
+    ``available`` while its own ``execution`` block publishes
+    ``block_reasons: ["financing_required"]`` and a ``block_reason`` ending "is
+    not a normal rebalance", and ``risk_studio`` reads ``available`` while
+    publishing ``omitted_fields``.
+
+    The obligation is therefore no longer keyed on the section's own status.  It
+    fires when EITHER the status is degraded OR the payload publishes a
+    degradation marker (:data:`DEGRADATION_MARKER_TOKENS`) with a usable value.
+    The exit is a warning that says what was degraded, which is a sentence an
+    engineer can write truthfully — no value anywhere has to change, so this
+    rule cannot be silenced by fabricating one.
+    """
     findings: list[Finding] = []
     for name, section in export.sections().items():
         if not isinstance(section, dict):
             continue
         status = section.get("status")
-        if status not in {"partial", "unavailable"}:
+        markers = _degradation_markers(section, f"sections.{name}")
+        degraded_status = status in DEGRADED_STATUSES
+        if not (degraded_status or markers):
             continue
         warnings = section.get("warnings")
         if isinstance(warnings, list) and warnings:
             continue
+        if degraded_status and markers:
+            because = (f"status is {status!r} and the payload withholds "
+                       f"{markers[:3]}")
+        elif degraded_status:
+            because = f"status is {status!r}"
+        else:
+            because = (f"status is {status!r} but the payload withholds "
+                       f"{markers[:3]}")
         findings.append(
             Finding(
                 "ENV-016",
                 name,
                 f"sections.{name}.warnings",
-                f"status is {status!r} but warnings is {warnings!r}; a "
-                "degraded section must name why it is degraded",
+                f"{because} while warnings is {warnings!r}; a section that "
+                "publishes a degradation has to name it whatever its own status "
+                "says",
+            )
+        )
+    return findings
+
+
+# --------------------------------------------------------------------------
+# ENVELOPE RULES WRITTEN AGAINST THE v5 REVIEW
+# --------------------------------------------------------------------------
+
+
+def env_019_record_status_respects_section_gate(export: Export) -> list[Finding]:
+    """Catches AD-5/G3: a record asserting executability inside a gated section.
+
+    ``volatility_sizing`` published 13 of its 14 trades as
+    ``status: "executable"`` while the section's own
+    ``execution.execution_eligible`` was ``false``, its ``block_reasons`` read
+    ``["financing_required"]`` and its ``methodology`` said the target "is not
+    executable as a normal rebalance".  A per-record label that overrides a
+    section-level gate is the most dangerous kind of contradiction in this
+    export, because the gate is a field a consumer has to go looking for and the
+    label is on the row an agent acts on.
+
+    Nothing here names ``volatility_sizing`` or a ticker.  The rule is: if a
+    section publishes ``execution_eligible: false`` anywhere, no record inside it
+    may claim to be executable.  A record that carries its own gate is
+    disclosing the conflict rather than asserting against it, so it passes.
+    """
+    findings: list[Finding] = []
+    for name, section in export.sections().items():
+        if not isinstance(section, dict):
+            continue
+        prefix = f"sections.{name}"
+        gates = [
+            path
+            for path, node in _walk(section, prefix)
+            if isinstance(node, dict) and node.get("execution_eligible") is False
+        ]
+        if not gates:
+            continue
+        offending: dict[str, list[str]] = {}
+        mapping_paths = {path for path, _ in export.dicts}
+        for path, node in _walk(section, prefix):
+            if not isinstance(node, dict):
+                continue
+            status = node.get("status")
+            if not (isinstance(status, str)
+                    and status.strip().lower() in EXECUTABLE_STATUSES):
+                continue
+            if any(key in node for key in ("execution_eligible", "blocked", "blocked_by")):
+                continue
+            # Group on the nearest enclosing MAPPING, not on a dot split: a
+            # record keyed by an NSE scrip ends in '.NS' and a naive rsplit
+            # files it under its own ticker.
+            container = max(
+                (candidate for candidate in mapping_paths
+                 if candidate != path
+                 and (path.startswith(f"{candidate}.") or path.startswith(f"{candidate}["))),
+                key=len,
+                default=prefix,
+            )
+            label = path[len(container) + 1 :]
+            offending.setdefault(container, []).append(label)
+        for container, labels in sorted(offending.items()):
+            findings.append(
+                Finding(
+                    "ENV-019",
+                    name,
+                    container,
+                    f"{len(labels)} record(s) claim {sorted(set(labels))[0]!r} "
+                    f"status inside a section whose own "
+                    f"{gates[0]}.execution_eligible is false: {labels[:6]}",
+                )
+            )
+    return findings
+
+
+def env_020_point_estimates_carry_uncertainty(export: Export) -> list[Finding]:
+    """Catches SI-5: a section of naked point estimates.
+
+    The v5 artifact publishes on the order of two thousand estimated parameters
+    and ratios — alphas, betas, Sharpe ratios, Sortinos, R-squareds, VaRs,
+    CVaRs, correlations — and exactly one interval, which
+    :func:`num_022_interval_is_not_a_constant_band` shows to be a constant
+    multiple of the estimate.  ``standard_error``, ``conf_int``,
+    ``effective_n``, an autocorrelation adjustment and a HAC/Newey-West standard
+    error appear zero times in 876 KB.
+
+    The escape is a precision disclosure anywhere in the section's own subtree
+    (:data:`UNCERTAINTY_KEY_TOKENS`) — a standard error, an interval, or an
+    effective-sample-size figure that acknowledges that 39 autocorrelated daily
+    returns are not 39 independent observations.
+
+    A raw observation or window count is deliberately NOT an escape.  The
+    artifact publishes those everywhere (``covered_days: 39``,
+    ``observations: 174``), and counting the rows is not a statement about how
+    precisely anything was estimated; letting a row count pass this rule would
+    have made it green on an artifact that discloses no uncertainty at all.
+    """
+    findings: list[Finding] = []
+    for name, section in export.sections().items():
+        if not isinstance(section, dict):
+            continue
+        prefix = f"sections.{name}"
+        estimates: list[str] = []
+        uncertainty: set[str] = set()
+        for path, node in _walk(section, prefix):
+            if not isinstance(node, dict):
+                continue
+            uncertainty |= _keys_matching(node, UNCERTAINTY_KEY_TOKENS)
+            estimates.extend(
+                f"{path}.{key}"
+                for key, value in node.items()
+                if _finite(value) and any(t in key.lower() for t in ESTIMATE_KEY_TOKENS)
+            )
+        if not estimates or uncertainty:
+            continue
+        families = sorted({key.rsplit(".", 1)[-1] for key in estimates})
+        findings.append(
+            Finding(
+                "ENV-020",
+                name,
+                prefix,
+                f"{len(estimates)} point estimate(s) {families[:8]} are published "
+                f"with no standard error, no interval and no effective-sample-size "
+                f"figure anywhere in this section; the only precision disclosure "
+                f"in 876 KB of export is one constant-multiple band",
+            )
+        )
+    return findings
+
+
+def env_021_zero_ratio_needs_a_count(export: Export) -> list[Finding]:
+    """Catches AD-10/G4: a hard zero beside a null count.
+
+    ``india_flows.data.component_coverage.delivery_anomalies`` published
+    ``coverage_ratio: 0`` beside ``covered_count: null`` and
+    ``covered_symbols: null``.  ``0`` is a measurement — it asserts that zero of
+    fourteen scrips had usable delivery history.  ``null`` is an absence — it
+    says the count was never taken.  Publishing the first beside the second
+    claims a ratio out of a number that does not exist, and a consumer that
+    multiplies a ratio by a universe gets ``0`` instead of "unknown".
+
+    Fires only when the ratio and a null count are in the SAME mapping, so a
+    block that correctly omits the ratio (the ``institutional_flows`` sibling
+    does) is untouched.  The honest fix is ``covered_count: 0``, which is the
+    measurement the ratio already asserts.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        ratio = node.get("coverage_ratio")
+        if not (_finite(ratio) and float(ratio) == 0.0):
+            continue
+        nulls = [key for key in COVERAGE_COUNT_KEYS if key in node and node[key] is None]
+        if not nulls:
+            continue
+        findings.append(
+            Finding(
+                "ENV-021",
+                _section_of(path),
+                f"{path}.coverage_ratio",
+                f"coverage_ratio is a hard 0 beside {sorted(nulls)} = null: 0 is "
+                "a measurement and null is an absence, so this ratio is asserted "
+                "over a count that was never taken",
             )
         )
     return findings
@@ -944,12 +1405,55 @@ def _holding_window_blocks(export: Export) -> list[tuple[str, dict[str, Any]]]:
     ]
 
 
+def _holding_window_start(node: dict[str, Any]) -> tuple[Any, str | None]:
+    """The window start a holding-window block claims, and the key it used.
+
+    A block that dates its holding window under any name other than
+    ``intersection_start`` used to drop out of the cross-section comparison
+    altogether, so the contradiction it carried was invisible rather than
+    reported.  ``intersection_start``, the block's own ``start``/``end`` pair,
+    ``measured_window.start`` and ``delivered_start`` are all consulted, in that
+    order of specificity.
+
+    Deliberately does NOT consult a bare ``start`` on a block that is not itself
+    a scoped window, and never looks outside the block: ``dashboard``'s
+    ``performance_history`` publishes ``history_coverage.delivered_start =
+    2026-08-25`` for a 90-day requested dashboard window that it already reports
+    as ``partial``/``truncated``/``stale``, and it publishes no
+    ``covered_days_scope`` — so it is a different population, not a
+    contradiction, and admitting it would be a false positive that only an
+    honest fix could not silence.  A block that DID claim a holding-window scope
+    and a ``delivered_start`` is compared, because then the two names describe
+    the same window.
+    """
+    for key in WINDOW_START_KEYS:
+        if key == "delivered_start":
+            break
+        if _iso_date(node.get(key)):
+            return node[key], key
+    if (
+        node.get("covered_days_scope") in HOLDING_WINDOW_SCOPES
+        and _iso_date(node.get("start"))
+        and _iso_date(node.get("end"))
+    ):
+        return node["start"], "start"
+    window = node.get(MEASURED_WINDOW_KEY)
+    if isinstance(window, dict) and _iso_date(window.get("start")):
+        return window["start"], f"{MEASURED_WINDOW_KEY}.start"
+    if _iso_date(node.get("delivered_start")):
+        return node["delivered_start"], "delivered_start"
+    return None, None
+
+
 def xs_001_holding_window_agreement(export: Export) -> list[Finding]:
     """Every section publishing the holding window must agree on it.
 
     ``covered_days_scope`` is the join key: a model window (174 or 251 days)
     and a conditional regime sample (19 days) are legitimately different
     populations, so they are excluded rather than averaged in.
+
+    MY-1, fixed: the start comparison reads whichever key a block used (see
+    :func:`_holding_window_start`) instead of only ``intersection_start``.
     """
     blocks = _holding_window_blocks(export)
     findings: list[Finding] = []
@@ -957,11 +1461,12 @@ def xs_001_holding_window_agreement(export: Export) -> list[Finding]:
         return findings
     # Only well-formed blocks can be compared; a block that publishes
     # covered_days as null is XS-002's problem, not an agreement failure.
-    starts = {
-        str(node.get("intersection_start"))
-        for _, node in blocks
-        if _iso_date(node.get("intersection_start"))
-    }
+    starts: dict[str, list[str]] = {}
+    for path, node in blocks:
+        value, key = _holding_window_start(node)
+        if value is None:
+            continue
+        starts.setdefault(str(value), []).append(f"{path} ({key})")
     days = {
         node.get("covered_days")
         for _, node in blocks
@@ -973,8 +1478,11 @@ def xs_001_holding_window_agreement(export: Export) -> list[Finding]:
                 "XS-001",
                 _section_of(blocks[0][0]),
                 blocks[0][0],
-                f"{len(blocks)} holding-window blocks disagree on "
-                f"intersection_start: {sorted(starts)}",
+                f"{len(blocks)} holding-window blocks disagree on their start: "
+                + "; ".join(
+                    f"{value} declared by {len(holders)} block(s) e.g. {holders[0]}"
+                    for value, holders in sorted(starts.items())
+                ),
             )
         )
     if len(days) > 1:
@@ -985,6 +1493,56 @@ def xs_001_holding_window_agreement(export: Export) -> list[Finding]:
                 blocks[0][0],
                 f"{len(blocks)} holding-window blocks disagree on covered_days: "
                 f"{sorted(days)}",
+            )
+        )
+    return findings
+
+
+def xs_010_holding_window_start_matches_itself(export: Export) -> list[Finding]:
+    """MY-1: a block that publishes its own ``holding_window_start`` must not
+    date itself differently.
+
+    ``tear_sheet.data.measured_window`` claims
+    ``covered_days_scope: "holding_window_aligned_return_rows"`` with
+    ``start: "2026-08-04"`` and ``days: 39``, publishes
+    ``holding_window_start: "2026-08-03"`` on the same mapping, and twenty
+    sibling holding-window blocks all say ``intersection_start: "2026-08-03"``.
+    The block states the contradiction itself and then publishes it anyway.
+
+    A block may hold BOTH dates when they describe different things AND it
+    reconciles them. A portfolio return is only measurable once every held leg
+    has a price, so the first measurable date is legitimately later than the
+    holding window's own start. Publishing the gap and its basis resolves the
+    contradiction; publishing both dates silently does not.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        declared = node.get("holding_window_start")
+        if not _iso_date(declared):
+            continue
+        value, key = _holding_window_start(node)
+        if value is None or value == declared:
+            continue
+        # Reconciled: the block names the gap and says what produced it.
+        gap = node.get("holding_window_to_measured_start_gap_days")
+        basis = node.get("measured_start_basis")
+        if _is_number(gap) and isinstance(basis, str) and basis.strip():
+            continue
+        findings.append(
+            Finding(
+                "XS-010",
+                _section_of(path),
+                f"{path}.{key}",
+                f"{key}={value!r} contradicts the holding_window_start="
+                f"{declared!r} published on the same block, which claims "
+                f"covered_days_scope={node.get('covered_days_scope')!r}"
+                + (
+                    "; the block states no "
+                    "holding_window_to_measured_start_gap_days and no "
+                    "measured_start_basis explaining the difference"
+                    if not (isinstance(basis, str) and basis.strip())
+                    else ""
+                ),
             )
         )
     return findings
@@ -2682,6 +3240,254 @@ def num_020_short_window_is_reported_partial(export: Export) -> list[Finding]:
 
 
 # --------------------------------------------------------------------------
+# NUMERIC RULES WRITTEN AGAINST THE v5 REVIEW
+# --------------------------------------------------------------------------
+
+
+def num_021_return_series_declares_breadth(export: Export) -> list[Finding]:
+    """Catches QM-1: a return series that never says how many legs it held.
+
+    ``analytics_engine.py:74-77`` renormalises the surviving weights on every
+    date, so a day where only some tickers have a finite return is a return for
+    the PARTIAL basket, scaled to 1.0.  In the v5 export 20 of the 39 holding
+    window days are partial, and the final day is one small-cap alone at
+    ``1/0.033177 = 30.14x`` its weight — and that observation is the one that
+    sets the terminal value, CAGR, Sharpe and Sortino.  All seven occurrences of
+    "renormaliz" in the artifact are about risk-score weights, regime rounding
+    and ``india_flows``.
+
+    A series therefore has to say, per row or in aggregate, how many
+    constituents were active — or state that every observation used the full
+    universe (``renorm: "not_applied"``, ``partial_basket_days: 0``).  Either is
+    a disclosure, so an engineer who genuinely stops renormalising can pass this
+    with one true line.  ``*_position_count``-style universe sizes are NOT
+    accepted: "the book has 14 holdings" does not say how many were in the
+    basket on 2026-09-25.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        rows = _performance_rows(node)
+        if not rows:
+            continue
+        measured = [row for row in rows if _finite(row.get("return"))]
+        if not measured:
+            continue
+        per_row = sum(1 for row in rows if _keys_matching(row, BREADTH_KEY_TOKENS))
+        if per_row == len(rows):
+            continue
+        beside = _keys_matching(node, BREADTH_KEY_TOKENS)
+        enclosing = next(
+            (node_at for candidate, node_at in reversed(export.dicts)
+             if candidate == path.rsplit(".", 1)[0]),
+            None,
+        )
+        if not beside and (enclosing is None
+                           or not _keys_matching(enclosing, BREADTH_KEY_TOKENS)):
+            findings.append(
+                Finding(
+                    "NUM-021",
+                    _section_of(path),
+                    f"{path}.data",
+                    f"a {len(rows)}-row ({len(measured)} measured) portfolio return "
+                    f"series publishes a constituent count on {per_row} rows and "
+                    "no breadth aggregate beside it; there is no way to tell a "
+                    "full-basket day from a partial-basket day whose surviving "
+                    "weights were renormalised to 1.0",
+                )
+            )
+    return findings
+
+
+def _round_interval_multiple(ratio: float) -> float | None:
+    """``ratio`` as a round band multiplier, or None if it is not one.
+
+    Round means a multiple of :data:`ROUND_INTERVAL_STEP` (0.05) inside
+    ``[0.5, 2.0]``, and not 1.0 itself.  A computed interval whose endpoints
+    land on 0.643x and 1.357x the centre — which is what most real ones do —
+    returns None and is left alone.
+    """
+    if not (MIN_INTERVAL_MULTIPLE <= ratio <= MAX_INTERVAL_MULTIPLE):
+        return None
+    steps = ratio / ROUND_INTERVAL_STEP
+    nearest = round(steps)
+    if nearest < 1 or not _close(steps, float(nearest), abs_tol=0.0, rel_tol=1e-9):
+        return None
+    multiple = nearest * ROUND_INTERVAL_STEP
+    if _close(multiple, 1.0, abs_tol=1e-12):
+        return None
+    return multiple
+
+
+def num_022_interval_is_not_a_constant_band(export: Export) -> list[Finding]:
+    """Catches SI-3/QM-3: a confidence interval that is a constant multiple.
+
+    ``forecast_risk.data.portfolio.confidence_interval`` is
+    ``[midpoint*0.8, midpoint*1.2]`` to exact float equality — not a computed
+    interval, a hardcoded +/-20% band wearing the field's name.  It is worse
+    than a wrong number because the SAME export has ``stress_testing`` labelling
+    its nominal 0.95 ``nominal_label_not_simulated``: the artifact knows the
+    honest spelling and uses the dishonest one a section over.
+
+    Symmetry alone is NOT the finding — plenty of legitimate intervals are
+    symmetric.  The finding is symmetry whose half-width is a round constant
+    fraction of the centre, so a computed interval is never a false positive
+    here.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        for key, value in node.items():
+            if not any(token in key.lower() for token in INTERVAL_KEY_TOKENS):
+                continue
+            if not (isinstance(value, list) and len(value) == 2):
+                continue
+            if not all(_finite(endpoint) for endpoint in value):
+                continue
+            low, high = float(value[0]), float(value[1])
+            if not (0.0 < low < high):
+                continue
+            centre = (low + high) / 2.0
+            low_multiple = _round_interval_multiple(low / centre)
+            high_multiple = _round_interval_multiple(high / centre)
+            if low_multiple is None or high_multiple is None:
+                continue
+            findings.append(
+                Finding(
+                    "NUM-022",
+                    _section_of(path),
+                    f"{path}.{key}",
+                    f"{key}=[{_fmt(low)}, {_fmt(high)}] is exactly the centre "
+                    f"{_fmt(centre)} multiplied by [{low_multiple:g}, "
+                    f"{high_multiple:g}] — a fixed band is not an interval, and "
+                    "no sample can produce one to the last bit",
+                )
+            )
+    return findings
+
+
+def num_023_achieved_value_is_not_its_own_target(export: Export) -> list[Finding]:
+    """Catches QM-4: an ``achieved_*`` field that restates its target.
+
+    ``volatility_sizing`` published ``achieved_volatility == target_volatility ==
+    0.15`` to 1e-12 beside ``scale_factor: 1.295309``.  The scale is defined as
+    ``target / rec_vol`` and the "achieved" value is ``rec_vol * scale``, so the
+    identity closes on ``target`` by construction: it is a restatement dressed
+    as a measurement, and the review's own retraction of agent 05 recorded that
+    the published ``current_volatility`` (0.145465) is not the volatility the
+    sizing used (0.1158) either.
+
+    The guard is ``scale_factor``: a scaling step that exists to hit a target
+    makes a later equality with that target an identity rather than evidence.
+    Without a published scale the equality might be a genuine coincidence of a
+    re-measurement, and the rule stays quiet.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        scaled = any(
+            "scale" in key.lower() and _finite(value)
+            for key, value in node.items()
+        )
+        if not scaled:
+            continue
+        for key, value in node.items():
+            if not (key.startswith("achieved_") and _finite(value)):
+                continue
+            quantity = key[len("achieved_") :]
+            targets = [
+                other
+                for other, candidate in node.items()
+                if other != key
+                and quantity in other
+                and other.startswith(TARGET_KEY_PREFIXES)
+                and _finite(candidate)
+            ]
+            for target_key in sorted(targets):
+                if _close(float(value), float(node[target_key]),
+                          abs_tol=1e-12, rel_tol=1e-12):
+                    findings.append(
+                        Finding(
+                            "NUM-023",
+                            _section_of(path),
+                            f"{path}.{key}",
+                            f"{key}={_fmt(value)} equals {target_key}="
+                            f"{_fmt(node[target_key])} exactly while a scale "
+                            "factor is published; a scaling step defined as "
+                            "target/v reproduces its own target, so this is a "
+                            "restatement, not an achieved measurement",
+                        )
+                    )
+    return findings
+
+
+def _directives(export: Export) -> list[tuple[str, str, dict[str, Any]]]:
+    """Every ``(path, key, value)`` whose field is a trade DIRECTIVE.
+
+    A directive is a directive-named field whose value names a directional
+    action with a word boundary.  ``"NOT_COINTEGRATED"`` and ``"NEUTRAL"`` are
+    labels, and prose elsewhere in the artifact that happens to contain the
+    substring "buy" is never looked at, because only directive-named keys are
+    read.
+    """
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path, node in export.dicts:
+        for key, value in node.items():
+            if not any(token in key.lower() for token in DIRECTIVE_KEY_TOKENS):
+                continue
+            if not (isinstance(value, str) and DIRECTIVE_ACTION_RE.search(value)):
+                continue
+            out.append((path, key, node))
+    return out
+
+
+def num_024_trade_directive_publishes_its_basis(export: Export) -> list[Finding]:
+    """Catches SI-1/G9: an actionable directive with no published basis.
+
+    ``pairs`` published ``"LONG_SPREAD (Long ELECTCAST.NS, Short MCX.NS)"`` and
+    ``"SHORT_SPREAD (Short JUNIORBEES.NS, Long MIDCAPIETF.NS)"`` on pairs where
+    ``johansen_agrees_with_decision`` is ``false``, out of 91 Engle-Granger
+    tests whose p-values are indistinguishable from Uniform(0,1)
+    (D=0.131, p=0.080).  ``bonferroni``/``fdr``/``multiple_testing``/
+    ``false_discovery`` appear zero times in 876 KB, so four declared positives
+    where 4.55 are expected by chance are published as instructions with no
+    correction and no hedge ratio in the string.
+
+    A directive has to publish, on the record or on any mapping enclosing it:
+    the decision threshold, the diagnostic test's agreement, how many
+    comparisons were made, whether a multiplicity correction was applied, and
+    the size ratio.  Scan-level constants count from the enclosing mapping, so
+    publishing one honest ``bonferroni_alpha`` beside the record list is enough
+    for all of them.
+    """
+    findings: list[Finding] = []
+    for path, key, node in _directives(export):
+        scope = [node] + [
+            ancestor
+            for candidate, ancestor in export.dicts
+            if candidate in _ancestor_paths(export, path)
+        ]
+        visible: set[str] = set()
+        for mapping in scope:
+            visible |= set(mapping)
+        missing = [
+            label
+            for label, tokens in DIRECTIVE_BASIS_TOKENS
+            if not any(any(token in name.lower() for token in tokens) for name in visible)
+        ]
+        if not missing:
+            continue
+        findings.append(
+            Finding(
+                "NUM-024",
+                _section_of(path),
+                f"{path}.{key}",
+                f"{key}={_fmt(node[key])} is an actionable instruction that "
+                f"publishes none of: {', '.join(missing)}; a reader cannot "
+                "tell whether the decision survived its own correction",
+            )
+        )
+    return findings
+
+
+# --------------------------------------------------------------------------
 # The rule table.  A new invariant is one entry here.
 # --------------------------------------------------------------------------
 
@@ -2717,8 +3523,11 @@ RULES: tuple[Rule, ...] = (
          "available_tickers is a subset of requested_tickers unless "
          "raw_available_tickers documents the extras", env_011_available_within_requested),
     Rule("ENV-012", CATEGORY_ENVELOPE,
-         "a section as_of does not sit inside the envelope collection window "
-         "unless a refresh timestamp is disclosed", env_012_as_of_outside_collection_window),
+         "a section as_of is ORDERED against the collection clock: not after "
+         "completed_at, not older than "
+         f"{AS_OF_STALENESS_DAYS:g} days before generated_at, and a date inside "
+         "the collection window only with a disclosed refresh timestamp",
+         env_012_as_of_outside_collection_window),
     Rule("ENV-013", CATEGORY_ENVELOPE,
          "a section does not report as_of: null while its payload carries dated "
          "observations", env_013_no_null_as_of_with_dated_payload),
@@ -2729,17 +3538,31 @@ RULES: tuple[Rule, ...] = (
          "a section whose payload declares a monetary unit also declares "
          "section.currency", env_015_monetary_sections_declare_currency),
     Rule("ENV-016", CATEGORY_ENVELOPE,
-         "every partial/unavailable section has a non-empty warnings array",
+         "a section that publishes a degradation — a partial/unavailable status "
+         "OR a non-empty block_reason/omitted/withheld/excluded marker — has a "
+         "non-empty warnings array, whatever its own status",
          env_016_degraded_sections_warn),
     Rule("ENV-017", CATEGORY_ENVELOPE,
          "no NaN/Infinity anywhere and the bytes re-parse as strict JSON",
          env_017_strict_finite_json),
     Rule("ENV-018", CATEGORY_ENVELOPE,
          "no duplicate object keys in the source bytes", env_018_no_duplicate_keys),
+    Rule("ENV-019", CATEGORY_ENVELOPE,
+         "catches AD-5/G3: no record claims an executable status inside a "
+         "section whose own execution_eligible is false", env_019_record_status_respects_section_gate),
+    Rule("ENV-020", CATEGORY_ENVELOPE,
+         "catches SI-5: a section publishing estimated parameters/ratios carries "
+         "a standard error, an interval or an effective-sample-size figure",
+         env_020_point_estimates_carry_uncertainty),
+    Rule("ENV-021", CATEGORY_ENVELOPE,
+         "catches AD-10/G4: a hard 0 coverage_ratio is never published beside a "
+         "null covered_count in the same block", env_021_zero_ratio_needs_a_count),
     # ---- cross-section
     Rule("XS-001", CATEGORY_CROSS_SECTION,
-         "every section publishing the holding window agrees on intersection_start, "
-         "covered_days and covered_days_scope", xs_001_holding_window_agreement),
+         "every section publishing the holding window agrees on its start "
+         "(intersection_start, the block's own start, measured_window.start or "
+         "delivered_start), covered_days and covered_days_scope",
+         xs_001_holding_window_agreement),
     Rule("XS-002", CATEGORY_CROSS_SECTION,
          "catches D-01: a published covered_days carries a non-empty covered_days_scope",
          xs_002_covered_days_requires_scope),
@@ -2766,6 +3589,9 @@ RULES: tuple[Rule, ...] = (
          "catches D-06: every published factor fit statistic declares its window "
          "and observation count, and disagreeing sections distinguish their windows",
          xs_009_factor_fit_declares_window),
+    Rule("XS-010", CATEGORY_CROSS_SECTION,
+         "catches MY-1: a holding-window block's own start matches the "
+         "holding_window_start it publishes beside it", xs_010_holding_window_start_matches_itself),
     # ---- numeric
     Rule("NUM-001", CATEGORY_NUMERIC,
          "sum(market_value) == total_value and sum(weight) == 1",
@@ -2829,6 +3655,20 @@ RULES: tuple[Rule, ...] = (
     Rule("NUM-020", CATEGORY_NUMERIC,
          "a short or stale performance window is reported as partial and the "
          "dashboard section reflects it", num_020_short_window_is_reported_partial),
+    Rule("NUM-021", CATEGORY_NUMERIC,
+         "catches QM-1: a portfolio return series publishes, per row or in "
+         "aggregate, how many constituents were active on each date",
+         num_021_return_series_declares_breadth),
+    Rule("NUM-022", CATEGORY_NUMERIC,
+         "catches SI-3/QM-3: a two-element interval is never exactly a round "
+         "constant multiple of its own centre", num_022_interval_is_not_a_constant_band),
+    Rule("NUM-023", CATEGORY_NUMERIC,
+         "catches QM-4: an achieved_* field does not restate its own target while "
+         "a scale factor is published", num_023_achieved_value_is_not_its_own_target),
+    Rule("NUM-024", CATEGORY_NUMERIC,
+         "catches SI-1/G9: a trade directive publishes its threshold, diagnostic "
+         "agreement, comparison count, multiplicity correction and size ratio",
+         num_024_trade_directive_publishes_its_basis),
 )
 
 RULES_BY_ID: dict[str, Rule] = {rule.rule_id: rule for rule in RULES}

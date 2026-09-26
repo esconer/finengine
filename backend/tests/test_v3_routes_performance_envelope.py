@@ -37,13 +37,22 @@ from app.api.analytics import (
 )
 
 ENVELOPE_KEYS = {
-    "data", "data_status", "as_of", "as_of_semantics", "history_coverage", "warnings"
+    "data", "data_status", "as_of", "as_of_semantics", "history_coverage", "warnings",
+    # QM-1 breadth disclosure, ADDITIVE. The default bare-array response is
+    # unchanged and the six original keys keep their names, types and positions;
+    # these four qualify the series itself, so they sit beside `data` rather than
+    # only inside `history_coverage`.
+    "constituent_count", "constituent_count_basis", "partial_basket_policy",
+    "refused_partial_coverage_rows",
 }
 COVERAGE_KEYS = {
     "requested_start", "requested_end", "requested_days", "delivered_start",
     "delivered_end", "observation_count", "expected_observation_count",
     "first_observation", "last_observation", "coverage_ratio", "truncated",
     "stale", "status",
+    "constituent_count", "constituent_count_basis", "partial_basket_policy",
+    "measurable_price_rows", "complete_coverage_price_rows",
+    "refused_partial_coverage_price_rows",
 }
 
 
