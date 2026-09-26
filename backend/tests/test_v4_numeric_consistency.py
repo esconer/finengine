@@ -42,6 +42,7 @@ from app.api.analytics import (
     CONTRIBUTION_DECIMALS,
     CONTRIBUTION_UNIT,
     HOLDING_COVERED_DAYS_SCOPE,
+    HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
     LIQUIDITY_SPREAD_DEFINITION,
     LIQUIDITY_SPREAD_UNIT,
     PRICE_FRAME_COUNT_UNITS,
@@ -1002,11 +1003,12 @@ async def test_risk_contribution_publishes_return_row_counts_and_their_unit():
     assert entry["return_observations"] == entry["raw_days"]
     assert entry["holding_window_return_observations"] == entry["masked_days"]
     # The unit is declared at the block level too, and the block count keeps its
-    # own scope label.
-    assert context["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
+    # own scope label. XS-001: this section measures the wide per-leg frame, so
+    # the label says so rather than borrowing the whole-book one.
+    assert context["covered_days_scope"] == HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
     assert result["history_coverage"]["per_ticker_count_units"] == RETURN_FRAME_COUNT_UNITS
     assert result["history_coverage"]["holding_window_days_scope"] == (
-        HOLDING_COVERED_DAYS_SCOPE
+        HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
     )
     # And the share map beside `annualized: true` declares what it is.
     basis = result["contribution_basis"]
@@ -1043,7 +1045,10 @@ async def test_factor_exposure_answers_the_holding_window_in_return_rows():
     price_rows = int((dates >= pd.Timestamp(start)).sum())
     assert price_rows == EVIDENCE_BARS - 100
     assert context["covered_days"] == price_rows - 1
-    assert context["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
+    # XS-001: `port_ret` is the wide per-leg frame and keeps partially-covered
+    # dates, so this count is NOT the whole-book population the other sections
+    # publish. The name says which one it is; the count itself is untouched.
+    assert context["covered_days_scope"] == HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
     # The price-row count is kept, labelled, one larger because the bar on the
     # start date has no held predecessor.
     assert context["holding_window_price_rows"] == price_rows

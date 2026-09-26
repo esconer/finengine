@@ -1208,6 +1208,35 @@ HOLDING_PROVENANCE_LOOKBACK_DAYS = 252
 #: how one portfolio reported 39 days in one section and 40 in another.
 HOLDING_COVERED_DAYS_SCOPE = "holding_window_aligned_return_rows"
 
+#: XS-001: `holding_window_observation_count` counts whatever frame it is
+#: handed, so the same helper produces two different populations under one
+#: scope name. The 12 sections that pass a whole-book PORTFOLIO series get 20 on
+#: the audited book - only rows where every held leg had a return. The sections
+#: that pass the wide per-leg return frame get 39, because that frame
+#: deliberately RETAINS dates on which some leg was unpriced (its documented
+#: contract: per-leg truth, NaN-masked dates kept, never narrowed to match the
+#: portfolio series - see `PORTFOLIO_RETURN_MIN_COVERAGE`).
+#:
+#: Those are different populations, not a disagreement, so they must not share a
+#: scope name. Renaming the minority is the honest fix: the counts are both
+#: correct, and the alternative - narrowing the wide frame to 20 to make the
+#: numbers agree - would destroy the per-leg truth the frame exists to carry.
+HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE = (
+    "holding_window_wide_return_rows_partial_dates_retained"
+)
+
+#: XS-001: a MEASURED window is a sub-window of the holding window, not the
+#: holding window. It starts at the first date every held position had a
+#: measurable return, which on a sparse book is later than the holding-window
+#: start, and it counts only the whole-book complete rows inside it. Labelling
+#: it with the holding-window scope made the audit rule read its start as the
+#: holding-window start and compare 22 legitimately-later against 13 blocks that
+#: were right. The block keeps `holding_window_start`, the day gap and
+#: `measured_start_basis`, so the difference stays reconciled and visible.
+MEASURED_WINDOW_COVERED_DAYS_SCOPE = (
+    "holding_window_whole_book_complete_return_rows"
+)
+
 HOLDING_PROVENANCE_RULE = (
     "One window start per position for every section: the stored import date, "
     "or an earlier close within tolerance of the buy price found inside the "
@@ -1625,6 +1654,55 @@ PERFORMANCE_AS_OF_SEMANTICS = (
     "window end, and never backfilled."
 )
 
+#: Why the delivered series can start later than the holding window. The
+#: holding mask is a DATE cut; a portfolio VALUE additionally needs a price on
+#: every leg, so the first measurable date is the first holding-window session on
+#: which the whole book was quoted. Sessions between the two that lack any leg
+#: are refused, not renormalised, and the legs responsible are named beside this
+#: sentence - an unexplained "the requested start was not delivered" reads as
+#: missing data and sends a reader looking for a vendor problem that is not there.
+PERFORMANCE_MEASURED_START_BASIS = (
+    "first date on which every priced position had a price, so a whole-book "
+    "portfolio value existed; earlier holding-window sessions had at least one "
+    "leg without a price and were refused rather than renormalised into a "
+    "partial-basket portfolio return"
+)
+
+
+def _refused_coverage_legs(
+    price_df: pd.DataFrame,
+    complete: pd.Series,
+) -> List[Dict[str, Any]]:
+    """Which legs, and how many holding-window sessions, each blocked a value.
+
+    `complete` marks the dates on which `sum(min_count=len(legs))` produced a
+    whole-book value. Every other date in the masked frame is a refused session,
+    and a leg is named here only if it was actually missing a price on one of
+    them - so the count is the cause of the late start, measured, not a guess
+    about which position is illiquid. A leg quoted on every refused session
+    cannot be the reason and is omitted.
+    """
+    if price_df is None or price_df.empty:
+        return []
+    refused = [stamp for stamp in price_df.index if not bool(complete.get(stamp, False))]
+    if not refused:
+        return []
+    legs: List[Dict[str, Any]] = []
+    for ticker in sorted(price_df.columns):
+        column = price_df[ticker]
+        missing = [stamp for stamp in refused if bool(pd.isna(column.get(stamp)))]
+        if not missing:
+            continue
+        legs.append({
+            "ticker": ticker,
+            "refused_price_rows": len(missing),
+            "held_price_rows": int(column.notna().sum()),
+            "first_refused_date": _observation_date(missing[0]),
+            "last_refused_date": _observation_date(missing[-1]),
+        })
+    legs.sort(key=lambda entry: (-entry["refused_price_rows"], entry["ticker"]))
+    return legs
+
 
 def _expected_observation_count(requested_start: Any, requested_end: Any) -> Optional[int]:
     """Mon-Fri calendar days in the requested window, or None if unparseable.
@@ -1660,6 +1738,59 @@ def _calendar_day_gap(later: Any, earlier: Any) -> Optional[int]:
     return int((b - a).days)
 
 
+def _holding_start_gap_sentence(
+    holding_block: Optional[Mapping[str, Any]],
+    delivered_start: Optional[str],
+) -> str:
+    """The MEASURED reason a delivered start sits after the holding-window start.
+
+    "The requested start was not delivered" states the gap and stops, so a reader
+    infers missing data. On this book the data is present and the real cause is a
+    refusal: a portfolio value needs a price on every leg, and the sessions
+    between the holding-window start and the first whole-book quote were dropped
+    rather than renormalised. The sentence names the window start, the number of
+    refused sessions and the legs responsible, every term of which is also a
+    number on `history_coverage.holding_window` — so it is checkable, not prose.
+    Empty when no holding window was resolved: an unmeasured reason is never
+    invented, and the gap sentence stands alone.
+    """
+    if not isinstance(holding_block, Mapping):
+        return ""
+    window_start = holding_block.get("intersection_start")
+    if not isinstance(window_start, str) or not window_start:
+        return ""
+    gap_days = holding_block.get("holding_window_to_measured_start_gap_days")
+    measured = holding_block.get("measured_start_basis")
+    if not _declared(measured):
+        return ""
+    refused = holding_block.get("refused_partial_coverage_price_rows")
+    legs = holding_block.get("refused_coverage_legs")
+    parts = [
+        f" The holding window starts {window_start}"
+        + (f" ({gap_days} calendar days before the delivered start)" if _declared(gap_days) else "")
+        + ", and the basis for measuring from a later date is: "
+        + f"{measured}."
+    ]
+    if _declared(refused):
+        parts.append(
+            f" {int(refused)} holding-window session(s) were refused for partial coverage."
+        )
+    if isinstance(legs, list) and legs:
+        named = ", ".join(
+            f"{entry.get('ticker')} ({entry.get('refused_price_rows')} session(s) without a price)"
+            for entry in legs
+            if isinstance(entry, Mapping)
+        )
+        if named:
+            parts.append(f" Legs missing a price on a refused session: {named}.")
+    return "".join(parts)
+
+
+def _declared(value: Any) -> bool:
+    """A real measured value, not a `None`/blank placeholder."""
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+
 def _performance_history_envelope(
     series: Any,
     *,
@@ -1667,6 +1798,7 @@ def _performance_history_envelope(
     requested_end: Any,
     warnings: Optional[Iterable[str]] = None,
     coverage_extra: Optional[Mapping[str, Any]] = None,
+    holding_window: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Opt-in metadata envelope for one delivered performance-history series.
 
@@ -1690,6 +1822,19 @@ def _performance_history_envelope(
     price, so a partial basket is refused rather than renormalised — but a
     shortened series is indistinguishable from a thin one unless the refusal is
     counted and published.
+
+    ``holding_window`` carries the holding-window declaration for the delivered
+    series: the canonical window start with its provenance, the count in the
+    sibling sections' unit, and the measured reason the delivered start can sit
+    after the window start. It travels as ONE sub-mapping rather than being
+    flattened into the coverage block, because ``history_coverage`` mixes two
+    populations - the REQUESTED window (freshness) and the holding window
+    (realized truth) - and a consumer that cannot tell them apart reads the
+    requested start as a holding date. Without it the only sentence explaining
+    a late start is "the requested start was not delivered", which reads as
+    missing data rather than as the refusal it is. Always present, ``None``
+    when no holding window was resolved, so the key set never depends on the
+    call path.
     """
     rows = [row for row in (series or []) if isinstance(row, Mapping)]
     # Only a genuinely dated row is an observation. A positional label or an
@@ -1770,6 +1915,11 @@ def _performance_history_envelope(
         "refused_partial_coverage_price_rows",
     ):
         history[key] = coverage_extra.get(key)
+    # The holding-window declaration, or None. Published beside the freshness
+    # axes rather than inside them, and defaulted like the breadth keys above so
+    # the shape stays a function of the call, not of the data.
+    holding_block = holding_window if isinstance(holding_window, Mapping) else None
+    history["holding_window"] = holding_block
 
     messages: List[str] = [str(item) for item in (warnings or []) if item]
     if not observation_count:
@@ -1777,9 +1927,11 @@ def _performance_history_envelope(
     else:
         if truncated and delivered_start and isinstance(requested_start, str):
             late = _calendar_day_gap(delivered_start, requested_start)
+            gap = _holding_start_gap_sentence(holding_block, delivered_start)
             messages.append(
                 f"Delivered history starts {delivered_start}, {late} calendar days after "
                 f"the requested {requested_start}; the requested start was not delivered."
+                + gap
             )
         if stale and delivered_end and isinstance(requested_end, str):
             gap = _calendar_day_gap(requested_end, delivered_end)
@@ -3665,6 +3817,13 @@ async def get_factor_exposure(
             requested_end=end,
             covered_days=holding_days,
             evidence_window=provenance["evidence_window"],
+            # XS-001: `port_ret` is the wide per-leg frame and keeps dates on
+            # which some leg was unpriced, so `holding_days` counts a different
+            # population from the 12 sections that publish a whole-book complete
+            # count. Naming it accurately is what keeps 39 and 20 from reading
+            # as a contradiction. The count itself is NOT changed - narrowing the
+            # frame to make it match would discard the per-leg truth.
+            covered_days_scope=HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
         )
         # The held PRICE-row count is kept beside the canonical count so nothing
         # is lost: it is one larger, because the bar on the start date is the
@@ -5342,6 +5501,11 @@ async def get_performance_history(
         end = datetime.now().strftime('%Y-%m-%d')
         start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
+        # Populated once the holding window and the whole-book coverage are both
+        # measured; read by `_deliver`, which several early returns reach before
+        # that point and correctly report no holding window.
+        holding_context: Dict[str, Any] = {}
+
         def _deliver(
             rows: List[Dict[str, Any]],
             extra: Optional[Iterable[str]] = None,
@@ -5354,6 +5518,7 @@ async def get_performance_history(
                 requested_start=start,
                 requested_end=end,
                 warnings=extra,
+                holding_window=holding_context or None,
                 coverage_extra=coverage,
             )
 
@@ -5405,8 +5570,27 @@ async def get_performance_history(
                 "added_on": coerce_holding_date(pos.added_on),
                 "buy_price": buy,
             }
+        # The holding leg is masked to the CANONICAL window start, resolved by the
+        # one rule every other holding-window section uses, not to whatever this
+        # route's own 90-day request implies. This function used to call
+        # `holding_window` with the request's own price frames, so the buy-price
+        # inference saw only `days` of evidence and could resolve a LATER
+        # start for a position than every sibling section resolved for the same
+        # stored `added_on` - the exact mechanism the v4 export used to carry
+        # three holding dates for one portfolio (see the rule note above). The
+        # canonical evidence window is anchored to the requested END, is read
+        # cache-first through the same DataService this leg already used, and
+        # `frames` is deliberately not passed: these frames are `days` wide, and
+        # handing them over as "evidence in hand" would silently narrow the
+        # evidence window while publishing that it was the canonical one.
+        provenance = await holding_provenance(
+            data_service, perf_holdings, list(perf_holdings), end=end,
+        )
+        unmasked_price_dict = {
+            t: price_df[t] for t in price_df.columns if t in quantities
+        }
         price_df_dict, _perf_effectives = holding_window(
-            {t: price_df[t] for t in price_df.columns if t in quantities}, perf_holdings
+            unmasked_price_dict, canonical_holding_window_input(provenance["detail"])
         )
         # Do not backfill or zero-fill a position before/inside its actual
         # history.  A portfolio value is emitted only for dates where every
@@ -5468,6 +5652,7 @@ async def get_performance_history(
         # tell a short series from a thin one. Count it and publish it.
         measurable_price_rows = int(len(price_df))
         constituent_count = int(len(q_series))
+        complete_coverage = portfolio_series.notna()
         portfolio_series = portfolio_series.dropna()
         coverage_disclosure = {
             "constituent_count": constituent_count,
@@ -5477,6 +5662,10 @@ async def get_performance_history(
             "complete_coverage_price_rows": int(len(portfolio_series)),
             "refused_partial_coverage_price_rows": measurable_price_rows - int(len(portfolio_series)),
         }
+        # Name the legs that actually blocked a whole-book value, so a delivered
+        # start later than the holding-window start is attributable instead of
+        # looking like absent data.
+        refused_legs = _refused_coverage_legs(price_df, complete_coverage)
         if portfolio_series.empty:
             return _deliver(
                 [], extra=["No date had a usable price for every priced position."]
@@ -5612,6 +5801,56 @@ async def get_performance_history(
                 "carries a benchmark value; the delivered series is the "
                 "portfolio leg only."
             )
+        # The holding-window declaration. The mask cutoff is the canonical
+        # intersection every sibling section publishes, the count is in the
+        # sibling unit (return observations, so the first held price row is
+        # excluded), and the two dates are reconciled here rather than left for a
+        # reader to notice: the window starts on one date and the series is
+        # measurable from another, and both are true.
+        window_start = provenance.get("start")
+        if isinstance(window_start, str) and window_start:
+            measured_start = _observation_date(output[0].get("date")) if output else None
+            gap_days = _calendar_day_gap(measured_start, window_start)
+            per_ticker = {}
+            own_returns = price_df.pct_change(fill_method=None)
+            for ticker in sorted(price_df.columns):
+                held = price_df_dict.get(ticker)
+                raw = unmasked_price_dict.get(ticker)
+                # Frame attrs (the feed's own coverage declaration) live on the
+                # per-ticker series, not on the column the wide frame was built
+                # from, so they are read from the fetched series.
+                fetched = price_data_dict.get(ticker)
+                per_ticker[ticker] = {
+                    "raw_days": int(len(raw)) if raw is not None else 0,
+                    "masked_days": int(len(held)) if held is not None else 0,
+                    "return_observations": int(own_returns[ticker].notna().sum()),
+                    "coverage_reason": fetched.attrs.get("coverage_reason") if fetched is not None else None,
+                    "limited_history": bool(fetched.attrs.get("limited_history", False)) if fetched is not None else False,
+                }
+            holding_context.update(publish_holding_coverage(
+                detail=provenance["detail"],
+                per_ticker=per_ticker,
+                requested_start=start,
+                requested_end=end,
+                # The unit every holding-window section publishes: the measured
+                # whole-book return observations, so the first held price row is
+                # excluded. Counted on the measured series rather than on the
+                # delivered rows, because a row withheld for want of a BENCHMARK
+                # is still a measured portfolio return - counting deliveries would
+                # make this section's number move with the benchmark leg and
+                # disagree with its siblings for a reason that has nothing to do
+                # with the holding window.
+                covered_days=int(len(daily_returns)),
+                evidence_window=provenance["evidence_window"],
+            ))
+            holding_context["holding_window_start"] = window_start
+            holding_context["delivered_measured_start"] = measured_start
+            holding_context["holding_window_to_measured_start_gap_days"] = gap_days
+            holding_context["measured_start_basis"] = PERFORMANCE_MEASURED_START_BASIS
+            holding_context["refused_coverage_legs"] = refused_legs
+            holding_context["refused_partial_coverage_price_rows"] = coverage_disclosure[
+                "refused_partial_coverage_price_rows"
+            ]
         return _deliver(output, extra=extra_warnings, coverage=coverage_disclosure)
 
     except HTTPException:
@@ -6113,7 +6352,7 @@ async def get_tear_sheet(
             "end": measured_last or _latest_observation_date(port_ret),
             "days": int(covered_days),
             "observation_count": int(covered_days),
-            "covered_days_scope": HOLDING_COVERED_DAYS_SCOPE,
+            "covered_days_scope": MEASURED_WINDOW_COVERED_DAYS_SCOPE,
             "truncated_to_holding_window": bool(history_coverage.get("truncated")),
             "holding_window_start": holding_window_start,
             "holding_window_to_measured_start_gap_days": leading_gap_days,
@@ -6258,6 +6497,13 @@ async def get_risk_contribution(
             covered_days=holding_days,
             evidence_window=provenance["evidence_window"],
             per_ticker_count_units=RETURN_FRAME_COUNT_UNITS,
+            # XS-001: same wide-per-leg-frame population as factor_exposure, for
+            # the same reason. This section does not appear in the audited export
+            # because it 500s there, so the disagreement it would raise is latent
+            # rather than observed - which is exactly why it is fixed now instead
+            # of waiting for it to show up on the first book where the section
+            # succeeds.
+            covered_days_scope=HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
         )
         # `holding_coverage` only knows the three legacy count keys, so the
         # window count this section measures is stamped on afterwards, in the

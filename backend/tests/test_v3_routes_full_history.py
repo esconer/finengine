@@ -28,6 +28,7 @@ from app.api import analytics as analytics_mod
 from app.api.analytics import (
     FULL_HISTORY_BASIS,
     HOLDING_CONTEXT_SCOPE,
+    HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
     get_factor_exposure,
     get_regime,
     get_risk_contribution,
@@ -148,7 +149,13 @@ async def test_factor_exposure_model_window_is_not_the_holding_window():
     expected_holding_days = int((dates[1:] > pd.Timestamp("2026-08-04")).sum())
     assert expected_holding_days < MODEL_OBSERVATIONS // 2
     assert holding["covered_days"] == expected_holding_days
-    assert holding["covered_days_scope"] == "holding_window_aligned_return_rows"
+    # XS-001: the held-row count comes from the wide per-leg frame, which keeps
+    # dates on which some leg was unpriced, so it names that population instead
+    # of borrowing the whole-book one the other sections publish.
+    assert (
+        holding["covered_days_scope"]
+        == HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
+    )
     assert holding["intersection_start"] == "2026-08-04"
     assert coverage["holding_window_days"] == holding["covered_days"]
     assert coverage["covered_days"] == MODEL_OBSERVATIONS
@@ -281,7 +288,12 @@ async def test_risk_contribution_holding_context_keeps_its_own_window():
     # The holding context counts the HELD rows, not the model's whole span.
     assert holding["covered_days"] == expected_holding_days
     assert holding["covered_days"] < MODEL_OBSERVATIONS // 2
-    assert holding["covered_days_scope"] == "holding_window_aligned_return_rows"
+    # XS-001: wide per-leg frame, as above - the count is unchanged, the name is
+    # not borrowed from the whole-book population.
+    assert (
+        holding["covered_days_scope"]
+        == HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
+    )
     assert coverage["holding_window_days"] == expected_holding_days
     assert coverage["covered_days"] == MODEL_OBSERVATIONS
 

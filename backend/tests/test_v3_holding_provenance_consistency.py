@@ -45,6 +45,8 @@ from app.api.analytics import (
     HOLDING_EVIDENCE_CANONICAL,
     HOLDING_PROVENANCE_LOOKBACK_DAYS,
     HOLDING_PROVENANCE_RULE,
+    HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
+    MEASURED_WINDOW_COVERED_DAYS_SCOPE,
     canonical_holding_window_input,
     get_regime,
     get_risk_contribution,
@@ -430,16 +432,24 @@ async def test_three_sections_publish_one_holding_window():
         assert coverage["inferred_start_tickers"] == ["FRESH.NS"]
         assert coverage["oldest_holding"] == str(dates[OLD_ADDED_OFFSET].date())
 
-    # 3. The count is identical and published under one unit label.
+    # 3. The count is identical and each section names its own unit.
     counts = {coverage["covered_days"] for coverage in (regime, tear_sheet, contribution)}
     assert len(counts) == 1
     # 42 held price rows produce 41 return observations: the bar on the start
     # date is the first held price and has no held predecessor.
     held_price_rows = -FRESH_INFERRED_OFFSET
     assert counts == {held_price_rows - 1}
-    assert all(
-        coverage["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
-        for coverage in (regime, tear_sheet, contribution)
+    # XS-001: the unit labels are deliberately NOT all the same any more.
+    # `regime` and `tear_sheet` count a whole-book complete-coverage series;
+    # `risk_contribution` counts the wide per-leg frame, which retains dates on
+    # which some leg was unpriced. On THIS fixture the two populations have the
+    # same length because no leg is sparse here - which is exactly why the
+    # mislabel stayed invisible until a real book had a leg with price gaps, and
+    # why "one shared label" was the wrong assertion rather than a stale one.
+    assert regime["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
+    assert tear_sheet["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
+    assert (
+        contribution["covered_days_scope"] == HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE
     )
     # The count is never a price-row count wearing a return-row name.
     assert all(
@@ -545,7 +555,14 @@ async def test_tear_sheet_window_is_a_request_beside_a_measurement():
     measured = sheet["measured_window"]
     assert measured["observation_count"] == coverage["covered_days"]
     assert measured["days"] == coverage["covered_days"]
-    assert measured["covered_days_scope"] == coverage["covered_days_scope"]
+    # XS-001: the measured window is a SUB-window of the holding window, so it
+    # no longer borrows the holding-window unit label. The two counts are still
+    # the same number on this dense fixture; what changed is that a reader can
+    # now tell the measured complete-coverage rows from the holding window's
+    # aligned rows, instead of being handed one label for two populations.
+    assert measured["covered_days_scope"] == MEASURED_WINDOW_COVERED_DAYS_SCOPE
+    assert measured["covered_days_scope"] != coverage["covered_days_scope"]
+    assert coverage["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
     assert measured["truncated_to_holding_window"] is True
     assert measured["holding_window_start"] == coverage["intersection_start"]
     assert measured["end"] == str(dates[-1].date())

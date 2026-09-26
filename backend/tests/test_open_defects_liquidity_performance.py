@@ -64,6 +64,11 @@ COVERAGE_KEYS = {
     "constituent_count", "constituent_count_basis", "partial_basket_policy",
     "measurable_price_rows", "complete_coverage_price_rows",
     "refused_partial_coverage_price_rows",
+    # XS-001/MY-1: the holding-window declaration. It travels as one
+    # sub-mapping (or None) because `history_coverage` mixes the requested
+    # window with the holding window, and a reader that cannot tell the two
+    # populations apart reads the requested start as a holding date.
+    "holding_window",
 }
 
 

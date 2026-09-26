@@ -53,6 +53,10 @@ COVERAGE_KEYS = {
     "constituent_count", "constituent_count_basis", "partial_basket_policy",
     "measurable_price_rows", "complete_coverage_price_rows",
     "refused_partial_coverage_price_rows",
+    # XS-001/MY-1: always present, None when no holding window was resolved, so
+    # the key set stays a function of the call rather than of the data. This pure
+    # helper is called without a holding window here, so it publishes None.
+    "holding_window",
 }
 
 
