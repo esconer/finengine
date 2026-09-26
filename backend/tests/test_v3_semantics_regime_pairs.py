@@ -468,7 +468,25 @@ class TestPairsCacheCompatibility:
         assert pair.depth_status is None
 
     async def test_db_cache_read_backfills_roles_from_legacy_row(self):
+        """A row legacy only in its DECLARATIONS is still served and upgraded.
+
+        Legacy is two different things. The role/depth fields are declarations,
+        so they can be backfilled from the engine's own constants. The hedge
+        regression's standard errors are MEASUREMENTS and cannot be, so a row
+        missing those is a miss and gets recomputed. This test covers the first
+        kind, which is the behaviour it was written for.
+        """
         row = _legacy_pair_row()
+        row.update(
+            {
+                "hedge_ratio_beta_std_error": 0.05,
+                "intercept_alpha_std_error": 1.4,
+                "hedge_regression_observations": 107,
+                "hedge_regression_std_error_basis": (
+                    "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
+                ),
+            }
+        )
         db_ticker, metric = _db_cache_keys("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
         cache = _FakeCache({(db_ticker, metric): {"metric_value": 0.031, "model_params": row}})
         svc = CointegrationService(db_session=None, cache_service=cache)
@@ -483,6 +501,23 @@ class TestPairsCacheCompatibility:
         assert got.johansen_role == JOHANSEN_ROLE == "diagnostic_only"
         # Derived from two booleans the legacy row already carried.
         assert got.johansen_agrees_with_decision is (got.johansen_cointegrated == got.is_cointegrated)
+
+    async def test_db_cache_misses_a_row_that_predates_the_uncertainty_measurement(self):
+        """The other kind of legacy: a row written before the standard errors
+        existed. It is a MISS, not a hit, because the slope drives a trade
+        instruction and a standard error cannot be invented from a constant.
+        Serving it would make the omission indistinguishable from a deliberate
+        `not_computed` in the artifact."""
+        row = _legacy_pair_row()
+        db_ticker, metric = _db_cache_keys("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+        cache = _FakeCache({(db_ticker, metric): {"metric_value": 0.031, "model_params": row}})
+        svc = CointegrationService(db_session=None, cache_service=cache)
+        _IN_MEMORY_COINT_CACHE.clear()
+        try:
+            got = await svc._get_cached_pair("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+        finally:
+            _IN_MEMORY_COINT_CACHE.clear()
+        assert got is None
 
     def test_with_test_role_metadata_is_idempotent(self):
         pair = with_test_role_metadata(CointPairResult(**_legacy_pair_row()))

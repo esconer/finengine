@@ -55,6 +55,16 @@ def _pair(a, b, pvalue=0.01):
         last_price_a=100.0,
         last_price_b=200.0,
         signal="hold",
+        # Required for a cache HIT: a row that cannot answer the uncertainty
+        # contract is a miss, because a standard error is a measurement and
+        # cannot be backfilled from a constant the way role/depth declarations
+        # can. Fixtures that store a pair must therefore carry it.
+        hedge_ratio_beta_std_error=0.04,
+        intercept_alpha_std_error=1.2,
+        hedge_regression_observations=174,
+        hedge_regression_std_error_basis=(
+            "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
+        ),
     )
 
 

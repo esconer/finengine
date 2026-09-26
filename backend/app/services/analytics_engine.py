@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Any, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import warnings
 
 # Financial analytics libraries
@@ -407,6 +407,748 @@ FORECAST_NO_INTERVAL_REASON = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Estimator uncertainty (SI-5)
+# ---------------------------------------------------------------------------
+# The export publishes on the order of two thousand point estimates and, before
+# this block existed, not one of them carried a standard error, an interval or
+# an effective-sample-size figure.  A point estimate published with the visual
+# authority of a measurement IS the defect, so every estimate now carries one
+# of two things:
+#
+#   * a real interval, with its method, its confidence level and the n it rests
+#     on, or
+#   * `not_computed` (nothing was measured) / `not_applicable` (the field is a
+#     threshold, not an estimate) with the reason.
+#
+# Nothing here invents an interval.  An interval fabricated to satisfy the rule
+# is worse than the absence, because it converts a known gap into a false
+# precision - which is why `measure_estimate_uncertainty` refuses to publish a
+# band unless the resampling estimator reproduces the PUBLISHED point value
+# first (see `point_tolerance`).
+#
+# METHOD: a circular moving-block bootstrap (Politis & Romano 1994), reported
+# as a percentile interval.  It is the right tool for this payload for two
+# reasons.  (1) Every quantity measured here is a ratio of two estimated
+# quantities - Sharpe, Sortino, Calmar, Omega, beta, alpha, expected return -
+# or a path statistic, and none of them has a usable closed-form standard error.
+# (2) Daily equity returns are serially dependent, so the naive sqrt(n) interval
+# is too narrow; an iid bootstrap would destroy exactly the dependence that
+# causes the understatement.  Resampling contiguous blocks keeps the dependence
+# inside a block, and `effective_n` publishes how far the naive n sits from the
+# count that carries the same information about the mean.
+UNCERTAINTY_CONFIDENCE_LEVEL = 0.95
+UNCERTAINTY_BOOTSTRAP_RESAMPLES = 1000
+#: Fixed so every interval in the export is reproducible from the payload alone.
+UNCERTAINTY_BOOTSTRAP_SEED = 20260925
+#: A percentile interval needs enough draws for its own 2.5 % tail to mean
+#: anything.  Below this the block publishes `not_computed` plus the count.
+UNCERTAINTY_MIN_OBSERVATIONS = 20
+#: How far the resampling estimator's OWN point value may sit from the value
+#: the payload publishes before the band is withheld.  An interval for a
+#: neighbouring function is a fabricated precision, not a wider honest one.
+UNCERTAINTY_POINT_TOLERANCE = 1e-6
+#: Display rounding for a standard error or interval bound.  Half a 6-decimal
+#: step, so a reader recomputing from the published numbers lands inside 1e-6.
+UNCERTAINTY_DECIMALS = 6
+
+BOOTSTRAP_METHOD = "circular_moving_block_bootstrap_percentile"
+BOOTSTRAP_METHOD_BASIS = (
+    "Circular moving-block bootstrap (Politis & Romano 1994) of the measured "
+    "return series, reported as a percentile interval at the stated level. "
+    "Contiguous blocks are resampled rather than individual observations "
+    "because daily equity returns are serially dependent: an iid bootstrap "
+    "would destroy the dependence that makes the naive sqrt(n) interval too "
+    "narrow. The standard error is the sample standard deviation (ddof=1) of "
+    "the resampled statistic."
+)
+BOOTSTRAP_RESAMPLING_BASIS = (
+    "For each draw, ceil(n / block_size) start offsets are drawn uniformly from "
+    "0..n-1 and concatenated circularly, then truncated to n. Indices wrap "
+    "modulo n, so every observation enters every resample and none is dropped."
+)
+
+
+def ar1_autocorrelation(values: Any) -> Optional[float]:
+    """Sample AR(1) coefficient: OLS slope of r_t on r_(t-1).
+
+    ``None`` when too few lagged pairs survive to fit a slope.  An absence, not
+    0.0 - a "no autocorrelation" claim is itself an estimate.
+    """
+    series = np.asarray(values, dtype=float).ravel()
+    if series.size < 5:
+        return None
+    left, right = series[1:], series[:-1]
+    mask = np.isfinite(left) & np.isfinite(right)
+    if int(mask.sum()) < 3:
+        return None
+    left, right = left[mask], right[mask]
+    denominator = float(np.sum((right - right.mean()) ** 2))
+    if denominator <= 0.0 or not np.isfinite(denominator):
+        return None
+    rho = float(np.sum((right - right.mean()) * (left - left.mean())) / denominator)
+    return rho if np.isfinite(rho) else None
+
+
+def effective_sample_size(
+    observations: Optional[int], ar1: Optional[float]
+) -> Optional[float]:
+    """Quenouille/Bartlett AR(1) variance-inflation adjustment of the mean.
+
+    ``n_eff = n * (1 - rho) / (1 + rho)`` is the count of iid observations that
+    carries the same information about the sample mean as these ``n``
+    autocorrelated ones.  With ``rho > 0`` it is below ``n``, which is the
+    entire point: autocorrelated daily returns are not independent daily
+    returns, and pretending otherwise understates every interval in this
+    payload.
+    """
+    if observations is None or int(observations) <= 0 or ar1 is None:
+        return None
+    rho = float(ar1)
+    if not np.isfinite(rho) or rho <= -1.0 or rho >= 1.0:
+        return None
+    return float(int(observations)) * (1.0 - rho) / (1.0 + rho)
+
+
+def autocorrelation_disclosure(observations: Any) -> Dict[str, Any]:
+    """`ar1` / `effective_n` for a block, or the reason neither exists."""
+    values = np.asarray(observations, dtype=float)
+    series = values[:, 0] if values.ndim == 2 else values
+    count = int(series.size)
+    ar1 = ar1_autocorrelation(series)
+    effective = effective_sample_size(count, ar1)
+    computed = ar1 is not None and effective is not None
+    return {
+        "ar1": round(ar1, UNCERTAINTY_DECIMALS) if ar1 is not None else None,
+        "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+        "effective_n": (
+            round(effective, 4) if effective is not None else None
+        ),
+        "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+        "effective_n_basis": (
+            "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to "
+            "the sample mean. It is the count of independent observations that "
+            "carries the same information about the mean as the measured n; "
+            "below n whenever the returns are positively autocorrelated."
+        ),
+        "observations": count,
+        "naive_n_would_assume": "independent observations, which the measured "
+        "AR(1) does not support",
+        "status": "computed" if computed else "not_computed",
+        "reason": None if computed else (
+            "the measured window is too short, or has too little variation in "
+            "the lagged series, to fit an AR(1) slope; the effective sample "
+            "size is therefore not published rather than assumed to equal n"
+        ),
+    }
+
+
+def moving_block_size(observations: int) -> int:
+    """Politis & White (2004) rule of thumb: ``n ** (1/3)`` trading days."""
+    count = int(observations)
+    if count <= 0:
+        return 1
+    return max(1, int(round(float(count) ** (1.0 / 3.0))))
+
+
+def moving_block_indices(
+    observations: int,
+    block_size: int,
+    resamples: int,
+    seed: int,
+) -> np.ndarray:
+    """``(resamples, n)`` index matrix of circular, contiguous blocks.
+
+    Published with the interval via `bootstrap_resamples` / `resample_seed` /
+    `block_size`, so the exact draws behind a published band can be regenerated.
+    """
+    count = max(1, int(observations))
+    length = max(1, min(int(block_size), count))
+    draws = max(1, int(resamples))
+    starts_count = int(np.ceil(count / length))
+    rng = np.random.default_rng(int(seed))
+    starts = rng.integers(0, count, size=(draws, starts_count))
+    offsets = np.arange(length)
+    indices = (starts[:, :, None] + offsets[None, None, :]) % count
+    return indices.reshape(draws, starts_count * length)[:, :count]
+
+
+def _percentile_interval(
+    draws: np.ndarray, level: float
+) -> Optional[List[float]]:
+    """Percentile interval at `level`, or None when too few draws are finite."""
+    values = np.asarray(draws, dtype=float).ravel()
+    finite = values[np.isfinite(values)]
+    if finite.size < 30:
+        return None
+    alpha = 1.0 - float(level)
+    low, high = np.percentile(finite, [50.0 * alpha, 50.0 * (2.0 - alpha)])
+    return [float(low), float(high)]
+
+
+def _finite_observation_block(observations: Any) -> Tuple[np.ndarray, int]:
+    """``(n, k)`` float block with non-finite rows dropped, plus the drop count."""
+    raw = np.asarray(observations, dtype=float)
+    if raw.ndim == 1:
+        raw = raw.reshape(-1, 1)
+    elif raw.ndim != 2:
+        return np.zeros((0, 0), dtype=float), 0
+    finite = np.isfinite(raw).all(axis=1)
+    return raw[finite], int(raw.shape[0] - int(finite.sum()))
+
+
+def _uncertainty_entry(
+    field: str,
+    *,
+    point: Optional[float],
+    status: str,
+    reason: Optional[str],
+    observations: Optional[int],
+    effective_n: Optional[float],
+    standard_error: Optional[float] = None,
+    conf_int: Optional[List[float]] = None,
+    method: Optional[str] = None,
+    method_basis: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One field's precision disclosure.
+
+    `conf_int` is ALWAYS present, `None` when there is no interval: a payload
+    that simply omits the key leaves a consumer unable to tell "no interval was
+    computed" from "this field has no uncertainty", which is the ambiguity this
+    whole block exists to remove.
+
+    `point_within_conf_int` is published because a percentile bootstrap does NOT
+    guarantee the observed value lies inside its own interval. It does not, for
+    a statistic whose denominator is a non-smooth functional - a maximum
+    drawdown, an order statistic - because the resampling distribution of such
+    a ratio is shifted relative to the observed one. A band that silently
+    excludes the number printed beside it is exactly the kind of thing a reader
+    cannot check, so the fact is stated rather than smoothed over.
+    """
+    inside: Optional[bool] = None
+    if conf_int is not None and point is not None:
+        inside = bool(float(conf_int[0]) <= float(point) <= float(conf_int[1]))
+    entry = {
+        "point": point,
+        "standard_error": standard_error,
+        "conf_int": conf_int,
+        "conf_int_level": (
+            UNCERTAINTY_CONFIDENCE_LEVEL if conf_int is not None else None
+        ),
+        "conf_int_method": method if conf_int is not None else None,
+        "conf_int_basis": method_basis if conf_int is not None else None,
+        "point_within_conf_int": inside,
+        "point_within_conf_int_note": (
+            None
+            if inside is not False
+            else (
+                "the observed point value lies outside its own percentile "
+                "interval. That is a real property of a percentile bootstrap on "
+                "a statistic whose denominator is a non-smooth functional (a "
+                "maximum drawdown, an order statistic) or whose resampling "
+                "distribution is shifted relative to the observed one. It is "
+                "published rather than hidden: read the interval as the spread "
+                "of the resampled statistic, not as a guarantee of coverage."
+            )
+        ),
+        "observations": observations,
+        "effective_n": effective_n,
+        "status": status,
+        "reason": reason,
+    }
+    return entry
+
+
+def _statistic_matrix_from(statistics: Any) -> Any:
+    """Accept either a callable or a `{field: callable}` mapping.
+
+    The factories above return the mapping form because it is what a caller
+    wants to read; `measure_estimate_uncertainty` wants the callable form
+    because it evaluates the whole set on every resample. Accepting both keeps
+    the call sites free of adapter noise.
+    """
+    if isinstance(statistics, Mapping):
+        def _evaluate(block: Any) -> Dict[str, Any]:
+            return {name: fn(block) for name, fn in statistics.items()}
+
+        return _evaluate
+    return statistics
+
+
+def measure_estimate_uncertainty(
+    observations: Any,
+    statistics: Any,
+    published: Mapping[str, Any],
+    *,
+    scope: str,
+    point_tolerance: float = UNCERTAINTY_POINT_TOLERANCE,
+    level: float = UNCERTAINTY_CONFIDENCE_LEVEL,
+    resamples: int = UNCERTAINTY_BOOTSTRAP_RESAMPLES,
+    seed: int = UNCERTAINTY_BOOTSTRAP_SEED,
+    not_computed: Optional[Mapping[str, str]] = None,
+    not_applicable: Optional[Mapping[str, str]] = None,
+    statistic_names: Optional[Mapping[str, str]] = None,
+    notes: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Precision disclosure for one block of published estimates.
+
+    `observations` is the measured sample, shape ``(n,)`` or ``(n, k)``.
+    `statistics` is either a `{field: callable}` mapping or a single callable;
+    it is invoked as ``statistics(block)`` with ``block`` of shape
+    ``(n, draws, k)`` and must return ``{field: array of shape (draws,)}`` -
+    the same statistic, computed on each resample.  `published` maps every
+    field this block is responsible for to the value the payload publishes, and
+    EVERY key in it appears in the result, whatever happens next.
+
+    The safety property that makes the whole thing trustworthy: the estimator
+    is also run on the ORIGINAL sample, and a field's interval is published
+    only if that own point value reproduces the published one to within
+    `point_tolerance`.  A statistic that quietly measures something else gets
+    `not_computed` with the discrepancy in the reason, instead of lending the
+    published number a band that was never its own.
+    """
+    values, dropped = _finite_observation_block(observations)
+    evaluate = _statistic_matrix_from(statistics)
+    count = int(values.shape[0])
+    width = int(values.shape[1])
+    autocorrelation = (
+        autocorrelation_disclosure(values)
+        if count
+        else {
+            "ar1": None,
+            "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+            "effective_n": None,
+            "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+            "effective_n_basis": None,
+            "observations": 0,
+            "naive_n_would_assume": None,
+            "status": "not_computed",
+            "reason": "no finite observation was measured for this block",
+        }
+    )
+    effective_n = autocorrelation.get("effective_n")
+    block_length = moving_block_size(count)
+
+    draws: Dict[str, np.ndarray] = {}
+    own_point: Dict[str, Optional[float]] = {}
+    blocked_reason: Optional[str] = None
+    if count >= UNCERTAINTY_MIN_OBSERVATIONS:
+        try:
+            indices = moving_block_indices(count, block_length, resamples, seed)
+            # (draws, n, k) -> (n, draws, k): time axis first, one draw per column.
+            sample = values[indices]
+            draws = {
+                field: np.asarray(value, dtype=float).ravel()
+                for field, value in evaluate(np.swapaxes(sample, 0, 1)).items()
+            }
+            own_point = {
+                field: _scalar_or_none(value)
+                for field, value in evaluate(values[:, None, :]).items()
+            }
+        except Exception as exc:  # noqa: BLE001 - degrade, never guess
+            blocked_reason = (
+                "the resampling estimator could not be evaluated on this sample "
+                f"({type(exc).__name__}: {exc})"
+            )
+            draws, own_point = {}, {}
+    elif count == 0:
+        blocked_reason = "no finite observation was measured for this block"
+    else:
+        blocked_reason = (
+            f"{count} measured observation(s) is below the "
+            f"{UNCERTAINTY_MIN_OBSERVATIONS} a percentile interval needs before "
+            "its own 2.5 % tail carries any information"
+        )
+
+    declared_not_computed = dict(not_computed or {})
+    declared_not_applicable = dict(not_applicable or {})
+    #: published field -> key in the statistics mapping. Identity when absent;
+    #: it exists because one payload field (`benchmark_sharpe`) is one
+    #: estimator (`sharpe`) under a section-specific name.
+    source_field = {field: (statistic_names or {}).get(field, field) for field in published}
+    estimates: Dict[str, Any] = {}
+    for field, published_value in published.items():
+        point = (
+            float(published_value)
+            if isinstance(published_value, (int, float))
+            and not isinstance(published_value, bool)
+            and np.isfinite(float(published_value))
+            else None
+        )
+        if field in declared_not_applicable:
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_applicable",
+                reason=declared_not_applicable[field], observations=count or None,
+                effective_n=effective_n,
+            )
+            continue
+        if field in declared_not_computed:
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_computed",
+                reason=declared_not_computed[field], observations=count or None,
+                effective_n=effective_n,
+            )
+            continue
+        if point is None:
+            estimates[field] = _uncertainty_entry(
+                field, point=None, status="not_computed",
+                reason=(
+                    "the point estimate itself is withheld (below the "
+                    "annualization gate, or unmeasurable on this window), so "
+                    "there is no number to put an interval around"
+                ),
+                observations=count or None, effective_n=effective_n,
+            )
+            continue
+        source = source_field[field]
+        distribution = draws.get(source)
+        reproduced = own_point.get(source)
+        if distribution is None or reproduced is None or not np.isfinite(reproduced):
+            if draws and source not in draws:
+                missing_reason = (
+                    f"no resampling estimator is registered for {field} (looked "
+                    f"for '{source}' among {sorted(draws)}), so no interval can "
+                    "belong to it"
+                )
+            else:
+                missing_reason = (
+                    f"the resampling estimator produces no finite value for "
+                    f"{field} on this sample"
+                )
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_computed",
+                reason=blocked_reason or missing_reason,
+                observations=count or None, effective_n=effective_n,
+            )
+            continue
+        difference = abs(float(reproduced) - point)
+        if difference > float(point_tolerance):
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_computed",
+                reason=(
+                    f"the resampling estimator's own point value "
+                    f"({reproduced:.12g}) does not reproduce the published "
+                    f"{field} ({point:.12g}); difference {difference:.3g} "
+                    f"exceeds the {point_tolerance:g} identity tolerance. The "
+                    "band would describe a different statistic, so it is "
+                    "withheld."
+                ),
+                observations=count, effective_n=effective_n,
+            )
+            continue
+        interval = _percentile_interval(distribution, level)
+        if interval is None:
+            finite = int(np.isfinite(distribution).sum())
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_computed",
+                reason=(
+                    f"only {finite} of {int(resamples)} resamples produced a "
+                    "finite value, too few for a percentile interval"
+                ),
+                observations=count, effective_n=effective_n,
+            )
+            continue
+        finite = distribution[np.isfinite(distribution)]
+        standard_error = float(finite.std(ddof=1)) if finite.size > 1 else None
+        estimates[field] = _uncertainty_entry(
+            field, point=point, status="computed", reason=None,
+            observations=count, effective_n=effective_n,
+            standard_error=(
+                None if standard_error is None
+                else round(standard_error, UNCERTAINTY_DECIMALS)
+            ),
+            conf_int=[round(bound, UNCERTAINTY_DECIMALS) for bound in interval],
+            method=BOOTSTRAP_METHOD,
+            method_basis=(
+                f"percentile interval at level {level:g} over "
+                f"{int(resamples)} circular moving-block resamples of block "
+                f"length {block_length}, drawn from the {count} measured "
+                f"observations (effective_n {effective_n})"
+            ),
+        )
+
+    with_interval = sorted(
+        field for field, entry in estimates.items() if entry["status"] == "computed"
+    )
+    block: Dict[str, Any] = {
+        "scope": scope,
+        "status": "computed" if with_interval else "not_computed",
+        "reason": None if with_interval else (
+            "no field in this block carries a resampling interval; each field "
+            "states its own reason under estimates.<field>.reason"
+        ),
+        "method": BOOTSTRAP_METHOD if with_interval else None,
+        "method_basis": BOOTSTRAP_METHOD_BASIS,
+        "confidence_level": level,
+        "observations": count,
+        "observation_columns": width,
+        "dropped_non_finite_observations": dropped,
+        "block_size": block_length,
+        "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) "
+        "trading days",
+        "bootstrap_resamples": int(resamples),
+        "resample_seed": int(seed),
+        "resampling_basis": BOOTSTRAP_RESAMPLING_BASIS,
+        "point_tolerance": float(point_tolerance),
+        "point_tolerance_basis": (
+            "an interval is published only after the resampling estimator "
+            "reproduces the published point value to within this tolerance, so "
+            "the band provably belongs to the statistic the reader can see"
+        ),
+        "autocorrelation": autocorrelation,
+        "estimates": estimates,
+    }
+    if notes:
+        block["notes"] = dict(notes)
+    return block
+
+
+def _scalar_or_none(value: Any) -> Optional[float]:
+    """First element of `value` as a finite float, else None."""
+    array = np.asarray(value, dtype=float).ravel()
+    if array.size == 0 or not np.isfinite(array[0]):
+        return None
+    return float(array[0])
+
+
+def _statistic_column(block: Any, column: int = 0) -> np.ndarray:
+    """``(n, draws)`` slice of an ``(n, draws, k)`` statistic input."""
+    values = np.asarray(block, dtype=float)
+    if values.ndim == 3:
+        return values[:, :, column]
+    return values
+
+
+def quantstats_returns_look_like_prices(returns: Any) -> bool:
+    """True when quantstats would reclassify this return series as a price series.
+
+    `quantstats.utils._prepare_returns` treats any series with
+    ``min >= 0 and max > 1`` as PRICES and differences it.  A daily equity
+    return series does not look like that, but "does not" is not "cannot": if a
+    window ever did, every ratio in this module would silently change meaning,
+    so the caller checks and degrades with a reason instead of publishing a
+    band for a statistic that is no longer the published one.
+    """
+    values = np.asarray(returns, dtype=float)
+    if values.size == 0:
+        return False
+    return bool(np.nanmin(values) >= 0.0 and np.nanmax(values) > 1.0)
+
+
+def quantstats_ratio_statistics(
+    risk_free_rate: float, periods: int = 252
+) -> Any:
+    """Vectorised restatements of the quantstats ratios this payload publishes.
+
+    Each entry reproduces `quantstats.stats.<name>` on the SAME return series to
+    floating-point noise.  That fidelity is what lets
+    `measure_estimate_uncertainty` verify the resampling distribution belongs to
+    the published statistic before it publishes a band beside it - without it
+    the block would be measuring a neighbour and calling it the same number.
+
+    `block` has shape ``(n, draws, k)``; the single-series case uses column 0.
+    """
+    root_periods = float(np.sqrt(periods))
+    # quantstats deannualises the risk-free rate COMPOUNDED
+    # (`(1 + rf) ** (1 / periods) - 1`), not by dividing it by the period
+    # count. The two differ at the fourth decimal at rf=0.02 over 252 days,
+    # which is far wider than the identity tolerance below, so the published
+    # point value has to come from the same deannualisation.
+    daily_rf = float((1.0 + float(risk_free_rate)) ** (1.0 / float(periods)) - 1.0)
+
+    def sharpe(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        deviation = series.std(axis=0, ddof=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (series.mean(axis=0) - daily_rf) / deviation * root_periods
+
+    def sortino(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        shortfall = np.minimum(0.0, series - daily_rf)
+        downside = np.sqrt((shortfall ** 2).sum(axis=0) / series.shape[0])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (series.mean(axis=0) - daily_rf) / downside * root_periods
+
+    def omega(block: Any) -> np.ndarray:
+        # quantstats' `omega` with rf=0 and required_return=0: the threshold is
+        # the per-period zero, so numerator and denominator are the positive
+        # and negative parts of the return series.
+        series = _statistic_column(block)
+        gains = np.clip(series, 0.0, None).sum(axis=0)
+        losses = -np.clip(series, -np.inf, 0.0).sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return gains / losses
+
+    def total_return(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.expm1(np.log1p(series).sum(axis=0))
+
+    def cagr(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        years = series.shape[0] / float(periods)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            growth = np.exp(np.log1p(series).sum(axis=0) / years)
+        return np.abs(growth) - 1.0
+
+    def volatility(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        return series.std(axis=0, ddof=1) * root_periods
+
+    def max_drawdown(block: Any) -> np.ndarray:
+        # quantstats' max_drawdown: `_prepare_prices` turns returns into
+        # `1 + compsum(r)` at base 1.0, and compsum is a cumulative PRODUCT, so
+        # the price path is `cumprod(1 + r)`. A phantom baseline of 1.0 is
+        # prepended (so a first-day loss has a drawdown) and the deepest fall
+        # from a running peak is returned.
+        series = _statistic_column(block)
+        prices = np.cumprod(1.0 + series, axis=0)
+        baseline = np.where(
+            prices[0] > 1000.0, 1e5, np.where(prices[0] > 10.0, 100.0, 1.0)
+        )
+        extended = np.vstack([baseline[None, :], prices])
+        running_peak = np.maximum.accumulate(extended, axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (extended / running_peak).min(axis=0) - 1.0
+
+    def calmar(block: Any) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return cagr(block) / np.abs(max_drawdown(block))
+
+    def tail_ratio(block: Any) -> np.ndarray:
+        # quantstats' tail_ratio: |q95 / q05| under pandas' default linear
+        # interpolation, which is numpy's default quantile method.
+        series = _statistic_column(block)
+        upper = np.quantile(series, 0.95, axis=0)
+        lower = np.quantile(series, 0.05, axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.abs(upper / lower)
+
+    return {
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "omega": omega,
+        "tail_ratio": tail_ratio,
+        "total_return": total_return,
+        "cagr": cagr,
+        "volatility": volatility,
+        "max_drawdown": max_drawdown,
+    }
+
+
+def market_model_statistics(periods: int = 252) -> Any:
+    """Vectorised `beta = cov(p, b) / var(b)` and the annualised Jensen alpha.
+
+    Reproduces the tear-sheet's own closed form (`p.cov(b) / b.var()`, then
+    `(p.mean() - beta * b.mean()) * periods`, both ddof=1) so the published
+    band belongs to the published number.  `block` is ``(n, draws, 2)``:
+    column 0 is the portfolio, column 1 the benchmark, resampled JOINTLY so the
+    pair of series keeps the co-movement that produces the estimate.
+    """
+    count = int(periods)
+
+    def _beta_alpha(block: Any) -> Tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(block, dtype=float)
+        portfolio = values[:, :, 0]
+        benchmark = values[:, :, 1]
+        bench_mean = benchmark.mean(axis=0)
+        port_mean = portfolio.mean(axis=0)
+        centred_bench = benchmark - bench_mean
+        denominator = (centred_bench ** 2).sum(axis=0) / max(1, values.shape[0] - 1)
+        numerator = ((portfolio - port_mean) * centred_bench).sum(axis=0) / max(
+            1, values.shape[0] - 1
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            beta = numerator / denominator
+        return beta, (port_mean - beta * bench_mean) * float(count)
+
+    def beta(block: Any) -> np.ndarray:
+        return _beta_alpha(block)[0]
+
+    def alpha_annualized(block: Any) -> np.ndarray:
+        return _beta_alpha(block)[1]
+
+    return {"beta": beta, "alpha_annualized": alpha_annualized}
+
+
+def engine_risk_statistics(
+    risk_free_rate: float, periods: int = 252
+) -> Any:
+    """Vectorised restatements of the realized-risk engine's own formulas.
+
+    Mirrors `_calculate_basic_metrics`, `_calculate_risk_metrics` and
+    `_calculate_drawdown_metrics` exactly - including the Sortino downside
+    deviation over the FULL sample length, the ddof=1 volatility, the
+    `np.percentile(r, 5)` VaR and the `r <= var_95` ES mask - so the interval
+    published beside `sharpe_ratio` or `cvar_95` is an interval for the number
+    the engine actually printed.  `block` is ``(n, draws, k)``, column 0 in the
+    single-series case.
+    """
+    root_periods = float(np.sqrt(periods))
+    daily_rf = float(risk_free_rate) / float(periods)
+
+    def annual_return(block: Any) -> np.ndarray:
+        return _statistic_column(block).mean(axis=0) * float(periods)
+
+    def annual_volatility(block: Any) -> np.ndarray:
+        return _statistic_column(block).std(axis=0, ddof=1) * root_periods
+
+    def sharpe_ratio(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (
+                (series.mean(axis=0) * float(periods) - float(risk_free_rate))
+                / (series.std(axis=0, ddof=1) * root_periods)
+            )
+
+    def sortino_ratio(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        shortfall = np.minimum(0.0, series - daily_rf)
+        downside = np.sqrt((shortfall ** 2).mean(axis=0)) * root_periods
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (
+                series.mean(axis=0) * float(periods) - float(risk_free_rate)
+            ) / downside
+
+    def hit_ratio(block: Any) -> np.ndarray:
+        return (_statistic_column(block) > 0.0).mean(axis=0)
+
+    def var_95(block: Any) -> np.ndarray:
+        return np.percentile(_statistic_column(block), 5, axis=0)
+
+    def cvar_95(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        threshold = np.percentile(series, 5, axis=0)
+        mask = series <= threshold[None, :]
+        support = mask.sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            total = np.where(mask, series, 0.0).sum(axis=0) / support
+        # The engine falls back to the VaR itself when the tail is empty; a
+        # bootstrap resample with no observation at or below its own 5th
+        # percentile cannot, so it stays non-finite and is reported as such.
+        return np.where(support > 0, total, np.nan)
+
+    def max_drawdown(block: Any) -> np.ndarray:
+        series = _statistic_column(block)
+        wealth = np.cumprod(1.0 + series, axis=0)
+        extended = np.vstack([np.ones((1, series.shape[1]), dtype=float), wealth])
+        running_peak = np.maximum.accumulate(extended, axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return ((extended - running_peak) / running_peak).min(axis=0)
+
+    return {
+        "annual_return": annual_return,
+        "annual_volatility": annual_volatility,
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+        "hit_ratio": hit_ratio,
+        "var_95": var_95,
+        "cvar_95": cvar_95,
+        "max_drawdown": max_drawdown,
+    }
+
+
 def _liquidity_band(published_score: float) -> tuple[str, str]:
     """Band label and liquidation window for an ALREADY-ROUNDED published score."""
     for band, floor, window in LIQUIDITY_SCORE_BANDS:
@@ -511,6 +1253,19 @@ class AnalyticsEngine:
             metrics.update(self._calculate_risk_metrics(portfolio_returns))
             metrics.update(self._calculate_drawdown_metrics(portfolio_returns))
             metrics.update(self._calculate_return_distribution(portfolio_returns))
+            # SI-5: the twelve numbers above were all naked point estimates.
+            # This block is the one place the whole realized-risk family states
+            # its precision, so the route forwards it verbatim and no consumer
+            # has to reconstruct it per field.
+            metrics["estimate_uncertainty"] = self._estimate_uncertainty_block(
+                portfolio_returns,
+                metrics,
+                scope=(
+                    "realized_risk portfolio block: the published portfolio "
+                    "return observations every metric in this block was "
+                    "computed from"
+                ),
+            )
 
             # Position-level metrics using active price series
             metrics['positions'] = self._calculate_position_metrics(returns, weights, raw_prices=price_data)
@@ -1853,7 +2608,89 @@ class AnalyticsEngine:
             }
         except Exception:
             return {}
-    
+
+    #: Fields this engine publishes per realized-risk block, in publication
+    #: order.  Every one of them appears in the block's `estimates` map whether
+    #: or not an interval could be computed, so a null interval is never a
+    #: silently absent key.
+    REALIZED_RISK_ESTIMATE_FIELDS = (
+        "annual_return",
+        "annual_volatility",
+        "sharpe_ratio",
+        "sortino_ratio",
+        "hit_ratio",
+        "var_95",
+        "cvar_95",
+        "max_drawdown",
+        "skewness",
+        "kurtosis",
+    )
+
+    #: The two distribution shapes have no honest interval here, and the reason
+    #: is a missing estimator rather than a missing measurement.
+    _DISTRIBUTION_SHAPE_REASON = (
+        "not computed: pandas' sample skewness and kurtosis are bias-corrected "
+        "shape statistics whose adjustment coefficients are not reimplemented "
+        "here, so a resampling distribution over the SAME statistic cannot be "
+        "produced. Hand-rolling a second implementation of an unmeasured "
+        "estimator to satisfy an interval rule would trade a declared gap for "
+        "an unverified number. The point estimate stands; its precision is "
+        "declared absent rather than approximated."
+    )
+
+    def _estimate_uncertainty_block(
+        self,
+        returns: pd.Series,
+        published: Mapping[str, Any],
+        *,
+        scope: str,
+    ) -> Dict[str, Any]:
+        """Precision disclosure for one realized-risk block (SI-5).
+
+        The statistics handed to `measure_estimate_uncertainty` are vectorised
+        restatements of `_calculate_basic_metrics`, `_calculate_risk_metrics`
+        and `_calculate_drawdown_metrics` - not of a textbook formula that
+        happens to look similar - so the band published beside `sharpe_ratio`
+        or `cvar_95` is a band for the number this engine actually printed.
+        """
+        clean = pd.Series(returns).replace([np.inf, -np.inf], np.nan).dropna()
+        values = clean.to_numpy(dtype=float) if not clean.empty else np.zeros(0)
+        declared = {
+            name: published.get(name) for name in self.REALIZED_RISK_ESTIMATE_FIELDS
+        }
+        return measure_estimate_uncertainty(
+            values,
+            engine_risk_statistics(self.risk_free_rate),
+            declared,
+            scope=scope,
+            point_tolerance=1e-9,
+            not_computed={
+                "skewness": self._DISTRIBUTION_SHAPE_REASON,
+                "kurtosis": self._DISTRIBUTION_SHAPE_REASON,
+            },
+            notes={
+                "estimator": (
+                    "engine_risk_statistics: vectorised restatements of the "
+                    "engine's own _calculate_basic_metrics / "
+                    "_calculate_risk_metrics / _calculate_drawdown_metrics "
+                    "formulas, so the interval belongs to the published point "
+                    "value"
+                ),
+                "risk_free_rate": self.risk_free_rate,
+                "risk_free_rate_basis": (
+                    "the engine's configured annual risk-free rate, used as "
+                    "risk_free_rate / 252 for the Sortino downside target and "
+                    "as the numerator deduction for both ratios"
+                ),
+                "cvar_95_support_note": (
+                    "cvar_95 is the mean of the return observations at or below "
+                    "this block's own 5th percentile, so the number of "
+                    "observations that support it is the tail count, not the "
+                    "sample size"
+                ),
+            },
+        )
+
     def _calculate_position_metrics(
         self,
         returns: pd.DataFrame,
@@ -1886,6 +2723,17 @@ class AnalyticsEngine:
                     metrics = self._calculate_basic_metrics(ticker_returns)
                     metrics.update(self._calculate_risk_metrics(ticker_returns))
                     metrics.update(self._calculate_drawdown_metrics(ticker_returns))
+                    # SI-5: one precision block per leg, over that leg's OWN
+                    # return observations - never the portfolio's count, which
+                    # is the number a consumer cannot use to judge this leg.
+                    metrics["estimate_uncertainty"] = self._estimate_uncertainty_block(
+                        ticker_returns,
+                        metrics,
+                        scope=(
+                            f"realized_risk position {ticker}: this leg's own "
+                            "published return observations, not the portfolio's"
+                        ),
+                    )
                     position_metrics[ticker] = {
                         **metrics,
                         "weight": weights.get(ticker, 0),

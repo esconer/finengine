@@ -447,6 +447,15 @@ class CointPairResult(BaseModel):
     ou_half_life_days: Optional[float] = None
     ou_reversion_speed_theta: Optional[float] = None
     current_spread_zscore: Optional[float] = None
+    # OLS standard errors for the spread regression that produced
+    # `hedge_ratio_beta` and `intercept_alpha`. The slope drives a trade
+    # instruction, so publishing it with no standard error gives that
+    # instruction false precision. Optional-with-None for the same reason as
+    # every other field here: absent means "not recorded", never 0.0.
+    hedge_ratio_beta_std_error: Optional[float] = None
+    intercept_alpha_std_error: Optional[float] = None
+    hedge_regression_observations: Optional[int] = None
+    hedge_regression_std_error_basis: Optional[str] = None
     johansen_cointegrated: bool
     last_price_a: float
     last_price_b: float

@@ -8,7 +8,7 @@ import math
 import time
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,12 @@ import pandas as pd
 from app.db.database import get_db_session
 from app.models.database import PortfolioPosition
 from app.services.benchmark_service import BenchmarkService
-from app.services.optimization_service import optimize
+from app.services.optimization_service import (
+    no_estimate_uncertainty,
+    optimizer_estimate_uncertainty,
+    optimizer_no_sample_reason,
+    optimize,
+)
 from app.services.backtest_service import run_walk_forward_backtest
 from app.services.regime_service import detect_regime
 from app.services.monte_carlo_service import simulate_goal
@@ -38,6 +43,10 @@ from app.services.analytics_engine import (
     GlobalAnalyticsEngine,
     AnalyticsEngine,
     aggregate_active_returns,
+    market_model_statistics,
+    measure_estimate_uncertainty,
+    quantstats_ratio_statistics,
+    quantstats_returns_look_like_prices,
 )
 from app.models.schemas import (
     StressTestRequest, CorrelationStabilityResponse, CointScannerResponse
@@ -499,6 +508,156 @@ def _q(metric_fn, *args, **kwargs):
     except Exception:  # noqa: BLE001
         logger.debug("quantstats metric unavailable")
         return None
+
+
+# ---------------------------------------------------------------------------
+# SI-5 -- estimator uncertainty for the tear sheet
+# ---------------------------------------------------------------------------
+# The tear sheet carries the numbers a reader ACTS on, and before this block
+# every one of them - Sharpe 3.49, Sortino 5.31, Calmar 20.19, CAGR 43% - was a
+# naked point estimate at 6 decimal places on as few as 20 daily observations.
+# The block publishes a resampling interval beside each of them, or says why
+# there is none.  It never invents one.
+#
+# The published numbers come from `quantstats`, so the statistics fed to the
+# bootstrap are vectorised restatements of the SAME quantstats functions, and
+# `measure_estimate_uncertainty` refuses to publish a band unless its own point
+# value reproduces the published one.  The two things a Sharpe's interval has to
+# say - how it was measured, and on how many observations - travel with it.
+TEAR_SHEET_RISK_FREE_RATE = 0.02
+#: The two shape statistics.  No honest interval, and a stated reason.
+_SHAPE_STATISTIC_REASON = (
+    "not computed: quantstats' skew and kurtosis are pandas bias-corrected "
+    "shape statistics whose adjustment coefficients are not reimplemented here, "
+    "so a resampling distribution over the SAME statistic cannot be produced. "
+    "Re-deriving the correction by hand to satisfy an interval rule would trade "
+    "a declared gap for a second, unverified implementation. The point estimate "
+    "stands; its precision is declared absent rather than approximated."
+)
+#: quantstats' own gate: a series with min >= 0 and max > 1 is treated as
+#: PRICES and differenced.  A daily equity return series does not look like
+#: that, but "does not" is not "cannot" - if a window ever did, every ratio here
+#: would silently change meaning, so the block is withheld with a reason.
+_PRICE_RECLASSIFICATION_REASON = (
+    "not computed: quantstats reclassifies this series as a PRICE series "
+    "(min >= 0 and max > 1) and differences it before measuring, so the "
+    "published value is a return of prices rather than a return of returns. "
+    "Resampling it would describe a different statistic than the one published "
+    "beside the band."
+)
+
+
+def _finite_return_values(frame: Any) -> np.ndarray:
+    """A return series/frame as a finite ``(n,)`` or ``(n, k)`` float block."""
+    if frame is None:
+        return np.zeros((0, 1), dtype=float)
+    values = (
+        frame.to_numpy(dtype=float)
+        if hasattr(frame, "to_numpy")
+        else np.asarray(frame, dtype=float)
+    )
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    elif values.ndim != 2:
+        return np.zeros((0, 1), dtype=float)
+    return values[np.isfinite(values).all(axis=1)]
+
+
+def _tear_sheet_uncertainty(
+    frame: Any,
+    published: Mapping[str, Any],
+    *,
+    scope: str,
+    statistics: Optional[Mapping[str, Any]] = None,
+    statistic_names: Optional[Mapping[str, str]] = None,
+    not_computed: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """One tear-sheet block's precision disclosure.
+
+    `statistics` defaults to the quantstats ratio suite; the relative block
+    passes the market-model estimators instead, because beta and alpha are not
+    quantstats functions.
+    """
+    values = _finite_return_values(frame)
+    resolved = dict(not_computed or {})
+    if quantstats_returns_look_like_prices(values):
+        for field in published:
+            resolved.setdefault(field, _PRICE_RECLASSIFICATION_REASON)
+    return measure_estimate_uncertainty(
+        np.zeros((0, 1)) if quantstats_returns_look_like_prices(values) else values,
+        statistics if statistics is not None else quantstats_ratio_statistics(
+            TEAR_SHEET_RISK_FREE_RATE
+        ),
+        published,
+        scope=scope,
+        # The tear sheet publishes its metrics at 6 dp, so half a display step
+        # (5e-7) is the floor; the margin above it absorbs the vectorised
+        # restatement's float noise without admitting a different estimator.
+        point_tolerance=1e-5,
+        not_computed=resolved,
+        statistic_names=statistic_names,
+        notes={
+            "estimator": (
+                "quantstats_ratio_statistics: vectorised restatements of the "
+                "quantstats functions this route already calls, verified to "
+                "reproduce each published metric before the band is attached"
+            ),
+            "risk_free_rate": TEAR_SHEET_RISK_FREE_RATE,
+            "risk_free_rate_basis": (
+                "the annualized rf this route passes to quantstats; quantstats "
+                "deannualises it COMPOUNDED as (1 + rf) ** (1/252) - 1 and the "
+                "resampling statistics use the same deannualisation"
+            ),
+            "annualization_periods": 252,
+        },
+    )
+
+
+def _tear_sheet_relative_uncertainty(
+    portfolio: Any,
+    benchmark: Any,
+    published: Mapping[str, Any],
+    *,
+    scope: str,
+) -> Dict[str, Any]:
+    """Beta and alpha precision over the ALIGNED window the two were fitted on.
+
+    The pair is resampled jointly, so the co-movement that produces the
+    estimate survives the resampling; resampling the two series separately would
+    destroy the very covariance `beta_vs_nifty` is made of.
+    """
+    p_values = _finite_return_values(portfolio).ravel()
+    b_values = _finite_return_values(benchmark).ravel()
+    aligned = min(p_values.size, b_values.size)
+    frame = (
+        np.column_stack([p_values[:aligned], b_values[:aligned]])
+        if aligned
+        else np.zeros((0, 2), dtype=float)
+    )
+    return measure_estimate_uncertainty(
+        frame,
+        market_model_statistics(252),
+        published,
+        scope=scope,
+        # beta and alpha are published at 4 dp, so half a display step is 5e-5;
+        # the margin above it absorbs the restatement's float noise.
+        point_tolerance=1e-4,
+        statistic_names={"beta_vs_nifty": "beta"},
+        notes={
+            "estimator": (
+                "market_model_statistics: the tear sheet's own closed form, "
+                "beta = cov(p, b) / var(b) and alpha = (p.mean() - beta * "
+                "b.mean()) * 252, both on ddof=1, with the portfolio and the "
+                "benchmark resampled as aligned pairs"
+            ),
+            "resampling_basis": (
+                "the portfolio and benchmark are resampled on the SAME index "
+                "draw, so the joint distribution the covariance is estimated "
+                "from is preserved inside every block"
+            ),
+            "annualization_periods": 252,
+        },
+    )
 
 
 def _price_series(df: pd.DataFrame) -> Optional[pd.Series]:
@@ -3018,7 +3177,12 @@ async def get_realized_risk(
             "max_drawdown": metrics.get("max_drawdown"),
             "var_95": metrics.get("var_95"),
             "cvar_95": metrics.get("cvar_95"),
-            "hit_ratio": metrics.get("hit_ratio")
+            "hit_ratio": metrics.get("hit_ratio"),
+            # SI-5: the engine's precision block for exactly the ten fields
+            # above, over exactly the series they were measured from. Forwarded
+            # verbatim so the interval always names the same n the point
+            # estimate did.
+            "estimate_uncertainty": metrics.get("estimate_uncertainty"),
         }
         
         # Position-level metrics & data quality warnings
@@ -3076,6 +3240,9 @@ async def get_realized_risk(
                 "return_observations": own_observations,
                 "is_limited_history": is_limited,
                 "history_warning": pos_metrics.get("history_warning"),
+                # SI-5: this leg's own precision block, measured over this
+                # leg's own return observations.
+                "estimate_uncertainty": pos_metrics.get("estimate_uncertainty"),
                 **provenance,
             }
 
@@ -5702,6 +5869,25 @@ async def get_tear_sheet(
         apply_annualization_gate(
             metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(port_ret)
         )
+        # SI-5: precision for the eleven numbers above, over exactly the series
+        # they were measured from. Built AFTER the annualization gate, so a
+        # withheld metric reports "the point estimate itself is withheld"
+        # rather than lending a band to a null.
+        metrics_uncertainty = _tear_sheet_uncertainty(
+            port_ret,
+            {field: metrics.get(field) for field in (
+                "total_return", "cagr", "sharpe", "sortino", "calmar", "omega",
+                "tail_ratio", "volatility", "max_drawdown", "skew", "kurtosis",
+            )},
+            scope=(
+                "tear_sheet metrics: the holding-window portfolio return series "
+                "every metric in this block was computed from"
+            ),
+            not_computed={
+                "skew": _SHAPE_STATISTIC_REASON,
+                "kurtosis": _SHAPE_STATISTIC_REASON,
+            },
+        )
 
         # --- Full-history instrument risk (DSP-10) ---------------------------
         # CAGR/Sharpe/Sortino/Calmar and benchmark beta/alpha are asset-
@@ -5724,6 +5910,18 @@ async def get_tear_sheet(
         }
         apply_annualization_gate(
             full_metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(full_port_ret)
+        )
+        full_metrics_uncertainty = _tear_sheet_uncertainty(
+            full_port_ret,
+            {field: full_metrics.get(field) for field in (
+                "total_return", "cagr", "sharpe", "sortino", "calmar",
+                "volatility", "max_drawdown",
+            )},
+            scope=(
+                "tear_sheet full_history metrics: the hypothetical-current-"
+                "weights portfolio return series over the full cache depth, "
+                "which is a DIFFERENT sample from the holding-window block"
+            ),
         )
         try:
             full_history_start = str(full_port_ret.index.min().date())
@@ -5751,7 +5949,49 @@ async def get_tear_sheet(
                     "overlap_days": int(len(common_full)),
                 }
 
+        # Three different samples live in `relative_vs_nifty` and its full-
+        # history sibling: the ALIGNED portfolio/benchmark pair, the benchmark
+        # sliced back to the requested window, and (above) the aligned pair over
+        # the full cache depth. Each gets its own block, because an interval
+        # whose n belongs to a different window than its point estimate is the
+        # defect this block exists to remove.
+        full_relative_uncertainty = _tear_sheet_relative_uncertainty(
+            full_port_ret, bench_ret, full_relative,
+            scope=(
+                "tear_sheet full_history relative_vs_nifty: beta and alpha over "
+                "the full-depth portfolio/benchmark overlap"
+            ),
+        )
+
         relative: Dict[str, Any] = {}
+        relative_uncertainty: Dict[str, Any] = {
+            "market_model": _tear_sheet_relative_uncertainty(
+                None, None, {},
+                scope=(
+                    "tear_sheet relative_vs_nifty: beta and alpha over the "
+                    "holding-window portfolio/benchmark overlap"
+                ),
+            ),
+            "benchmark": _tear_sheet_uncertainty(
+                None,
+                {
+                    field: None for field in (
+                        "benchmark_sharpe", "benchmark_volatility",
+                        "benchmark_max_drawdown", "benchmark_total_return",
+                    )
+                },
+                scope=(
+                    "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
+                    "return series sliced back to the requested window"
+                ),
+                statistic_names={
+                    "benchmark_sharpe": "sharpe",
+                    "benchmark_volatility": "volatility",
+                    "benchmark_max_drawdown": "max_drawdown",
+                    "benchmark_total_return": "total_return",
+                },
+            ),
+        }
         if bench_ret is not None and len(bench_ret) > 20:
             # Holding leg stays on the requested window: slice the (possibly
             # deeper) benchmark back down. Benchmark standalone stats describe
@@ -5773,14 +6013,50 @@ async def get_tear_sheet(
             # Beta/alpha genuinely need joint history: gate on the common
             # window so a handful of overlapping days never annualizes noise.
             common = port_ret.index.intersection(bench_ret.index)
+            aligned_p = aligned_b = None
             if len(common) >= MIN_ANNUALIZE_DAYS:
                 p, b = port_ret.loc[common], bench_ret.loc[common]
+                # The frames the interval will be built from are exactly the
+                # frames the estimate was fitted on. When the gate withholds
+                # beta/alpha they stay None, and the block then says the point
+                # estimate is withheld rather than lending a band to a null.
+                aligned_p, aligned_b = p, b
                 var_b = float(b.var())
                 beta = float(p.cov(b) / var_b) if var_b > 0 else None
                 alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
                 relative["beta_vs_nifty"] = round(beta, 4) if beta is not None else None
                 relative["alpha_annualized"] = round(alpha_ann, 4) if alpha_ann is not None else None
             relative["overlap_days"] = int(len(common))
+            relative_uncertainty["market_model"] = _tear_sheet_relative_uncertainty(
+                aligned_p, aligned_b,
+                {
+                    "beta_vs_nifty": relative.get("beta_vs_nifty"),
+                    "alpha_annualized": relative.get("alpha_annualized"),
+                },
+                scope=(
+                    "tear_sheet relative_vs_nifty: beta and alpha over the "
+                    "holding-window portfolio/benchmark overlap"
+                ),
+            )
+            relative_uncertainty["benchmark"] = _tear_sheet_uncertainty(
+                bench_window,
+                {
+                    field: relative.get(field) for field in (
+                        "benchmark_sharpe", "benchmark_volatility",
+                        "benchmark_max_drawdown", "benchmark_total_return",
+                    )
+                },
+                scope=(
+                    "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
+                    "return series sliced back to the requested window"
+                ),
+                statistic_names={
+                    "benchmark_sharpe": "sharpe",
+                    "benchmark_volatility": "volatility",
+                    "benchmark_max_drawdown": "max_drawdown",
+                    "benchmark_total_return": "total_return",
+                },
+            )
 
         monthly: Dict[str, Dict[str, float]] = {}
         try:
@@ -5867,11 +6143,23 @@ async def get_tear_sheet(
                 "full_history": "hypothetical_current_weights",
             },
             "metrics": metrics,
+            # SI-5: one precision block per SAMPLE, not per section. The
+            # holding-window, the full-depth and the benchmark-slice blocks sit
+            # on three different series, so an interval can never be read
+            # against a point estimate measured on another one.
+            "estimate_uncertainty": {
+                "metrics": metrics_uncertainty,
+                "relative_vs_nifty": relative_uncertainty,
+            },
             "full_history": {
                 **full_history_evidence,
                 "metrics": full_metrics,
                 "universe_coverage": full_coverage,
                 "relative_vs_nifty": full_relative,
+                "estimate_uncertainty": {
+                    "metrics": full_metrics_uncertainty,
+                    "relative_vs_nifty": full_relative_uncertainty,
+                },
                 "start": full_history_start,
             },
             "relative_vs_nifty": relative,
@@ -6227,6 +6515,35 @@ async def run_optimization(
                 "expected_annual_return": ann_ret,
                 "expected_annual_volatility": ann_vol,
                 "expected_sharpe": sharpe,
+                # SI-5: a single-holding record's triple is a one-asset sample
+                # mean and standard deviation, so the block is built when one
+                # exists and declared absent - never omitted - when it does not.
+                "estimate_uncertainty": (
+                    optimizer_estimate_uncertainty(
+                        measured_returns.to_frame("A"),
+                        np.array([1.0]),
+                        {
+                            "expected_annual_return": ann_ret,
+                            "expected_annual_volatility": ann_vol,
+                            "expected_sharpe": sharpe,
+                        },
+                        rf,
+                        scope=(
+                            "optimizer single-holding moment triple: one leg at "
+                            "weight 1.0, moments are the sample mean and sample "
+                            "standard deviation of that leg's own returns"
+                        ),
+                    )
+                    if single_usable and measured_returns is not None
+                    else no_estimate_uncertainty(
+                        optimizer_no_sample_reason(
+                            "this single-holding record has no usable return "
+                            f"history ({len(rets) if prices is not None and len(prices) > 1 else 0} "
+                            f"return rows, below the {MIN_ANNUALIZE_DAYS} required "
+                            "to annualize)"
+                        )
+                    )
+                ),
                 "solver": "single-holding",
                 "universe": ticker_list,
                 "current_weights": {single_t: 1.0},
@@ -6259,6 +6576,14 @@ async def run_optimization(
                 "expected_annual_return": None,
                 "expected_annual_volatility": None,
                 "expected_sharpe": None,
+                # SI-5: no sample means no mu/cov, so every moment is null and
+                # says so rather than leaving the interval question open.
+                "estimate_uncertainty": no_estimate_uncertainty(
+                    optimizer_no_sample_reason(
+                        f"the common return frame holds {len(returns_df)} rows, "
+                        f"below the {MIN_ANNUALIZE_DAYS} this route requires"
+                    )
+                ),
                 "solver": None,
                 "universe": ticker_list,
                 "calculation_universe": [],
@@ -6957,6 +7282,225 @@ def _pairs_test_agreement(
     }
 
 
+# ---------------------------------------------------------------------------
+# SI-5 -- the pairs section's precision, stated once for the whole group
+# ---------------------------------------------------------------------------
+# This section publishes ~180 estimates and they are NOT 180 independent
+# measurements: they are the same two OLS coefficients, the same OU fit and the
+# same standardised spread, recomputed on 91 overlapping windows. Manufacturing
+# 91x3 intervals would look like coverage while saying nothing a reader can use,
+# so the section states the BASIS for the group once and records, per family,
+# either the estimator that would produce the interval or the reason there is
+# none. A per-row band is also the wrong instrument here: a 95 % interval per
+# pair, uncorrected across 91 simultaneous tests, understates the family-wise
+# uncertainty by construction - the correction that does apply is published in
+# `multiple_testing`.
+_PAIRS_NO_PER_ROW_BAND_REASON = (
+    "not computed per row: this family is one estimator re-run on every pair of "
+    "a simultaneous scan, so a per-row band would understate the family-wise "
+    "uncertainty by construction - at 91 tests an uncorrected 95 % interval is "
+    "not a 95 % statement about any single pair. The correction that does apply "
+    "is published once, over the whole family, in multiple_testing. The "
+    "per-row standard error is computable from each row's own overlap "
+    "(OLS, two coefficients, ddof=1, no autocorrelation correction) and is "
+    "deliberately not published 91 times: the sample depths differ row by row, "
+    "so a reader who needs one must recompute it from the row's "
+    "overlap_observations, and a uniform-looking field would hide that spread."
+)
+_PAIRS_FAMILY_ALPHA_REASON = (
+    "not applicable: family_alpha is the significance level the whole family of "
+    "tests is declared at - a threshold chosen before any test ran, not a "
+    "quantity estimated from data. An interval around a threshold would be a "
+    "statement about the analyst's choice, not about the market."
+)
+_PAIRS_DECISION_REASON = (
+    "not applicable: is_cointegrated and johansen_cointegrated are hypothesis "
+    "VERDICTS, not estimates. Their uncertainty is the false-positive rate of "
+    "the test, which is declared once in signal_policy and corrected once in "
+    "multiple_testing; a per-row interval on a boolean would be meaningless."
+)
+
+
+def _pairs_family_entry(
+    *,
+    estimator: Optional[str],
+    estimated_parameters: int,
+    status: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """One pairs family's precision disclosure, in the shared entry shape.
+
+    `conf_int` is present and null. The section publishes no per-row interval,
+    and a consumer has to be able to SEE that it publishes none - an absent key
+    is indistinguishable from a family whose uncertainty was never considered.
+    """
+    return {
+        "point": None,
+        "standard_error": None,
+        "conf_int": None,
+        "conf_int_level": None,
+        "conf_int_method": None,
+        "conf_int_basis": None,
+        "point_within_conf_int": None,
+        "point_within_conf_int_note": None,
+        "observations": None,
+        "effective_n": None,
+        "status": status,
+        "reason": reason,
+        "estimator": estimator,
+        "estimated_parameters": estimated_parameters,
+    }
+
+
+def _pairs_estimate_uncertainty(
+    pairs: Sequence[Any],
+    comparisons: Optional[int],
+    p_value_threshold: float,
+) -> Dict[str, Any]:
+    """One precision declaration covering every estimated family in the scan."""
+    rows = list(pairs or [])
+    depths = [
+        int(getattr(row, "overlap_observations", 0) or 0)
+        for row in rows
+    ]
+    depths = [depth for depth in depths if depth > 0]
+    families = {
+        "hedge_ratio_beta": _pairs_family_entry(
+            estimator=(
+                "OLS slope of P_A on P_B (np.polyfit degree 1) over the pair's "
+                "own overlapping window"
+            ),
+            estimated_parameters=2,
+            status="not_computed",
+            reason=_PAIRS_NO_PER_ROW_BAND_REASON,
+        ),
+        "intercept_alpha": _pairs_family_entry(
+            estimator=(
+                "OLS intercept of P_A on P_B, in the price space of the pair"
+            ),
+            estimated_parameters=2,
+            status="not_computed",
+            reason=_PAIRS_NO_PER_ROW_BAND_REASON,
+        ),
+        "ou_reversion_speed_theta": _pairs_family_entry(
+            estimator=(
+                "Ornstein-Uhlenbeck mean-reversion speed fitted to the OLS "
+                "spread, ln(spread[t-1]/spread[t]) regressed on dt"
+            ),
+            estimated_parameters=1,
+            status="not_computed",
+            reason=_PAIRS_NO_PER_ROW_BAND_REASON,
+        ),
+        "ou_half_life_days": _pairs_family_entry(
+            estimator="ln(2) / ou_reversion_speed_theta",
+            estimated_parameters=0,
+            status="not_computed",
+            reason=(
+                "not computed: this field is a deterministic transformation of "
+                "ou_reversion_speed_theta, so it inherits that estimate's "
+                "uncertainty rather than carrying an independent one. When theta "
+                "is not positive the transform has no finite value and the field "
+                "is null, which is an absence rather than a wide interval."
+            ),
+        ),
+        "current_spread_zscore": _pairs_family_entry(
+            estimator=(
+                "the pair's last spread standardised by that pair's own sample "
+                "mean and sample standard deviation (ddof=1)"
+            ),
+            estimated_parameters=2,
+            status="not_computed",
+            reason=_PAIRS_NO_PER_ROW_BAND_REASON,
+        ),
+        "engle_granger_pvalue": _pairs_family_entry(
+            estimator="statsmodels Engle-Granger two-step cointegration p-value",
+            estimated_parameters=0,
+            status="not_applicable",
+            reason=(
+                "not applicable: a p-value is a hypothesis-test verdict already "
+                "expressed on the probability scale, not a point estimate in the "
+                "measured units. Its uncertainty is the test's power and its "
+                "false-positive rate, both of which are declared in "
+                "signal_policy and multiple_testing."
+            ),
+        ),
+        "family_alpha": _pairs_family_entry(
+            estimator=None,
+            estimated_parameters=0,
+            status="not_applicable",
+            reason=_PAIRS_FAMILY_ALPHA_REASON,
+        ),
+        "is_cointegrated": _pairs_family_entry(
+            estimator=None,
+            estimated_parameters=0,
+            status="not_applicable",
+            reason=_PAIRS_DECISION_REASON,
+        ),
+        "johansen_cointegrated": _pairs_family_entry(
+            estimator=None,
+            estimated_parameters=0,
+            status="not_applicable",
+            reason=_PAIRS_DECISION_REASON,
+        ),
+    }
+    declared_comparisons = (
+        int(comparisons) if isinstance(comparisons, int) and comparisons > 0 else None
+    )
+    with_interval = [
+        name for name, family in families.items() if family["status"] == "computed"
+    ]
+    return {
+        "scope": (
+            "every estimated family published by this scan, declared once for "
+            "the group rather than repeated per pair row"
+        ),
+        "status": "computed" if with_interval else "not_computed",
+        "reason": None if with_interval else (
+            "no per-row interval is published for this family by design; each "
+            "family states its estimator and its reason under "
+            "estimates.<family>.reason"
+        ),
+        "method": None,
+        "method_basis": (
+            "no per-row resampling interval is published here. The section runs "
+            f"{declared_comparisons} simultaneous tests on overlapping windows, "
+            "so a per-row band would look like coverage while understating the "
+            "family-wise error; the family-level correction is published once in "
+            "multiple_testing instead."
+        ),
+        "confidence_level": None,
+        "row_count": len(rows),
+        "comparisons_made": declared_comparisons,
+        "p_value_threshold": p_value_threshold,
+        "delivered_row_observations": (
+            {
+                "min": min(depths),
+                "max": max(depths),
+                "field": "overlap_observations",
+                "basis": (
+                    "the sample depth of the delivered rows, which is the n an "
+                    "estimator on any one of them rests on. The spread across "
+                    "rows is the reason a single uniform interval is not "
+                    "published for the group."
+                ),
+            }
+            if depths
+            else None
+        ),
+        "residual_gap": (
+            "This section publishes a DECLARED ABSENCE, not a precision "
+            "measurement, so a rule that requires a standard error, an interval "
+            "or an effective-sample-size figure will keep flagging it. That is "
+            "the correct outcome of an honest gap, not a rule to satisfy: the "
+            "per-row OLS standard errors this block describes are not in the "
+            "scan response contract, and manufacturing 91 intervals to make a "
+            "check pass would convert a known gap into a false precision. The "
+            "real fix is a standard-error field on the per-pair result."
+        ),
+        "estimates": families,
+    }
+
+
 @router.get("/coint", response_model=CointScannerResponse)
 async def get_cointegration_pairs(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
@@ -7225,6 +7769,15 @@ async def get_cointegration_pairs(
         extras["test_agreement"] = _pairs_test_agreement(
             list(getattr(response, "pairs", None) or []),
             test_roles=getattr(response, "test_roles", None),
+        )
+        # SI-5: the section's precision, declared once for the whole scan. 91
+        # per-row bands would look like coverage and understate the family-wise
+        # error, so the families are named with their estimator and their reason
+        # and the multiplicity that DOES apply stays in `multiple_testing`.
+        extras["estimate_uncertainty"] = _pairs_estimate_uncertainty(
+            list(getattr(response, "pairs", None) or []),
+            comparisons=getattr(response, "scanned_pairs_count", None),
+            p_value_threshold=p_value_threshold,
         )
 
         # --- multiplicity + signal policy (SI-1 / AD-1) ------------------

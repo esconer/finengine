@@ -40,6 +40,12 @@ import pandas as pd
 from scipy.cluster import hierarchy as sch
 from scipy.spatial.distance import squareform
 
+from app.services.analytics_engine import (
+    UNCERTAINTY_CONFIDENCE_LEVEL,
+    UNCERTAINTY_DECIMALS,
+    UNCERTAINTY_MIN_OBSERVATIONS,
+    measure_estimate_uncertainty,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -151,6 +157,193 @@ def _round_or_none(value: Optional[float], decimals: int) -> Optional[float]:
     return None if value is None else round(float(value), decimals)
 
 
+# ---------------------------------------------------------------------------
+# SI-5 -- estimation error on the moment triple
+# ---------------------------------------------------------------------------
+# `expected_annual_return`, `expected_annual_volatility` and `expected_sharpe`
+# are FORWARD-LOOKING ESTIMATES FROM A FITTED MODEL, not measurements: mu and
+# cov are estimated from the sample, and the weights are solved rather than
+# observed. The uncertainty that matters is therefore the estimation error on
+# mu and cov, and the sample they came from has to be published beside them.
+#
+# The method is the same circular moving-block bootstrap the rest of the export
+# uses, applied to what is actually uncertain here: the sample ROWS. Whole
+# trading days are resampled across every leg at once, mu and cov are refitted
+# from scratch on each resample exactly as `_as_matrices` fits them on the full
+# sample, and the moment triple is re-scored on the SAME published weights. A
+# resample that moved the weights would measure solver noise, not estimation
+# error.
+#
+# `expected_annual_return` additionally carries the closed-form normal-theory
+# standard error, so the two methods can be compared instead of one standing in
+# for the other.
+OPTIMIZER_POINT_TOLERANCE = 1e-4
+
+
+def _moment_statistic_closure(
+    w: np.ndarray, risk_free_rate: float
+) -> Any:
+    """`evaluate(block) -> {moment: array}` for one weight vector.
+
+    `block` is ``(n, draws, k)``: the resampled daily return rows, time axis
+    first. mu and cov are refitted on it, then the triple is scored on `w`.
+    """
+    weights = np.asarray(w, dtype=float)
+
+    def evaluate(block: Any) -> Dict[str, np.ndarray]:
+        rows = int(block.shape[0])
+        centred = block - block.mean(axis=0, keepdims=True)
+        mu_draws = block.sum(axis=0) / rows * TRADING_DAYS
+        cov_draws = (
+            np.einsum("ndi,ndj->dij", centred, centred) / max(1, rows - 1)
+        ) * TRADING_DAYS
+        expected = mu_draws @ weights
+        variance = np.einsum("dij,i,j->d", cov_draws, weights, weights)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            volatility = np.sqrt(np.where(variance > 0.0, variance, np.nan))
+            return {
+                "expected_annual_return": expected,
+                "expected_annual_volatility": volatility,
+                "expected_sharpe": (expected - float(risk_free_rate)) / volatility,
+            }
+
+    return evaluate
+
+
+def optimizer_estimate_uncertainty(
+    returns: pd.DataFrame,
+    w: np.ndarray,
+    moments: Mapping[str, Optional[float]],
+    risk_free_rate: float,
+    *,
+    scope: str,
+) -> Dict[str, Any]:
+    """Precision disclosure for one optimizer moment triple (SI-5).
+
+    `moments` is the UNROUNDED triple from `_moments`, because the identity
+    check below compares it against the published 4-decimal level; passing the
+    rounded values would make every block fail its own reproduction test.
+    """
+    published = {
+        key: _round_or_none(moments.get(key), MOMENT_DECIMALS) for key in MOMENT_KEYS
+    }
+    observations = len(returns)
+    block = measure_estimate_uncertainty(
+        returns.to_numpy(dtype=float),
+        _moment_statistic_closure(w, risk_free_rate),
+        published,
+        scope=scope,
+        point_tolerance=OPTIMIZER_POINT_TOLERANCE,
+        notes={
+            "estimator": (
+                "the moment triple re-scored on the SAME published weights "
+                "after mu_annual and cov_annual are refitted on each resampled "
+                "set of trading days; the weights are solved, not measured, so "
+                "the uncertainty being measured is the estimation error on mu "
+                "and cov, not solver noise"
+            ),
+            "resampling_basis": (
+                "whole trading days are resampled across every leg together, so "
+                "the cross-sectional dependence between legs on one day - which "
+                "is what the covariance estimate is made of - survives the "
+                "resampling"
+            ),
+            "annualization_factor": TRADING_DAYS,
+            "risk_free_rate": risk_free_rate,
+            "forward_looking": (
+                "these are ex-ante estimates of the moments of the PUBLISHED "
+                "weights, not realised outcomes; the interval is the sampling "
+                "error of that estimate, not a forecast error"
+            ),
+        },
+    )
+    entry = block["estimates"].get("expected_annual_return")
+    volatility = moments.get("expected_annual_volatility")
+    if entry is not None and volatility and observations > 1:
+        # Normal theory for the ANNUALIZED sample mean:
+        #   SE(252 * r_bar) = 252 * sigma_daily / sqrt(n)
+        #                  = 252 * (sigma_p / sqrt(252)) / sqrt(n)
+        #                  = sigma_p * sqrt(252 / n)
+        # The annualization factor does not cancel: `sigma_p` is already scaled
+        # by sqrt(252), so the SE carries sqrt(252) back out. Dropping it (the
+        # `sigma_p / sqrt(n)` form) understates the interval by a factor of
+        # sqrt(252 / n) - about 1.2x at n = 170 and 15.9x at n = 1.
+        analytic = float(volatility) * float(
+            np.sqrt(float(TRADING_DAYS) / float(observations))
+        )
+        entry["normal_theory_standard_error"] = round(analytic, UNCERTAINTY_DECIMALS)
+        entry["normal_theory_basis"] = (
+            "closed-form normal-theory standard error of the same estimate, "
+            "sqrt(252 / n) * expected_annual_volatility, which is "
+            "252 * (sigma_p / sqrt(252)) / sqrt(n) for the annualized sample "
+            "mean; valid under an independence assumption the measured AR(1) "
+            "may not support. Compare with the bootstrap standard error rather "
+            "than substituting one for the other."
+        )
+    return block
+
+
+def no_estimate_uncertainty(
+    reason: str, fields: tuple[str, ...] = MOMENT_KEYS
+) -> Dict[str, Any]:
+    """The declared-absence block for a record that never produced a moment.
+
+    The `conf_int` key is present and null for every field, so a consumer can
+    tell "no interval was computed, and here is why" from "this field has no
+    uncertainty", which is the ambiguity the whole block exists to remove.
+    """
+    entries = {
+        field: {
+            "point": None,
+            "standard_error": None,
+            "conf_int": None,
+            "conf_int_level": None,
+            "conf_int_method": None,
+            "conf_int_basis": None,
+            "point_within_conf_int": None,
+            "point_within_conf_int_note": None,
+            "observations": None,
+            "effective_n": None,
+            "status": "not_computed",
+            "reason": reason,
+        }
+        for field in fields
+    }
+    return {
+        "scope": "optimizer moment triple",
+        "status": "not_computed",
+        "reason": reason,
+        "method": None,
+        "method_basis": None,
+        "confidence_level": UNCERTAINTY_CONFIDENCE_LEVEL,
+        "observations": None,
+        "observation_columns": None,
+        "autocorrelation": {
+            "ar1": None,
+            "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+            "effective_n": None,
+            "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+            "effective_n_basis": None,
+            "observations": None,
+            "status": "not_computed",
+            "reason": reason,
+        },
+        "estimates": entries,
+    }
+
+
+def optimizer_no_sample_reason(what: str) -> str:
+    """The reason a record with no usable sample publishes no interval."""
+    return (
+        f"not computed: {what}, so no mu_annual or cov_annual was ever "
+        f"estimated and there is no sample to resample. A moment triple needs "
+        f"at least {UNCERTAINTY_MIN_OBSERVATIONS} return rows before a "
+        "percentile interval over a refitted mu/cov has any meaning; the point "
+        "estimate is null for the same reason and is not replaced by a "
+        "plausible-looking band."
+    )
+
+
 def _objective_block(strategy: str) -> Dict[str, Any]:
     """State what the strategy optimised, so `expected_sharpe` cannot read as
     'this Sharpe was maximised' when it was not (PA-2)."""
@@ -210,6 +403,33 @@ def _moments_basis_block(
     }
 
 
+def _current_uncertainty(
+    returns_frame: Optional[pd.DataFrame],
+    w: pd.Series,
+    current: Mapping[str, Optional[float]],
+    risk_free_rate: float,
+) -> Dict[str, Any]:
+    """Precision block for the incumbent, or the declared absence of one."""
+    if returns_frame is None or returns_frame.empty:
+        return no_estimate_uncertainty(
+            optimizer_no_sample_reason(
+                "the optimizer run carries no sampled return frame, so the "
+                "incumbent book was scored without one"
+            )
+        )
+    return optimizer_estimate_uncertainty(
+        returns_frame,
+        w.to_numpy(dtype=float),
+        current,
+        risk_free_rate,
+        scope=(
+            "optimizer current_portfolio: the incumbent book's moments on the "
+            "SAME mu_annual, cov_annual, column order, risk-free rate and return "
+            "observations as the recommended triple in this record"
+        ),
+    )
+
+
 def _current_portfolio_block(
     mu: np.ndarray,
     cov: np.ndarray,
@@ -217,6 +437,7 @@ def _current_portfolio_block(
     recommended: Dict[str, Optional[float]],
     current_weights: Optional[Mapping[str, float]],
     risk_free_rate: float,
+    returns_frame: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """Score the incumbent book on the SAME mu, cov, order and sample (PA-2).
 
@@ -259,6 +480,14 @@ def _current_portfolio_block(
         "expected_annual_return": _round_or_none(current["expected_annual_return"], MOMENT_DECIMALS),
         "expected_annual_volatility": _round_or_none(current["expected_annual_volatility"], MOMENT_DECIMALS),
         "expected_sharpe": _round_or_none(current["expected_sharpe"], MOMENT_DECIMALS),
+        # SI-5: the incumbent is an estimate on the same footing as the
+        # recommendation, so it carries its own interval rather than being
+        # read off the recommendation's. Same seed, same n, same block length,
+        # so the two bands come from identical resample draws and their
+        # difference is a difference of like with like.
+        "estimate_uncertainty": _current_uncertainty(
+            returns_frame, w, current, risk_free_rate
+        ),
         # The comparison PA-2 exists for. Both levels are computed from the same
         # mu, cov, order, sample and risk-free rate, so the difference is a
         # difference of like with like rather than two unrelated windows.
@@ -590,7 +819,20 @@ def optimize(
         "solver": "cvxpy/clarabel" if strategy != "hrp" else "hierarchical-bisection",
         "objective": _objective_block(strategy),
         "moments_basis": _moments_basis_block(returns, risk_free_rate, moments),
+        # SI-5: the triple above is an ex-ante estimate from a fitted mu/cov,
+        # not a measurement, so it carries the estimation error on that fit and
+        # the sample it was fitted on. 170 rows is the number a reader needs in
+        # order to judge an `expected_annual_return` of 0.16.
+        "estimate_uncertainty": optimizer_estimate_uncertainty(
+            returns, w_vec, moments, risk_free_rate,
+            scope=(
+                "optimizer moment triple: mu_annual and cov_annual estimated "
+                "from this record's return observations, re-scored on the "
+                "published weights on every resample"
+            ),
+        ),
         "current_portfolio": _current_portfolio_block(
-            mu, cov, assets, moments, current_weights, risk_free_rate
+            mu, cov, assets, moments, current_weights, risk_free_rate,
+            returns_frame=returns,
         ),
     }

@@ -794,6 +794,31 @@ def analyze_pair_cointegration(
         logger.debug(f"OLS hedge ratio error for {ticker_a}-{ticker_b}: {e}")
         return None
 
+    # 2b. Standard errors for that regression. The slope drives a TRADE: a
+    # directive says how many units of B to short per unit of A, and a slope
+    # published with no standard error gives that instruction false precision.
+    # `np.polyfit(..., cov=True)` returns the covariance of [slope, intercept]
+    # scaled by the residual variance, so the diagonal is the OLS variance of
+    # each coefficient with df = n - 2. Unmeasurable is None, never 0.0.
+    beta_std_error: Optional[float] = None
+    alpha_std_error: Optional[float] = None
+    hedge_regression_observations: Optional[int] = None
+    hedge_regression_std_error_basis: Optional[str] = None
+    try:
+        _n = int(len(p_b))
+        if _n > 2:
+            _deg, _cov = np.polyfit(p_b, p_a, 1, cov=True)
+            _diag = np.diag(np.asarray(_cov, dtype=float))
+            if np.all(np.isfinite(_diag)) and float(_diag[0]) >= 0.0:
+                beta_std_error = float(np.sqrt(_diag[0]))
+                alpha_std_error = float(np.sqrt(_diag[1]))
+                hedge_regression_observations = _n
+                hedge_regression_std_error_basis = (
+                    "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
+                )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(f"OLS hedge ratio SE unavailable for {ticker_a}-{ticker_b}: {exc}")
+
     # 3. Spread time series: z_t = P_A - (alpha + beta * P_B)
     spread = p_a - (alpha + beta * p_b)
 
@@ -890,6 +915,14 @@ def analyze_pair_cointegration(
         is_cointegrated=is_coint,
         hedge_ratio_beta=round(beta, 6),
         intercept_alpha=round(alpha, 4),
+        hedge_ratio_beta_std_error=(
+            round(beta_std_error, 6) if beta_std_error is not None else None
+        ),
+        intercept_alpha_std_error=(
+            round(alpha_std_error, 6) if alpha_std_error is not None else None
+        ),
+        hedge_regression_observations=hedge_regression_observations,
+        hedge_regression_std_error_basis=hedge_regression_std_error_basis,
         ou_half_life_days=half_life,
         ou_reversion_speed_theta=theta,
         current_spread_zscore=current_zscore,
@@ -954,7 +987,10 @@ class CointegrationService:
             if cache_generation is not None and not cache_generation_is_current(cache_generation):
                 return None
             ts, data = _IN_MEMORY_COINT_CACHE[cache_key]
-            if _utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS):
+            if (
+                _utcnow() - ts < timedelta(hours=CACHE_TTL_HOURS)
+                and self._cached_pair_satisfies_contract(data)
+            ):
                 try:
                     return with_test_role_metadata(CointPairResult(**data))
                 except Exception:
@@ -978,7 +1014,7 @@ class CointegrationService:
                 )
                 if cached and cached.get("model_params"):
                     pair_data = cached["model_params"]
-                    if pair_data.get("ticker_a") == ticker_a and pair_data.get("ticker_b") == ticker_b:
+                    if pair_data.get("ticker_a") == ticker_a and pair_data.get("ticker_b") == ticker_b and self._cached_pair_satisfies_contract(pair_data):
                         # Rows written by older builds carry none of the
                         # role/depth fields; every one of them is Optional, so
                         # the load still succeeds and the roles are backfilled
@@ -992,6 +1028,27 @@ class CointegrationService:
                 logger.debug(f"DB cache read error: {e}")
 
         return None
+
+    @staticmethod
+    def _cached_pair_satisfies_contract(pair_data: Any) -> bool:
+        """Is a cached row able to answer the CURRENT contract?
+
+        A cache entry that predates a newly-required field is not a usable cache
+        entry. The role/depth fields could be backfilled from engine constants
+        because they are declarations; a standard error cannot, because it is a
+        MEASUREMENT that needs the return series. So a row missing one is treated
+        as a miss and recomputed rather than served with the uncertainty silently
+        absent -- otherwise the cache launders a contract hole into the artifact
+        and the omission is indistinguishable from a deliberate `not_computed`.
+        """
+        if not isinstance(pair_data, dict):
+            return False
+        if pair_data.get("hedge_ratio_beta_std_error") is None:
+            return False
+        try:
+            return int(pair_data.get("hedge_regression_observations") or 0) > 2
+        except (TypeError, ValueError):
+            return False
 
     async def _set_cached_pair(
         self,

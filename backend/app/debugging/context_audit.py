@@ -193,6 +193,13 @@ UNCERTAINTY_KEY_TOKENS = (
     "standard_error",
     "standarderror",
     "stderr",
+    # `std_error` is this repo's own convention -- `alpha_std_error`,
+    # `market_std_error` on factor_exposure, published when the HAC standard
+    # errors were kept instead of discarded. This rule was written before that
+    # naming existed, so it could not see a real, correctly-computed, robust
+    # standard error because it was looking for a different word. A rule blind to
+    # the codebase's own vocabulary is not strict, it is broken.
+    "std_error",
     "conf_int",
     "confidence_interval",
     "confidence_band",

@@ -31,6 +31,28 @@ def _pair(a, b, pvalue=0.01):
         last_price_a=100.0,
         last_price_b=200.0,
         signal="hold",
+        # A stored pair must satisfy the CURRENT contract to be a cache hit: the
+        # slope drives a trade instruction, so a row without its standard error
+        # is recomputed rather than served with the uncertainty silently absent.
+        hedge_ratio_beta_std_error=0.04,
+        intercept_alpha_std_error=1.2,
+        hedge_regression_observations=174,
+        hedge_regression_std_error_basis=(
+            "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
+        ),
+    )
+
+
+def _legacy_pair(a, b, pvalue=0.01):
+    """A cache row written by a build that predates the uncertainty fields."""
+    pair = _pair(a, b, pvalue)
+    return pair.model_copy(
+        update={
+            "hedge_ratio_beta_std_error": None,
+            "intercept_alpha_std_error": None,
+            "hedge_regression_observations": None,
+            "hedge_regression_std_error_basis": None,
+        }
     )
 
 
@@ -91,3 +113,25 @@ async def test_roundtrip_preserves_pair():
     got = await svc._get_cached_pair("TCS.NS", "INFY.NS", "2026-09-03")
     assert got is not None
     assert (got.ticker_a, got.ticker_b) == ("TCS.NS", "INFY.NS")
+
+
+@pytest.mark.asyncio
+async def test_legacy_cached_row_without_uncertainty_is_a_miss():
+    """A cache row that cannot answer the current contract is not a cache hit.
+
+    The role/depth fields were backfillable from engine constants because they
+    are declarations. A standard error is a MEASUREMENT, so a row missing one is
+    recomputed instead of served with the uncertainty silently absent -- which
+    would make the omission indistinguishable from a deliberate `not_computed`.
+    """
+    svc = CointegrationService(db_session=None, cache_service=_FakeCache())
+    await svc._set_cached_pair(
+        "TCS.NS", "INFY.NS", "2026-09-03", _legacy_pair("TCS.NS", "INFY.NS", 0.02)
+    )
+    assert await svc._get_cached_pair("TCS.NS", "INFY.NS", "2026-09-03") is None
+    # And a row that does carry one is still served, so this is not a blanket
+    # cache bypass.
+    await svc._set_cached_pair(
+        "TCS.NS", "INFY.NS", "2026-09-04", _pair("TCS.NS", "INFY.NS", 0.02)
+    )
+    assert await svc._get_cached_pair("TCS.NS", "INFY.NS", "2026-09-04") is not None
