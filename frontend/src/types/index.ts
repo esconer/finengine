@@ -445,6 +445,24 @@ export interface AIContextResponse {
   generated_at: string;
   completed_at: string;
   snapshot_consistency: 'best_effort' | 'frozen';
+  /**
+   * AD-16: the EVIDENCE beside the collection-mode claim above, not a
+   * replacement for it. `snapshot_consistency` says how the export was
+   * collected; this says whether the prices that came back actually agreed.
+   * The full block, with per-ticker attribution and what it invalidates, lives
+   * at `sections.portfolio.data.snapshot_consistency`.
+   */
+  snapshot_consistency_measured?: {
+    status?: 'single_instant' | 'multiple_instants' | 'partial' | 'unmeasured' | string;
+    distinct_price_instants?: number | null;
+    distinct_delivered_bar_dates?: number | null;
+    mark_instant_spread_seconds?: number | null;
+    delivered_bar_spread_calendar_days?: number | null;
+    per_position_price_as_of_at?: string;
+    what_this_invalidates_at?: string;
+    detail_at?: string;
+    reason?: string;
+  };
   base_currency: 'INR' | 'USD';
   currency_policy: string;
   detail: AIContextDetail;

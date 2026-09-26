@@ -55,6 +55,10 @@ Every section includes:
 
 `base_currency` controls the portfolio snapshot. Analytics sections retain the monetary unit declared by their underlying endpoint (currently INR for most analytics); the top-level `currency_policy` makes this explicit. `generated_at` is the collection start, `completed_at` is the collection end, and `snapshot_consistency` is `best_effort` because live page endpoints can observe slightly different quote times during a full export.
 
+`snapshot_consistency` is a **collection mode** — `best_effort` or `frozen` — and says how the export was gathered. It does not say whether the prices that came back actually agreed. A v5 review counted 31 mismatching `(ticker, price)` pairs, up to 3.5% apart, across the same 14 holdings while the envelope still read `best_effort`, so the evidence now arrives beside the claim as `snapshot_consistency_measured` (`status`, `distinct_price_instants`, `distinct_delivered_bar_dates`, and both spreads). These are deliberately two keys: a `frozen` export whose clocks still disagree is a different finding from a `best_effort` one that happens to agree. The full block — per-ticker attribution under `per_position_price_as_of`, and a `what_this_invalidates` list — stays where it was measured, at `sections.portfolio.data.snapshot_consistency`.
+
+**Price basis and cost accounting.** The portfolio section publishes an `accounting_basis` block: `gross_or_net: "gross"`, `net_of_costs: false`, `value_mark.adjusted: false`, and an explicit per-category `accounted_for: false` for dividends, corporate actions, fees, tax, slippage, turnover and survivorship. The artifact's numbers are gross and price-only. That block's `scope.does_not_cover` states that the basis of `monte_carlo`, the tear sheet and the optimiser is **unknown**, not gross — do not read the portfolio's declaration across sections.
+
 The export never fabricates missing values. A failed provider or insufficient history is represented as an unavailable/partial section so an AI can distinguish absence from zero.
 
 ### Three separate status axes

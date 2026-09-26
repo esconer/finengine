@@ -1572,6 +1572,75 @@ def _normalize_risk_score_change(component: Dict[str, Any]) -> List[str]:
     ]
 
 
+def _snapshot_consistency_measured(
+    sections: Mapping[str, Any], portfolio_payload: Any
+) -> Dict[str, Any]:
+    """AD-16, the envelope half: the EVIDENCE beside the collection-mode claim.
+
+    `snapshot_consistency` at the envelope is a collection-mode word -
+    `best_effort` or `frozen` - and it stays exactly that. It says how the
+    export was collected. It does not say whether the collected prices
+    actually agreed, and a reviewer counted 31 mismatching (ticker, price)
+    pairs up to 3.5% apart for the same 14 holdings while the envelope still
+    read `best_effort`.
+
+    Those are two different axes and they get two keys. Overwriting the
+    Literal with a dict would have broken the schema, the TypeScript union and
+    the Markdown renderer to make a sentence shorter, and would have thrown
+    away a real distinction: a `frozen` export whose prices still disagree is
+    not the same finding as a `best_effort` one that happens to agree. So the
+    claim keeps its key and the measurement arrives beside it.
+
+    Compact by design - the full block, including per-ticker attribution and
+    what it invalidates, stays where it was measured, in the portfolio
+    section's own `data`.
+    """
+    block: Any = None
+    for source in (sections.get("portfolio"), portfolio_payload):
+        if isinstance(source, Mapping):
+            data = source.get("data")
+            candidate = data.get("snapshot_consistency") if isinstance(data, Mapping) else None
+            # A Mapping alone is not a measurement. An empty dict, or one that
+            # publishes no `status`, would otherwise be promoted into a
+            # measurement whose status is null -- the same move the whole rule
+            # exists to prevent, one level up.
+            if isinstance(candidate, Mapping) and candidate.get("status"):
+                block = candidate
+                break
+    if not isinstance(block, Mapping):
+        # The count keys are published as null rather than omitted so a consumer
+        # iterating the shape cannot hit a KeyError. `null` is the honest value
+        # for "not measured", and `status` plus `reason` say so explicitly.
+        return {
+            "status": "unmeasured",
+            "distinct_price_instants": None,
+            "distinct_delivered_bar_dates": None,
+            "mark_instant_spread_seconds": None,
+            "delivered_bar_spread_calendar_days": None,
+            "reason": (
+                "The portfolio section published no measured price-clock block, so "
+                "this export asserts no agreement between its price instants."
+            ),
+            "detail_at": "sections.portfolio.data.snapshot_consistency",
+        }
+    return {
+        "status": block.get("status"),
+        "distinct_price_instants": block.get("distinct_price_instants"),
+        "distinct_delivered_bar_dates": block.get("distinct_delivered_bar_dates"),
+        "mark_instant_spread_seconds": block.get("mark_instant_spread_seconds"),
+        "delivered_bar_spread_calendar_days": block.get(
+            "delivered_bar_spread_calendar_days"
+        ),
+        "per_position_price_as_of_at": (
+            "sections.portfolio.data.snapshot_consistency.per_position_price_as_of"
+        ),
+        "what_this_invalidates_at": (
+            "sections.portfolio.data.snapshot_consistency.what_this_invalidates"
+        ),
+        "detail_at": "sections.portfolio.data.snapshot_consistency",
+    }
+
+
 class PortfolioContextService:
     """Collect the portfolio pages into one stable AI-facing document."""
 
@@ -1755,6 +1824,14 @@ class PortfolioContextService:
             "generated_at": generated_at,
             "completed_at": completed_at,
             "snapshot_consistency": "best_effort",
+            # AD-16: the claim above is the collection mode; this is whether the
+            # prices that came back actually agreed. A `best_effort` export
+            # whose clocks line up and one whose clocks do not are different
+            # findings, so the evidence gets its own key rather than overwriting
+            # a documented Literal. See _snapshot_consistency_measured.
+            "snapshot_consistency_measured": _snapshot_consistency_measured(
+                sections, portfolio_json
+            ),
             "base_currency": options.base_currency,
             "currency_policy": (
                 "Portfolio section uses the requested base_currency; analytics sections "
@@ -2755,6 +2832,15 @@ def render_markdown(payload: Mapping[str, Any]) -> str:
         f"- Generated: `{safe_payload.get('generated_at', '')}`",
         f"- Completed: `{safe_payload.get('completed_at', '')}`",
         f"- Snapshot consistency: `{safe_payload.get('snapshot_consistency', 'unknown')}`",
+        (
+            "- Price clocks measured: "
+            f"`{(safe_payload.get('snapshot_consistency_measured') or {}).get('status', 'unmeasured')}` "
+            f"({(safe_payload.get('snapshot_consistency_measured') or {}).get('distinct_price_instants', '?')}"
+            " price instant(s), "
+            f"{(safe_payload.get('snapshot_consistency_measured') or {}).get('distinct_delivered_bar_dates', '?')}"
+            " delivered bar date(s)) - full block at "
+            "`sections.portfolio.data.snapshot_consistency`"
+        ),
         f"- Base currency: `{safe_payload.get('base_currency', '')}`",
         f"- Currency policy: {safe_payload.get('currency_policy', '')}",
         f"- Detail: `{safe_payload.get('detail', 'summary')}`",

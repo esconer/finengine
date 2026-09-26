@@ -158,6 +158,13 @@ class AIContextResponse(BaseModel):
     generated_at: datetime
     completed_at: datetime
     snapshot_consistency: Literal["best_effort", "frozen"]
+    # Declared here, not added at runtime by the exporter, for the reason
+    # CointScannerResponse spells out below: FastAPI re-serialises against the
+    # DECLARED response_model, so a key the route only adds is dropped from the
+    # HTTP wire while the in-process exporter still sees it -- the audited path
+    # and the wire disagree. `snapshot_consistency` is the collection-mode claim
+    # (best_effort / frozen); this is the measured evidence beside it, per AD-16.
+    snapshot_consistency_measured: Optional[Dict[str, Any]] = None
     base_currency: Literal["INR", "USD"]
     currency_policy: str
     detail: Literal["summary", "full"]

@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -55,6 +55,24 @@ _SUPPORTED_CURRENCIES = frozenset({"INR", "USD"})
 _DEFAULT_BASE_CURRENCY = "INR"
 
 
+class PortfolioPositionEnvelope(PortfolioPositionResponse):
+    """A position row plus the date its mark is actually measured against.
+
+    AD-16: `last_price` was published beside `updated_on`, which is a quote
+    WRITE clock, and beside nothing that says which delivered daily bar the mark
+    belongs to. A reader could not check whether two sections pricing the same
+    ticker used the same instant, so the disagreement could only be asserted
+    globally ("best_effort") instead of located per position. `price_as_of` makes
+    it local: two rows are comparable exactly when this field matches.
+    """
+
+    #: Newest DELIVERED daily bar date for this one ticker, or null when no bar
+    #: has been delivered for it. Never the quote write clock and never the
+    #: book-wide `as_of`.
+    price_as_of: Optional[str] = None
+    price_as_of_semantics: Optional[str] = None
+
+
 class PortfolioSummaryEnvelope(PortfolioSummaryResponse):
     """Existing summary fields plus an explicit monetary-unit contract."""
 
@@ -66,6 +84,13 @@ class PortfolioSummaryEnvelope(PortfolioSummaryResponse):
     as_of: Optional[str] = None
     as_of_semantics: Optional[str] = None
     valuation_refreshed_at: Optional[str] = None
+    # AD-16: replaces a one-word adjective. Every price instant used to value the
+    # book is counted and bounded here, per clock, instead of being asserted to
+    # have lined up.
+    snapshot_consistency: Dict[str, Any] = Field(default_factory=dict)
+    # AD-8: what these numbers are gross OF, stated once so a reader acting on a
+    # per-position P&L or a book total knows the costs that are absent.
+    accounting_basis: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
 
 
@@ -97,9 +122,23 @@ def _normalise_currency(value: Any) -> str:
 #: What `PortfolioSummaryEnvelope.as_of` measures once the two clocks are split.
 #: The section names it, so a reader never has to infer it from the shape of the
 #: value.
+#: What the portfolio's own money figures are. Published on the envelope so a
+#: reader knows whether the numbers they are about to act on are gross or net.
+PORTFOLIO_ACCOUNTING_BASIS = "gross_of_all_transaction_costs_and_tax_unadjusted_prices"
+
 PORTFOLIO_AS_OF_SEMANTICS = "last_delivered_daily_close_date_for_the_held_universe"
 
 PORTFOLIO_VALUATION_BASIS = "live_quote_last_price_per_position"
+
+#: `positions[].price_as_of` means exactly this and nothing else. It is the
+#: book-wide `as_of` resolved to ONE ticker, so a reader can compare two rows -
+#: or a row against another section - without inferring anything from a shape.
+PORTFOLIO_PRICE_AS_OF_SEMANTICS = "newest_delivered_daily_bar_date_for_this_ticker"
+
+#: The two clocks this section uses to value the book, named once so
+#: `snapshot_consistency` keys are self-describing rather than cryptic.
+PORTFOLIO_MARK_CLOCK = "live_quote_write_clock"
+PORTFOLIO_BAR_CLOCK = "delivered_daily_bar_date"
 
 
 def _portfolio_freshness_warnings(
@@ -130,6 +169,37 @@ def _portfolio_freshness_warnings(
     return warnings
 
 
+def _price_instant_warnings(consistency: Dict[str, Any]) -> List[str]:
+    """Name the disagreement `as_of` cannot express, when there is one.
+
+    A single book-wide date can only ever name the NEWEST delivered bar. If the
+    held universe was delivered to more than one date, that one value silently
+    dates the newest leg and misdates every other one, so the spread is stated
+    here rather than left for a reader to infer from `positions[].price_as_of`.
+    """
+    bar = (consistency.get("price_clocks") or {}).get(PORTFOLIO_BAR_CLOCK) or {}
+    if int(bar.get("distinct_instants") or 0) > 1:
+        return [
+            f"The held universe spans {bar['distinct_instants']} distinct delivered "
+            f"daily bar dates ({bar.get('oldest')} to {bar.get('newest')}, "
+            f"{bar.get('spread')} calendar days): as_of "
+            f"{bar.get('newest')} dates only the newest leg, and the stale legs sit "
+            "on the older instants named in "
+            "snapshot_consistency.price_clocks."
+            f"{PORTFOLIO_BAR_CLOCK}.positions_at_each_instant."
+        ]
+    return []
+
+
+def _utc_stamp(value: Any) -> Optional[str]:
+    """One naive-or-aware datetime as a UTC ISO-8601 instant, or None."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _quote_refresh_instant(positions: List[PortfolioPosition]) -> Optional[str]:
     """Newest persisted quote WRITE time, for refresh provenance only.
 
@@ -138,16 +208,54 @@ def _quote_refresh_instant(positions: List[PortfolioPosition]) -> Optional[str]:
     export, so a value built from it is necessarily later than the envelope that
     contains it. It belongs in `valuation_refreshed_at` and nowhere else.
     """
-    values = []
-    for position in positions:
-        value = getattr(position, "updated_on", None)
-        if isinstance(value, datetime):
+    values = [
+        stamp
+        for stamp in (
+            _utc_stamp(getattr(position, "updated_on", None)) for position in positions
+        )
+        if stamp
+    ]
+    return max(values) if values else None
+
+
+async def _delivered_close_dates(
+    db: AsyncSession, tickers: List[str]
+) -> Dict[str, str]:
+    """Newest stored daily bar date PER TICKER, keyed by ticker.
+
+    `_latest_delivered_close_date` used to take one `max()` over the whole
+    universe. That is a single number standing in for up to N distinct price
+    instants: if one held name delivered through the 25th and another only
+    through the 22nd, the book published the 25th and the 3-day gap vanished.
+    Grouping by ticker keeps the identical column and the identical clock and
+    refuses to average a spread away.
+
+    `StockTimeseries.date` is an exchange session date, so every value here is a
+    real observation made before any refresh could run. An empty table, a
+    lookup failure, or a ticker with no delivered bar yields an absent entry -
+    never a borrowed clock.
+    """
+    candidates = sorted({t for t in tickers if isinstance(t, str) and t.strip()})
+    if not candidates:
+        return {}
+    latest: Dict[str, str] = {}
+    try:
+        result = await db.execute(
+            select(StockTimeseries.ticker, func.max(StockTimeseries.date))
+            .where(StockTimeseries.ticker.in_(candidates))
+            .group_by(StockTimeseries.ticker)
+        )
+        for row in result.all():
+            ticker, value = row[0], row[1]
+            if not isinstance(ticker, str) or not isinstance(value, datetime):
+                continue
             if value.tzinfo is None:
                 value = value.replace(tzinfo=timezone.utc)
-            values.append(value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"))
-        elif value:
-            values.append(str(value))
-    return max(values) if values else None
+            latest[ticker] = value.date().isoformat()
+    except Exception:
+        logger.warning("Portfolio observation date lookup failed")
+        return {}
+    return latest
 
 
 async def _latest_delivered_close_date(
@@ -155,29 +263,12 @@ async def _latest_delivered_close_date(
 ) -> Optional[str]:
     """Newest stored daily bar date across the held universe: a real observation.
 
-    `StockTimeseries.date` is an exchange session date, so this is a measurement
-    that happened before any refresh could run. Nothing here fabricates a date:
-    an empty table, or no bar for any held ticker, yields None and the section
-    says it has no observation date rather than borrowing a clock.
+    Retained as the book-wide roll-up of `_delivered_close_dates`, so the one
+    value that `as_of` publishes is derived from exactly the per-ticker map the
+    section now discloses rather than from a second, independent query.
     """
-    candidates = sorted({t for t in tickers if isinstance(t, str) and t.strip()})
-    if not candidates:
-        return None
-    try:
-        result = await db.execute(
-            select(func.max(StockTimeseries.date)).where(
-                StockTimeseries.ticker.in_(candidates)
-            )
-        )
-        latest = result.scalar()
-    except Exception:
-        logger.warning("Portfolio observation date lookup failed")
-        return None
-    if not isinstance(latest, datetime):
-        return None
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=timezone.utc)
-    return latest.date().isoformat()
+    dates = await _delivered_close_dates(db, tickers)
+    return max(dates.values()) if dates else None
 
 
 def _holding_date_provenance() -> Dict[str, Any]:
@@ -208,6 +299,373 @@ def _holding_date_provenance() -> Dict[str, Any]:
             f"are live quotes ({PORTFOLIO_VALUATION_BASIS}), so the market data "
             "itself has no observation date; the two fields are deliberately "
             "separate."
+        ),
+        "price_as_of": (
+            "positions[].price_as_of is "
+            f"{PORTFOLIO_PRICE_AS_OF_SEMANTICS}. It resolves the book-wide as_of "
+            "to one ticker so two marks can be compared directly; it is the only "
+            "per-position price date, and a null means NO bar has been delivered "
+            "for that ticker rather than a fall-back to a neighbour's date."
+        ),
+    }
+
+
+def _mark_clock_block(positions: List[PortfolioPosition]) -> Dict[str, Any]:
+    """Every instant at which a PUBLISHED MARK was written, counted.
+
+    `_update_portfolio_prices` re-stamps each refreshed leg with its own
+    `datetime.now()`, so a 14-position book refreshed from a 15-minute-stale
+    state is written at 14 distinct instants, not one. That is not a bug and it
+    is not hidden here either: the count and the span are published so a reader
+    knows the book is a set of asynchronously fetched quotes, and so a later
+    reconciliation against another section can be scoped to seconds rather than
+    days.
+    """
+    stamps: Dict[str, str] = {}
+    for position in positions:
+        ticker = getattr(position, "ticker", None)
+        if not isinstance(ticker, str) or not ticker:
+            continue
+        stamp = _utc_stamp(getattr(position, "updated_on", None))
+        if stamp:
+            stamps[ticker] = stamp
+    distinct = sorted(set(stamps.values()))
+    block: Dict[str, Any] = {
+        "clock": PORTFOLIO_MARK_CLOCK,
+        "source": "PortfolioPosition.updated_on (quote write time, per leg)",
+        "measures": (
+            "The instant each position's last_price was written. A database "
+            "write clock, not an observation date: it is restamped on every "
+            "refresh and is always later than the delivered bar it is dated "
+            "against."
+        ),
+        "distinct_instants": len(distinct),
+        "oldest": distinct[0] if distinct else None,
+        "newest": distinct[-1] if distinct else None,
+        "spread_unit": "seconds",
+        "spread": None,
+        "per_ticker": dict(sorted(stamps.items())),
+    }
+    if len(distinct) >= 2:
+        oldest = datetime.fromisoformat(distinct[0].replace("Z", "+00:00"))
+        newest = datetime.fromisoformat(distinct[-1].replace("Z", "+00:00"))
+        block["spread"] = round((newest - oldest).total_seconds(), 6)
+    return block
+
+
+def _bar_clock_block(
+    price_as_of: Dict[str, str], held_tickers: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Every delivered daily bar date in the book, counted and attributed.
+
+    This is the clock the export's cross-section staleness is really made of: a
+    reader comparing this ticker against another section's mark needs to know
+    which leg is the stale one, and `as_of` can only ever name the newest.
+
+    `held_tickers` is the full roster. The grouped query only returns tickers
+    that HAVE a bar, so without the roster a leg with no delivered bar at all
+    would be indistinguishable from a leg that is not held - and the count of
+    distinct instants would silently exclude the leg that cannot be dated.
+    """
+    roster = sorted({
+        t for t in list(held_tickers or []) + list(price_as_of)
+        if isinstance(t, str) and t
+    })
+    resolved: Dict[str, Optional[str]] = {t: None for t in roster}
+    for ticker, value in price_as_of.items():
+        if isinstance(ticker, str) and ticker:
+            resolved[ticker] = value if isinstance(value, str) and value else None
+    per_date: Dict[str, List[str]] = {}
+    for ticker, value in sorted(resolved.items()):
+        if value:
+            per_date.setdefault(value, []).append(ticker)
+    dates = sorted(per_date)
+    undated = sorted(ticker for ticker, value in resolved.items() if not value)
+    spread: Optional[int] = None
+    if len(dates) >= 2:
+        try:
+            spread = (date.fromisoformat(dates[-1]) - date.fromisoformat(dates[0])).days
+        except ValueError:
+            spread = None
+    return {
+        "clock": PORTFOLIO_BAR_CLOCK,
+        "source": "max(StockTimeseries.date) grouped by ticker",
+        "measures": (
+            "The exchange session date of the newest daily bar DELIVERED for each "
+            "held ticker. A real observation date that always precedes the quote "
+            "refresh above."
+        ),
+        "semantics": PORTFOLIO_PRICE_AS_OF_SEMANTICS,
+        "distinct_instants": len(dates),
+        "oldest": dates[0] if dates else None,
+        "newest": dates[-1] if dates else None,
+        "spread_unit": "calendar_days",
+        "spread": spread,
+        "positions_at_each_instant": {key: per_date[key] for key in dates},
+        "positions_without_a_delivered_bar": undated,
+        "per_ticker": dict(sorted(resolved.items())),
+    }
+
+
+def _price_snapshot_consistency(
+    positions: List[PortfolioPosition], price_as_of: Dict[str, str]
+) -> Dict[str, Any]:
+    """AD-16: measure the price spread instead of asserting it did not happen.
+
+    The export published `snapshot_consistency: "best_effort"` and an empty
+    warnings list while its own sections valued the same 14 tickers from
+    different instants - a reviewer later counted 31 mismatching (ticker, price)
+    pairs, up to 3.5% apart, and the `pairs` trade signals rested on the
+    stalest set. One adjective cannot carry that: it says nothing about how many
+    instants, how far apart, or which section disagrees.
+
+    This block answers the first two from measurements this route can actually
+    make - one per clock, counted and bounded - and is explicit that the third
+    requires comparing `positions[].price_as_of` across sections, which no
+    single route can do. Nothing here claims a cross-section measurement it did
+    not take.
+    """
+    marks = _mark_clock_block(positions)
+    held = [
+        getattr(position, "ticker", None) for position in positions
+    ]
+    bars = _bar_clock_block(price_as_of, held)
+    mark_count = int(marks["distinct_instants"])
+    bar_count = int(bars["distinct_instants"])
+    if mark_count == 0 and bar_count == 0:
+        status = "unmeasured"
+    elif mark_count > 1 or bar_count > 1:
+        status = "multiple_instants"
+    elif bars["positions_without_a_delivered_bar"]:
+        status = "partial"
+    else:
+        status = "single_instant"
+
+    invalidates: List[str] = []
+    if mark_count > 1:
+        invalidates.append(
+            f"The {len(price_as_of)} position marks were written at {mark_count} "
+            f"distinct instants spanning {marks['spread']}s, so the book is not a "
+            "single simultaneous snapshot: a weight or sector share here is a ratio "
+            "of prices fetched at different moments, and no cross-section figure "
+            "that sums these marks is co-temporal with any single quote."
+        )
+    if bar_count > 1:
+        invalidates.append(
+            f"The delivered daily bars behind the held universe span {bar_count} "
+            f"distinct dates ({bars['oldest']} to {bars['newest']}, "
+            f"{bars['spread']} calendar days). The envelope `as_of` names only the "
+            "newest of them, so it is the correct date for the newest leg and a "
+            f"WRONG date for the {sum(len(v) for k, v in bars['positions_at_each_instant'].items() if k != bars['newest'])} "
+            "stale leg(s); use positions[].price_as_of, not as_of, per position."
+        )
+    if bars["positions_without_a_delivered_bar"]:
+        invalidates.append(
+            f"{len(bars['positions_without_a_delivered_bar'])} held position(s) "
+            "have no delivered daily bar at all, so they are absent from the bar "
+            "clock and from any date comparison that trusts as_of; the count is "
+            "published rather than omitted because a missing date is a fact."
+        )
+    invalidates.append(
+        "This block does NOT reconcile another section. Sections that price the "
+        "same tickers from their own delivered bars or their own quote fetches "
+        "publish their own price dates, and the pairs / volatility_sizing trade "
+        "signals in particular are struck from a different set of prices than "
+        "these marks. Comparing one ticker's number in this section with the same "
+        "ticker in one of those sections compares two instants unless "
+        "positions[].price_as_of agrees; that comparison is the reader's to make "
+        "and this route cannot make it for them."
+    )
+
+    return {
+        "status": status,
+        # Headline count for the clock that produced the published prices.
+        "distinct_price_instants": mark_count,
+        # And the count for the clock every date-based figure is aligned to.
+        "distinct_delivered_bar_dates": bar_count,
+        "delivered_bar_spread_calendar_days": bars["spread"],
+        "mark_instant_spread_seconds": marks["spread"],
+        "price_clocks": {
+            PORTFOLIO_MARK_CLOCK: marks,
+            PORTFOLIO_BAR_CLOCK: bars,
+        },
+        "per_position_price_as_of": dict(
+            sorted(bars["per_ticker"].items())
+        ),
+        "cross_section_reconciliation": {
+            "measured_here": False,
+            "reason": (
+                "This route values the held universe and returns; it cannot observe "
+                "the price instant any other section used, so it publishes its own "
+                "clocks and refuses to assert an alignment it did not measure."
+            ),
+            "rule_for_a_reader": (
+                "Treat two numbers for the same ticker as one fact only when their "
+                "published price dates match; otherwise the gap is a snapshot gap, "
+                "not an arithmetic disagreement."
+            ),
+        },
+        "what_this_invalidates": invalidates,
+    }
+
+
+def _portfolio_accounting_basis() -> Dict[str, Any]:
+    """AD-8: state, once, what the portfolio's numbers do and do not account for.
+
+    The artifact carried per-position P&L, a book total, a weight vector and a
+    day-change figure and never said whether any of it was gross or net. It also
+    never named dividends, fees, tax, slippage, survivorship, corporate actions
+    or splits - each appeared zero times across 784 KB - so a reader could not
+    tell a price-only series from a total-return one, or assume the unmentioned
+    costs were deducted.
+
+    Nothing is deducted here. Deducting them would move every published figure
+    and is a different mission; this block's whole job is to make the ABSENCE
+    explicit and countable. Every `accounted_for: false` is a real, checked
+    property of this route's arithmetic, not a placeholder: the marks come from
+    `fetch_quote` current_price with no adjustment, and the buy price is the
+    single stored `PortfolioPosition.buy_price`.
+    """
+    return {
+        "basis": PORTFOLIO_ACCOUNTING_BASIS,
+        "gross_or_net": "gross",
+        "net_of_costs": False,
+        "value_mark": {
+            "field": "positions[].last_price",
+            "source": (
+                "DataService.fetch_quote -> current_price, written to "
+                "PortfolioPosition.last_price. A live vendor last-trade price."
+            ),
+            "adjusted": False,
+            "note": (
+                "StockTimeseries.adj_close is stored alongside the delivered bars "
+                "and is NOT used to value a position here. No split, bonus or "
+                "dividend adjustment is applied to any mark in this section, so "
+                "the marks are unadjusted prices, not a total-return series."
+            ),
+        },
+        "arithmetic": {
+            "market_value": "quantity * last_price, native currency",
+            "total_cost": (
+                "quantity * PortfolioPosition.buy_price, native currency. One "
+                "stored buy price per position: not FIFO, not lot-weighted, and not "
+                "a broker statement."
+            ),
+            "unrealized_gain_loss": (
+                "quantity * (last_price - buy_price) in the native currency, then "
+                "converted at the SAME fx rate used for market_value_base. A paper "
+                "mark on an unclosed position, not a settled P&L."
+            ),
+            "realised_pnl": (
+                "NOT produced by this route. A closed or deleted position leaves "
+                "no realised ledger here, so no realised return can be computed "
+                "from this section."
+            ),
+            "weights": (
+                "converted_value / total_mv_target, restated from the live marks "
+                "on every request. A weight therefore implies a trade that has not "
+                "happened, at a cost that is not deducted anywhere."
+            ),
+        },
+        "accounted_for": [
+            (
+                "fx_conversion: every position is converted at one rate published "
+                "in currency_provenance.pairs, and a same-currency pair is an "
+                "identity at rate 1.0 with provenance 'identity'."
+            ),
+            (
+                "quantity: shares are taken as stored, and a non-positive quantity "
+                "is valued at 0.0 rather than at a negative value."
+            ),
+        ],
+        "not_accounted_for": [
+            {
+                "item": "dividends",
+                "accounted_for": False,
+                "effect": (
+                    "Marks are unadjusted last prices, so dividend income is "
+                    "neither added to a position's value nor compounded into "
+                    "anything this section publishes. The stored adj_close column "
+                    "is not used here."
+                ),
+            },
+            {
+                "item": "corporate actions (splits, bonus issues, rights issues, demergers, ticker or ISIN changes)",
+                "accounted_for": False,
+                "effect": (
+                    "No split or bonus adjustment is applied to last_price and none "
+                    "to the stored quantity, so an unadjusted corporate action "
+                    "surfaces as a price move and as a phantom gain or loss."
+                ),
+            },
+            {
+                "item": "fees, brokerage, STT, GST, stamp duty and every other transaction charge",
+                "accounted_for": False,
+                "effect": (
+                    "buy_price is taken as stored with no charge loading, and no "
+                    "charge is deducted from any mark, so unrealized_gain_loss is a "
+                    "pre-cost figure and the true break-even is above last_price by "
+                    "an amount this section cannot quantify."
+                ),
+            },
+            {
+                "item": "tax (capital gains, dividend withholding, TDS)",
+                "accounted_for": False,
+                "effect": (
+                    "No tax liability is computed, accrued or reserved, realised or "
+                    "unrealised, anywhere in this section."
+                ),
+            },
+            {
+                "item": "slippage and market impact",
+                "accounted_for": False,
+                "effect": (
+                    "Marks are the quoted last price. The cost of actually trading "
+                    "at that price, at this book's size, is not modelled and not "
+                    "deducted."
+                ),
+            },
+            {
+                "item": "turnover and rebalancing cost",
+                "accounted_for": False,
+                "effect": (
+                    "Weights move with the marks on every request while the "
+                    "holdings do not, so a published target silently assumes a "
+                    "rebalance whose cost is absent from every projection built on "
+                    "it."
+                ),
+            },
+            {
+                "item": "survivorship and selection bias in the universe",
+                "accounted_for": False,
+                "effect": (
+                    "The universe is exactly the tickers currently held. Names that "
+                    "were delisted, merged or failed are absent by construction, so "
+                    "any long-horizon statistic a reader builds from these names is "
+                    "optimistically biased, and the bias grows with the horizon."
+                ),
+            },
+        ],
+        "scope": {
+            "covers": (
+                "sections.portfolio only: positions[*] (market_value, total_cost, "
+                "unrealized_gain_loss and their base-currency twins), total_value "
+                "and sectors."
+            ),
+            "does_not_cover": (
+                "Every other section's return series, the monte_carlo projection, "
+                "the tear sheet, tear-down risk rows and the optimiser target are "
+                "computed elsewhere from their own delivered bars and declare no "
+                "basis of their own. This block must not be read as stating theirs: "
+                "read a number from one of those sections and its gross-or-net "
+                "status is UNKNOWN, not gross."
+            ),
+        },
+        "reader_consequence": (
+            "These are GROSS figures. A reader sizing a position, projecting "
+            "terminal wealth or comparing a return against a benchmark must add "
+            "the unmodelled costs above themselves; the published numbers are an "
+            "upper bound on net outcome, not an estimate of it."
         ),
     }
 
@@ -451,6 +909,10 @@ async def get_portfolio(
                 as_of=None,
                 as_of_semantics=None,
                 valuation_refreshed_at=None,
+                # An empty book has no marks and no instants, so the block says
+                # `unmeasured` rather than implying a single consistent snapshot.
+                snapshot_consistency=_price_snapshot_consistency([], {}),
+                accounting_basis=_portfolio_accounting_basis(),
             )
 
         await _update_portfolio_prices(positions, data_service, force=bool(force_refresh))
@@ -473,6 +935,14 @@ async def get_portfolio(
         position_currencies: Dict[str, str] = {}
         pairs: Dict[str, Dict[str, Any]] = {}
         source_currencies = set()
+
+        # One grouped query serves BOTH the book-wide `as_of` and the
+        # per-position `price_as_of`, so the two can never disagree. Two
+        # independent lookups are exactly how a per-ticker spread goes invisible.
+        # Queried before the render loop because every row carries its own date.
+        price_as_of_by_ticker = await _delivered_close_dates(
+            db, [getattr(p, "ticker", None) for p in positions]
+        )
 
         # First pass is required: weights and sector shares must use the same
         # converted values as the aggregate total.
@@ -544,7 +1014,10 @@ async def get_portfolio(
                 converted_value / total_mv_target
                 if total_mv_target > 0 else float(position.weight or 0.0)
             )
-            position_responses.append(PortfolioPositionResponse(
+            # AD-16: the mark's own price date, resolved to this ticker. Null is a
+            # measurement (no delivered bar for this name), never a neighbour's.
+            leg_price_as_of = price_as_of_by_ticker.get(position.ticker) or None
+            position_responses.append(PortfolioPositionEnvelope(
                 id=position.id,
                 ticker=position.ticker,
                 weight=live_weight,
@@ -575,6 +1048,13 @@ async def get_portfolio(
                 total_cost_base=base_cost,
                 unrealized_gain_loss_base=base_gain_loss,
                 unrealized_gain_loss_pct_base=base_gain_loss_pct,
+                # AD-16: sit `price_as_of` next to the `last_price` it dates, so
+                # alignment with another section is checkable per row rather than
+                # asserted once for the whole export.
+                price_as_of=leg_price_as_of,
+                price_as_of_semantics=(
+                    PORTFOLIO_PRICE_AS_OF_SEMANTICS if leg_price_as_of else None
+                ),
             ))
             total_value += converted_value
             sector_key = position.sector or "Unknown"
@@ -593,8 +1073,18 @@ async def get_portfolio(
             "rates": {pair: data.get("rate") for pair, data in pairs.items()},
             "rate_provider": "currency_service",
         }
-        observation_date = await _latest_delivered_close_date(db, list(position_currencies))
+        # ONE grouped query now serves both the book-wide `as_of` and the
+        # per-position `price_as_of`, so the two can never disagree: a second
+        # independent lookup is exactly how a spread becomes invisible.
+        price_as_of_by_ticker = await _delivered_close_dates(db, list(position_currencies))
+        # One grouped query now serves both the book-wide `as_of` and the
+        # per-position `price_as_of`, so the two can never disagree: a second
+        # independent lookup is exactly how a spread becomes invisible.
+        observation_date = max(price_as_of_by_ticker.values(), default=None)
         refreshed_at = _quote_refresh_instant(positions)
+        snapshot_consistency = _price_snapshot_consistency(
+            positions, price_as_of_by_ticker
+        )
         return PortfolioSummaryEnvelope(
             positions=position_responses,
             total_value=total_value,
@@ -617,9 +1107,19 @@ async def get_portfolio(
                 PORTFOLIO_AS_OF_SEMANTICS if observation_date else None
             ),
             valuation_refreshed_at=refreshed_at,
+            # AD-16: the measured count of price instants and the spread between
+            # them, replacing the one-word `best_effort` the export used to
+            # publish about the same fact.
+            snapshot_consistency=snapshot_consistency,
+            # AD-8: one declaration of what these money figures are gross OF.
+            accounting_basis=_portfolio_accounting_basis(),
             # The disclosure the split would otherwise drop: the values are live
-            # quotes, and the refresh instant is beside the date, not in it.
-            warnings=_portfolio_freshness_warnings(observation_date, refreshed_at),
+            # quotes, and the refresh instant is beside the date, not in it. The
+            # second sentence is the spread the single `as_of` cannot express.
+            warnings=(
+                _portfolio_freshness_warnings(observation_date, refreshed_at)
+                + _price_instant_warnings(snapshot_consistency)
+            ),
         )
     except ProviderError as exc:
         _raise_provider_http_error(exc)
