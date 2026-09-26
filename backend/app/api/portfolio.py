@@ -12,14 +12,14 @@ from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 import csv
 import io
 
 from app.db.database import get_db_session
 from app.services.data_service import GlobalDataService, DataService, canonical_ticker
-from app.models.database import PortfolioPosition
+from app.models.database import PortfolioPosition, StockTimeseries
 from app.models.schemas import (
     PortfolioPositionCreate, PortfolioPositionUpdate, PortfolioPositionResponse,
     PortfolioSummaryResponse, BulkAddRequest, BulkAddResponse,
@@ -64,6 +64,9 @@ class PortfolioSummaryEnvelope(PortfolioSummaryResponse):
     position_currencies: Dict[str, str] = Field(default_factory=dict)
     holding_date_provenance: Dict[str, Any] = Field(default_factory=dict)
     as_of: Optional[str] = None
+    as_of_semantics: Optional[str] = None
+    valuation_refreshed_at: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
 
 
 class BulkAddEnvelope(BulkAddResponse):
@@ -91,8 +94,50 @@ def _normalise_currency(value: Any) -> str:
     return currency
 
 
-def _quote_as_of(positions: List[PortfolioPosition]) -> Optional[str]:
-    """Use the newest persisted quote timestamp for snapshot provenance."""
+#: What `PortfolioSummaryEnvelope.as_of` measures once the two clocks are split.
+#: The section names it, so a reader never has to infer it from the shape of the
+#: value.
+PORTFOLIO_AS_OF_SEMANTICS = "last_delivered_daily_close_date_for_the_held_universe"
+
+PORTFOLIO_VALUATION_BASIS = "live_quote_last_price_per_position"
+
+
+def _portfolio_freshness_warnings(
+    as_of: Optional[str], refreshed_at: Optional[str]
+) -> List[str]:
+    """The two-clock disclosure the section would otherwise lose.
+
+    `as_of` used to be a quote/update timestamp written during the request, which
+    is honest data with an honest meaning and a misleading NAME. Splitting the
+    clocks fixes the name, and this sentence keeps the meaning: the position
+    values are live quotes, so the market data behind them has no observation
+    date, and the instant they were refreshed is published beside the date
+    rather than in place of it.
+    """
+    warnings: List[str] = []
+    if refreshed_at:
+        warnings.append(
+            f"Position values are live quotes refreshed at {refreshed_at} during "
+            "this request, so the quote itself carries no observation date; "
+            + (
+                f"as_of {as_of} is the newest DELIVERED daily close date for the "
+                "held universe and is a separate measurement"
+                if as_of
+                else "no delivered daily bar exists for the held universe, so this "
+                "section publishes no as_of at all"
+            )
+        )
+    return warnings
+
+
+def _quote_refresh_instant(positions: List[PortfolioPosition]) -> Optional[str]:
+    """Newest persisted quote WRITE time, for refresh provenance only.
+
+    This is a database write clock, not an observation date: it is re-stamped
+    every time this route refreshes a stale leg, and it is written DURING the
+    export, so a value built from it is necessarily later than the envelope that
+    contains it. It belongs in `valuation_refreshed_at` and nowhere else.
+    """
     values = []
     for position in positions:
         value = getattr(position, "updated_on", None)
@@ -105,6 +150,36 @@ def _quote_as_of(positions: List[PortfolioPosition]) -> Optional[str]:
     return max(values) if values else None
 
 
+async def _latest_delivered_close_date(
+    db: AsyncSession, tickers: List[str]
+) -> Optional[str]:
+    """Newest stored daily bar date across the held universe: a real observation.
+
+    `StockTimeseries.date` is an exchange session date, so this is a measurement
+    that happened before any refresh could run. Nothing here fabricates a date:
+    an empty table, or no bar for any held ticker, yields None and the section
+    says it has no observation date rather than borrowing a clock.
+    """
+    candidates = sorted({t for t in tickers if isinstance(t, str) and t.strip()})
+    if not candidates:
+        return None
+    try:
+        result = await db.execute(
+            select(func.max(StockTimeseries.date)).where(
+                StockTimeseries.ticker.in_(candidates)
+            )
+        )
+        latest = result.scalar()
+    except Exception:
+        logger.warning("Portfolio observation date lookup failed")
+        return None
+    if not isinstance(latest, datetime):
+        return None
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=timezone.utc)
+    return latest.date().isoformat()
+
+
 def _holding_date_provenance() -> Dict[str, Any]:
     return {
         "added_on": "PortfolioPosition.added_on (stored import date)",
@@ -114,9 +189,25 @@ def _holding_date_provenance() -> Dict[str, Any]:
             "buy-price-implied start; it is not the quote timestamp."
         ),
         "quote_timestamp_timezone": (
-            "updated_on is a naive datetime column and carries no offset. as_of "
-            "renders it as UTC (a trailing Z) so the envelope stays ISO-parseable; "
-            "the UTC designation is an interpretation, not a stored fact."
+            "updated_on is a naive datetime column and carries no offset. "
+            "valuation_refreshed_at renders it as UTC (a trailing Z) so the "
+            "envelope stays ISO-parseable; the UTC designation is an "
+            "interpretation, not a stored fact."
+        ),
+        "as_of": (
+            "as_of is the newest DELIVERED daily close date across the held "
+            f"tickers ({PORTFOLIO_AS_OF_SEMANTICS}), read from "
+            "StockTimeseries.date. It is a real observation date and it always "
+            "precedes the refresh that produced this response."
+        ),
+        "valuation_refreshed_at": (
+            "valuation_refreshed_at is the newest PortfolioPosition.updated_on: "
+            "the instant the newest quote was WRITTEN to the database during "
+            "this request. It is a refresh clock, not an observation date, and it "
+            "can be later than the response that contains it. Position values "
+            f"are live quotes ({PORTFOLIO_VALUATION_BASIS}), so the market data "
+            "itself has no observation date; the two fields are deliberately "
+            "separate."
         ),
     }
 
@@ -358,6 +449,8 @@ async def get_portfolio(
                 position_currencies={},
                 holding_date_provenance=_holding_date_provenance(),
                 as_of=None,
+                as_of_semantics=None,
+                valuation_refreshed_at=None,
             )
 
         await _update_portfolio_prices(positions, data_service, force=bool(force_refresh))
@@ -500,6 +593,8 @@ async def get_portfolio(
             "rates": {pair: data.get("rate") for pair, data in pairs.items()},
             "rate_provider": "currency_service",
         }
+        observation_date = await _latest_delivered_close_date(db, list(position_currencies))
+        refreshed_at = _quote_refresh_instant(positions)
         return PortfolioSummaryEnvelope(
             positions=position_responses,
             total_value=total_value,
@@ -511,7 +606,20 @@ async def get_portfolio(
             currency_provenance=provenance,
             position_currencies=position_currencies,
             holding_date_provenance=_holding_date_provenance(),
-            as_of=_quote_as_of(positions),
+            # DI-1: `as_of` is a real observation date, so it can never postdate
+            # the envelope that carries it, and it never names a day the exchange
+            # was shut. The quote WRITE clock moves to its own field, because it
+            # is a refresh instant and saying so in a warning while leaving it in
+            # `as_of` is what made the value misleading in the first place.
+            as_of=observation_date,
+            # The label describes `as_of`, so it exists only when `as_of` does.
+            as_of_semantics=(
+                PORTFOLIO_AS_OF_SEMANTICS if observation_date else None
+            ),
+            valuation_refreshed_at=refreshed_at,
+            # The disclosure the split would otherwise drop: the values are live
+            # quotes, and the refresh instant is beside the date, not in it.
+            warnings=_portfolio_freshness_warnings(observation_date, refreshed_at),
         )
     except ProviderError as exc:
         _raise_provider_http_error(exc)

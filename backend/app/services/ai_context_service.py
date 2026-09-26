@@ -18,7 +18,18 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -168,6 +179,18 @@ _STRESS_SCENARIOS: Tuple[str, ...] = (
     "Tech Sector Correction",
 )
 _SECTION_TIMEOUT_SECONDS = 180.0
+
+#: The stress composite is a set of scenarios, each measured over its own
+#: delivered frame. It dates itself by the OLDEST of them, which is the
+#: envelope's own composite rule: a section is only as fresh as its stalest leg,
+#: so a scenario that happened to receive a newer bar cannot make the whole
+#: section - including its worst loss - look fresher than it is.
+STRESS_AS_OF_SEMANTICS = "oldest_scenario_latest_observation_date"
+STRESS_AS_OF_BASIS = (
+    "min over scenarios of each scenario's latest_observation_date, which is the "
+    "newest bar in the frame its volatility factors were measured over; "
+    "scenario_observation_dates publishes the per-scenario values"
+)
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1035,241 @@ def _run_timestamp_as_of(data: Any, resolved: Optional[str]) -> Optional[str]:
     )
 
 
+#: The same bound the audit's ENV-012 staleness arm applies.  Mirrored rather
+#: than imported: `app.debugging` is a diagnostic tool and production code must
+#: not depend on it. `tests/test_ai_context_freshness_disclosure.py` asserts the
+#: two constants agree, so the mirror cannot drift.
+AS_OF_STALENESS_DAYS = 7.0
+
+#: Tokens that make an existing warning a staleness disclosure. Same vocabulary
+#: the audit rule accepts, so a section that already says so is not told twice.
+_STALE_DISCLOSURE_TOKENS = ("stale", "outdated", "not current")
+
+
+def _stale_as_of_warning(resolved: Optional[str]) -> Optional[str]:
+    """Name the measured age of an `as_of` older than the freshness bound.
+
+    A reader who does not know the age cannot weigh the section, and an
+    observation more than `AS_OF_STALENESS_DAYS` behind this export's own start
+    cannot be the newest one behind it. Measured from the export clock, never
+    assumed: a payload with no `as_of`, or one whose age is inside the bound,
+    produces nothing.
+    """
+    if not resolved:
+        return None
+    stamp = _parse_iso_timestamp(resolved)
+    started = _parse_iso_timestamp(_EXPORT_STARTED_AT[0])
+    if stamp is None or started is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    age_days = (started - stamp).total_seconds() / 86400.0
+    if age_days <= AS_OF_STALENESS_DAYS:
+        return None
+    return (
+        f"as_of {resolved} is {age_days:.2f} calendar days older than this "
+        f"export's own start, past the {AS_OF_STALENESS_DAYS:g}-day freshness "
+        "bound: it is the newest observation this payload declared, but it is "
+        "stale, and the section's numbers should be aged accordingly"
+    )
+
+
+# --- ENV-016: a section that publishes a degradation has to name it ----------
+# The rule fires whenever a section is degraded OR its payload carries a
+# degradation marker, whatever its own `status` says. Every warning below is
+# derived from a fact the payload or the section already computed - a gate, an
+# error, an omission, a component that produced nothing, a measured window
+# shortfall - so adding one can never invent a degradation, and the exit costs a
+# sentence rather than a changed number.
+_DEGRADED_PAYLOAD_STATUSES = frozenset({"partial", "unavailable"})
+
+#: Blocks whose keys carry a real short-history disclosure, in the order the
+#: sentence prefers them.
+_WINDOW_BLOCK_KEYS = ("measured_window", "history_coverage", "holding_context")
+
+
+def _execution_gate_degradation(data: Any) -> Optional[str]:
+    """Name the execution gate a sizing payload already published.
+
+    `execution.block_reasons` / `block_reason` are a degradation marker: the
+    target was refused by the shared normalization rule. The sentence is built
+    from that refusal plus the financing figure the same block measured, so it
+    states the size of the problem rather than gesturing at it.
+    """
+    execution = data.get("execution") if isinstance(data, Mapping) else None
+    if not isinstance(execution, Mapping):
+        return None
+    if execution.get("execution_eligible") is not False:
+        return None
+    reasons = [
+        str(reason).strip()
+        for reason in (execution.get("block_reasons") or [])
+        if isinstance(reason, str) and reason.strip()
+    ]
+    block_reason = execution.get("block_reason")
+    detail = (
+        block_reason.strip()
+        if isinstance(block_reason, str) and block_reason.strip()
+        else "; ".join(reasons)
+    )
+    if not detail:
+        return None
+    financing = execution.get("financing_requirement")
+    currency = execution.get("financing_requirement_currency")
+    amount = ""
+    try:
+        magnitude = float(financing) if financing is not None else None
+    except (TypeError, ValueError):
+        magnitude = None
+    if magnitude is not None and math.isfinite(magnitude) and magnitude > 0:
+        unit = f" {currency}" if isinstance(currency, str) and currency.strip() else ""
+        amount = f" ({magnitude:,.2f}{unit} of financing is required)"
+    return (
+        f"The recommended target is not executable as a normal rebalance: {detail}"
+        f"{amount}. Every trades[*] record inherits this gate, so the published "
+        "list is a financing-dependent target rather than an order set."
+    )
+
+
+def _component_degradations(data: Any) -> List[str]:
+    """Composite components that produced no measurement, named individually.
+
+    A composite that reports `partial` because one leg is `unavailable` and says
+    nothing about which leg is the most misleading warning it can write: the
+    reader cannot tell which number is missing.
+    """
+    components = data.get("components") if isinstance(data, Mapping) else None
+    if not isinstance(components, Mapping):
+        return []
+    degraded: List[str] = []
+    for name, component in components.items():
+        if not isinstance(component, Mapping):
+            continue
+        status = component.get("status")
+        component_error = component.get("error")
+        if status not in _DEGRADED_PAYLOAD_STATUSES and not component_error:
+            continue
+        detail = str(component_error).strip() if component_error else (
+            f"status {status!r}"
+        )
+        degraded.append(f"{name} ({detail})")
+    return sorted(degraded)
+
+
+def _window_degradation(data: Any) -> Optional[str]:
+    """Name the measured shortfall behind a section's own degraded `data_status`.
+
+    Prefers the window block the payload publishes (its truncation flag, the
+    delivered day count, and the request it fell short of). With no window block
+    to read, it falls back to the endpoint's own `data_status` value, which is
+    still a fact the payload declares rather than one invented here.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    for key in _WINDOW_BLOCK_KEYS:
+        block = data.get(key)
+        if not isinstance(block, Mapping):
+            continue
+        delivered = block.get("covered_days")
+        if delivered is None:
+            delivered = block.get("days")
+        if delivered is None:
+            delivered = block.get("observation_count")
+        requested = data.get("requested_window")
+        requested = requested if isinstance(requested, Mapping) else None
+        if requested is not None and delivered is not None:
+            span = _calendar_span_days(requested.get("start"), requested.get("end"))
+            if span is not None and int(delivered) < span:
+                flags = [
+                    name
+                    for name, value in block.items()
+                    if isinstance(value, bool) and value and "truncat" in name
+                ]
+                return (
+                    f"Only {int(delivered)} of the {span} requested days were "
+                    "measured"
+                    + (f" ({', '.join(flags)})" if flags else "")
+                    + ": the delivered window is shorter than the request, so the "
+                    "figures here describe the measured window only"
+                )
+        if block.get("truncated") is True and delivered is not None:
+            return (
+                f"The delivered history is truncated: {int(delivered)} day(s) "
+                "measured, flagged truncated by the endpoint, so this section's "
+                "statistics describe that window and not the requested one"
+            )
+    status = _normalize_data_status(data.get("data_status"))
+    if status in _DEGRADED_PAYLOAD_STATUSES:
+        return (
+            f"The endpoint published data_status {status!r} for this payload, so "
+            "its numbers come from a degraded result and not from a complete one"
+        )
+    return None
+
+
+def _calendar_span_days(start: Any, end: Any) -> Optional[int]:
+    """Inclusive calendar span of two ISO dates, or None when unreadable."""
+    first = _date_text(start)
+    last = _date_text(end)
+    if not first or not last:
+        return None
+    try:
+        return (date.fromisoformat(last) - date.fromisoformat(first)).days + 1
+    except ValueError:
+        return None
+
+
+def _degradation_warnings(
+    data: Any,
+    *,
+    status: str,
+    error: Optional[str],
+    omitted: Sequence[str],
+) -> List[str]:
+    """Sentences naming the degradation this section already computes.
+
+    Only ever called to fill an EMPTY warning list: a section that has already
+    said something has discharged the obligation, and appending a second generic
+    sentence to a disclosed section would be noise. Returns nothing when the
+    payload carries no degradation to name, so it can never manufacture one.
+    """
+    warnings: List[str] = []
+    if error:
+        warnings.append(
+            f"This section failed and publishes no measurement of it: {error}. "
+            "Nothing in this payload is a measurement of the requested quantity."
+        )
+    gate = _execution_gate_degradation(data)
+    if gate:
+        warnings.append(gate)
+    components = _component_degradations(data)
+    if components:
+        warnings.append(
+            "Composite component(s) that produced no measurement: "
+            + ", ".join(components)
+        )
+    if omitted:
+        warnings.append(
+            f"Summary compaction dropped {len(omitted)} field(s) from this "
+            f"section ({', '.join(omitted)}); the payload is the compacted view, "
+            "so request detail=full for the untrimmed one"
+        )
+    window = _window_degradation(data)
+    if window:
+        warnings.append(window)
+    if not warnings and status in _DEGRADED_PAYLOAD_STATUSES:
+        # Last resort, and still a fact rather than an invention: the section
+        # resolved to a degraded status and the payload names no specific
+        # shortfall to quote. Saying so beats shipping the status alone.
+        warnings.append(
+            f"This section is {status!r} and publishes no explanation of the "
+            "shortfall; treat its numbers as a degraded result"
+        )
+    return list(dict.fromkeys(warnings))
+
+
 def _component_as_of_entry(
     component: Any, declared_semantics: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
@@ -1589,6 +1847,31 @@ class PortfolioContextService:
             # historical measurement. Saying so beats implying an observation
             # precision the source never had.
             section_warnings.append(run_freshness)
+        if not section_warnings:
+            # ENV-016: a section that publishes a degradation must name it, and
+            # the obligation does not stop at this list being empty. Filled from
+            # the degradations this payload actually computed - a gate, an
+            # error, an omission, a component that produced nothing, a measured
+            # window shortfall - so no number anywhere has to change to comply.
+            section_warnings.extend(
+                _degradation_warnings(
+                    compact_data,
+                    status=resolved_status,
+                    error=error,
+                    omitted=omitted,
+                )
+            )
+        if resolved_as_of and not any(
+            token in str(warning).lower()
+            for warning in section_warnings
+            for token in _STALE_DISCLOSURE_TOKENS
+        ):
+            # A section that gained an `as_of` has to be readable as fresh or as
+            # old; publishing the date without its measured age is what leaves a
+            # consumer to guess. Derived from the export's own clock.
+            stale = _stale_as_of_warning(resolved_as_of)
+            if stale:
+                section_warnings.append(stale)
         section_warnings = list(dict.fromkeys(section_warnings))
         section = {
             "key": key,
@@ -1970,6 +2253,26 @@ class PortfolioContextService:
             else "available" if results and not failures and not coverage.get("missing_tickers")
             else "partial" if results else "unavailable"
         )
+        # DI-2: every scenario's loss is scaled by a MEASURED annualized
+        # volatility over that scenario's own delivered frame, so a -54% loss
+        # published with no date and no window cannot be aged. The composite is
+        # only as fresh as its stalest leg, so the section dates itself by the
+        # OLDEST scenario observation and names that rule in the semantics label
+        # - a newer leg must never make the section look fresher than the leg
+        # that produced the worst number in it.
+        scenario_dates = {
+            name: _date_text(scenario.get("latest_observation_date"))
+            for name, scenario in results.items()
+            if isinstance(scenario, Mapping)
+        }
+        measured = sorted({value for value in scenario_dates.values() if value})
+        if measured:
+            data["as_of"] = measured[0]
+            data["as_of_semantics"] = STRESS_AS_OF_SEMANTICS
+            data["scenario_observation_dates"] = {
+                name: value for name, value in sorted(scenario_dates.items()) if value
+            }
+            data["scenario_observation_date_basis"] = STRESS_AS_OF_BASIS
         return _Collected(
             data=data,
             inputs={"tickers": context.tickers, "scenarios": list(_STRESS_SCENARIOS)},
@@ -2254,6 +2557,7 @@ class PortfolioContextService:
             delivery_sigma_threshold=2.0,
             components=components,
         )
+        _drop_unmeasured_coverage_ratios(composite)
         return _Collected(
             data=composite,
             inputs={
@@ -2261,6 +2565,67 @@ class PortfolioContextService:
                 "component_inputs": composite["component_inputs"],
             },
             status=composite["data_status"],
+        )
+
+
+#: Count keys a coverage ratio is asserted over. Mirrors the audit's
+#: `COVERAGE_COUNT_KEYS`; asserted equal in the freshness test so the two lists
+#: cannot drift apart.
+COVERAGE_COUNT_KEYS = (
+    "covered_count",
+    "available_count",
+    "delivered_count",
+    "observed_count",
+    "measured_count",
+)
+
+
+def _iter_mappings(value: Any, path: str = "payload") -> Iterable[Tuple[str, Any]]:
+    """Every mutable mapping in a payload tree, paired with its path, in order.
+
+    Yields the live object, not a copy, so a caller can normalise in place. Only
+    plain dicts are yielded: a read-only mapping cannot be corrected by writing
+    to it, and pretending otherwise would hide the defect.
+    """
+    if isinstance(value, dict):
+        yield path, value
+        for key, item in value.items():
+            yield from _iter_mappings(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _iter_mappings(item, f"{path}[{index}]")
+
+
+def _drop_unmeasured_coverage_ratios(payload: Any) -> None:
+    """A ratio asserted over a count that was never taken is a fabricated number.
+
+    `0` is a measurement: it says zero of fourteen symbols had usable delivery
+    history. `null` is an absence: it says the count was never taken because no
+    bhavcopy delivery history was ingested. Shipping the first beside the second
+    - which is what the india-flows component coverage did for
+    `delivery_anomalies` - hands a consumer multiplying a ratio by a universe a
+    confident `0` instead of "unknown", and the sibling `institutional_flows`
+    block already gets this right by publishing no ratio at all.
+
+    The count is never invented: where it is null the ratio is dropped and the
+    reason is recorded, so the honest absence survives the edit. Where a real
+    count is present the ratio stands, because that is the measurement it
+    describes.
+    """
+    for _path, node in _iter_mappings(payload, "payload"):
+        ratio = node.get("coverage_ratio")
+        if not (isinstance(ratio, (int, float)) and math.isfinite(ratio)):
+            continue
+        nulls = [key for key in COVERAGE_COUNT_KEYS if key in node and node[key] is None]
+        if not nulls:
+            continue
+        node["coverage_ratio"] = None
+        node["coverage_ratio_status"] = "unavailable"
+        node["coverage_ratio_unavailable_reason"] = (
+            "coverage_ratio is not published because "
+            + ", ".join(sorted(nulls))
+            + " is null: the coverage count was never taken, so a ratio over it "
+            "would be a measurement of nothing"
         )
 
 
@@ -2337,8 +2702,48 @@ def _compact_detail(key: str, data: Any, detail: str) -> Tuple[Any, List[str]]:
             if isinstance(values, list) and len(values) > 30:
                 flows["data"]["flows"] = values[-30:]
                 omitted.append("components.institutional_flows.flows")
+    elif key == "portfolio" and isinstance(compact, dict):
+        # DI-5: `omitted_fields` is read as "nothing was dropped from this
+        # section", and for `portfolio` that read is wrong in a second way: the
+        # ledger is a COMPACTION ledger, so it stayed `[]` while the endpoint
+        # never produced the book-level aggregates a reader needs to reconcile
+        # `total_value` at all. Compaction is not the only way a field goes
+        # missing, so the absent aggregates are named here with the reason,
+        # rather than leaving an empty list to imply the ledger is complete.
+        # Book level means the payload's own top level: `total_cost` exists on
+        # every position row, and that per-leg figure is exactly what is NOT the
+        # book-level total the section is missing.
+        absent = [
+            name for name in PORTFOLIO_AGGREGATES_NOT_PRODUCED if name not in compact
+        ]
+        if absent:
+            compact["aggregates_not_produced"] = {
+                "fields": sorted(absent),
+                "reason": PORTFOLIO_AGGREGATES_ABSENT_REASON,
+            }
+            omitted.extend(sorted(absent))
 
     return compact, sorted(set(omitted))
+
+
+#: Book-level aggregates the portfolio endpoint does not compute. Named here
+#: because the export is what promises a reader that `omitted_fields` is a
+#: complete account of what is not in the payload.
+PORTFOLIO_AGGREGATES_NOT_PRODUCED = (
+    "total_cost",
+    "total_pnl",
+    "day_change",
+    "previous_close",
+)
+
+PORTFOLIO_AGGREGATES_ABSENT_REASON = (
+    "The portfolio endpoint publishes per-position cost, P&L and market value "
+    "but no previous close, so it cannot produce a book-level day change, and it "
+    "publishes no book-level cost or unrealized-P&L total. These are absent from "
+    "the endpoint, not dropped by compaction; a reader who needs them must sum "
+    "the per-position rows, and cannot derive day_change at all because no "
+    "previous_close is published."
+)
 
 
 def render_markdown(payload: Mapping[str, Any]) -> str:

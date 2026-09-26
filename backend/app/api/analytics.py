@@ -2367,6 +2367,123 @@ def _exposure_projection(
     }
 
 
+#: Per-trade ``status`` values that assert the record can be placed as an order.
+#: Mirrors the audit rule that reconciles a record against its section's gate.
+EXECUTABLE_TRADE_STATUSES = frozenset(
+    {"executable", "execute", "ready", "actionable", "tradable", "tradeable"}
+)
+
+#: The status a record carries when the SECTION refuses the target. It is not one
+#: of the executable literals above, so nothing in the export can read it as
+#: permission, and the engine's own per-leg verdict is preserved beside it.
+BLOCKED_BY_SECTION_GATE_STATUS = "blocked_by_section_execution_gate"
+
+TRADE_GATE_RECONCILIATION_RULE = (
+    "A per-trade status is the ENGINE's verdict on that leg alone: whether the "
+    "notional buys a whole share at the sizing price. It is not permission to "
+    "trade, because the target as a whole is gated by execution.execution_eligible. "
+    "Where that gate is false, every leg's executable status is restated as "
+    f"{BLOCKED_BY_SECTION_GATE_STATUS!r} with the engine's own reading kept in "
+    "leg_status, and the record carries the gate itself, so a consumer iterating "
+    "trades[] cannot collect 13 order instructions from a target the section says "
+    "is not a normal rebalance."
+)
+
+
+def _reconcile_trade_status_with_gate(
+    trades: Any, execution: Optional[Mapping[str, Any]]
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Restate per-trade executability against the section's own execution gate.
+
+    The engine labels a leg `executable` from the leg's own arithmetic, with no
+    access to what the shared normalization rule decided about the target those
+    legs add up to. So a target that requires financing publishes a gate saying
+    so at section level and an instruction set that never mentions it, and the
+    instruction set is the thing a consumer iterating `trades[]` reads.
+
+    Nothing is recomputed and nothing is dropped: the engine's verdict moves to
+    `leg_status`, the section's gate moves onto the record, and `status` becomes
+    the gated literal. A leg that was never executable (`below_minimum_notional`,
+    `immaterial_no_op`, `no_trade_required`, `unavailable`) keeps its own status,
+    which never claimed permission in the first place - the gate still rides
+    along on it.
+    """
+    if not isinstance(trades, Mapping):
+        return {}, None
+    eligible = None
+    block_reason = None
+    if isinstance(execution, Mapping):
+        eligible = execution.get("execution_eligible")
+        block_reason = execution.get("block_reason")
+    if eligible is not False:
+        return dict(trades), None
+    reason = block_reason if isinstance(block_reason, str) and block_reason.strip() else None
+    reconciled: Dict[str, Any] = {}
+    restated: List[str] = []
+    for ticker, record in trades.items():
+        if not isinstance(record, Mapping):
+            reconciled[ticker] = record
+            continue
+        entry = dict(record)
+        status = entry.get("status")
+        if isinstance(status, str) and status.strip().lower() in EXECUTABLE_TRADE_STATUSES:
+            entry["leg_status"] = status
+            entry["status"] = BLOCKED_BY_SECTION_GATE_STATUS
+            restated.append(str(ticker))
+        entry["execution_eligible"] = False
+        entry["section_gate_reason"] = reason
+        reconciled[ticker] = entry
+    disclosure = None
+    if restated:
+        disclosure = {
+            "restated_trade_tickers": sorted(restated),
+            "restated_trade_count": len(restated),
+            "gate_source": "execution.execution_eligible",
+            "block_reason": reason,
+            "rule": TRADE_GATE_RECONCILIATION_RULE,
+        }
+    return reconciled, disclosure
+
+
+def _execution_gate_warning(execution: Mapping[str, Any]) -> Optional[str]:
+    """The section-level sentence for a target the shared rule refuses.
+
+    Derived from the block the route already published: the reasons, the
+    measured gross exposure and the financing requirement. A section that names
+    its own gate in prose while its records read as orders is the defect this
+    closes, so the sentence travels with the response rather than only with the
+    exporter.
+    """
+    reasons = [
+        str(reason)
+        for reason in (execution.get("block_reasons") or [])
+        if isinstance(reason, str) and reason.strip()
+    ]
+    block_reason = execution.get("block_reason")
+    detail = (
+        block_reason.strip()
+        if isinstance(block_reason, str) and block_reason.strip()
+        else "; ".join(reasons)
+    )
+    if not detail:
+        return None
+    financing = execution.get("financing_requirement")
+    currency = execution.get("financing_requirement_currency")
+    financing_text = ""
+    if isinstance(financing, (int, float)) and math.isfinite(float(financing)) and float(financing) > 0:
+        financing_text = (
+            f" Financing of {float(financing):,.2f}"
+            f"{f' {currency}' if isinstance(currency, str) and currency.strip() else ''}"
+            " is required before any leg of it can be placed."
+        )
+    return (
+        f"This target is not executable as published: {detail}. Every "
+        "trades[*] record inherits that gate, so the list is a financing-dependent "
+        "target rather than an order set."
+        f"{financing_text}"
+    )
+
+
 # The rebalance workflow publishes this exact block for a submitted target; the
 # optimizer publishes the same shape for the weights its solver produced, so one
 # rule string describes both. Solver weights are published rounded to six
@@ -3514,6 +3631,26 @@ async def get_factor_exposure(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+#: What the concentration cross-section is measured over, and therefore why it
+#: carries no `as_of`. Every number on this route is a function of ONE set of
+#: market-value weights read from the live position rows, so the only clock the
+#: inputs carry is the moment the quote was written. A refresh instant is not an
+#: observation date, and the delivered daily bars this route never reads cannot
+#: stand in for one.
+CONCENTRATION_VALUATION_BASIS = (
+    "cross_section_of_live_quoted_market_value_weights_normalized_to_100_percent"
+)
+
+CONCENTRATION_NO_VALUATION_DATE_WARNING = (
+    "No valuation date: concentration is a cross-section of live-quoted "
+    "market-value weights, and a quote publishes the instant it was refreshed "
+    "rather than an observation date, so these concentration indices have no "
+    "as_of to report. The daily close series the other analytics sections date "
+    "themselves by was not read here; a reader who needs a dated book must read "
+    "that series rather than treat this snapshot's clock as one."
+)
+
+
 @router.get("/concentration")
 async def get_concentration_metrics(
     db: AsyncSession = Depends(get_db_session),
@@ -3609,6 +3746,22 @@ async def get_concentration_metrics(
             ),
             "universe_coverage": coverage,
             "data_status": _data_status(coverage),
+            # DI-2: these are cross-section statistics of a live-quoted book, and
+            # a live quote carries a REFRESH instant, not an observation date, so
+            # there is no real valuation date to publish. `as_of` stays null and
+            # the reason is named, rather than borrowing a date from a price
+            # series this payload never read. Stating the basis next to the
+            # numbers is what lets a reader age the section themselves.
+            "as_of": None,
+            "as_of_semantics": None,
+            "valuation_basis": CONCENTRATION_VALUATION_BASIS,
+            "valuation_date_status": "unavailable",
+            "valuation_date_unavailable_reason": (
+                "concentration_is_a_cross_section_of_live_quoted_market_value_"
+                "weights_and_a_quote_carries_a_refresh_instant_not_an_observation_"
+                "date"
+            ),
+            "warnings": [CONCENTRATION_NO_VALUATION_DATE_WARNING],
             "methodology": "Concentration analysis using Herfindahl-Hirschman Index (HHI), Effective Positions (N_eff), and Lorenz Gini Coefficient"
         }
         
@@ -3712,6 +3865,22 @@ async def get_liquidity_metrics(
                     None,
                 )
                 vol_col = 'Volume' if 'Volume' in df.columns else ('volume' if 'volume' in df.columns else None)
+                # A fresh yfinance fetch carries `date` as a COLUMN over an
+                # integer row index. Read it off the DELIVERED frame, before the
+                # price/volume projection below drops every column but the two
+                # the engine needs: projected first, the only dated evidence is
+                # gone and the frame keeps a positional RangeIndex, so every
+                # delivered-window date and the section's `latest_observation_date`
+                # come back null over ~20 real bars per leg. Promoted here, the
+                # engine still sees the Close/Volume frame it expects and the
+                # reported window describes observations rather than row numbers.
+                # Never synthesise dates from a positional index.
+                date_col = next((c for c in ("date", "Date") if c in df.columns), None)
+                dated = (
+                    pd.to_datetime(df[date_col], errors="coerce")
+                    if date_col is not None
+                    else None
+                )
                 if vol_col and price_col in df.columns:
                     frame = df[[price_col, vol_col]].rename(columns={vol_col: 'Volume', price_col: 'Close'})
                 elif price_col in df.columns:
@@ -3719,17 +3888,7 @@ async def get_liquidity_metrics(
                 else:
                     frame = None
                 if frame is not None:
-                    # A fresh yfinance fetch carries `date` as a COLUMN over an
-                    # integer row index, so slicing the frame keeps a RangeIndex
-                    # and every delivered-window date comes out null. Promote the
-                    # real date column to the index so the liquidity engine still
-                    # sees the Close/Volume frame it expects, while the reported
-                    # observation window describes actual observations rather than
-                    # row numbers. Never synthesise dates from a positional index.
-                    date_col = next((c for c in ("date", "Date") if c in frame.columns), None)
-                    if date_col is not None:
-                        dated = pd.to_datetime(frame[date_col], errors="coerce")
-                        frame = frame.drop(columns=[date_col])
+                    if dated is not None:
                         keep = ~dated.isna()
                         frame = frame[keep.to_numpy()]
                         frame.index = pd.DatetimeIndex(dated[keep.to_numpy()], name=frame.index.name)
@@ -3935,6 +4094,36 @@ async def run_stress_test(
             ticker_list, price_data_dict.keys(), active=_active_weight_tickers(weights)
         )
         stress_result["data_status"] = _data_status(stress_result["universe_coverage"])
+        # The `volatility_adjustment.factor` every shock was scaled by is a
+        # MEASURED annualized volatility over this frame, so a scenario loss
+        # published without the window it was measured over cannot be aged by a
+        # reader. The window is measured from the delivered frame, not from the
+        # 756-day request: a short delivery says so instead of borrowing the
+        # requested end as evidence.
+        measured_window = _history_window(
+            start, end, price_data.pct_change(fill_method=None).iloc[1:],
+            price_frame=price_data,
+        )
+        adjustment = (
+            (stress_result.get("shock_inputs") or {}).get("volatility_adjustment")
+            if isinstance(stress_result.get("shock_inputs"), Mapping)
+            else None
+        )
+        adjustment = adjustment if isinstance(adjustment, Mapping) else {}
+        stress_result["measurement_window"] = measured_window
+        stress_result["latest_observation_date"] = _latest_observation_date(price_data)
+        stress_result["volatility_adjustment_window"] = {
+            "basis": "measured_annualized_volatility_over_this_frame",
+            "min_observations": adjustment.get("min_observations"),
+            "annualization_trading_days": adjustment.get("annualization_trading_days"),
+            "window": measured_window,
+            "note": (
+                "The per-ticker factors in "
+                "shock_inputs.volatility_adjustment.by_ticker were measured over "
+                "this window, not over the requested one, so every scenario loss "
+                "in this payload is only as old as the newest bar in it."
+            ),
+        }
         return stress_result
         
     except HTTPException:
@@ -4282,6 +4471,21 @@ async def get_volatility_sizing(
             execution = dict(execution)
             response["execution"] = execution
             response["exposure"] = _exposure_projection(execution, response)
+            # The gate and the records it governs are published together. A
+            # consumer that iterates `trades[]` - the natural way to read a
+            # sizing section - must not be able to collect order instructions
+            # from a target this response says is not a normal rebalance.
+            response["trades"], gate_disclosure = _reconcile_trade_status_with_gate(
+                response.get("trades"), execution
+            )
+            if gate_disclosure is not None:
+                response["trade_gate_reconciliation"] = gate_disclosure
+            gate_warning = _execution_gate_warning(execution)
+            if gate_warning:
+                response["warnings"] = [
+                    *(response.get("warnings") or []),
+                    gate_warning,
+                ]
         return response
         
     except HTTPException:
