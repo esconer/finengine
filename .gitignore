@@ -91,3 +91,9 @@ backups/
 .scratch/frontend-audit/evidence/
 .scratch/frontend-audit/shots/
 
+# `app.debugging.context_audit generate` default output dir. Every file here is a
+# raw AI-context export: live tickers, quantities, cost basis, P&L. The audit
+# SCRIPT is committed; the artifacts it writes never are.
+/.audit-exports/
+.audit-exports/
+
