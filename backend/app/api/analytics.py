@@ -6077,6 +6077,12 @@ async def run_optimization(
             risk_free_rate=rf,
             views=views,
             relative_views=relative_views,
+            # The incumbent book, scored on the SAME mu, cov, order, sample and
+            # risk-free rate the recommendation is built from. Without this the
+            # payload cannot answer the only question a reader has -- is this
+            # better than what I already hold? -- because the recommended Sharpe
+            # and the portfolio's own Sharpe were never on a common basis.
+            current_weights=current_weights,
         )
 
         recommended = result["weights"]

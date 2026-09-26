@@ -18,9 +18,21 @@ Strategies
 - min_vol    : global minimum variance (long-only, fully invested)
 - max_sharpe : tangency portfolio via the standard homogenization trick
 - min_cvar   : Rockafellar-Uryasev scenario LP at 95%
+
+The ordering invariant (PA-1)
+-----------------------------
+`mu`, `cov` and the weight vector are ALWAYS in `returns.columns` order.
+`_as_matrices` establishes that order once, `_weight_vector` is the single
+funnel that puts every solver's output into it, and `_moments` is the only
+producer of the `expected_annual_*` triple. So the published moments are, by
+construction, the moments of the published weights. HRP previously broke this:
+it returned its Series in scipy-linkage leaf order, `optimize()` rebound only
+`assets` to that order, and `mu @ w_vec` became a dot product of two
+differently-ordered vectors - a Sharpe that could come out with the opposite
+sign. Nothing downstream may reintroduce a positionally-aligned product.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import cvxpy as cp
 import numpy as np
@@ -34,13 +46,245 @@ logger = setup_logger(__name__)
 
 STRATEGIES = ("hrp", "min_vol", "max_sharpe", "min_cvar", "black_litterman")
 TRADING_DAYS = 252
+WEIGHT_DECIMALS = 6
+MOMENT_DECIMALS = 4
+
+#: What each strategy actually optimises (PA-2). `hrp` clusters and allocates
+#: by inverse cluster variance and never reads mu at all, so a Sharpe printed
+#: beside its weights describes the solution - it is not the quantity the
+#: solver maximised. Only the two tangency solvers may claim Sharpe.
+STRATEGY_OBJECTIVES = {
+    "hrp": "hierarchical risk parity (recursive bisection on cluster variance; mu is not used by the allocation)",
+    "min_vol": "minimum portfolio variance",
+    "max_sharpe": "maximum Sharpe (tangency portfolio)",
+    "min_cvar": "minimum conditional value at risk at the requested beta",
+    "black_litterman": "maximum Sharpe of the Black-Litterman posterior",
+}
+SHARPE_OBJECTIVE_STRATEGIES = frozenset({"max_sharpe", "black_litterman"})
+
+#: The published moment triple, in publication order.
+MOMENT_KEYS = (
+    "expected_annual_return",
+    "expected_annual_volatility",
+    "expected_sharpe",
+)
 
 
-def _as_matrices(returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(mu_annual, cov_annual, assets) aligned to returns.columns order."""
+def _as_matrices(returns: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """(mu_annual, cov_annual, assets) aligned to returns.columns order.
+
+    PA-1: this is the single place the order is established. Every weight
+    vector that is ever dot-multiplied against `mu`/`cov` comes back through
+    `_weight_vector` in exactly this order.
+    """
     mu = returns.mean().values * TRADING_DAYS
     cov = returns.cov().values * TRADING_DAYS
     return mu, cov, list(returns.columns)
+
+
+def _weight_vector(weights: pd.Series, assets: list[str]) -> np.ndarray:
+    """Reindex a solver's weights into `assets` (= returns.columns) order.
+
+    PA-1: the single funnel. `hrp` comes back keyed in scipy-linkage LEAF
+    order, which is not the column order; every other solver returns a bare
+    array already in column order. Funnelling once, here, with a universe
+    check that fails loudly on a solver that returned somebody else's tickers,
+    is what stops `mu @ w` from becoming a dot product of two orders.
+    """
+    if len(weights) != len(assets) or set(weights.index) != set(assets):
+        raise ValueError(
+            "solver returned weights for a different universe than the sample: "
+            f"{len(weights)} legs vs {len(assets)} assets"
+        )
+    return weights.reindex(assets).to_numpy(dtype=float)
+
+
+def _moments(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    w: np.ndarray,
+    risk_free_rate: float,
+) -> Dict[str, Optional[float]]:
+    """mu'w, sqrt(w' Sigma w) and their Sharpe, in ONE order (PA-1).
+
+    The only producer of the `expected_annual_*` triple. `w` must already be
+    in `mu`/`cov` order (see `_weight_vector`); the shape guard below is the
+    cheap check against a transposed covariance. A quantity that cannot be
+    computed is None with a reason - never a substitute number.
+    """
+    if w.shape != (mu.shape[0],) or cov.shape != (mu.shape[0], mu.shape[0]):
+        raise ValueError(
+            "moment inputs disagree in shape: "
+            f"mu={mu.shape}, cov={cov.shape}, w={w.shape}"
+        )
+    exp_ret = float(mu @ w)
+    variance = float(w @ cov @ w)
+    if not np.isfinite(exp_ret) or not np.isfinite(variance):
+        return {
+            "expected_annual_return": None,
+            "expected_annual_volatility": None,
+            "expected_sharpe": None,
+            "unavailable_reason": "mu or covariance contains non-finite values",
+        }
+    if variance < 0.0:
+        # Reachable only from a non-PSD covariance estimate. A negative
+        # variance has no square root; it is not reported as zero volatility.
+        return {
+            "expected_annual_return": exp_ret,
+            "expected_annual_volatility": None,
+            "expected_sharpe": None,
+            "unavailable_reason": (
+                f"portfolio variance is negative ({variance:.6e}); the covariance "
+                "estimate is not positive semi-definite"
+            ),
+        }
+    exp_vol = float(np.sqrt(variance))
+    return {
+        "expected_annual_return": exp_ret,
+        "expected_annual_volatility": exp_vol,
+        "expected_sharpe": (exp_ret - risk_free_rate) / exp_vol if exp_vol > 0.0 else None,
+        "unavailable_reason": None if exp_vol > 0.0 else "portfolio volatility is zero, so Sharpe is undefined",
+    }
+
+
+def _round_or_none(value: Optional[float], decimals: int) -> Optional[float]:
+    return None if value is None else round(float(value), decimals)
+
+
+def _objective_block(strategy: str) -> Dict[str, Any]:
+    """State what the strategy optimised, so `expected_sharpe` cannot read as
+    'this Sharpe was maximised' when it was not (PA-2)."""
+    is_sharpe_objective = strategy in SHARPE_OBJECTIVE_STRATEGIES
+    return {
+        "what_was_optimised": STRATEGY_OBJECTIVES[strategy],
+        "expected_sharpe_was_the_optimised_objective": is_sharpe_objective,
+        "expected_sharpe_basis": (
+            "expected_sharpe is the objective this strategy maximised, subject to "
+            "the long-only fully-invested constraint."
+            if is_sharpe_objective
+            else (
+                f"{strategy} optimises {STRATEGY_OBJECTIVES[strategy]}, so "
+                "expected_sharpe is DESCRIPTIVE of the weights this record "
+                "publishes - it is not the quantity that was maximised, and a "
+                "higher expected_sharpe alone would not make this solution "
+                "better. Compare it against current_portfolio.expected_sharpe, "
+                "which is scored on the same mu, cov and sample."
+            )
+        ),
+    }
+
+
+def _moments_basis_block(
+    returns: pd.DataFrame,
+    risk_free_rate: float,
+    moments: Dict[str, Optional[float]],
+) -> Dict[str, Any]:
+    """Publish the recipe behind `expected_annual_*` (PA-1)."""
+    return {
+        "order": "returns_column_order",
+        "order_invariant": (
+            "mu, cov and the weight vector share returns.columns order by "
+            "construction, so expected_annual_return == mu_annual @ w and "
+            "expected_annual_volatility == sqrt(w @ cov_annual @ w) for the "
+            "exact weights published in this record."
+        ),
+        "formulas": {
+            "expected_annual_return": "mu_annual @ w, mu_annual = mean(daily return) * 252",
+            "expected_annual_volatility": "sqrt(w @ cov_annual @ w), cov_annual = cov(daily return) * 252",
+            "expected_sharpe": "(expected_annual_return - risk_free_rate) / expected_annual_volatility",
+        },
+        "annualization_factor": TRADING_DAYS,
+        "risk_free_rate": risk_free_rate,
+        "return_observations": int(len(returns)),
+        "display_rounding": {
+            "weights_decimals": WEIGHT_DECIMALS,
+            "moment_decimals": MOMENT_DECIMALS,
+            "note": (
+                "A reader recomputing from the published 6-decimal weights lands "
+                "within 5e-7 * len(universe) of the internally computed moment, "
+                "which is orders of magnitude below the 4-decimal display step "
+                "except within one display step of a rounding boundary."
+            ),
+        },
+        "unavailable_reason": moments["unavailable_reason"],
+    }
+
+
+def _current_portfolio_block(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    assets: list[str],
+    recommended: Dict[str, Optional[float]],
+    current_weights: Optional[Mapping[str, float]],
+    risk_free_rate: float,
+) -> Dict[str, Any]:
+    """Score the incumbent book on the SAME mu, cov, order and sample (PA-2).
+
+    Without this, "is the recommendation better than what I hold?" cannot be
+    answered from the payload - every other Sharpe in the export sits on a
+    different window. `current_weights` is the published book; it is used as
+    given and never renormalised, so a cash or off-universe leg shows up in
+    `tickers_without_sample` and in `published_weight_total` rather than
+    being silently absorbed into the scored vector.
+    """
+    if current_weights is None:
+        return {
+            "available": False,
+            "unavailable_reason": (
+                "no current weights were supplied to the optimizer, so the "
+                "incumbent book cannot be scored on this sample"
+            ),
+        }
+    try:
+        w = pd.Series(
+            {a: float(current_weights.get(a, 0.0)) for a in assets}, dtype=float
+        )
+    except (TypeError, ValueError):
+        return {
+            "available": False,
+            "unavailable_reason": "current weights are not numeric",
+        }
+    if not bool(np.isfinite(w.to_numpy()).all()) or float(w.sum()) <= 0.0:
+        return {
+            "available": False,
+            "unavailable_reason": (
+                "current weights contain non-finite values or carry no positive "
+                "gross exposure, so their moments are undefined"
+            ),
+        }
+
+    current = _moments(mu, cov, w.to_numpy(), risk_free_rate)
+    return {
+        "available": True,
+        "expected_annual_return": _round_or_none(current["expected_annual_return"], MOMENT_DECIMALS),
+        "expected_annual_volatility": _round_or_none(current["expected_annual_volatility"], MOMENT_DECIMALS),
+        "expected_sharpe": _round_or_none(current["expected_sharpe"], MOMENT_DECIMALS),
+        # The comparison PA-2 exists for. Both levels are computed from the same
+        # mu, cov, order, sample and risk-free rate, so the difference is a
+        # difference of like with like rather than two unrelated windows.
+        "recommended_minus_current": {
+            key: (
+                None
+                if recommended[key] is None or current[key] is None
+                else round(float(recommended[key] - current[key]), MOMENT_DECIMALS)
+            )
+            for key in MOMENT_KEYS
+        },
+        "published_weight_total": round(float(w.sum()), WEIGHT_DECIMALS),
+        "tickers_without_sample": sorted(set(current_weights) - set(assets)),
+        "same_sample": True,
+        "basis": (
+            "identical mu_annual, cov_annual, column order, annualization factor "
+            "and risk_free_rate as the recommended moments in this record, over "
+            "the same return observations; the weights are the published current "
+            "weights, used as given and NOT renormalised"
+        ),
+        "note": (
+            "Cash and legs outside the sampled universe are not credited: they "
+            "appear in published_weight_total and tickers_without_sample instead. "
+            "Compare recommended_minus_current, not the two levels in isolation."
+        ),
+    }
 
 
 def _solve(prob: cp.Problem) -> None:
@@ -290,41 +534,63 @@ def optimize(
     views: Optional[Dict[str, float]] = None,
     relative_views: Optional[list[dict[str, Any]]] = None,
     beta: float = 0.95,
+    current_weights: Optional[Mapping[str, float]] = None,
 ) -> Dict[str, Any]:
     """Run one strategy over a wide returns frame.
 
     Returns weights (normalized, long-only) plus ex-post diagnostics.
     Raises ValueError for unknown strategies or solver failures.
+
+    PA-1: `assets` is never rebound. Every solver's output is funnelled through
+    `_weight_vector` into `returns.columns` order, and the moments are then
+    computed from that one vector, so the published moments are the moments of
+    the published weights.
+
+    PA-2: pass `current_weights` (the published book) to also score the
+    incumbent on the SAME mu, cov and sample. Without it `current_portfolio` is
+    `available: false` with a reason, because a Sharpe printed beside a
+    recommendation with nothing to compare it against is not actionable.
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy '{strategy}'. Choose from {list(STRATEGIES)}")
 
     mu, cov, assets = _as_matrices(returns)
     if strategy == "hrp":
-        weights_series = _hrp_weights(returns)
-        assets = list(weights_series.index)
-        w_vec = weights_series.values
+        # Keyed in scipy-linkage leaf order - deliberately NOT assumed to be
+        # the column order. `_weight_vector` is what aligns it.
+        solved: pd.Series = _hrp_weights(returns)
     else:
         if strategy == "min_vol":
-            w_vec = _min_vol(cov)
+            solved = pd.Series(_min_vol(cov), index=assets)
         elif strategy == "max_sharpe":
-            w_vec = _max_sharpe(mu, cov, risk_free_rate)
+            solved = pd.Series(_max_sharpe(mu, cov, risk_free_rate), index=assets)
         elif strategy == "black_litterman":
-            w_vec = _black_litterman(returns, views=views, relative_views=relative_views, risk_free_rate=risk_free_rate)
+            solved = pd.Series(
+                _black_litterman(returns, views=views, relative_views=relative_views, risk_free_rate=risk_free_rate),
+                index=assets,
+            )
         else:
-            w_vec = _min_cvar(returns, beta=beta)
+            solved = pd.Series(_min_cvar(returns, beta=beta), index=assets)
 
+    w_vec = _weight_vector(solved, assets)
     w_vec = np.clip(w_vec, 0.0, None)
-    w_vec = w_vec / w_vec.sum()
+    gross = float(w_vec.sum())
+    if not np.isfinite(gross) or gross <= 0.0:
+        raise ValueError(f"{strategy} produced no positive gross exposure to normalize")
+    w_vec = w_vec / gross
 
-    exp_ret = float(mu @ w_vec)
-    exp_vol = float(np.sqrt(max(0.0, w_vec @ cov @ w_vec)))
+    moments = _moments(mu, cov, w_vec, risk_free_rate)
 
     return {
         "strategy": strategy,
-        "weights": {a: round(float(x), 6) for a, x in zip(assets, w_vec)},
-        "expected_annual_return": round(exp_ret, 4),
-        "expected_annual_volatility": round(exp_vol, 4),
-        "expected_sharpe": round((exp_ret - risk_free_rate) / exp_vol, 4) if exp_vol > 0 else None,
+        "weights": {a: round(float(x), WEIGHT_DECIMALS) for a, x in zip(assets, w_vec)},
+        "expected_annual_return": _round_or_none(moments["expected_annual_return"], MOMENT_DECIMALS),
+        "expected_annual_volatility": _round_or_none(moments["expected_annual_volatility"], MOMENT_DECIMALS),
+        "expected_sharpe": _round_or_none(moments["expected_sharpe"], MOMENT_DECIMALS),
         "solver": "cvxpy/clarabel" if strategy != "hrp" else "hierarchical-bisection",
+        "objective": _objective_block(strategy),
+        "moments_basis": _moments_basis_block(returns, risk_free_rate, moments),
+        "current_portfolio": _current_portfolio_block(
+            mu, cov, assets, moments, current_weights, risk_free_rate
+        ),
     }
