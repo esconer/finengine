@@ -22,6 +22,7 @@ No DB, no network: seeded price frames plus the real `CointegrationService`
 """
 
 import json
+from typing import List, Optional
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -477,12 +478,14 @@ class TestPreservedInvariants:
         result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
         assert isinstance(result, CointScannerResponse)
         assert isinstance(result.pairs[0], CointPairResult)
-        # The foundation-owned schema is untouched: the disclosures ride on an
-        # `extra="allow"` subclass, not on new declared fields.
-        assert "currency" not in CointScannerResponse.model_fields
-        assert "currency_provenance" not in CointScannerResponse.model_fields
-        assert "currency_basis" not in CointScannerResponse.model_fields
-        assert "warnings" not in CointScannerResponse.model_fields
+        # D-07: the disclosures are DECLARED on the foundation-owned schema, not
+        # smuggled in as `extra="allow"` extras. FastAPI re-serializes a route
+        # response against the declared `response_model`, so a field only the
+        # route adds at runtime is dropped from the HTTP wire even though the
+        # in-process exporter can see it: the AI path was audited and the direct
+        # API path was not. Declaring them is what makes the two agree.
+        for name in ("currency", "currency_provenance", "currency_basis", "warnings"):
+            assert name in CointScannerResponse.model_fields
         assert set(CointScannerResponse.model_fields).issuperset(
             {
                 "as_of",
@@ -495,6 +498,13 @@ class TestPreservedInvariants:
                 "shallow_tickers",
             }
         )
+        # Every declared field keeps its own type, default and validation.
+        fields = CointScannerResponse.model_fields
+        for name in ("currency", "currency_provenance", "currency_basis"):
+            assert fields[name].annotation is Optional[str]
+            assert fields[name].default is None
+        assert fields["warnings"].annotation == List[str]
+        assert fields["warnings"].get_default(call_default_factory=True) == []
 
     async def test_cached_pair_rows_still_load_from_the_unchanged_pair_schema(self):
         """`CointPairResult(**cached_row)` must keep working unchanged."""

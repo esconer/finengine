@@ -148,6 +148,15 @@ STRESS_VOL_MIN_OBSERVATIONS = 20
 STRESS_DRAWDOWN_UPLIFT = 1.15
 STRESS_CONFIDENCE_LABEL = 0.95
 
+#: Risk points, on the 0-30 sub-score scale, per unit of measured average
+#: pairwise correlation. The sub-score is `min(30, POINTS * max(0, avg_corr))`.
+#: There is deliberately no "free" correlation baseline: the previous form,
+#: `clip((avg_corr - 0.3) * 50, 0, 30)`, mapped every measured average
+#: correlation at or below 0.3 onto exactly 0, which is the same value an
+#: UNMEASURED leg publishes, so a real measurement shipped as an
+#: indistinguishable hard zero and dragged `overall_score` down (D-04).
+RISK_CORRELATION_POINTS_PER_UNIT = 50.0
+
 
 def _liquidity_band(published_score: float) -> tuple[str, str]:
     """Band label and liquidation window for an ALREADY-ROUNDED published score."""
@@ -1146,6 +1155,12 @@ class AnalyticsEngine:
             
             # Calculate component scores (0-30 scale, higher is riskier)
             scores = {}
+            # A leg that could not be measured is listed here, and the weight
+            # below is dropped + the rest renormalized. `excluded` and
+            # `scores[...] is None` are kept in agreement deliberately: a null
+            # sub-score that was still counted would be a fabricated 0.
+            excluded: list[str] = []
+            excluded_reasons: dict[str, str] = {}
             
             # Concentration risk (20% weight in overall score)
             concentration_result = await self.concentration_analysis(weights)
@@ -1158,19 +1173,45 @@ class AnalyticsEngine:
             scores['volatility'] = volatility_score
             
             # Correlation risk (20% weight)
+            #
+            # The sub-score is RISK POINTS on a 0-30 scale, so 0 has to mean one
+            # thing only: "this leg was not measured". The old expression,
+            # `clip((avg - 0.3) * 50, 0, 30)`, collapsed into that same 0 for
+            # every measured average correlation at or below the 0.3 baseline,
+            # and a one-asset book - which has no cross-asset correlation at all
+            # - published 0 as well. Both looked identical to a real reading and
+            # both pulled `overall_score` down, while Risk Studio measured
+            # 0.1404 over its own window. So: measure the average, publish the
+            # measurement, score the measurement, and null + exclude the leg
+            # when there is nothing to measure.
+            avg_correlation: Optional[float] = None
             if len(returns.columns) > 1:
-                corr_values = returns.corr().values
-                avg_correlation = corr_values[np.triu_indices_from(corr_values, k=1)].mean()
-                correlation_score = min(30, max(0, (avg_correlation - 0.3) * 50))  # High correlation = high risk
+                corr_values = returns.corr().to_numpy(dtype=float)
+                upper_triangle = corr_values[np.triu_indices_from(corr_values, k=1)]
+                finite_pairs = upper_triangle[np.isfinite(upper_triangle)]
+                if finite_pairs.size:
+                    avg_correlation = float(finite_pairs.mean())
+            if avg_correlation is None:
+                correlation_score = None
+                excluded.append('correlation')
+                excluded_reasons['correlation'] = (
+                    "fewer than two return series, or no finite pairwise "
+                    "correlation to measure"
+                )
             else:
-                avg_correlation = 0.0
-                correlation_score = 0
+                # Risk points per unit of measured average pairwise correlation.
+                # The slope and the 30-point cap are unchanged; only the
+                # collapsing `max(0, . - 0.3)` floor is gone, so a book that
+                # measures positively-correlated still contributes to the score
+                # instead of reading as an unmeasured leg.
+                correlation_score = min(
+                    30.0, max(0.0, avg_correlation) * RISK_CORRELATION_POINTS_PER_UNIT
+                )
             scores['correlation'] = correlation_score
             
             # Factor risk (25% weight) — only with a real benchmark. Calling
             # factor_exposure_analysis without one yields R²=0 always, which
             # would pin this leg at max risk, so exclude + renormalize instead.
-            excluded: list[str] = []
             if benchmark_data is not None and not benchmark_data.empty:
                 factor_result = await self.factor_exposure_analysis(
                     price_data, benchmark_data=benchmark_data, weights=weights
@@ -1179,12 +1220,17 @@ class AnalyticsEngine:
                 if r_squared is None:
                     factor_score = None
                     excluded.append('factor_risk')
+                    excluded_reasons['factor_risk'] = (
+                        "a benchmark was supplied but the factor fit published no "
+                        "R-squared"
+                    )
                 else:
                     factor_score = min(30, (1 - r_squared) * 100)
             else:
                 r_squared = None
                 factor_score = None
                 excluded.append('factor_risk')
+                excluded_reasons['factor_risk'] = "no benchmark supplied"
             scores['factor_risk'] = factor_score
             
             # Market risk (10% weight) - based on recent volatility
@@ -1202,7 +1248,14 @@ class AnalyticsEngine:
                 'factor_risk': 0.25,
                 'market_risk': 0.10
             }
-            active_weights = {k: w for k, w in weights_scores.items() if k not in excluded}
+            # Belt and braces: a null sub-score is never counted, whether or not
+            # it reached `excluded`. `sum()` over a None would raise, and
+            # treating None as 0 is the hard-zero fabrication D-04 is about.
+            active_weights = {
+                k: w
+                for k, w in weights_scores.items()
+                if k not in excluded and scores.get(k) is not None
+            }
             w_total = sum(active_weights.values()) or 1.0
             active_weights = {k: w / w_total for k, w in active_weights.items()}
 
@@ -1228,12 +1281,19 @@ class AnalyticsEngine:
                 alerts.append(f"High concentration risk (HHI: {concentration_result.get('herfindahl_index', 0):.3f})")
             if volatility_score > 20:
                 alerts.append(f"High volatility risk ({portfolio_vol:.1%} annualized)")
-            if correlation_score > 15:
+            if correlation_score is not None and correlation_score > 15:
                 alerts.append(f"High correlation risk (avg correlation: {avg_correlation:.2f})")
             if factor_score is not None and factor_score > 15:
                 alerts.append(f"High unexplained risk (low R-squared: {r_squared:.2f})")
             if excluded:
-                alerts.append("Factor leg excluded: no benchmark supplied (remaining legs renormalized)")
+                named = "; ".join(
+                    f"{name}: {excluded_reasons.get(name, 'not measured')}"
+                    for name in excluded
+                )
+                alerts.append(
+                    f"Excluded from the weighted score ({named}); "
+                    "remaining legs renormalized"
+                )
             
             return {
                 "overall_score": round(overall_score, 1),
@@ -1242,10 +1302,25 @@ class AnalyticsEngine:
                 "change_status": "unavailable",
                 "change_reason": "no_persisted_prior_score",
                 "components": {k: (round(v, 1) if v is not None else None) for k, v in scores.items()},
+                # The measurement the correlation leg was scored from, so a low
+                # sub-score is explicable rather than a bare number. Null means
+                # the same thing it means on `factor_r_squared`: not measured.
+                "avg_pairwise_correlation": (
+                    round(avg_correlation, 4) if avg_correlation is not None else None
+                ),
                 "alerts": alerts,
                 "excluded_components": excluded,
                 "factor_r_squared": r_squared,
-                "methodology": "Multi-factor risk scoring with weighted components (stateless; factor leg requires a benchmark, else excluded + renormalized)"
+                "methodology": (
+                    "Multi-factor risk scoring with weighted components, 0-30 per "
+                    "leg (stateless; weights concentration 0.20, volatility 0.25, "
+                    "correlation 0.20, factor_risk 0.25, market_risk 0.10, "
+                    "renormalized over the legs that were measured; correlation "
+                    f"leg = min(30, {RISK_CORRELATION_POINTS_PER_UNIT:g} x max(0, "
+                    "avg pairwise correlation) and is null + excluded when no "
+                    "finite pairwise correlation exists; factor leg requires a "
+                    "benchmark, else excluded)"
+                )
             }
             
         except Exception as e:

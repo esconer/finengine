@@ -3,9 +3,9 @@ Pydantic schemas for Daisy Risk Engine
 """
 
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import math
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, model_serializer, validator
 
 
 # Portfolio Schemas
@@ -416,6 +416,18 @@ class CorrelationStabilityResponse(BaseModel):
 
 
 # Cointegration Scanner Schemas
+#: Fields of `CointScannerResponse` that the pairs route supplies at call time
+#: rather than at construction. They are declared (so FastAPI's `response_model`
+#: keeps them on the wire) but omitted from the dump while they still hold their
+#: default, so the route can pass them without colliding with the base payload.
+_COINT_ROUTE_FILLED_DISCLOSURES: Tuple[str, ...] = (
+    "currency",
+    "currency_provenance",
+    "currency_basis",
+    "warnings",
+)
+
+
 class CointPairResult(BaseModel):
     """Schema for a single cointegrated pair analysis result.
 
@@ -459,7 +471,15 @@ class CointPairResult(BaseModel):
 
 
 class CointScannerResponse(BaseModel):
-    """Schema for cointegration scanner response"""
+    """Schema for cointegration scanner response.
+
+    The monetary-unit and degradation declarations below are declared here, not
+    smuggled in as `extra="allow"` fields. FastAPI re-serializes a route's
+    response against the DECLARED `response_model`, so anything the route only
+    adds at runtime is dropped from the HTTP wire even though the in-process
+    exporter (which calls `model_dump()`) can see it — the AI path is audited,
+    the direct API path is not. Declaring them is what makes the two agree.
+    """
     as_of: str
     as_of_semantics: str = "latest_available_observation"
     latest_observation_date: Optional[str] = None
@@ -492,6 +512,47 @@ class CointScannerResponse(BaseModel):
     depth_status: Optional[str] = None
     depth_limited_pair_count: Optional[int] = None
     shallow_tickers: Optional[List[str]] = None
+    # --- Monetary unit + degradation, on the wire (D-07) ---------------
+    # `last_price_a`, `last_price_b` and the price-space `intercept_alpha` are
+    # all monetary, so a payload that publishes them owes the reader a unit.
+    # The provenance and the basis ship with the unit: a unit derived from the
+    # scrips' exchange suffix is a property of the inputs, not a field read off
+    # a quote, and must not be presented as if it were measured on a tick.
+    currency: Optional[str] = None
+    currency_provenance: Optional[str] = None
+    currency_basis: Optional[str] = None
+    # Degradation reasons. `Field(default_factory=list)` (never `Optional`) so
+    # a consumer can always iterate it and the exporter's warning collector
+    # never has to guard against a null.
+    warnings: List[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _serialize_route_filled_disclosure(
+        self, handler: Any
+    ) -> Dict[str, Any]:
+        """Keep a still-unset disclosure out of the dump.
+
+        The pairs route fills these four in by handing them to the constructor
+        after it has already dumped the base payload, so a *declared* field
+        still sitting at its default would be in that dump and collide with the
+        route's own value (`TypeError: got multiple values for keyword
+        argument`). Omitting a field nobody filled in is also the house rule for
+        this payload — `error` is dropped the same way, and a scan that is
+        clean should not publish an empty `currency: null` or `warnings: []`.
+
+        So a disclosure is emitted only once the route has actually declared
+        it. This keeps the wire byte-identical to the pre-declaration shape
+        (nothing to strip) while the declaration itself is what stops FastAPI
+        dropping the real value.
+        """
+        data = handler(self)
+        fields = type(self).model_fields
+        for name in _COINT_ROUTE_FILLED_DISCLOSURES:
+            if name not in data:
+                continue
+            if data[name] == fields[name].get_default(call_default_factory=True):
+                data.pop(name)
+        return data
 
 
 # Volatility Term Structure & Cone Schemas

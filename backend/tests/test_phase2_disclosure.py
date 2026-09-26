@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import numpy as np
 import pandas as pd
 
-from app.api.analytics import get_realized_risk
+from app.api.analytics import HOLDING_COVERED_DAYS_SCOPE, get_realized_risk
 from app.models.database import PortfolioPosition
 from app.services.analytics_engine import AnalyticsEngine
 from app.utils.holdings import (
@@ -100,15 +100,31 @@ async def test_realized_risk_case_a_intersection_copy():
     assert cov["truncated"] is True
     assert cov["intersection_start"] == "2026-08-04"
     assert cov["tickers"]["OLD.NS"]["raw_days"] == 300
-    assert cov["tickers"]["OLD.NS"]["masked_days"] == cov["covered_days"]
+    # D-02: `covered_days` is the aligned RETURN-row count inside the holding
+    # window and `masked_days` is the ticker's held PRICE rows, so the two are
+    # one apart - the bar on the start date is the first held price and has no
+    # held predecessor to difference against. Asserting equality here asserted
+    # the two-unit confusion this block now declares; the reconciliation is what
+    # makes the relationship checkable instead of assumed.
+    assert cov["covered_days_scope"] == HOLDING_COVERED_DAYS_SCOPE
+    assert cov["tickers"]["OLD.NS"]["masked_days"] == cov["covered_days"] + 1
+    assert cov["tickers"]["OLD.NS"]["return_observations"] == cov["covered_days"]
     assert cov["tickers"]["OLD.NS"]["masked_days"] < 300
+    recon = cov["per_ticker_count_reconciliation"]["tickers"]["OLD.NS"]
+    assert recon["held_price_rows"] == 25 and recon["reconciles"] is True
+    assert recon["interior_price_gaps"] == 0
+    assert recon["first_held_price_yields_no_return"] == 1
     assert cov["full_history_days"] == 300
     by_ticker = {w["ticker"]: w["message"] for w in res["warnings"]}
     old_msg = by_ticker["OLD.NS"]
-    assert "realized P&L covers" in old_msg
-    assert "2026-08-04" in old_msg
+    # The disclosure line reports the position's OWN measured sample and names
+    # the start with its provenance (V3-06), rather than the pre-V3-06 phrasing
+    # this test used to pin ("realized P&L covers <intersection start>").
+    assert "OLD.NS: 24 own return observations" in old_msg
     assert "held since 2020-01-01" in old_msg
-    assert "instrument risk uses full" in old_msg
+    assert "(stored import date)" in old_msg
+    assert "Instrument risk uses the full 300 exchange days" in old_msg
+    assert "does not extend this holding window" in old_msg
     assert "exchange feeds" not in old_msg
 
 

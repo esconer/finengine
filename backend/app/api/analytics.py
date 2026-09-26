@@ -1287,6 +1287,87 @@ RETURN_FRAME_COUNT_UNITS = {
 }
 
 
+#: Scope label for the per-ticker price-row -> aligned-return-row reconciliation.
+#: The two published counts are measured over DIFFERENT frames (held price rows vs
+#: the portfolio-aligned return rows those prices produced), so the block states
+#: the identity that relates them and publishes every term of it, measured.
+PRICE_ROW_RECONCILIATION_SCOPE = "held_price_rows_to_aligned_return_rows"
+
+PRICE_ROW_RECONCILIATION_IDENTITY = (
+    "held_price_rows - first_held_price_yields_no_return - interior_price_gaps "
+    "= own_return_observations, and own_return_observations - "
+    "portfolio_alignment_dropped_rows = aligned_return_observations (the block's "
+    "per-ticker return_observations). Every term is measured, never imputed: a leg "
+    "with no interior gap and no alignment drop therefore reads held_price_rows = "
+    "return_observations + 1 exactly, and a wider gap is a real missing-bar or "
+    "portfolio-alignment loss rather than a different counting unit."
+)
+
+
+def _price_frame_count_reconciliation(
+    per_ticker: Optional[Mapping[str, Mapping[str, Any]]],
+    own_return_observations: Optional[Mapping[str, int]] = None,
+) -> Dict[str, Any]:
+    """The terms that close `masked_days` against `return_observations`.
+
+    `masked_days` counts the ticker's HELD PRICE rows and `return_observations`
+    counts the ALIGNED return rows those prices produced, so the two differ by a
+    knowable amount:
+
+    * the bar on the holding-window start date is the first held price and has no
+      held predecessor, so it yields no return (0 or 1 rows);
+    * an interior missing bar splits the held prices into runs and a return
+      cannot cross a gap (`interior_price_gaps`);
+    * rows the PORTFOLIO aggregate dropped are not attributable to this ticker at
+      all (`portfolio_alignment_dropped_rows`).
+
+    `own_return_observations` is the ticker's own-frame return count
+    (`_own_return_observations`, which differences that ticker's held prices).
+    A caller that supplies none falls back to the block's aligned count, which
+    makes `interior_price_gaps` an UPPER bound on the missing bars; every caller
+    of this helper passes its own counts, so that path is only a guard. A count
+    that cannot be read at all leaves the ticker out rather than publishing a
+    zero for it.
+    """
+    own_counts = own_return_observations or {}
+    tickers: Dict[str, Any] = {}
+    for ticker in sorted(per_ticker or {}):
+        row = per_ticker.get(ticker)
+        if not isinstance(row, Mapping):
+            continue
+        held = row.get("masked_days")
+        aligned = row.get("return_observations")
+        own = own_counts.get(ticker, aligned)
+        try:
+            held_rows = int(held)
+            aligned_rows = int(aligned)
+            own_rows = int(own)
+        except (TypeError, ValueError):
+            continue
+        first_row = 1 if held_rows > 0 else 0
+        interior = held_rows - first_row - own_rows
+        dropped = own_rows - aligned_rows
+        tickers[ticker] = {
+            "held_price_rows": held_rows,
+            "own_return_observations": own_rows,
+            "aligned_return_observations": aligned_rows,
+            "first_held_price_yields_no_return": first_row,
+            "interior_price_gaps": interior,
+            "portfolio_alignment_dropped_rows": dropped,
+            "reconciles": bool(
+                interior >= 0
+                and dropped >= 0
+                and held_rows - first_row - interior == own_rows
+                and own_rows - dropped == aligned_rows
+            ),
+        }
+    return {
+        "scope": PRICE_ROW_RECONCILIATION_SCOPE,
+        "identity": PRICE_ROW_RECONCILIATION_IDENTITY,
+        "tickers": tickers,
+    }
+
+
 def _coverage_per_ticker(
     coverage: Optional[Mapping[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
@@ -1892,12 +1973,103 @@ def _liquidity_scoring_block(
         "requested_window": dict(data_range),
         "observation_window": dict(observation_window),
         "measured_positions": sorted(positions),
+        "measured_positions_basis": (
+            "Positions with a measured price and volume over the observation "
+            "window. This is NOT a market-cap measurement: the market-cap "
+            "provenance of every leg is counted in `market_cap_provenance`."
+        ),
+        "market_cap_provenance": _liquidity_market_cap_provenance_counts(positions),
         "unavailable_reason": (
             liquidity_result.get("error")
             if liquidity_result.get("overall_score") is None
             else None
         ),
         "score_basis": "turnover_and_market_cap_tiers",
+    }
+
+
+def _liquidity_floor_value(scoring_block: Mapping[str, Any]) -> float:
+    """The published INR market-cap floor, read back from the scoring block.
+
+    Read from the block the response already carries rather than repeated as a
+    second literal, so the warning cannot name a different floor than the one
+    the score was banded against.
+    """
+    floor = scoring_block.get("market_cap_floor")
+    value = floor.get("value") if isinstance(floor, Mapping) else None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _liquidity_market_cap_provenance_counts(positions: Mapping[str, Any]) -> Dict[str, int]:
+    """How many legs' market caps came from a quote, an estimate, or the floor.
+
+    Counted from the engine's own per-position `market_cap_provenance`, never
+    re-derived: `estimated` (annualised from measured turnover) and `fallback`
+    (the fixed INR 1bn floor) are both substitutes for a measurement, and a
+    score banded partly on either is not a clean measurement of the book.
+    """
+    counts: Dict[str, int] = {}
+    for row in positions.values():
+        if not isinstance(row, Mapping) or "market_cap_provenance" not in row:
+            continue
+        label = str(row.get("market_cap_provenance") or "unknown").strip() or "unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return {label: counts[label] for label in sorted(counts)}
+
+
+def _liquidity_market_cap_estimate_disclosure(
+    positions: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Section-level count and names for the non-measured market caps (D-03).
+
+    Every leg already published `market_cap_provenance`/`is_estimate`, and the
+    scoring block already published the INR 1bn floor, so the information
+    existed - but the section HEADLINE aggregated none of it: 5 of 14 legs were
+    estimated or floored and the section still read `data_status: available`
+    with zero warnings. A score resting partly on a hard-coded floor is a
+    fallback presented as a measurement, the same fabrication class as the
+    original single-ticker finding one level up.
+
+    Returns the disclosure block, or an empty mapping when the engine published
+    no provenance at all: an unlabelled result is not counted as clean, and it
+    is not counted as estimated either.
+    """
+    rows = {
+        ticker: row
+        for ticker, row in positions.items()
+        if isinstance(row, Mapping) and "market_cap_provenance" in row
+    }
+    if not rows:
+        return {}
+    non_measured = sorted(
+        ticker
+        for ticker, row in rows.items()
+        if row.get("market_cap_provenance") != "measured"
+    )
+    by_provenance: Dict[str, List[str]] = {}
+    for ticker in non_measured:
+        label = str(rows[ticker].get("market_cap_provenance") or "unknown").strip() or "unknown"
+        by_provenance.setdefault(label, []).append(ticker)
+    floored = by_provenance.get("fallback") or []
+    return {
+        "estimated_market_cap_count": len(non_measured),
+        "measured_market_cap_count": len(rows) - len(non_measured),
+        "market_cap_count": len(rows),
+        "non_measured_market_caps": non_measured,
+        "non_measured_by_provenance": {
+            label: by_provenance[label] for label in sorted(by_provenance)
+        },
+        "fallback_market_cap_count": len(floored),
+        "estimated_market_cap_basis": (
+            "A leg is counted here unless a quote supplied its market cap: "
+            "`estimated` caps are annualised from measured daily turnover and "
+            "`fallback` caps are the fixed INR 1bn floor published in "
+            "scoring.market_cap_floor. Each leg keeps its own provenance in "
+            "by_position; this block only counts them for the section headline."
+        ),
     }
 
 
@@ -2601,6 +2773,16 @@ async def get_realized_risk(
         history_coverage = holding_coverage(
             effectives, start, end, covered_days, per_ticker, provenance=start_detail
         )
+        # This section is the REFERENCE window the four sibling holding-window
+        # sections are defined against, so it declares the unit of its block
+        # count and the unit of every per-ticker count, and publishes the terms
+        # that relate the two per-ticker frames (held price rows vs the return
+        # rows they produced) instead of leaving `masked_days` and
+        # `return_observations` as two numbers no reader can reconcile.
+        history_coverage["per_ticker_count_units"] = dict(PRICE_FRAME_COUNT_UNITS)
+        history_coverage["per_ticker_count_reconciliation"] = (
+            _price_frame_count_reconciliation(per_ticker, own_return_observations)
+        )
 
         # --- Instrument risk on FULL exchange history (DSP-10) --------------
         # Risk characteristics belong to the assets, not the ownership
@@ -2666,6 +2848,12 @@ async def get_realized_risk(
         # make a short active sample look fully covered.
         covered_days = int(metrics.get("active_observations") or metrics.get("observations") or 0)
         history_coverage["covered_days"] = covered_days
+        # The unit of that count: the active return observations the engine
+        # measured inside the holding window. Published here because this is the
+        # section `factor_exposure`, `risk_contribution`, `tear_sheet` and
+        # `regime` are all defined against - a reference count with no unit is
+        # the one number a consumer cannot compare with its siblings'.
+        history_coverage["covered_days_scope"] = HOLDING_COVERED_DAYS_SCOPE
         history_coverage["annualized"] = covered_days >= MIN_ANNUALIZE_DAYS
         
         # Format response — absent engine keys are None, never fabricated constants.
@@ -3555,7 +3743,14 @@ async def get_liquidity_metrics(
         )
         scoring_block["spread"] = spread_block
 
-        return {
+        # A score banded partly on an estimated or floored market cap is a
+        # fallback, not a clean measurement, so the section says so instead of
+        # reporting `available` over inputs it never measured. Each leg keeps
+        # its own provenance in `by_position`; the section only counts them.
+        estimate_disclosure = _liquidity_market_cap_estimate_disclosure(by_position)
+        non_measured = list(estimate_disclosure.get("non_measured_market_caps") or [])
+
+        result = {
             "overall_score": liquidity_result.get("overall_score"),
             "overall_score_raw": liquidity_result.get("overall_score_raw"),
             "overall_band": liquidity_result.get("overall_band"),
@@ -3583,10 +3778,38 @@ async def get_liquidity_metrics(
             "latest_observation_date": latest_observation_date,
             "scoring": scoring_block,
             "universe_coverage": coverage,
-            "data_status": _data_status(coverage),
-            "methodology": "Liquidity scoring based on trading volume and market capitalization"
+            "data_status": _data_status(coverage, partial=bool(non_measured)),
+            "methodology": "Liquidity scoring based on trading volume and market capitalization",
         }
-        
+        result.update(estimate_disclosure)
+        if non_measured:
+            # The warning is the section-level half of the disclosure: it is what
+            # makes a reader of `data_status` alone see that the headline score
+            # is not a clean measurement, and it is what the linked dashboard
+            # summary reads when it declines to publish `liquidity_score`.
+            floored = list(
+                (estimate_disclosure.get("non_measured_by_provenance") or {}).get(
+                    "fallback"
+                )
+                or []
+            )
+            result["warnings"] = [
+                f"{len(non_measured)} of {estimate_disclosure['market_cap_count']} "
+                "market caps the score was banded on are not measured ("
+                f"{', '.join(non_measured)}): "
+                + (
+                    f"{len(floored)} sit on the fixed INR "
+                    f"{_liquidity_floor_value(scoring_block):,.0f} floor "
+                    f"({', '.join(floored)})"
+                    if floored
+                    else "each is annualised from measured daily turnover"
+                )
+                + ", so the published score, band and liquidation window are "
+                "partly derived from a substitute for a measurement. Each leg "
+                "keeps its own market_cap_provenance in by_position."
+            ]
+        return result
+
     except HTTPException:
         raise
     except ProviderError as exc:
@@ -4021,6 +4244,109 @@ async def get_volatility_sizing(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+#: What the risk score's factor leg is fitted over. It is the SAME OLS-vs-market
+#: model `get_factor_exposure` publishes an R-squared for, on a DIFFERENT sample:
+#: the holding window's aligned return rows, not full exchange history. The basis
+#: is published with the fit so the two R-squared values can never be read as
+#: contradictory measurements of one window.
+RISK_SCORE_FACTOR_BASIS = "holding_window_portfolio_return_vs_benchmark_regression"
+
+RISK_SCORE_FACTOR_BASIS_NOTE = (
+    "The factor leg is an OLS regression of the holding-window portfolio return "
+    "series on the benchmark, fitted only on rows that overlap the benchmark AND "
+    "carry a real constituent return. factor_exposure publishes the same model "
+    "over full exchange history, so its R-squared describes a longer, different "
+    "sample: compare the two only through this block's basis and window, never "
+    "by their values alone."
+)
+
+
+def _factor_leg_evidence(
+    price_frame: Any,
+    benchmark: Any,
+    *,
+    r_squared: Any,
+) -> Dict[str, Any]:
+    """Window, sample and basis of the risk score's factor leg (D-06).
+
+    The engine fits this leg on the masked holding-window price frame it is
+    handed, so the frame IS the model's evidence: the window is that frame's own
+    first/last dated price row, and the sample is measured exactly as the fit
+    measures it - return rows that overlap the benchmark and carry a real
+    constituent return. Nothing here is imputed: with no benchmark the leg is not
+    fitted, and that is published as an exclusion rather than as a zero sample.
+    """
+    frame = price_frame if isinstance(price_frame, pd.DataFrame) else pd.DataFrame()
+    clean = (
+        frame.replace([np.inf, -np.inf], np.nan).sort_index() if not frame.empty else frame
+    )
+    returns = clean.pct_change(fill_method=None) if not clean.empty else clean
+    if len(returns):
+        returns = returns.iloc[1:]
+    return_rows = int(len(returns))
+    input_first, input_last = _observation_bounds(clean)
+    block: Dict[str, Any] = {
+        "basis": RISK_SCORE_FACTOR_BASIS,
+        "note": RISK_SCORE_FACTOR_BASIS_NOTE,
+        "published_fit_key": "factor_r_squared",
+        "input_window": {"start": input_first, "end": input_last, "days": return_rows},
+        "input_return_rows": return_rows,
+        "model_used_tickers": [str(column) for column in clean.columns],
+        "fitted": r_squared is not None,
+    }
+    if r_squared is None:
+        block["status"] = "excluded_not_fitted"
+        block["status_reason"] = (
+            "No factor R-squared was measured for this request, so no regression "
+            "sample exists. The engine excludes the leg and renormalizes the "
+            "remaining components; no window or count is invented here."
+        )
+        block["model_window"] = None
+        block["model_observation_count"] = None
+        block["model_observation_count_scope"] = None
+        block["benchmark_overlap_return_rows"] = None
+        return block
+
+    series = benchmark.dropna() if isinstance(benchmark, pd.Series) else pd.Series(dtype=float)
+    if len(series) and bool(series.abs().gt(1.0).any()):
+        series = series.pct_change(fill_method=None).dropna()
+    common = returns.index.intersection(series.index) if (len(series) and return_rows) else returns.index[:0]
+    aligned = returns.loc[common]
+    traded = aligned.notna().any(axis=1) if len(common) else pd.Series(dtype=bool)
+    active = traded[traded].index.intersection(series.index) if len(traded) else common[:0]
+    observations = int(len(active))
+    if observations:
+        block["model_window"] = {
+            "start": _observation_date(active[0]),
+            "end": _observation_date(active[-1]),
+            "days": observations,
+        }
+        block["model_observation_count"] = observations
+        block["model_observation_count_scope"] = "active_benchmark_overlap_return_rows"
+        block["status"] = "fitted"
+    else:
+        # The engine fitted, but the active subset is not reproducible from the
+        # published inputs. Say which frame the count describes rather than
+        # reporting a sample nobody can verify as the regression's own.
+        block["model_window"] = {
+            "start": input_first,
+            "end": input_last,
+            "days": return_rows,
+        }
+        block["model_observation_count"] = return_rows
+        block["model_observation_count_scope"] = (
+            "input_return_rows_regression_subset_unmeasured"
+        )
+        block["status"] = "fitted_regression_subset_unmeasured"
+        block["status_reason"] = (
+            "The active benchmark-overlap subset could not be re-measured from the "
+            "published inputs, so the count below describes the whole input return "
+            "frame the fit was handed, which is an upper bound on the sample used."
+        )
+    block["benchmark_overlap_return_rows"] = int(len(common))
+    return block
+
+
 @router.get("/risk-score")
 async def get_risk_score(
     db: AsyncSession = Depends(get_db_session),
@@ -4146,6 +4472,13 @@ async def get_risk_score(
             }
             for ticker, count in return_observations.items()
         }
+        # This block measures a PRICE frame, so it declares the unit of every
+        # per-ticker count and publishes the terms that relate the two frames
+        # `masked_days` and `return_observations` are drawn from.
+        history_coverage["per_ticker_count_units"] = dict(PRICE_FRAME_COUNT_UNITS)
+        history_coverage["per_ticker_count_reconciliation"] = (
+            _price_frame_count_reconciliation(per_ticker, return_observations)
+        )
 
         # Benchmark returns for the factor leg (best-effort: without them the
         # engine excludes + renormalizes instead of scoring a silent R²=0).
@@ -4195,6 +4528,22 @@ async def get_risk_score(
                 "error": "Risk score unavailable for the measured return sample",
             }
         risk_result["history_coverage"] = history_coverage
+        # D-06: the factor leg's window, sample and basis travel WITH the fit
+        # statistic they explain. The engine's alert
+        # ("High unexplained risk (low R-squared: ...)") is driven by this
+        # number, so a reader has to be able to see it is a 39-observation
+        # holding-window fit and not the 174-observation full-history fit
+        # `factor_exposure` publishes beside it.
+        factor_leg = _factor_leg_evidence(
+            price_data, benchmark_returns,
+            r_squared=risk_result.get("factor_r_squared"),
+        )
+        risk_result["factor_model"] = factor_leg
+        risk_result["model_window"] = factor_leg.get("model_window")
+        risk_result["model_observation_count"] = factor_leg.get("model_observation_count")
+        risk_result["model_observation_count_scope"] = factor_leg.get(
+            "model_observation_count_scope"
+        )
         coverage = _universe_coverage(
             requested_tickers, usable_tickers, active=_active_weight_tickers(weights)
         )
@@ -4367,8 +4716,18 @@ async def get_analytics_summary(
             }
             for ticker in requested_tickers
         }
-        history_coverage = holding_coverage(
-            effectives, start, end, covered_days, per_ticker, provenance=start_detail
+        # This section measures a PRICE frame, so it publishes the same
+        # per-ticker count units and reconciliation the other holding-window
+        # sections do. Calling `holding_coverage` directly left its per-ticker
+        # counts in undeclared units — the same ambiguity D-02 fixed everywhere
+        # else, because the summary had no owner in that wave.
+        history_coverage = publish_holding_coverage(
+            detail=start_detail,
+            per_ticker=per_ticker,
+            requested_start=start,
+            requested_end=end,
+            covered_days=covered_days,
+            evidence_window=holding_evidence_window(end),
         )
 
         # Calculate portfolio metrics for summary
@@ -4528,6 +4887,17 @@ async def get_performance_history(
     `_performance_history_envelope` for the exact numeric rule. The request is
     never substituted for the delivery: `as_of` is the last delivered
     observation, and no gap is backfilled.
+
+    Row semantics a reader needs before trusting a point:
+
+    * row 0 is the warm-up row (`warm_up: true`). It carries `return: null`,
+      because its prior portfolio value lives in the undelivered first
+      observation, and it is the date the benchmark is rebased onto the book -
+      so `benchmark_value == portfolio_value` there by construction;
+    * when a benchmark was measured, a row is delivered only where the
+      benchmark was measured too, and a trailing portfolio session with no
+      benchmark is withheld, counted and named on the last row (and in the
+      envelope's `warnings`) instead of being delivered half-measured.
     """
     try:
         # A direct in-process call (backend unit tests) hands this function the
@@ -4698,26 +5068,109 @@ async def get_performance_history(
         except Exception:
             logger.debug("Benchmark data unavailable")
 
+        # A comparison row is only a comparison where BOTH legs were measured on
+        # that date.  The benchmark and the book are separate series with
+        # separate coverage, and the newest session is exactly where they
+        # disagree: the delivered rows ended with a portfolio value and no
+        # benchmark point at all, so every chart drew a benchmark line that
+        # stopped a day short of the series.  There is no measured benchmark
+        # return for such a date, and inventing one (carrying the last level
+        # forward, or growing it by the portfolio's own move) would be a
+        # fabricated benchmark, so the incomparable rows are withheld from the
+        # comparison and named rather than delivered half-measured.
+        emitted_dates = list(daily_returns.index)
+        withheld_dates: List[str] = []
+        if bench_val_series is not None:
+            comparable = [
+                date_idx
+                for date_idx in emitted_dates
+                if date_idx in bench_val_series.index
+            ]
+            if comparable:
+                withheld_dates = [
+                    str(date_idx)[:10]
+                    for date_idx in emitted_dates
+                    if date_idx not in bench_val_series.index
+                ]
+                emitted_dates = comparable
+
         output = []
-        for date_idx in daily_returns.index:
+        for index, date_idx in enumerate(emitted_dates):
             date_str = str(date_idx)[:10]
             val = float(portfolio_series.loc[date_idx])
-            ret = float(daily_returns.loc[date_idx])
             item = {
                 "date": date_str,
                 "portfolio_value": round(val, 2),
                 "portfolio_value_currency": target_currency,
-                "return": round(ret, 6),
+                # The first delivered row has no return of its own: its prior
+                # value sits in the undelivered warm-up observation, so any
+                # number here is a return against a value this response never
+                # published.  The key stays, with null, so every row keeps the
+                # same shape and the absence is explicit rather than implied.
+                "return": None if index == 0 else round(float(daily_returns.loc[date_idx]), 6),
                 "currency": target_currency,
                 "base_currency": target_currency,
                 "currency_provenance": currency_provenance,
+                # Row 0 is the series' warm-up row and the date the benchmark is
+                # rebased onto the book: `benchmark_value` equals
+                # `portfolio_value` here BY DEFINITION, because both series
+                # start from that one anchor.  It is labelled so a reader can
+                # tell a declared anchor from a coincidental copy.
+                "warm_up": index == 0,
             }
+            if index == 0:
+                item["warm_up_reason"] = (
+                    "first delivered row: no prior portfolio value was "
+                    "delivered, so its return is null"
+                    + (
+                        ", and its portfolio value anchors the benchmark "
+                        "rebasing, so benchmark_value equals portfolio_value "
+                        "here by construction"
+                        if bench_val_series is not None
+                        else ""
+                    )
+                )
+                if bench_val_series is None:
+                    # No benchmark at all is a disclosed degradation, not a
+                    # silently overlay-free chart: it is stated on the row every
+                    # bare-array consumer reads first, and in the envelope.
+                    item["benchmark_series_status"] = "unavailable"
+                    item["benchmark_unavailable_reason"] = (
+                        "the benchmark returned no usable returns for the "
+                        "requested window, so no row carries a benchmark value"
+                    )
             if bench_val_series is not None and date_idx in bench_val_series.index:
                 item["benchmark_value"] = round(float(bench_val_series.loc[date_idx]), 2)
                 item["benchmark_value_currency"] = target_currency
+            if withheld_dates and index == len(emitted_dates) - 1:
+                # The series stops here because the benchmark has no
+                # measurement after it.  The withheld sessions are named on
+                # the row a reader stops at, because the bare-array response
+                # has nowhere else to say so.
+                item["withheld_portfolio_observation_count"] = len(withheld_dates)
+                item["withheld_portfolio_observations"] = list(withheld_dates)
+                item["series_end_reason"] = (
+                    "the benchmark was not measured on the withheld session(s), "
+                    "so no benchmark value exists for them and they are not "
+                    "delivered as comparison rows"
+                )
             output.append(item)
 
-        return _deliver(output)
+        extra_warnings: List[str] = []
+        if withheld_dates:
+            extra_warnings.append(
+                f"{len(withheld_dates)} portfolio observation(s) "
+                f"({', '.join(withheld_dates)}) carry no measured benchmark and "
+                "are not delivered as comparison rows; the benchmark value for "
+                "those sessions was never measured and is not estimated here."
+            )
+        elif bench_val_series is None:
+            extra_warnings.append(
+                "No benchmark was measured for the requested window, so no row "
+                "carries a benchmark value; the delivered series is the "
+                "portfolio leg only."
+            )
+        return _deliver(output, extra=extra_warnings)
 
     except HTTPException:
         raise
@@ -4763,7 +5216,18 @@ async def _build_wide_returns(
     if not price_data_dict:
         raise ValueError("No price data available for the requested window")
     raw_price_data_dict = dict(price_data_dict)
-    masked_dict, effectives = holding_window(price_data_dict, holdings)
+    # The mask cutoff is the intersection of the legs whose PRICE DATA this call
+    # actually fetched, so the holdings that can set it are exactly those legs.
+    # A persisted row carrying no active weight has no bars here: letting its
+    # `added_on` into the intersection would move the window start later and mask
+    # the book to a window it has no price data for (D-08).
+    fetched_tickers = set(ticker_list)
+    mask_holdings = {
+        ticker: holding
+        for ticker, holding in (holdings or {}).items()
+        if ticker in fetched_tickers
+    }
+    masked_dict, effectives = holding_window(price_data_dict, mask_holdings)
     if not masked_dict:
         raise ValueError("No price data within actual holding period")
     # Preserve the active-price mask.  Back-filling a newly listed instrument
@@ -4774,6 +5238,10 @@ async def _build_wide_returns(
     returns_df = prices.pct_change(fill_method=None)
     if len(returns_df) > 1:
         returns_df = returns_df.iloc[1:]
+    # This ticker's OWN returns, before the portfolio aggregate narrows the
+    # frame, so the per-ticker reconciliation can separate a missing bar from a
+    # row the portfolio dropped.
+    own_return_observations = _own_return_observations(prices)
     finite_columns = [
         ticker for ticker in returns_df.columns
         if returns_df[ticker].notna().any()
@@ -4799,6 +5267,15 @@ async def _build_wide_returns(
     }
     coverage = holding_coverage(effectives, start, end, len(portfolio_returns), per_ticker)
     coverage["model_used_tickers"] = list(returns_df.columns)
+    # This leg measures a PRICE frame (`masked_days` is held price rows) and the
+    # return frame it then aligns, so it declares both units and publishes the
+    # terms that relate them. `covered_days` stays the aligned portfolio return
+    # row count the caller measures; this block only explains the per-ticker
+    # numbers, which are otherwise three questions under three names.
+    coverage["per_ticker_count_units"] = dict(PRICE_FRAME_COUNT_UNITS)
+    coverage["per_ticker_count_reconciliation"] = _price_frame_count_reconciliation(
+        per_ticker, own_return_observations
+    )
     return returns_df, portfolio_returns, coverage
 
 

@@ -1,18 +1,39 @@
 # Open defects after the v4 remediation
 
-Recorded 2026-09-26, after the v4 export passed 127/127 invariants. These are
-the things a fresh audit found that the remediation did **not** close, plus the
-suite failures that were already red at `HEAD` and remain so.
+**STATUS 2026-09-26: all eight defects below are FIXED.** A fresh export
+(`export_id portfolio-bb178fd632ce`, 506 678 bytes) passes **47/47** audit rules
+with 0 findings and exit 0, and `test_realized_risk_case_a_intersection_copy` —
+the only genuinely-red product test in the suite — is now green
+(1196 passed / 5 failed; the 5 are the wording/ordering reds in §2).
 
-Each entry states what is observed, why it matters, and what closing it would
-take. Verified against the fresh export (`export_id portfolio-01aa73807a73`),
-not from memory.
+The entries are kept as the record of what was wrong and why, because six of the
+audit rules exist specifically to catch them and still carry a `catches D-0x`
+marker. If one of those rules ever goes red again, the same defect has returned.
+Investigate; do not delete the rule.
+
+Reproduce with:
+
+    cd backend
+    uv run uvicorn main:app --host 127.0.0.1 --port 8000 --log-level warning
+    uv run python -m app.debugging.context_audit generate --out %TEMP%\v5.json
+    uv run python -m app.debugging.context_audit check --export %TEMP%\v5.json
+
+The observations recorded below were taken against the v4 export
+(`export_id portfolio-01aa73807a73`), not from memory.
 
 ---
 
-## 1. Real defects still in the export
+## 1. Real defects — all fixed
 
-### D-01 `realized_risk` is missing its `covered_days_scope` label
+### D-01 `realized_risk` was missing its `covered_days_scope` label
+
+**FIXED.** `get_realized_risk` now sets `covered_days_scope` beside its
+`covered_days`. `get_analytics_summary` — which had no owner in the fix wave and
+was therefore missed by everyone, including me — now goes through
+`publish_holding_coverage` like every other holding-window section, so its
+per-ticker counts are declared too. All five sections now agree on
+`intersection_start` 2026-08-03 and `covered_days` 39 under one label.
+Audit rules `XS-001` / `XS-002` green.
 
 **Severity:** high (documentation integrity; the numbers are correct)
 
@@ -216,8 +237,24 @@ Not incorrect, but a consumer can still get them wrong.
 
 ## 5. How these get caught from now on
 
-Every item above is encoded as a hard-failing rule in the new checker
-(`backend/app/debugging/context_audit.py`). D-01 through D-06 are expected to be
-**red** until fixed; they are deliberately recorded as failures rather than
-suppressed, so the tool reports the real state of the export rather than a
-comfortable one.
+Every item above is encoded as a hard-failing rule in
+`backend/app/debugging/context_audit.py`. D-01 through D-06 are now green; the
+two with no rule (D-07 is a FastAPI `response_model` re-serialisation issue
+visible only over HTTP, D-08 is filtering logic that publishes nothing) are fixed
+by inspection and covered by unit tests instead.
+
+Two rules had to be corrected during this wave, because once the defects were
+fixed honestly they began demanding the fix be un-done:
+
+- `NUM-018` flagged any sub-score of exactly 0. A genuinely uncorrelated
+  portfolio also measures 0, so silencing it would have meant fabricating an
+  epsilon floor. It now only fires when the payload publishes no measurement
+  behind the sub-score.
+- `XS-009` fired for any two declaring fits differing by >0.01, while its message
+  blamed a basis field the code never read. A 174-observation full-history fit
+  and a 39-observation holding-window fit are *supposed* to differ, so the only
+  way to satisfy it was to make one lie. It now compares basis identities.
+
+A rule that can only be silenced by fabricating a value is worse than no rule:
+it teaches the next engineer to invent an epsilon floor rather than publish a
+measurement.

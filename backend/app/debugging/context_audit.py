@@ -31,13 +31,18 @@ non-zero exit code rather than a subagent's opinion:
 The tool never writes to a portfolio endpoint and never mutates an export.  It
 only reads them.
 
-KNOWN-OPEN DEFECTS
-------------------
-D-01 .. D-06 in ``.scratch/ai-context-v3-remediation-2026-09/open-defects.md``
-are deliberately UNFIXED.  The rules that exist to catch them are therefore
-expected to be RED against today's export, and are marked ``catches D-0x`` in
-their description so nobody "fixes" the rule to make the tool green.  A red
-rule with that marker is the tool working, not the tool broken.
+DEFECT PROVENANCE
+-----------------
+Six rules were written against specific defects recorded in
+``.scratch/ai-context-v3-remediation-2026-09/open-defects.md`` and are still
+marked ``catches D-0x`` in their descriptions.  Those defects are now FIXED, so
+the rules are expected to be GREEN; the marker is kept so nobody deletes a rule
+believing it was written speculatively, and so the reason each exists stays
+readable.  If one of them ever goes red again, the same defect has returned.
+
+Two further defects from that file are NOT checkable from an artifact and so
+have no rule: D-07 is a FastAPI ``response_model`` re-serialisation issue
+visible only over HTTP, and D-08 is filtering logic that publishes nothing.
 """
 
 from __future__ import annotations
@@ -3032,9 +3037,9 @@ def render_check(export: Export, findings: list[Finding], errors: list[tuple[Rul
     if errors:
         out.append(f"  rule errors : {len(errors)}")
     out.append(
-        "  note        : a rule marked 'catches D-0x' is expected to be RED while "
-        "that defect is open.  See .scratch/ai-context-v3-remediation-2026-09/"
-        "open-defects.md."
+        "  note        : rules marked 'catches D-0x' guard defects that were "
+        "recorded in .scratch/ai-context-v3-remediation-2026-09/open-defects.md. "
+        "They are expected to be GREEN; red means that defect returned."
     )
     for rule, message in errors:
         out.append(f"  !! {rule.rule_id} raised: {message}")
@@ -3088,8 +3093,9 @@ def render_rules() -> str:
         f"AI-CONTEXT EXPORT AUDIT RULES ({len(RULES)} total)",
         "=" * 100,
         "Every rule is hard-failing: one finding exits non-zero.",
-        "A rule whose description says 'catches D-0x' is RED on purpose while that",
-        "defect is open (.scratch/ai-context-v3-remediation-2026-09/open-defects.md).",
+        "A rule marked 'catches D-0x' guards a defect recorded in",
+        ".scratch/ai-context-v3-remediation-2026-09/open-defects.md. Those are",
+        "fixed, so those rules are expected to be GREEN; red means a regression.",
         "",
     ]
     for category in CATEGORY_ORDER:
