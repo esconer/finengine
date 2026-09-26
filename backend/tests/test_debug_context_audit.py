@@ -827,6 +827,82 @@ class TestCrossSectionRules:
         )
         assert rule_ids(export) == set()
 
+    def test_xs009_two_fits_over_different_windows_do_not_contradict(self) -> None:
+        """A 174-observation full-history fit and a 39-observation holding-window
+        fit are EXPECTED to disagree — that difference is the disclosure working.
+        Flagging it would force a real disclosure to be deleted to silence the
+        check, or worse, invite fabricating one fit to match the other."""
+        export = make_export(
+            {
+                "factor_exposure": _section(
+                    "factor_exposure",
+                    {
+                        "r_squared": 0.6511,
+                        "model_window": {"start": "2026-01-20", "end": "2026-09-25"},
+                        "model_observation_count": 174,
+                        "full_history": {
+                            "observation_count": 174,
+                            "window": {"start": "2026-01-20", "end": "2026-09-25"},
+                            "scope": "full_exchange_history",
+                        },
+                    },
+                ),
+                "dashboard": _section(
+                    "dashboard",
+                    {
+                        "components": {
+                            "risk_score": {
+                                "factor_r_squared": 0.2391,
+                                "model_window": {
+                                    "start": "2026-08-04",
+                                    "end": "2026-09-25",
+                                },
+                                "model_observation_count": 39,
+                                "factor_model": {
+                                    "basis": "holding_window_current_composition"
+                                },
+                            }
+                        }
+                    },
+                    status="partial",
+                    warnings=["risk score component"],
+                ),
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_xs009_two_fits_claiming_the_same_basis_and_disagreeing_catches(self) -> None:
+        """Same declared window, same count, same basis, different value: at least
+        one of them is wrong, and that is a genuine contradiction."""
+        shared = {
+            "model_window": {"start": "2026-01-20", "end": "2026-09-25"},
+            "model_observation_count": 174,
+            "factor_model": {"basis": "full_exchange_history"},
+        }
+        export = make_export(
+            {
+                "factor_exposure": _section(
+                    "factor_exposure",
+                    {
+                        **shared,
+                        "r_squared": 0.6511,
+                        "full_history": {
+                            "observation_count": 174,
+                            "scope": "full_exchange_history",
+                            "window": {"start": "2026-01-20", "end": "2026-09-25"},
+                        },
+                    },
+                ),
+                "dashboard": _section(
+                    "dashboard",
+                    {"components": {"risk_score": {**shared, "factor_r_squared": 0.2391}}},
+                    status="partial",
+                    warnings=["risk score component"],
+                ),
+            }
+        )
+        assert_only(export, "XS-009")
+
 
 # --------------------------------------------------------------------------
 # NUM-001 .. NUM-020
@@ -1525,6 +1601,36 @@ class TestNumericRules:
                                 "overall_score": 12.7,
                                 "components": {"correlation": 0},
                                 "excluded_components": ["correlation"],
+                            }
+                        }
+                    },
+                    status="partial",
+                    warnings=["component"],
+                )
+            }
+        )
+        assert rule_ids(export) == set()
+
+    def test_num018_measured_zero_sub_score_passes(self) -> None:
+        """A genuinely uncorrelated portfolio also measures 0 — that is a real
+        result, not a floored placeholder. When the payload publishes the
+        measurement behind the sub-score, the rule must not fire, or the only
+        way to silence it would be to fabricate an epsilon floor."""
+        export = make_export(
+            {
+                "dashboard": _section(
+                    "dashboard",
+                    {
+                        "components": {
+                            "risk_score": {
+                                "overall_score": 9.0,
+                                "components": {
+                                    "concentration": 8.6,
+                                    "volatility": 9.8,
+                                    "correlation": 0,
+                                },
+                                "avg_pairwise_correlation": 0.0,
+                                "excluded_components": [],
                             }
                         }
                     },

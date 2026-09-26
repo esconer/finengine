@@ -1307,6 +1307,60 @@ def xs_008_composite_coverage_honesty(export: Export) -> list[Finding]:
 
 
 _FIT_KEYS = ("r_squared", "adjusted_r_squared", "factor_r_squared")
+# Where a payload states WHICH calculation produced a fit statistic. Two fits
+# that disagree are only a defect when they claim the same basis; two fits over
+# genuinely different windows are supposed to disagree, and that difference is
+# the disclosure working.
+_FIT_BASIS_KEYS = (
+    "factor_model",
+    "factor_leg",
+    "calculation_basis",
+    "basis",
+)
+
+
+def _fit_basis(data: dict[str, Any]) -> str | None:
+    """A stable identity for the calculation behind a fit, or None if undeclared.
+
+    Compares the declared window, observation count and basis label together, so
+    a 174-observation full-history fit and a 39-observation holding-window fit
+    get different identities instead of colliding and being reported as a
+    contradiction.
+    """
+    window = data.get("model_window") or data.get("window")
+    start = end = None
+    if isinstance(window, dict):
+        start, end = window.get("start"), window.get("end")
+    count = data.get("model_observation_count")
+    if not _is_number(count):
+        coverage = data.get("history_coverage")
+        if isinstance(coverage, dict):
+            count = coverage.get("model_observation_count") or coverage.get(
+                "covered_days"
+            )
+    full = data.get("full_history")
+    if not _is_number(count) and isinstance(full, dict):
+        count = full.get("observation_count")
+        if isinstance(full.get("window"), dict):
+            start = start or full["window"].get("start")
+            end = end or full["window"].get("end")
+    if not (_iso_date(start) or _is_number(count)):
+        return None
+    label = None
+    for key in _FIT_BASIS_KEYS:
+        block = data.get(key)
+        if isinstance(block, str) and block.strip():
+            label = block.strip()
+            break
+        if isinstance(block, dict):
+            for field in ("basis", "scope", "status"):
+                value = block.get(field)
+                if isinstance(value, str) and value.strip():
+                    label = value.strip()
+                    break
+        if label:
+            break
+    return f"{label or 'undeclared'}|{start}|{end}|{count}"
 
 
 def _declares_window_and_observations(data: dict[str, Any]) -> bool:
@@ -1341,7 +1395,7 @@ def xs_009_factor_fit_declares_window(export: Export) -> list[Finding]:
     mappings that both declare one must still say how they differ.
     """
     findings: list[Finding] = []
-    declared: list[tuple[str, str, float]] = []
+    declared: list[tuple[str, str, float, str | None]] = []
     for path, node in export.dicts:
         fits = {
             key: float(node[key])
@@ -1352,7 +1406,10 @@ def xs_009_factor_fit_declares_window(export: Export) -> list[Finding]:
             continue
         owner = _section_of(path)
         if _declares_window_and_observations(node):
-            declared.extend((owner, f"{path}.{key}", value) for key, value in fits.items())
+            basis = _fit_basis(node)
+            declared.extend(
+                (owner, f"{path}.{key}", value, basis) for key, value in fits.items()
+            )
             continue
         for key, value in fits.items():
             findings.append(
@@ -1365,20 +1422,26 @@ def xs_009_factor_fit_declares_window(export: Export) -> list[Finding]:
                     "section's R-squared for the same factor model",
                 )
             )
-    for index, (owner_a, path_a, value_a) in enumerate(declared):
-        for _owner_b, path_b, value_b in declared[index + 1 :]:
+    for index, (owner_a, path_a, value_a, basis_a) in enumerate(declared):
+        for _owner_b, path_b, value_b, basis_b in declared[index + 1 :]:
             if path_a == path_b or _close(value_a, value_b, abs_tol=0.01):
                 continue
-            findings.append(
-                Finding(
-                    "XS-009",
-                    owner_a,
-                    path_a,
-                    f"this fit reports {_fmt(value_a)} and another reports "
-                    f"{_fmt(value_b)} for the same factor model with no basis "
-                    "field distinguishing the windows",
+            # Only a contradiction when BOTH claim the same calculation. Two
+            # fits over different windows are expected to differ, and flagging
+            # that would force a real disclosure to be deleted to silence the
+            # check — the opposite of what this rule is for.
+            if basis_a is not None and basis_a == basis_b:
+                findings.append(
+                    Finding(
+                        "XS-009",
+                        owner_a,
+                        path_a,
+                        f"this fit reports {_fmt(value_a)} and another reports "
+                        f"{_fmt(value_b)} for the same factor model over the "
+                        f"same declared basis {basis_a!r}, so at least one is "
+                        "wrong",
+                    )
                 )
-            )
     return findings
 
 
@@ -2389,6 +2452,14 @@ def num_017_evt_declares_xi(export: Export) -> list[Finding]:
     return findings
 
 
+# Payload keys that prove a sub-score was MEASURED rather than defaulted. Without
+# one of these, a sub-score of exactly 0 is indistinguishable from a leg that was
+# never computed. Keys are tried on the node that owns the sub-scores.
+_SUB_SCORE_EVIDENCE: dict[str, tuple[str, ...]] = {
+    "correlation": ("avg_pairwise_correlation", "measured_avg_correlation"),
+}
+
+
 def num_018_no_hard_zero_sub_scores(export: Export) -> list[Finding]:
     """Catches D-04: an unmeasured sub-score indistinguishable from a real zero.
 
@@ -2396,6 +2467,13 @@ def num_018_no_hard_zero_sub_scores(export: Export) -> list[Finding]:
     ``excluded_components: []`` while Risk Studio independently measured an
     average correlation of 0.14.  A hard zero drags ``overall_score`` downward
     and nothing says why.
+
+    A sub-score of exactly zero is NOT a defect when the payload publishes the
+    measurement behind it. A genuinely uncorrelated portfolio also measures 0,
+    and that is a real result, not a floored placeholder — flagging it would
+    push the next engineer into fabricating an epsilon floor to silence the
+    check, which is strictly worse than the ambiguity this rule was written to
+    catch.
     """
     findings: list[Finding] = []
     for path, node in export.dicts:
@@ -2403,10 +2481,25 @@ def num_018_no_hard_zero_sub_scores(export: Export) -> list[Finding]:
         excluded = node.get("excluded_components")
         if not isinstance(components, dict) or not isinstance(excluded, list):
             continue
+
+        # A sub-score of exactly 0 is only suspicious when nothing measured it.
+        # A genuinely uncorrelated portfolio also measures 0, and reporting that
+        # honestly must not be flagged as the same defect as an unmeasured leg
+        # being silently floored to 0. A component is therefore treated as
+        # MEASURED when the payload publishes the quantity behind it, e.g.
+        # `avg_pairwise_correlation` for the correlation sub-score.
+        measured_evidence = {
+            name: node[key]
+            for name in components
+            for key in _SUB_SCORE_EVIDENCE.get(name, ())
+            if key in node and _is_number(node[key])
+        }
         zeros = [
             name
             for name, value in components.items()
-            if _is_number(value) and float(value) == 0.0
+            if _is_number(value)
+            and float(value) == 0.0
+            and name not in measured_evidence
         ]
         if not zeros:
             continue
