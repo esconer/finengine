@@ -206,13 +206,22 @@ class TailRiskService:
                 round(-float(raw_es_loss), 6) if raw_es_loss is not None else None
             ),
             "threshold_u": round(float(threshold_u), 6),
-            # This field is intentionally the raw MLE fit, never the clipped
-            # stability estimate.
+            # Headline shape is the raw MLE fit, never the clipped stability
+            # estimate. The two are published side by side so a reader can see
+            # which one the EVT metrics used, and which one was clipped.
             "gpd_shape_xi": round(float(xi_raw), 4) if xi_raw is not None else None,
+            "gpd_shape_xi_used": (
+                round(float(xi_constrained), 4) if xi_constrained is not None else None
+            ),
+            "gpd_shape_xi_basis": (
+                "constrained_clip" if xi_constrained is not None else "raw_mle"
+            ),
             "gpd_shape_xi_raw": round(float(xi_raw), 8) if xi_raw is not None else None,
             "gpd_shape_xi_constrained": (
                 round(float(xi_constrained), 8) if xi_constrained is not None else None
             ),
+            # Scale is symmetric with the shape above: the headline is the value
+            # the EVT metrics actually used.
             "gpd_scale_beta": round(float(beta_constrained), 6) if beta_constrained is not None else None,
             "gpd_scale_beta_raw": round(float(beta_raw), 6) if beta_raw is not None else None,
             "gpd_scale_beta_constrained": (

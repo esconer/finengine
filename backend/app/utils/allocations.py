@@ -88,6 +88,10 @@ SHARE_ROUNDING_RULE = "half_up_away_from_zero_to_whole_shares"
 
 #: The invariant a regression fixture asserts for every priced trade.
 TRADE_RECONCILIATION_RULE = "shares_delta == half_up(amount / sizing_price)"
+# Both reconciliation aggregates describe exactly this population, so a reader
+# can compare a residual against a tolerance without wondering which trades each
+# one covered.
+TRADE_RECONCILIATION_SCOPE = "all_trades_with_a_usable_sizing_price"
 
 #: Gross exposure within this distance of 1.0 counts as fully funded; anything
 #: above it needs financing.
@@ -594,6 +598,8 @@ def build_trade_instructions(
     unavailable: List[str] = []
     residuals: List[float] = []
     tolerances: List[float] = []
+    residuals_by_ticker: Dict[str, float] = {}
+    tolerances_by_ticker: Dict[str, float] = {}
     priced = 0
     reconciled = True
 
@@ -642,16 +648,30 @@ def build_trade_instructions(
         elif abs(amount) >= floor:
             entry["status"] = "below_minimum_notional"
             entry["below_minimum_notional"] = True
+            # The notional is ABOVE the floor; what happened is the notional
+            # rounding below one whole share. Say that, rather than leaving
+            # `reason` null and implying nothing was wrong.
+            entry["reason"] = (
+                f"notional {abs(amount):.2f} is below one whole share at "
+                f"{price:.4f}, so the instruction rounds to zero shares"
+            )
             below_minimum.append(ticker)
         elif amount:
             entry["status"] = "immaterial_no_op"
+            entry["reason"] = (
+                f"notional {abs(amount):.2f} is below the {floor:.2f} minimum "
+                "order notional"
+            )
             immaterial.append(ticker)
         else:
             entry["status"] = "no_trade_required"
+            entry["reason"] = "target weight already met; no trade is required"
 
         if residual is not None:
             residuals.append(abs(float(residual)))
             tolerances.append(float(tolerance))
+            residuals_by_ticker[ticker] = abs(float(residual))
+            tolerances_by_ticker[ticker] = float(tolerance)
         if abs(float(residual or 0.0)) - float(tolerance_bound) > 1e-9:
             reconciled = False
         trades[ticker] = entry
@@ -681,7 +701,18 @@ def build_trade_instructions(
             "max_abs_rounding_residual": round(max(residuals), AMOUNT_DECIMALS)
             if residuals
             else None,
-            "max_rounding_tolerance": round(min(tolerances), 6) if tolerances else None,
+            # Both aggregates describe the same population: every trade that had
+            # a usable sizing price. The maximum is the bound that certifies the
+            # residual, so publishing the MINIMUM here understated the very
+            # tolerance this field exists to state, by ~139x on a real book.
+            "reconciliation_scope": TRADE_RECONCILIATION_SCOPE,
+            "max_rounding_tolerance": round(max(tolerances), 6) if tolerances else None,
+            "min_rounding_tolerance": round(min(tolerances), 6) if tolerances else None,
+            "tolerance_breach_tickers": sorted(
+                ticker
+                for ticker, residual in residuals_by_ticker.items()
+                if abs(residual) > tolerances_by_ticker.get(ticker, float("inf")) + 1e-9
+            ),
             "below_minimum_notional_tickers": below_minimum,
             "immaterial_no_op_tickers": immaterial,
             "unavailable_tickers": unavailable,

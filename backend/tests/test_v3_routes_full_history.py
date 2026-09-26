@@ -141,9 +141,14 @@ async def test_factor_exposure_model_window_is_not_the_holding_window():
     assert full["latest_observation_date"] == str(dates[-1].date())
     # The holding window is present, but only as clearly ancillary context.
     holding = coverage["holding_context"]
-    expected_holding_days = int((dates >= pd.Timestamp("2026-08-04")).sum())
+    # Same canonical rule as the risk-contribution sibling below: the count a
+    # holding-window section publishes is the rows STRICTLY AFTER the start,
+    # because the bar on the start date is the first held price and has no held
+    # predecessor. Counting the start row itself reports a pre-purchase return.
+    expected_holding_days = int((dates[1:] > pd.Timestamp("2026-08-04")).sum())
     assert expected_holding_days < MODEL_OBSERVATIONS // 2
     assert holding["covered_days"] == expected_holding_days
+    assert holding["covered_days_scope"] == "holding_window_aligned_return_rows"
     assert holding["intersection_start"] == "2026-08-04"
     assert coverage["holding_window_days"] == holding["covered_days"]
     assert coverage["covered_days"] == MODEL_OBSERVATIONS

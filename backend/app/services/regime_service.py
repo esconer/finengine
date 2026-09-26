@@ -125,10 +125,13 @@ def classify(
        - 21-day log holding return: log(P_t / P_{t-21}).
        - 21-day realized volatility: rolling 21d std of daily returns, annualized.
     2. Persistence-friendly initialization (96% diagonal transition matrix,
-       balanced start probabilities). These are EM starting values, not
-       fixed priors: Baum-Welch re-estimates them, and on NIFTY data the
-       fitted diagonal stays ≈0.96, i.e. the persistence is in the data.
-       (A sticky HDP-HMM in the Fox et al., 2011 sense is out of scope.)
+       balanced start probabilities). NOTE: the transition matrix is assigned
+       this sticky value BEFORE fit() and, with params="mc", Baum-Welch does
+       not re-estimate it. The published diagonal is therefore a CONFIGURED
+       PRIOR, not a fitted quantity; the fitted parameters are the per-state
+       means and covariances. Callers must not read persistence out of the
+       transition matrix. (A sticky HDP-HMM in the Fox et al., 2011 sense is
+       out of scope.)
     3. Compound CAGR & Realized Volatility:
        - Computes geometric CAGR for each state to eliminate arithmetic Jensen's inequality skew.
     """

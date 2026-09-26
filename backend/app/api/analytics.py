@@ -52,6 +52,7 @@ from app.services.cointegration_service import (
 )
 from app.utils.allocations import (
     WEIGHT_NORMALIZATION_RULE,
+    gross_exposure,
     normalization_block,
     normalize_rebalance_weights,
     sizing_history_block,
@@ -698,12 +699,16 @@ def _history_window(
 # consulted, because a 176-observation book does not make a 20-observation leg
 # "full history" - that mislabelling is exactly what the gate exists to stop.
 def _own_return_observations(frame: Any) -> Dict[str, int]:
-    """Non-null return observations per ticker, measured from `frame` itself.
+    """Non-null return observations per ticker, measured from a PRICE frame.
 
     Mirrors the engine's own per-position sample (union index kept, so an
     interior gap stays a gap rather than becoming a synthetic multi-day
     return). A frame that is not a dated `DataFrame` measures nothing and
     returns an empty map rather than an invented count.
+
+    Only ever call this with prices: it differences the frame to MAKE returns, so
+    handing it a frame that is already a return frame measures the returns of
+    those returns and reports a count two rows short of the truth.
     """
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return {}
@@ -841,6 +846,79 @@ def _full_history_evidence(
     }
 
 
+# --- Risk contribution: what `positions.*` is a number OF --------------------
+# `positions.volatility` and `positions.cvar_tail` are dimensionless SHARES of
+# total portfolio risk, normalized to 1 and then rounded to six decimals, so they
+# publish as 0.999998 and 0.999999. They sat in a payload that also carries
+# `annualized: true` and `portfolio_volatility_annualized` (an absolute
+# annualized volatility in return units) with nothing saying which was which, so a
+# reader had no way to know the position rows were neither currency nor an
+# annualized figure, and no way to see the residual. Both are published here.
+CONTRIBUTION_UNIT = "fraction_of_portfolio_risk"
+CONTRIBUTION_DECIMALS = 6
+
+
+def _contribution_basis_block(
+    positions: Mapping[str, Any],
+    sector_rollup: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Unit, normalization rule and rounding residual for the share maps."""
+    models: Dict[str, Any] = {}
+    for model, shares in (positions or {}).items():
+        values = list(shares.values()) if isinstance(shares, Mapping) else []
+        try:
+            numbers = [float(value) for value in values]
+        except (TypeError, ValueError):
+            numbers = []
+        if not numbers:
+            models[str(model)] = {
+                "leg_count": len(values),
+                "published_total": None,
+                "rounding_residual": None,
+            }
+            continue
+        total = round(sum(numbers), 12)
+        models[str(model)] = {
+            "leg_count": len(numbers),
+            "published_total": total,
+            "rounding_residual": round(1.0 - total, 12),
+        }
+    sectors: Dict[str, Any] = {}
+    for model, roll in (sector_rollup or {}).items():
+        values = list(roll.values()) if isinstance(roll, Mapping) else []
+        try:
+            total = round(sum(float(value) for value in values), 12)
+        except (TypeError, ValueError):
+            continue
+        sectors[str(model)] = {
+            "published_total": total,
+            "rounding_residual": round(1.0 - total, 12),
+        }
+    return {
+        "unit": CONTRIBUTION_UNIT,
+        "field": "positions.* and sector_rollup.*",
+        "normalization": (
+            "Each model's shares are normalized to 1.0 over the legs that model "
+            "could support, then rounded to 6 decimals. A model that excluded a "
+            "leg (see excluded_assets) normalizes over the legs it kept, so its "
+            "shares sum to 1 over those legs and not over the whole book."
+        ),
+        "rounding_decimals": CONTRIBUTION_DECIMALS,
+        "per_model": models,
+        "sector_rollup_per_model": sectors,
+        "sector_rollup_note": (
+            "sector_rollup sums the per-leg shares of one model into their sector, "
+            "rounded to the same 6 decimals, so it carries its own residual."
+        ),
+        "annualized_note": (
+            "annualized and portfolio_volatility_annualized describe the "
+            "VOLATILITY model's window in annualized return units. They do not "
+            "apply to positions.* or sector_rollup.*, which are unitless shares of "
+            "total portfolio risk, annualized or not."
+        ),
+    }
+
+
 def _model_history_coverage(
     holding_context: Mapping[str, Any],
     full_history: Mapping[str, Any],
@@ -858,6 +936,10 @@ def _model_history_coverage(
         "full_history": dict(full_history),
         "holding_context": dict(holding_context),
         "holding_window_days": holding_context.get("covered_days"),
+        "holding_window_days_scope": holding_context.get("covered_days_scope"),
+        "per_ticker_count_units": dict(
+            holding_context.get("per_ticker_count_units") or PRICE_FRAME_COUNT_UNITS
+        ),
         # Model-scoped mirrors. The holding window never writes these.
         "annualized": bool(full_history.get("annualized")),
         "truncated": False,
@@ -1156,6 +1238,55 @@ def holding_window_observation_count(
     return int(mask.sum()), mask
 
 
+# --- Per-ticker observation counts: one key, one unit ------------------------
+# `raw_days` / `masked_days` / `return_observations` are the names every section
+# publishes per ticker, and the v4 export let three of them answer in three
+# different units. Two rows from the same portfolio read:
+#
+#   regime            raw_days 746  masked_days 39  return_observations 38
+#   risk_contribution raw_days 248  masked_days 38  return_observations 246
+#
+# The first two are PRICE rows (the regime frame is a price frame) and the third
+# is a RETURN-row count, so `return_observations != raw_days - masked_days` for
+# every ticker in the export - and a reader who assumed the identity was reading a
+# nonsense number. Worse, `risk_contribution` measured its third count off a
+# RETURNS frame, so it published the number of returns OF returns (246 where the
+# frame holds 248 aligned return rows). The units are therefore declared per
+# section, and the count that closes is published beside the one that does not.
+PRICE_FRAME_COUNT_UNITS = {
+    "raw_days": "delivered_price_rows_before_the_holding_window_mask",
+    "masked_days": "delivered_price_rows_after_the_holding_window_mask",
+    "return_observations": "aligned_return_rows_produced_by_those_price_rows",
+    "counts_identity": (
+        "raw_days - masked_days = the price rows the holding window removed. "
+        "return_observations is measured in RETURN rows, not price rows, so it is "
+        "NOT raw_days - masked_days: a return needs two held prices, and the bar "
+        "on the start date is the first held price and produces none. A gapless "
+        "leg therefore has return_observations == raw_days - 1, while the "
+        "block's covered_days counts the PORTFOLIO series inside the same window. "
+        "No per-ticker holding-window return count is published here: these "
+        "sections publish the held price rows instead."
+    ),
+}
+
+RETURN_FRAME_COUNT_UNITS = {
+    "raw_days": "aligned_return_rows_in_the_delivered_model_frame",
+    "masked_days": "aligned_return_rows_inside_the_canonical_holding_window",
+    "return_observations": "aligned_return_rows_in_the_delivered_model_frame",
+    "counts_identity": (
+        "This section measures a RETURN frame, so raw_days and return_observations "
+        "are the same population in the same unit. masked_days and "
+        "holding_window_return_observations are that population cut to the "
+        "canonical holding window, so raw_days - masked_days = the aligned return "
+        "rows OUTSIDE the window. The block's covered_days counts the PORTFOLIO "
+        "series inside the window and is not a sum of the per-ticker rows."
+    ),
+    "holding_window_return_observations": (
+        "aligned_return_rows_inside_the_canonical_holding_window"
+    ),
+}
+
+
 def _coverage_per_ticker(
     coverage: Optional[Mapping[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
@@ -1185,6 +1316,7 @@ def publish_holding_coverage(
     covered_days: int,
     evidence_window: Mapping[str, Any],
     covered_days_scope: str = HOLDING_COVERED_DAYS_SCOPE,
+    per_ticker_count_units: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """The one holding-window payload every one of these sections publishes.
 
@@ -1195,6 +1327,13 @@ def publish_holding_coverage(
     arrives with the source that produced it, every count with its unit, and a
     section that resolved its starts without price evidence publishes the
     reason beside them instead of quietly disagreeing with the others.
+
+    `per_ticker_count_units` declares the unit of each PER-TICKER count, because
+    the block count is unified but the per-ticker keys are still three different
+    questions: how many prices arrived, how many survived the holding mask, and
+    how many returns those prices produced. A section that measures a return
+    frame passes its own declaration, because the same key name legitimately means
+    a different thing there.
     """
     starts = {
         ticker: entry.get("analytics_start")
@@ -1214,6 +1353,9 @@ def publish_holding_coverage(
         provenance=detail or {},
     )
     payload["covered_days_scope"] = covered_days_scope
+    payload["per_ticker_count_units"] = dict(
+        per_ticker_count_units or PRICE_FRAME_COUNT_UNITS
+    )
     payload["provenance_rule"] = HOLDING_PROVENANCE_RULE
     payload["provenance_evidence_window"] = dict(evidence_window or {})
     if requested_end is not None:
@@ -1414,6 +1556,274 @@ LIQUIDITY_SCORE_PRECISION = 1
 LIQUIDITY_SCORE_SCALE = {"min": 2.5, "max": 10.0, "unit": "index_0_to_10"}
 
 
+# --- Liquidity: what `spread` and a capped `score_raw` actually are ---------
+# `spread` sat in the payload as a bare number next to `score`/`score_raw`, and
+# the obvious reading - |score - score_raw| - is wrong by two orders of magnitude
+# (CIPLA: 0.040271 vs a published spread of 0.0004). It is an ASSUMED bid-ask
+# spread derived from the position's average daily turnover by the tier formula
+# the score itself uses: nothing is read from a quote or measured intraday. The
+# formulas are restated here and RE-DERIVED from `avg_turnover`, so the
+# declaration is a reproduction of the published value, not a paraphrase: a leg
+# whose published spread the formulas do not reproduce publishes
+# `spread_formula_confirmed: false` rather than inheriting a claim.
+LIQUIDITY_SPREAD_UNIT = "fraction_of_price"
+LIQUIDITY_SPREAD_DEFINITION = "assumed_bid_ask_spread_from_turnover_tier_formula"
+LIQUIDITY_SPREAD_NOTE = (
+    "by_position.*.spread is NOT abs(score - score_raw). It is an ASSUMED "
+    "bid-ask spread as a fraction of price, computed from the position's average "
+    "daily turnover (avg_volume * last close of the window) by the tier formula "
+    "below. It is not read from a quote, not measured from intraday data and not "
+    "derived from the score, and it is rounded to 4 decimals."
+)
+
+#: (id, turnover tier predicate, score formula, spread formula, plateau) mirroring
+#: the engine's tier ladder. `plateau` is the avg_turnover above which the
+#: formula's own clamp binds and stops responding to turnover.
+LIQUIDITY_TIER_LADDER: Tuple[Dict[str, Any], ...] = (
+    {
+        "id": "tier_1",
+        "applies_when": "avg_turnover >= 5e8 or market_cap >= 5e11",
+        "score_raw": "min(10.0, 9.0 + min(1.0, (avg_turnover / 1e9) * 0.2))",
+        "spread": "max(0.0002, 0.0006 - min(0.0003, (avg_turnover / 2e9) * 0.0003))",
+        "score_plateau_turnover": 5e9,
+        "spread_plateau_turnover": 2e9,
+    },
+    {
+        "id": "tier_2",
+        "applies_when": "avg_turnover >= 1e8 or market_cap >= 1e11",
+        "score_raw": "min(8.9, 7.8 + (avg_turnover / 5e8) * 1.1)",
+        "spread": "max(0.0006, 0.0014 - (avg_turnover / 5e8) * 0.0006)",
+        "score_plateau_turnover": None,
+        "spread_plateau_turnover": None,
+    },
+    {
+        "id": "tier_3",
+        "applies_when": "avg_turnover >= 2e7 or market_cap >= 1e10",
+        "score_raw": "min(7.7, 6.2 + (avg_turnover / 1e8) * 0.15)",
+        "spread": "max(0.0012, 0.0028 - (avg_turnover / 1e8) * 0.0012)",
+        "score_plateau_turnover": None,
+        "spread_plateau_turnover": None,
+    },
+    {
+        "id": "tier_4",
+        "applies_when": "otherwise (avg_turnover < 2e7 and market_cap < 1e10)",
+        "score_raw": "max(2.5, min(5.9, 3.0 + (avg_turnover / 2e7) * 2.9))",
+        "spread": "max(0.0025, 0.0060 - (avg_turnover / 2e7) * 0.0030)",
+        "score_plateau_turnover": None,
+        "spread_plateau_turnover": None,
+    },
+)
+
+
+def _liquidity_tier_values(turnover: float) -> List[Tuple[str, float, float]]:
+    """(tier_id, score_raw, spread) this turnover produces under every tier.
+
+    Every tier is evaluated and the ones that reproduce the published values are
+    the evidence, so a leg whose tier cannot be identified publishes `null`
+    instead of the first tier that happens to fit.
+    """
+    rows: List[Tuple[str, float, float]] = []
+    if turnover >= 500_000_000.0:
+        rows.append((
+            "tier_1",
+            round(min(10.0, 9.0 + min(1.0, (turnover / 1e9) * 0.2)), 6),
+            round(max(0.0002, 0.0006 - min(0.0003, (turnover / 2e9) * 0.0003)), 4),
+        ))
+    if turnover >= 100_000_000.0:
+        rows.append((
+            "tier_2",
+            round(min(8.9, 7.8 + (turnover / 5e8) * 1.1), 6),
+            round(max(0.0006, 0.0014 - (turnover / 5e8) * 0.0006), 4),
+        ))
+    if turnover >= 20_000_000.0:
+        rows.append((
+            "tier_3",
+            round(min(7.7, 6.2 + (turnover / 1e8) * 0.15), 6),
+            round(max(0.0012, 0.0028 - (turnover / 1e8) * 0.0012), 4),
+        ))
+    rows.append((
+        "tier_4",
+        round(max(2.5, min(5.9, 3.0 + (turnover / 2e7) * 2.9)), 6),
+        round(max(0.0025, 0.0060 - (turnover / 2e7) * 0.0030), 4),
+    ))
+    return rows
+
+
+def _liquidity_score_spread_disclosure(
+    positions: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Section-level spread/cap declaration plus the per-position evidence.
+
+    Returns `(block, per_position)` so the route can stamp the per-position facts
+    onto the rows they describe without a second pass over the engine result.
+    """
+    scale_max = LIQUIDITY_SCORE_SCALE["max"]
+    block: Dict[str, Any] = {
+        "field": "by_position.*.spread",
+        "unit": LIQUIDITY_SPREAD_UNIT,
+        "definition": LIQUIDITY_SPREAD_DEFINITION,
+        "provenance": "model_assumed",
+        "observed": False,
+        "note": LIQUIDITY_SPREAD_NOTE,
+        "published_decimals": 4,
+        "tier_ladder": [dict(tier) for tier in LIQUIDITY_TIER_LADDER],
+    }
+    per_position: Dict[str, Dict[str, Any]] = {}
+    confirmed: List[str] = []
+    unconfirmed: List[str] = []
+    capped: List[str] = []
+    spread_plateau: List[str] = []
+    for ticker, entry in sorted((positions or {}).items()):
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            turnover = float(entry.get("avg_turnover"))
+        except (TypeError, ValueError):
+            turnover = None
+        published_score = entry.get("score_raw")
+        published_spread = entry.get("spread")
+        try:
+            published_spread = float(published_spread)
+        except (TypeError, ValueError):
+            published_spread = None
+        facts: Dict[str, Any] = {"spread_basis": LIQUIDITY_SPREAD_DEFINITION}
+        tier_id = None
+        recomputed_spread = None
+        if turnover is not None and math.isfinite(turnover):
+            ladder = _liquidity_tier_values(turnover)
+            recomputed_spread = ladder[0][2]
+            try:
+                published_score = float(published_score)
+            except (TypeError, ValueError):
+                published_score = None
+            if published_score is not None:
+                matching = [row for row in ladder if row[1] == published_score]
+                if len(matching) == 1:
+                    tier_id = matching[0][0]
+            spread_matches = (
+                published_spread is not None
+                and any(row[2] == published_spread for row in ladder)
+            )
+            facts["spread_tier"] = tier_id
+            facts["spread_recomputed"] = recomputed_spread
+            facts["spread_formula_confirmed"] = bool(spread_matches)
+            facts["spread_tier_plateau_turnover"] = next(
+                (
+                    tier["spread_plateau_turnover"]
+                    for tier in LIQUIDITY_TIER_LADDER
+                    if tier["id"] == tier_id
+                ),
+                None,
+            )
+            facts["spread_at_tier_plateau"] = bool(
+                tier_id
+                and any(
+                    tier["id"] == tier_id
+                    and tier["spread_plateau_turnover"] is not None
+                    and turnover >= float(tier["spread_plateau_turnover"])
+                    for tier in LIQUIDITY_TIER_LADDER
+                )
+            )
+        else:
+            facts["spread_tier"] = None
+            facts["spread_recomputed"] = None
+            facts["spread_formula_confirmed"] = False
+            facts["spread_tier_plateau_turnover"] = None
+            facts["spread_at_tier_plateau"] = False
+        if facts["spread_formula_confirmed"]:
+            confirmed.append(str(ticker))
+        else:
+            unconfirmed.append(str(ticker))
+        facts["score_ceiling_applied"] = bool(
+            published_score is not None
+            and math.isfinite(published_score)
+            and published_score >= float(scale_max)
+        )
+        if facts["score_ceiling_applied"]:
+            capped.append(str(ticker))
+        if facts["spread_at_tier_plateau"]:
+            spread_plateau.append(str(ticker))
+        per_position[str(ticker)] = facts
+    block["recomputed_from_avg_turnover"] = {
+        "confirmed_count": len(confirmed),
+        "unconfirmed_count": len(unconfirmed),
+        "confirmed_tickers": confirmed,
+        "unconfirmed_tickers": unconfirmed,
+    }
+    block["score_ceiling"] = {
+        "scale_max": scale_max,
+        "rule": (
+            "tier_1's score formula is min(10.0, 9.0 + min(1.0, "
+            "(avg_turnover / 1e9) * 0.2)), so score_raw stops responding to "
+            "turnover at avg_turnover >= 5e9. A score_raw equal to the scale "
+            "maximum is a CAPPED value, not a measurement of exactly 10.0."
+        ),
+        "positions_at_ceiling": capped,
+        "positions_at_ceiling_count": len(capped),
+    }
+    block["spread_at_tier_plateau"] = {
+        "positions": spread_plateau,
+        "positions_count": len(spread_plateau),
+        "note": (
+            "At or above the tier's plateau turnover the spread formula's own "
+            "clamp binds, so the published spread is the tier's floor and does "
+            "not respond to further turnover."
+        ),
+    }
+    return block, per_position
+
+
+def _liquidity_volume_band_residual(
+    volume_stats: Mapping[str, Any],
+    *,
+    positions: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Publish what the band percentages leave over, instead of renormalizing.
+
+    `high/medium/low_volume_pct` are each one position count over the measured
+    population, rounded to one decimal, so they sum to 99.9 or 100.1 rather than
+    100. The residual and the population they were taken over are published
+    beside them; nothing is redistributed to make the column close.
+    """
+    keys = ("high_volume_pct", "medium_volume_pct", "low_volume_pct")
+    values: List[float] = []
+    for key in keys:
+        try:
+            values.append(float(volume_stats.get(key)))
+        except (TypeError, ValueError):
+            continue
+    if len(values) != len(keys):
+        return {
+            "volume_band_pct_total": None,
+            "volume_band_rounding_residual": None,
+            "volume_band_rounding_decimals": 1,
+            "volume_band_basis": (
+                "Share of measured positions in each published-score band. The "
+                "residual is unavailable because the band column this export "
+                "received is incomplete."
+            ),
+        }
+    total = round(sum(values), 10)
+    counts = {"High": 0, "Medium": 0, "Low": 0}
+    for entry in (positions or {}).values():
+        category = entry.get("category") if isinstance(entry, Mapping) else None
+        if category in counts:
+            counts[category] += 1
+    return {
+        "volume_band_pct_total": total,
+        "volume_band_rounding_residual": round(100.0 - total, 10),
+        "volume_band_rounding_decimals": 1,
+        "volume_band_measured_positions": sum(counts.values()),
+        "volume_band_position_counts": counts,
+        "volume_band_basis": (
+            "Each band percentage is (positions in that published-score band / "
+            "measured positions) * 100, rounded to 1 decimal, so the column sums "
+            "to 100 only up to that rounding. The band is the published score's "
+            "band (see scoring.bands), never the raw score's."
+        ),
+    }
+
+
 def _liquidity_observation_window(frames: Mapping[str, Any]) -> Dict[str, Any]:
     """Delivered liquidity range measured from the fetched frames themselves.
 
@@ -1535,7 +1945,187 @@ def _sizing_basis_block(
         "unpriced_tickers": list(engine_result.get("sizing_price_unpriced_tickers") or []),
         "portfolio_value": float(portfolio_value) if portfolio_value is not None else None,
         "portfolio_value_currency": base_currency,
+        "portfolio_value_role": "exact_budget_every_trade_amount_was_struck_from",
     }
+
+
+# --- Volatility sizing: what the trade list is actually priced off ----------
+# Two portfolio values describe one budget, and two dates describe one trade
+# list. The share deltas are struck from `sizing_price` (the last close INSIDE
+# the sizing window), so that price's date - not the section `as_of` - is the
+# freshness of the executable list: a book whose sizing prices are three
+# sessions stale needs three sessions of drift absorbed before a delta is
+# correct. Both numbers are published with the rounding that relates them and
+# with the measured gap, so a reader can see which one moved.
+SIZING_PRICE_FRESHNESS_RULE = (
+    "sizing_price is the last close delivered inside the sizing window and is the "
+    "only price every share_delta was divided by, so sizing_price_as_of - not the "
+    "section as_of - is the freshness of the trade list. portfolio_value is the "
+    "exact base-currency budget the notionals were struck from; the section-level "
+    "portfolio_value is that same budget published at portfolio_value_decimals."
+)
+
+
+def _sizing_price_freshness(
+    sizing_price_as_of: Optional[str],
+    latest_observation_date: Optional[str],
+) -> Dict[str, Any]:
+    """How stale the sizing prices are against the newest delivered bar.
+
+    Measured, never assumed: a `sizing_price_as_of` the delivered frame cannot
+    date publishes `unavailable` instead of a fabricated gap.
+    """
+    gap = _calendar_day_gap(latest_observation_date, sizing_price_as_of)
+    return {
+        "sizing_price_as_of": sizing_price_as_of,
+        "latest_delivered_observation": latest_observation_date,
+        "sizing_price_calendar_days_behind": gap,
+        "sizing_price_as_of_status": "measured" if gap is not None else "unavailable",
+        "rule": SIZING_PRICE_FRESHNESS_RULE,
+    }
+
+
+def _sizing_price_vs_position_last_price(
+    sizing_prices: Optional[Mapping[str, Any]],
+    positions: Iterable[Any],
+) -> Dict[str, Any]:
+    """How far each trade's sizing price sits from the stored `last_price`.
+
+    The share deltas are struck from `sizing_price` while the position row
+    carries its own `last_price`, and those two are different observations of the
+    same scrip. The gap is measured per leg and never reconciled away: it is the
+    size of the drift a rebalance would absorb before a published delta is
+    correct. A leg with no comparable `last_price` publishes `null`.
+    """
+    prices = sizing_prices if isinstance(sizing_prices, Mapping) else {}
+    last_prices: Dict[str, float] = {}
+    for position in positions or ():
+        ticker = getattr(position, "ticker", None)
+        if not isinstance(ticker, str):
+            continue
+        try:
+            value = float(getattr(position, "last_price", None))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            last_prices[ticker] = value
+    gaps: Dict[str, Optional[float]] = {}
+    for ticker, price in sorted(prices.items()):
+        try:
+            sizing_price = float(price)
+        except (TypeError, ValueError):
+            gaps[str(ticker)] = None
+            continue
+        stored = last_prices.get(str(ticker))
+        if stored is None or not math.isfinite(sizing_price) or sizing_price <= 0:
+            gaps[str(ticker)] = None
+            continue
+        gaps[str(ticker)] = round((sizing_price - stored) / stored, 6)
+    measured = {t: g for t, g in gaps.items() if g is not None}
+    worst = max(measured, key=lambda t: abs(measured[t]), default=None)
+    return {
+        "rule": (
+            "(sizing_price - position.last_price) / position.last_price, per leg; "
+            "a positive value means the sizing price is the higher of the two."
+        ),
+        "compared_legs": len(measured),
+        "unavailable_legs": sorted(t for t, g in gaps.items() if g is None),
+        "max_abs_relative_gap": abs(measured[worst]) if worst is not None else None,
+        "max_abs_relative_gap_ticker": worst,
+        "per_ticker_relative_gap": gaps,
+    }
+
+
+# --- Volatility sizing: reconciliation aggregates (V4) ---------------------
+# The engine's reconciliation block published `max_rounding_tolerance` from the
+# MINIMUM per-trade tolerance. A book whose widest tolerance was 1631.300049
+# (MCX.NS) therefore published 11.77 - the narrowest one, MIDCAPIETF.NS - and
+# understated the very bound the block certifies by ~139x. Every trade IS inside
+# its own tolerance, so no trade was wrong; only the published summary was. The
+# aggregates are recomputed here from the delivered trades, and each declares the
+# population it was taken over, because a residual and a tolerance bound are not
+# the same measurement: one is the money a whole-share rule could not trade, the
+# other is the widest half-share value any leg could have moved.
+TRADE_AGGREGATE_SCOPE = "all_priced_trades_with_a_sizing_price"
+TRADE_AGGREGATE_NOTE = (
+    "Aggregates are recomputed from the delivered trades over "
+    f"{TRADE_AGGREGATE_SCOPE}. The residual is money the whole-share rule could "
+    "not trade; the tolerance is half the share price, i.e. the largest value one "
+    "leg's rounding could move. A trade is inside tolerance when ITS OWN residual "
+    "is within ITS OWN tolerance, so a single maximum does not certify a single "
+    "maximum: the widest tolerance in the book is reported beside the widest "
+    "residual, and tolerance_breach_tickers is the per-trade check itself."
+)
+
+
+def _trade_reconciliation_disclosure(
+    reconciliation: Optional[Mapping[str, Any]],
+    trades: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Publish the reconciliation summary with true maxima and declared scopes.
+
+    Nothing is invented: the per-trade residual and tolerance are the ones the
+    engine already published, the notional quantum is read back from the block,
+    and a leg with no sizing price contributes to no aggregate (it has no
+    whole-share instruction to reconcile).
+    """
+    if not isinstance(reconciliation, Mapping):
+        return {}
+    block = dict(reconciliation)
+    quantum = reconciliation.get("amount_rounding_quantum")
+    try:
+        quantum = abs(float(quantum)) if quantum is not None else 0.0
+    except (TypeError, ValueError):
+        quantum = 0.0
+    residuals: List[Tuple[str, float]] = []
+    tolerances: List[Tuple[str, float]] = []
+    breaches: List[str] = []
+    for ticker, entry in (trades or {}).items():
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            tolerance = float(entry.get("rounding_tolerance"))
+        except (TypeError, ValueError):
+            continue
+        tolerances.append((str(ticker), tolerance))
+        raw_residual = entry.get("rounding_residual")
+        try:
+            residual = abs(float(raw_residual)) if raw_residual is not None else None
+        except (TypeError, ValueError):
+            residual = None
+        if residual is None:
+            continue
+        residuals.append((str(ticker), residual))
+        if residual - (tolerance + quantum) > 1e-9:
+            breaches.append(str(ticker))
+    residual_max = max(residuals, key=lambda item: item[1], default=None)
+    tolerance_max = max(tolerances, key=lambda item: item[1], default=None)
+    tolerance_min = min(tolerances, key=lambda item: item[1], default=None)
+    decimals = reconciliation.get("amount_decimals")
+    block.update({
+        "max_abs_rounding_residual": (
+            round(residual_max[1], int(decimals)) if residual_max and isinstance(decimals, int)
+            else reconciliation.get("max_abs_rounding_residual")
+        ),
+        "max_abs_rounding_residual_scope": TRADE_AGGREGATE_SCOPE,
+        "max_abs_rounding_residual_ticker": residual_max[0] if residual_max else None,
+        # The maximum tolerance, not the minimum: the field certifies the widest
+        # bound the book has to live inside, so it must be the widest one.
+        "max_rounding_tolerance": (
+            round(tolerance_max[1], 6) if tolerance_max else reconciliation.get("max_rounding_tolerance")
+        ),
+        "max_rounding_tolerance_scope": TRADE_AGGREGATE_SCOPE,
+        "max_rounding_tolerance_ticker": tolerance_max[0] if tolerance_max else None,
+        # The previously published value, named for what it always was.
+        "min_rounding_tolerance": (
+            round(tolerance_min[1], 6) if tolerance_min else None
+        ),
+        "min_rounding_tolerance_scope": TRADE_AGGREGATE_SCOPE,
+        "tolerance_breach_tickers": sorted(breaches),
+        "aggregates_source": "recomputed_from_delivered_trades",
+        "aggregate_note": TRADE_AGGREGATE_NOTE,
+    })
+    return block
 
 
 def _exposure_projection(
@@ -1581,6 +2171,10 @@ def _exposure_projection(
 # the precision it publishes, and 1e-4 still sits far below any real leverage.
 _SOLVER_GROSS_TOLERANCE = 1e-4
 
+#: Decimals every published optimizer weight is rounded to, and therefore the
+#: precision a `trades_required` record is auditable at.
+TRADE_WEIGHT_DECIMALS = 4
+
 
 def _weight_normalization_block(
     weights: Optional[Mapping[str, Any]],
@@ -1590,17 +2184,38 @@ def _weight_normalization_block(
     The validated `weights` are not substituted into the response: this is a
     disclosure of what the shared rule measured about the published target, not
     a silent rewrite of a solver answer.
+
+    `financing_required` is decided from the UNROUNDED gross exposure. The shared
+    rule rounds its own answer to six decimals, so a solver target that sums to
+    0.999998 published `gross_exposure: 1.0` and `financing_required: false` with
+    a 2e-6 shortfall hidden inside that rounding - a book that is not quite fully
+    funded, displayed as exactly funded. The residual is published so the two
+    readings are reconcilable, and the decision no longer depends on the
+    rounding.
     """
     normalization = normalize_rebalance_weights(weights, tolerance=_SOLVER_GROSS_TOLERANCE)
+    measured_gross = gross_exposure(weights)
+    published_gross = float(normalization["gross_exposure"])
     block = {
         "normalization_rule": WEIGHT_NORMALIZATION_RULE,
         "normalization_mode": normalization["normalization_mode"],
         "weights_normalized": normalization["weights_normalized"],
         "submitted_gross_exposure": normalization["submitted_gross_exposure"],
+        "submitted_gross_exposure_measured": measured_gross,
         "gross_exposure": normalization["gross_exposure"],
+        "gross_exposure_residual": round(measured_gross - published_gross, 12),
+        "gross_exposure_tolerance": _SOLVER_GROSS_TOLERANCE,
         "execution_eligible": normalization["execution_eligible"],
-        "financing_required": normalization["financing_required"],
+        "financing_required": measured_gross > 1.0 + _SOLVER_GROSS_TOLERANCE,
+        "financing_required_basis": "unrounded_submitted_gross_exposure",
         "net_cash_weight": round(1.0 - normalization["gross_exposure"], 6),
+        "gross_exposure_residual_basis": (
+            "submitted_gross_exposure_measured - gross_exposure. gross_exposure is "
+            "the post-normalization value the shared rule produces (exactly 1.0 for "
+            "a fully funded book), so this residual is the shortfall or surplus the "
+            "normalization absorbs; it is negative for an under-funded target and "
+            "zero for a full exit."
+        ),
     }
     if normalization["rejection"] is not None:
         # Never silent: a target the rebalance workflow would refuse is named
@@ -2480,8 +3095,20 @@ async def get_factor_exposure(
         # holding window stays disclosed via history_coverage.
         holdings = await resolve_holdings(db, calculation_tickers)
         # The mask is measured only to describe the holding tenure; the model
-        # below still runs on the unmasked frame.
-        holding_dict, effectives, start_detail = holding_window_detail(price_data_dict, holdings)
+        # below still runs on the unmasked frame. The window is resolved by the
+        # canonical rule - the same `holding_provenance` read every other section
+        # makes - and the masked leg is handed the canonical start with the buy
+        # price withheld, so this section can no longer infer a different date
+        # from its own price window. It then counts the window in the unit every
+        # other section uses (aligned return rows), not in held price rows, which
+        # is what made this the one section that reported a holding window one
+        # row longer than its three siblings.
+        provenance = await holding_provenance(
+            data_service, holdings, calculation_tickers, end=end,
+        )
+        holding_dict, _effectives, _local_detail = holding_window_detail(
+            price_data_dict, canonical_holding_window_input(provenance["detail"])
+        )
         price_data = pd.DataFrame(price_data_dict)
         factor_weights = {
             ticker: float(weight)
@@ -2495,7 +3122,10 @@ async def get_factor_exposure(
                 for ticker, weight in factor_weights.items()
             }
         holding_frame = pd.DataFrame(holding_dict)
-        holding_days = int(len(holding_frame)) if not holding_frame.empty else 0
+        holding_days, _holding_mask = holding_window_observation_count(
+            holding_frame if not holding_frame.empty else None,
+            provenance["start"],
+        )
         own_return_observations = _own_return_observations(price_data)
         per_ticker = {
             ticker: {
@@ -2507,9 +3137,21 @@ async def get_factor_exposure(
             }
             for ticker, series in price_data_dict.items()
         }
-        holding_context = holding_coverage(
-            effectives, start, end, holding_days, per_ticker, provenance=start_detail
+        holding_context = publish_holding_coverage(
+            detail=provenance["detail"],
+            per_ticker=per_ticker,
+            requested_start=start,
+            requested_end=end,
+            covered_days=holding_days,
+            evidence_window=provenance["evidence_window"],
         )
+        # The held PRICE-row count is kept beside the canonical count so nothing
+        # is lost: it is one larger, because the bar on the start date is the
+        # first held price and has no held predecessor to produce a return.
+        holding_context["holding_window_price_rows"] = (
+            int(len(holding_frame)) if not holding_frame.empty else 0
+        )
+        holding_context["holding_window_price_rows_scope"] = "held_price_rows_incl_start_bar"
         # Model evidence lives in its own object: a full-history regression is
         # not truncated to the holding window, so it publishes its own window,
         # observation count, latest observation and annualization flag. The
@@ -2893,6 +3535,25 @@ async def get_liquidity_metrics(
         # the request end as its freshness.
         delivered = _liquidity_observation_window(price_data_dict)
         latest_observation_date = _latest_observation_date(price_data_dict)
+        by_position = liquidity_result.get("by_position", {})
+        by_position = dict(by_position) if isinstance(by_position, Mapping) else {}
+        spread_block, per_position_spread = _liquidity_score_spread_disclosure(
+            by_position
+        )
+        for ticker, facts in per_position_spread.items():
+            if isinstance(by_position.get(ticker), Mapping):
+                by_position[ticker] = {**by_position[ticker], **facts}
+        volume_stats = liquidity_result.get("volume_stats", {})
+        volume_stats = dict(volume_stats) if isinstance(volume_stats, Mapping) else {}
+        volume_stats.update(
+            _liquidity_volume_band_residual(volume_stats, positions=by_position)
+        )
+        scoring_block = _liquidity_scoring_block(
+            liquidity_result,
+            data_range={"start": start, "end": end},
+            observation_window=delivered,
+        )
+        scoring_block["spread"] = spread_block
 
         return {
             "overall_score": liquidity_result.get("overall_score"),
@@ -2900,8 +3561,8 @@ async def get_liquidity_metrics(
             "overall_band": liquidity_result.get("overall_band"),
             "liquidation_time_days": liquidity_result.get("liquidation_time_days"),
             "risk_level": liquidity_result.get("risk_level"),
-            "by_position": liquidity_result.get("by_position", {}),
-            "volume_stats": liquidity_result.get("volume_stats", {}),
+            "by_position": by_position,
+            "volume_stats": volume_stats,
             "currency": LIQUIDITY_SCORING_CURRENCY,
             "base_currency": LIQUIDITY_SCORING_CURRENCY,
             "currency_provenance": "derived",
@@ -2920,11 +3581,7 @@ async def get_liquidity_metrics(
                 _calendar_day_gap(end, start) or 0
             ),
             "latest_observation_date": latest_observation_date,
-            "scoring": _liquidity_scoring_block(
-                liquidity_result,
-                data_range={"start": start, "end": end},
-                observation_window=delivered,
-            ),
+            "scoring": scoring_block,
             "universe_coverage": coverage,
             "data_status": _data_status(coverage),
             "methodology": "Liquidity scoring based on trading volume and market capitalization"
@@ -3272,9 +3929,18 @@ async def get_volatility_sizing(
             coverage,
             partial=limited_history or bool(sizing_result.get("error")),
         )
+        published_pv = round(float(resolved_pv), 2)
         response.update({
-            "portfolio_value": round(float(resolved_pv), 2),
+            "portfolio_value": published_pv,
             "portfolio_value_currency": base_currency,
+            # The exact budget and its published form are one number, so the
+            # rounding that relates them is stated instead of leaving two
+            # `portfolio_value` readings to reconcile by eye.
+            "portfolio_value_decimals": 2,
+            "portfolio_value_rounding_residual": round(
+                float(resolved_pv) - published_pv, 12
+            ),
+            "portfolio_value_exact": float(resolved_pv),
             "currency": base_currency,
             "base_currency": base_currency,
             "currency_provenance": currency_provenance,
@@ -3307,6 +3973,23 @@ async def get_volatility_sizing(
         response["sizing_basis"] = _sizing_basis_block(
             sizing_result, base_currency=base_currency, portfolio_value=resolved_pv
         )
+        response["sizing_basis"]["price_freshness"] = _sizing_price_freshness(
+            response["sizing_basis"].get("sizing_price_as_of"),
+            response.get("latest_observation_date"),
+        )
+        response["sizing_basis"]["position_last_price_comparison"] = (
+            _sizing_price_vs_position_last_price(
+                response["sizing_basis"].get("sizing_price"), positions_list
+            )
+        )
+        # The engine's summary understated the tolerance bound it certifies; the
+        # published aggregates are recomputed from the delivered trades instead.
+        reconciliation = _trade_reconciliation_disclosure(
+            sizing_result.get("trade_reconciliation"),
+            sizing_result.get("trades"),
+        )
+        if reconciliation:
+            response["trade_reconciliation"] = reconciliation
         execution = sizing_result.get("execution")
         if not isinstance(execution, Mapping):
             # A degraded engine published no rule block, but the target it did
@@ -4449,7 +5132,6 @@ async def get_risk_contribution(
             data_service, holdings, _active_weight_tickers(weights), end=end,
         )
         start_detail = provenance["detail"]
-        own_return_observations = _own_return_observations(returns_df)
         # The holding-context window is measured on the delivered portfolio
         # return series against the canonical intersection start, so
         # `covered_days` there describes the holding tenure (return
@@ -4458,22 +5140,45 @@ async def get_risk_contribution(
         holding_days, holding_mask = holding_window_observation_count(
             port_ret, provenance["start"],
         )
+        # `returns_df` is already a RETURN frame here, so a ticker's own
+        # observation count is its non-null return rows. Taking it through
+        # `_own_return_observations` (which differences a frame to make returns)
+        # measured the returns OF those returns and published 246 where the
+        # frame holds 248: a count that was wrong by construction and published
+        # under the same key the price-frame sections use.
+        return_frame_counts = {
+            ticker: int(returns_df[ticker].notna().sum())
+            for ticker in returns_df.columns
+        }
         holding_context = publish_holding_coverage(
             detail=start_detail,
             per_ticker={
                 ticker: {
-                    "raw_days": int(returns_df[ticker].notna().sum()),
+                    "raw_days": count,
                     "masked_days": int(returns_df[ticker][holding_mask].notna().sum())
-                    if holding_mask is not None else int(returns_df[ticker].notna().sum()),
-                    "return_observations": int(count),
+                    if holding_mask is not None else count,
+                    "return_observations": count,
+                    "holding_window_return_observations": int(
+                        returns_df[ticker][holding_mask].notna().sum()
+                    ) if holding_mask is not None else count,
                 }
-                for ticker, count in own_return_observations.items()
+                for ticker, count in return_frame_counts.items()
             },
             requested_start=start,
             requested_end=end,
             covered_days=holding_days,
             evidence_window=provenance["evidence_window"],
+            per_ticker_count_units=RETURN_FRAME_COUNT_UNITS,
         )
+        # `holding_coverage` only knows the three legacy count keys, so the
+        # window count this section measures is stamped on afterwards, in the
+        # same unit the block-level `covered_days` uses.
+        for ticker, row in holding_context.get("tickers", {}).items():
+            if not isinstance(row, dict):
+                continue
+            row.setdefault(
+                "holding_window_return_observations", row.get("masked_days")
+            )
         full_history = _full_history_evidence(
             returns_df,
             requested_start=start,
@@ -4625,6 +5330,9 @@ async def get_risk_contribution(
                 "cvar_tail": cvar_rc,
             },
             "sector_rollup": sector_rollup,
+            "contribution_basis": _contribution_basis_block(
+                {"volatility": vol_rc, "cvar_tail": cvar_rc}, sector_rollup
+            ),
             "universe_coverage": coverage,
             "data_status": _data_status(coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS),
             "latest_observation_date": _latest_observation_date(port_ret),
@@ -4753,7 +5461,7 @@ async def run_optimization(
                 "solver": None,
                 "universe": ticker_list,
                 "calculation_universe": [],
-                "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
+                "current_weights": {t: round(float(current_weights.get(t, 0.0)), TRADE_WEIGHT_DECIMALS) for t in ticker_list},
                 "trades_required": {},
                 "universe_coverage": coverage,
                 "data_status": _data_status(coverage, unavailable=not coverage["covered_tickers"]),
@@ -4784,24 +5492,70 @@ async def run_optimization(
             ticker: float(recommended.get(ticker, 0.0))
             for ticker in calculation_universe
         }
+        published_current = {
+            t: round(float(current_weights.get(t, 0.0)), TRADE_WEIGHT_DECIMALS)
+            for t in calculation_universe
+        }
         trades = {}
         for t in calculation_universe:
             cur = float(current_weights.get(t, 0.0))
             rec = reported_recommended[t]
             if abs(rec - cur) > 1e-6:
+                # The delta is the difference of the two legs this record
+                # PUBLISHES, not of the unrounded weights behind them: a trade
+                # list exists to be executed and audited, so
+                # `recommended_weight - current_weight == weight_delta` has to
+                # hold in the numbers a reader can see. Deriving the delta from
+                # the unrounded legs and then rounding it left 2 of 14 records
+                # off by 1e-4 in exactly the fields an auditor adds up.
                 trades[t] = {
-                    "current_weight": round(cur, 4),
-                    "recommended_weight": round(rec, 4),
-                    "weight_delta": round(rec - cur, 4),
+                    "current_weight": published_current[t],
+                    "recommended_weight": round(rec, TRADE_WEIGHT_DECIMALS),
+                    "weight_delta": round(
+                        round(rec, TRADE_WEIGHT_DECIMALS) - published_current[t],
+                        TRADE_WEIGHT_DECIMALS,
+                    ),
                 }
+        recommended_sum = round(
+            sum(round(value, TRADE_WEIGHT_DECIMALS) for value in reported_recommended.values()),
+            12,
+        )
+        current_sum = round(
+            sum(published_current[t] for t in calculation_universe), 12
+        )
 
         response = {
             **result,
             "weights": reported_recommended,
             "universe": ticker_list,
             "calculation_universe": calculation_universe,
-            "current_weights": {t: round(float(current_weights.get(t, 0.0)), 4) for t in ticker_list},
+            "current_weights": {
+                t: round(float(current_weights.get(t, 0.0)), TRADE_WEIGHT_DECIMALS)
+                for t in ticker_list
+            },
             "trades_required": dict(sorted(trades.items(), key=lambda kv: abs(kv[1]["weight_delta"]), reverse=True)),
+            "trades_required_basis": {
+                "weight_decimals": TRADE_WEIGHT_DECIMALS,
+                "weight_delta_rule": (
+                    "weight_delta == round(recommended_weight - current_weight, 4) "
+                    "over the PUBLISHED legs of the same record, so every trade "
+                    "closes against the two weights printed beside it."
+                ),
+                "trade_count": len(trades),
+                "current_weights_published_total": current_sum,
+                "current_weights_rounding_residual": round(1.0 - current_sum, 12),
+                "recommended_weights_published_total": recommended_sum,
+                "recommended_weights_rounding_residual": round(1.0 - recommended_sum, 12),
+                "totals_note": (
+                    "Totals are sums of the published 4-decimal legs; the residual "
+                    "is what that display rounding costs. They are a SECOND "
+                    "rounding of the same vector as weight_normalization's "
+                    "submitted_gross_exposure_measured, and the two differ by up to "
+                    "n/2e4, so both are published rather than one standing in for "
+                    "the other. The financing decision is made on the unrounded "
+                    "figure and is published in weight_normalization."
+                ),
+            },
             "universe_coverage": coverage,
             "data_status": _data_status(
                 coverage, partial=bool(missing_tickers) or bool(result.get("error"))
@@ -4894,6 +5648,153 @@ async def run_backtest(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# --- Regime: what the published percentages are made of (V4) ----------------
+# Three published percentage aggregates did not close: `states[].historical_days_pct`
+# summed to 100.1, `regime_probabilities` to 99.9999, and `stability_pct` (96.7)
+# to nothing at all. The first two are display rounding and are published with
+# their residual. `stability_pct` is a genuine measurement - the label-flip rate
+# of the decoded path over the FULL sample - but nothing said so, and the
+# transition matrix's suspiciously exact uniform 96.0 diagonal reads as a
+# configured matrix unless it declares that it IS one.
+REGIME_PERCENTAGE_TOTAL = 100.0
+STABILITY_PCT_RULE = (
+    "stability_pct == 100 * (1 - share of consecutive observations in the decoded "
+    "display-regime path whose label changed). It is measured over the FULL "
+    "classification sample, not over recent_history, and it is not the mean "
+    "diagonal of transition_matrix: the matrix is a prior (see "
+    "transition_matrix_provenance) while this is a rate observed on the decoded "
+    "path."
+)
+TRANSITION_MATRIX_PROVENANCE = {
+    "source": "configured_sticky_prior",
+    "estimated": False,
+    "estimated_parameters": "means_and_covariances_only",
+    "rule": (
+        "The Gaussian HMM is fitted with params='mc', so only the emission means "
+        "and covariances are estimated. transmat_ is set to a fixed "
+        "sticky-persistence prior before fitting and is never re-estimated, so "
+        "this matrix is that PRIOR published at 1 decimal - its uniform diagonal "
+        "is the prior's persistence, not a persistence measured from the "
+        "benchmark's regime path. Read the observed persistence from "
+        "stability_pct instead."
+    ),
+    "rounding_decimals": 1,
+    "read_this_as": "model prior; not a fitted transition matrix",
+}
+
+
+def _regime_percentage_residuals(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Publish the rounding each percentage aggregate leaves behind.
+
+    Both aggregates are sums of individually rounded terms, so neither has to
+    close on 100 and neither is renormalized to make it look as though it did.
+    A missing aggregate publishes `unavailable` rather than a zero residual.
+    """
+    out: Dict[str, Any] = {}
+    states = result.get("states")
+    days_pct: List[float] = []
+    if isinstance(states, list):
+        for state in states:
+            if not isinstance(state, Mapping):
+                continue
+            try:
+                days_pct.append(float(state.get("historical_days_pct")))
+            except (TypeError, ValueError):
+                continue
+    if days_pct:
+        total = round(sum(days_pct), 10)
+        out["historical_days_pct_total"] = total
+        out["historical_days_pct_rounding_residual"] = round(
+            REGIME_PERCENTAGE_TOTAL - total, 10
+        )
+        out["historical_days_pct_rounding_decimals"] = 1
+        out["historical_days_pct_basis"] = (
+            "Share of the classification sample assigned to each state; the "
+            "per-state values are rounded to 1 decimal, so their sum is published "
+            "beside them instead of being renormalized to 100."
+        )
+    probabilities = result.get("regime_probabilities")
+    if isinstance(probabilities, Mapping) and probabilities:
+        try:
+            total = round(sum(float(value) for value in probabilities.values()), 10)
+        except (TypeError, ValueError):
+            total = None
+        if total is not None:
+            out["regime_probabilities_total"] = total
+            out["regime_probabilities_rounding_residual"] = round(
+                REGIME_PERCENTAGE_TOTAL - total, 10
+            )
+            out["regime_probabilities_rounding_decimals"] = 4
+            out["regime_probabilities_basis"] = (
+                "Filtered posterior of the final observation, per state, in "
+                "percentage points; each value is rounded to 4 decimals, so the "
+                "posterior's own rounding is published beside them."
+            )
+    matrix = result.get("transition_matrix")
+    if isinstance(matrix, Mapping) and matrix:
+        row_residuals = {}
+        for state, row in matrix.items():
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                row_residuals[str(state)] = round(
+                    REGIME_PERCENTAGE_TOTAL - sum(float(value) for value in row.values()),
+                    10,
+                )
+            except (TypeError, ValueError):
+                continue
+        if row_residuals:
+            out["transition_matrix_row_residuals"] = row_residuals
+            out["transition_matrix_row_residual_max_abs"] = max(
+                abs(value) for value in row_residuals.values()
+            )
+    return out
+
+
+def _regime_stability_disclosure(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Say how `stability_pct` was measured, and re-measure the recent window.
+
+    The full-sample rate is the classifier's own measurement and cannot be
+    re-derived here (the decoded path is not republished in full), so its rule and
+    scope are declared instead. The rate over the window that IS republished -
+    `recent_history` - is recomputed and labelled as a different measurement, so
+    the two can never be read as one number with two names.
+    """
+    observations = result.get("observations")
+    out: Dict[str, Any] = {
+        "stability_pct_rule": STABILITY_PCT_RULE,
+        "stability_pct_scope": "full_classification_sample_consecutive_label_transitions",
+        "stability_pct_unit": "percent_0_to_100",
+        "stability_pct_observations": (
+            int(observations) if isinstance(observations, int) else None
+        ),
+        "transition_matrix_provenance": dict(TRANSITION_MATRIX_PROVENANCE),
+    }
+    history = result.get("recent_history")
+    labels: List[str] = []
+    if isinstance(history, list):
+        for row in history:
+            if isinstance(row, Mapping) and isinstance(row.get("regime"), str):
+                labels.append(str(row["regime"]))
+    if len(labels) > 1:
+        unchanged = sum(
+            1 for before, after in zip(labels, labels[1:]) if before == after
+        )
+        out["recent_history_self_transition_pct"] = round(
+            100.0 * unchanged / (len(labels) - 1), 4
+        )
+        out["recent_history_transitions"] = len(labels) - 1
+        out["recent_history_self_transition_scope"] = (
+            "last_120_observations_of_the_decoded_path"
+        )
+        out["recent_history_note"] = (
+            "Recomputed from recent_history, which publishes the last 120 "
+            "observations only. It is NOT stability_pct, which is measured over "
+            "the full classification sample."
+        )
+    return out
+
+
 @router.get("/regime")
 async def get_regime(
     lookback_days: int = Query(default=1100, ge=300, le=3000),
@@ -4960,6 +5861,8 @@ async def get_regime(
                 port_ret = None
 
         result = await detect_regime(db, lookback_days=lookback_days, portfolio_returns=port_ret)
+        result.update(_regime_percentage_residuals(result))
+        result.update(_regime_stability_disclosure(result))
         if history_coverage is not None and "portfolio_in_current_regime" in result:
             # The conditional block measured the days the classifier assigned
             # to the CURRENT regime, so it gets a coverage object describing
@@ -5192,6 +6095,61 @@ async def get_correlation_stability(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+def _pairs_test_agreement(
+    pairs: Optional[Iterable[Any]],
+    *,
+    test_roles: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """How often the two cointegration tests agree, measured over delivered rows.
+
+    `is_cointegrated` (Engle-Granger) and `johansen_cointegrated` are two
+    different tests, and a consumer that sums them double counts: on the audited
+    book 4 + 4 = 8 pairs, with ZERO overlap. The per-row
+    `johansen_agrees_with_decision` flag answers the question one row at a time;
+    this answers it for the whole scan, so the headline count and the diagnostic
+    cannot be added together by accident.
+    """
+    rows = list(pairs or [])
+    decision_positive: List[str] = []
+    diagnostic_positive: List[str] = []
+    agree: List[str] = []
+    disagree: List[str] = []
+    for pair in rows:
+        key = f"{getattr(pair, 'ticker_a', None)}/{getattr(pair, 'ticker_b', None)}"
+        decision = bool(getattr(pair, "is_cointegrated", False))
+        diagnostic = bool(getattr(pair, "johansen_cointegrated", False))
+        if decision:
+            decision_positive.append(key)
+        if diagnostic:
+            diagnostic_positive.append(key)
+        (agree if decision == diagnostic else disagree).append(key)
+    flagged = set(decision_positive) | set(diagnostic_positive)
+    return {
+        "decision_test": "engle_granger",
+        "diagnostic_test": "johansen",
+        "test_roles": (
+            dict(test_roles) if isinstance(test_roles, Mapping) else dict(TEST_ROLES)
+        ),
+        "counted_pairs": len(rows),
+        "decision_positive_count": len(decision_positive),
+        "diagnostic_positive_count": len(diagnostic_positive),
+        "agreement_count": len(agree),
+        "disagreement_count": len(disagree),
+        "decision_positive_only_count": len(set(decision_positive) - set(diagnostic_positive)),
+        "diagnostic_positive_only_count": len(set(diagnostic_positive) - set(decision_positive)),
+        "decision_positive_pairs": sorted(decision_positive),
+        "diagnostic_positive_pairs": sorted(diagnostic_positive),
+        "summed_count_note": (
+            "is_cointegrated and johansen_cointegrated are different tests and must "
+            "NOT be added: a pair can carry both. is_cointegrated (engle_granger) is "
+            "the published decision; johansen_cointegrated is diagnostic_only. "
+            "Summing the two positive counts would report "
+            f"{len(decision_positive) + len(diagnostic_positive)} pairs where only "
+            f"{len(flagged)} are flagged by at least one test."
+        ),
+    }
+
+
 @router.get("/coint", response_model=CointScannerResponse)
 async def get_cointegration_pairs(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
@@ -5386,6 +6344,10 @@ async def get_cointegration_pairs(
             warnings.append(
                 _depth_warning(response, depth_by_ticker or {}, list(shallow or []))
             )
+        extras["test_agreement"] = _pairs_test_agreement(
+            list(getattr(response, "pairs", None) or []),
+            test_roles=getattr(response, "test_roles", None),
+        )
         if warnings:
             extras["warnings"] = warnings
         return extras
@@ -5819,6 +6781,116 @@ def clear_tails_cache() -> None:
     _TAILS_RESPONSE_CACHE.clear()
 
 
+# --- Tail risk: which level was fitted and which level is reported ----------
+# Two numbers in this payload used to be read as the same thing. `threshold_u`
+# sits at the POT threshold quantile (0.95 by default), so only the worst ~5% of
+# the loss sample is fitted and 26 of 518 observations are the exceedances - yet
+# `confidence_level` is 0.99 and the `evt_pot_var_99` field names read as though
+# a 1% tail had been fitted. Both are legitimate and neither is wrong; what was
+# missing is that they are different levels, so the threshold basis is published
+# with the measured exceedance fraction beside it. The fit is not changed.
+POT_THRESHOLD_BASIS_RULE = (
+    "Peaks-over-threshold is FIT on the losses strictly above the empirical "
+    "threshold_quantile of the return sample; the reported VaR/ES is the "
+    "confidence_level quantile OF THAT FITTED TAIL. threshold_u and "
+    "exceedance_fraction therefore describe the fitting threshold, while "
+    "confidence_level and the *_99 fields describe the reported level. They are "
+    "different levels on purpose: the tail is fitted where there are enough "
+    "exceedances to be stable, and reported at the level the caller asked for."
+)
+
+
+def _pot_threshold_disclosure(
+    evt_stats: Mapping[str, Any],
+    *,
+    confidence_level: Any,
+    threshold_quantile: Any,
+) -> Dict[str, Any]:
+    """Declare the level the POT tail was fitted at, measured from the fit."""
+    exceedances = evt_stats.get("exceedances_count")
+    total = evt_stats.get("total_observations")
+    try:
+        exceedances = int(exceedances)
+        total = int(total)
+    except (TypeError, ValueError):
+        exceedances = total = None
+    fraction = (
+        round(exceedances / total, 6)
+        if exceedances is not None and total
+        else None
+    )
+    return {
+        "pot_threshold_basis": {
+            "rule": POT_THRESHOLD_BASIS_RULE,
+            "threshold_quantile": (
+                float(threshold_quantile)
+                if isinstance(threshold_quantile, (int, float))
+                and not isinstance(threshold_quantile, bool)
+                else None
+            ),
+            "reported_level": (
+                float(confidence_level)
+                if isinstance(confidence_level, (int, float))
+                and not isinstance(confidence_level, bool)
+                else evt_stats.get("confidence_level")
+            ),
+            "exceedance_fraction": fraction,
+            "exceedances_count": exceedances,
+            "total_observations": total,
+            "threshold_u": evt_stats.get("threshold_u"),
+            "level_fields": {
+                "fitted": "threshold_u",
+                "reported": "confidence_level",
+            },
+            "suffixed_field_rule": (
+                "evt_pot_var_99 / evt_pot_es_99 / historical_var_99 / "
+                "historical_es_99 are the same values as the unsuffixed fields, "
+                "published only when confidence_level is exactly 0.99. The suffix "
+                "names the REPORTED level; it is not the POT threshold level."
+            ),
+        },
+    }
+
+
+GPD_SHAPE_USAGE_RULE = (
+    "evt_pot_var / evt_pot_es (and the historical floors they are max'd against) "
+    "are computed from the CONSTRAINED GPD moments. gpd_shape_xi is the raw "
+    "maximum-likelihood fit and gpd_shape_xi_constrained is the clipped value that "
+    "produced those moments, so gpd_shape_xi_used is the parameter the reported "
+    "risk was actually computed from."
+)
+
+
+def _gpd_shape_usage_disclosure(evt_stats: Mapping[str, Any]) -> Dict[str, Any]:
+    """Name the GPD shape that produced the reported tail risk.
+
+    The service publishes the raw MLE fit under `gpd_shape_xi` (deliberately: it
+    is the unconstrained estimate) while computing the metrics from the clipped
+    value, so the field a consumer reaches for first is not the one that produced
+    the answer. The used value is published explicitly rather than by overwriting
+    the raw one.
+    """
+    raw = evt_stats.get("gpd_shape_xi_raw")
+    constrained = evt_stats.get("gpd_shape_xi_constrained")
+    clipped = bool(evt_stats.get("gpd_shape_constrained"))
+    if clipped and constrained is not None:
+        used, basis = constrained, "constrained_clip"
+    elif raw is not None:
+        used, basis = raw, "raw_maximum_likelihood_fit"
+    else:
+        used, basis = None, "unavailable"
+    return {
+        "gpd_shape_xi_used": used,
+        "gpd_shape_xi_used_basis": basis,
+        "gpd_shape_xi_used_rule": GPD_SHAPE_USAGE_RULE,
+        "gpd_shape_constraint_reason": evt_stats.get("constraint_reason"),
+        "gpd_shape_xi_raw_field": "gpd_shape_xi_raw",
+        "gpd_shape_xi_raw_equals_published_headline": (
+            raw is not None and evt_stats.get("gpd_shape_xi") == round(float(raw), 4)
+        ),
+    }
+
+
 @router.get("/tail-dependence")
 @router.get("/tails")
 async def get_tail_risk_and_copula(
@@ -5879,6 +6951,11 @@ async def get_tail_risk_and_copula(
             "universe_coverage": coverage,
             "data_status": _data_status(coverage),
             "observations": len(port_ret),
+            **_pot_threshold_disclosure(
+                evt_stats, confidence_level=confidence_level,
+                threshold_quantile=threshold_quantile,
+            ),
+            **_gpd_shape_usage_disclosure(evt_stats),
         }
         if cache_generation == _TAILS_CACHE_GENERATION:
             _TAILS_RESPONSE_CACHE[cache_key] = (time.monotonic(), response)

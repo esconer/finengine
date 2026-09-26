@@ -289,7 +289,11 @@ async def test_material_sub_lot_trade_is_reported_not_silently_zero_shares():
     assert trade["shares_delta"] == 0
     assert trade["below_minimum_notional"] is True
     assert trade["status"] == "below_minimum_notional"
-    assert trade["reason"] is None
+    # A sub-lot trade is a real outcome, so it must SAY why it rounds to zero:
+    # the notional is above the order floor but below one whole share. An empty
+    # reason read as "nothing unusual happened".
+    assert trade["reason"], "a sub-lot trade must state why it rounds to zero"
+    assert "below one whole share" in trade["reason"]
     # The money that cannot be traded in whole shares is published, not lost.
     assert trade["rounding_residual"] == pytest.approx(trade["amount"], abs=0.01)
     assert second["trade_reconciliation"]["reconciled"] is True
