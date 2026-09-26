@@ -410,6 +410,11 @@ class CorrelationStabilityResponse(BaseModel):
     current_avg_correlation: Optional[float] = None
     historical_threshold_90th: Optional[float] = None
     historical_threshold_75th: Optional[float] = None
+    # AD-9 made the regime test two-sided, so the LOWER bound is now one of the
+    # two comparisons that can fire `is_regime_break`. It has to be a field
+    # rather than prose inside `message`: a consumer that cannot read the bound
+    # that triggered the alert has to parse English to find out why it fired.
+    historical_threshold_10th: Optional[float] = None
     historical_median: Optional[float] = None
     is_regime_break: bool
     alert_level: str  # "CRITICAL", "ELEVATED", "NORMAL"

@@ -73,7 +73,14 @@ def analyze_correlation_stability(
     min_periods: Optional[int] = None,
 ) -> CorrelationStabilityResponse:
     """
-    Analyze rolling correlation stability and evaluate regime breaks against historical distribution.
+    Analyze rolling correlation stability and evaluate regime breaks against the
+    rolling series' own historical distribution.
+
+    The break test is TWO-SIDED: the upper tail is a diversification breakdown
+    (CRITICAL) and the lower tail is a collapse in co-movement (ELEVATED). Both
+    tails set ``is_regime_break``. A monitor that tests only the upper tail
+    calls a correlation collapse "normal", which is the failure mode this
+    function exists to prevent.
 
     Args:
         returns_df: Wide DataFrame of daily returns for assets
@@ -92,14 +99,33 @@ def analyze_correlation_stability(
     corr_values = avg_corr_series.values
     threshold_90th = float(np.percentile(corr_values, 90))
     threshold_75th = float(np.percentile(corr_values, 75))
+    threshold_10th = float(np.percentile(corr_values, 10))
     historical_median = float(np.median(corr_values))
 
     current_avg_corr = float(corr_values[-1])
-    # Single comparison for both the flag and the CRITICAL alert: on a flat
-    # series where current == p90 exactly, flag and alert must agree.
-    is_regime_break = bool(current_avg_corr >= threshold_90th)
+    # TWO-SIDED test, from the same two comparisons that pick the alert:
+    # `is_regime_break` and `alert_level` can therefore never contradict on a
+    # flat series where current == p90 exactly (and, symmetrically, == p10).
+    #
+    # Only the upper tail was tested before, so ANY collapse in co-movement
+    # reached the ELSE branch and its reassuring message. A book whose average
+    # pairwise correlation sits at a fraction of its own historical median was
+    # reported as "within normal historical bounds", which is the one direction
+    # a diversification monitor must never call normal: a low-correlation
+    # reading means the historical diversification benefit may not be
+    # available in the current regime at all.
+    upper_break = bool(current_avg_corr >= threshold_90th)
+    lower_break = bool(current_avg_corr <= threshold_10th)
+    is_regime_break = upper_break or lower_break
 
-    if is_regime_break:
+    # The distribution being ranked against is a series of OVERLAPPING rolling
+    # windows, so publish its size inside the message the consumer will quote.
+    tested_basis = (
+        f"tested two-sided against its own history of {len(corr_values)} "
+        f"overlapping {int(window_days)}-day rolling windows"
+    )
+
+    if upper_break:
         alert_level = "CRITICAL"
         message = (
             f"Average pairwise correlation ({current_avg_corr:.3f}) meets or exceeds 90th percentile "
@@ -111,11 +137,27 @@ def analyze_correlation_stability(
             f"Average pairwise correlation ({current_avg_corr:.3f}) exceeds 75th percentile "
             f"({threshold_75th:.3f}). Pairwise correlation is elevated."
         )
+    elif lower_break:
+        alert_level = "ELEVATED"
+        message = (
+            f"Average pairwise correlation ({current_avg_corr:.3f}) is at or below the 10th "
+            f"percentile ({threshold_10th:.3f}) of its own history "
+            f"(median {historical_median:.3f}). Co-movement has collapsed: this is a change of "
+            f"correlation regime, not a reassurance. Positions that diversified historically may "
+            f"not diversify against each other in this regime, so historical risk estimates that "
+            f"assumed the median correlation no longer describe this book. ({tested_basis}.)"
+        )
     else:
         alert_level = "NORMAL"
+        # "Normal" is only meaningful as a bounded claim, so the bounds are
+        # named: inside the 10th-90th percentile band, and nothing more.
         message = (
-            f"Average pairwise correlation ({current_avg_corr:.3f}) is within normal historical bounds "
-            f"(median {historical_median:.3f})."
+            f"Average pairwise correlation ({current_avg_corr:.3f}) is inside the "
+            f"10th-90th percentile band of its own history "
+            f"(10th {threshold_10th:.3f}, median {historical_median:.3f}, "
+            f"90th {threshold_90th:.3f}); no correlation regime break on either tail. "
+            f"This is an in-sample rank, not a significance test "
+            f"({tested_basis})."
         )
 
     # Format series
@@ -142,6 +184,7 @@ def analyze_correlation_stability(
         current_avg_correlation=round(current_avg_corr, 4),
         historical_threshold_90th=round(threshold_90th, 4),
         historical_threshold_75th=round(threshold_75th, 4),
+        historical_threshold_10th=round(threshold_10th, 4),
         historical_median=round(historical_median, 4),
         is_regime_break=is_regime_break,
         alert_level=alert_level,

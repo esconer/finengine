@@ -113,6 +113,94 @@ def apply_crash_veto(
     return display, vetoed
 
 
+def _fit_convergence_disclosure(hmm: Any) -> Dict[str, Any]:
+    """Publish what hmmlearn's own convergence monitor recorded for the fit.
+
+    `hmm.fit()` RETURNS self and also leaves the monitor on `hmm.monitor_`;
+    the return value used to be discarded, so `converged` was never read and
+    the payload published `n_iter: 200` with nothing to say whether the fit
+    actually reached the tolerance or simply ran out of iterations.
+
+    hmmlearn's `ConvergenceMonitor.converged` is true when EITHER the last
+    log-likelihood improvement fell below `tol` OR the iteration cap was
+    reached, so the bare flag cannot distinguish a converged fit from an
+    exhausted one. Both conditions are reported separately and the flag is
+    republished verbatim, un-reinterpreted, so a reader can see which happened.
+
+    A model with no usable monitor publishes `available: false` and why, rather
+    than a fabricated `converged`.
+    """
+    monitor = getattr(hmm, "monitor_", None)
+    if monitor is None:
+        return {
+            "available": False,
+            "converged": None,
+            "reason": (
+                "the fitted estimator exposed no convergence monitor "
+                "(hmm.monitor_ is absent), so no convergence state exists to "
+                "publish; the model was fitted by something other than "
+                "hmmlearn's Baum-Welch and its stopping rule is unknown"
+            ),
+            "evaluation_basis": "unknown",
+        }
+
+    # A non-finite log-likelihood is not a measurement; it would also serialize
+    # as a bare NaN, so it is dropped rather than rounded and republished.
+    history = []
+    for value in getattr(monitor, "history", []) or []:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            history.append(value)
+    iterations_run = getattr(monitor, "iter", None)
+    if isinstance(iterations_run, bool) or not isinstance(iterations_run, int):
+        iterations_run = None
+    tolerance = getattr(monitor, "tol", None)
+    tolerance = float(tolerance) if isinstance(tolerance, (int, float)) else None
+    cap = getattr(monitor, "n_iter", None)
+    if isinstance(cap, bool) or not isinstance(cap, int):
+        cap = None
+
+    final_ll = history[-1] if history else None
+    final_delta = (history[-1] - history[-2]) if len(history) >= 2 else None
+    # `report()` warns and keeps going when the likelihood falls, so a
+    # non-monotone history is the monitor's own "not converging" signal.
+    monotonic = all(b >= a for a, b in zip(history, history[1:])) if len(history) >= 2 else None
+    hit_cap = bool(iterations_run is not None and cap is not None and iterations_run >= cap)
+    within_tol = bool(final_delta is not None and tolerance is not None and final_delta < tolerance)
+
+    return {
+        "available": True,
+        "converged": bool(getattr(monitor, "converged", False)),
+        "converged_within_tolerance": within_tol if final_delta is not None else None,
+        "hit_iteration_cap": hit_cap,
+        "iterations_run": iterations_run,
+        "iteration_cap": cap if cap is not None else HMM_N_ITER,
+        "tolerance": tolerance if tolerance is not None else HMM_TOL,
+        "final_log_likelihood": round(final_ll, 6) if final_ll is not None else None,
+        "final_log_likelihood_delta": round(final_delta, 10) if final_delta is not None else None,
+        "log_likelihood_monotonic": monotonic,
+        "log_likelihood_observations": len(history),        "convergence_rule": (
+            "hmmlearn's monitor: converged is true when EITHER the last "
+            "log-likelihood improvement is below tolerance OR the iteration cap "
+            "was reached, so a true flag with hit_iteration_cap true means the "
+            "cap was exhausted, not that the tolerance was met; "
+            "converged_within_tolerance reports the tolerance test alone"
+        ),
+        "evaluation_basis": "in_sample_baum_welch_on_the_requested_window",
+        "posterior_basis": (
+            "regime_probabilities is the IN-SAMPLE filtered posterior of the "
+            "final observation: the standard scaler and the HMM were both "
+            "fitted on this same window and there is no holdout, so the "
+            "posterior is not a validated probability and no convergence flag "
+            "can make it one"
+        ),
+        "reason": None,
+    }
+
+
 def classify(
     bench_data: Any,
     n_components: int = 3,
@@ -120,9 +208,14 @@ def classify(
 ) -> Optional[Dict[str, Any]]:
     """Fit a 3-state Gaussian HMM over 21-day return and realized volatility.
 
+    Every input is BENCHMARK data (``bench_data``, the NIFTY 50 frame or its
+    return series) — this function has no access to portfolio holdings, so
+    every feature it derives describes the benchmark, never the book. That is
+    why the published feature name says `benchmark`.
+
     Architecture (Hamilton, 1989):
-    1. Features:
-       - 21-day log holding return: log(P_t / P_{t-21}).
+    1. Features (all benchmark-derived):
+       - 21-day log benchmark return: log(P_t / P_{t-21}).
        - 21-day realized volatility: rolling 21d std of daily returns, annualized.
     2. Persistence-friendly initialization (96% diagonal transition matrix,
        balanced start probabilities). NOTE: the transition matrix is assigned
@@ -134,6 +227,10 @@ def classify(
        out of scope.)
     3. Compound CAGR & Realized Volatility:
        - Computes geometric CAGR for each state to eliminate arithmetic Jensen's inequality skew.
+       - Each state's observation count and its 252/n annualization
+         extrapolation factor are published beside the annualized figure,
+         because the figure is a geometric mean over that count extrapolated to
+         a year.
     """
     from hmmlearn.hmm import GaussianHMM
     from sklearn.preprocessing import StandardScaler
@@ -191,7 +288,9 @@ def classify(
         ewma_vol = float((ret_1d.ewm(span=10).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).iloc[-1]) if len(ret_1d) > 10 else None
         parkinson_vol = None
 
-    # Macroeconomic continuous features: 21-day holding return and 21-day realized volatility
+    # Benchmark-derived continuous features: 21-day log return and 21-day
+    # realized volatility. `close` comes from `bench_data`, so both describe
+    # the benchmark; this function never sees the portfolio.
     ret21 = np.log(close / close.shift(REGIME_FEATURE_WINDOW_DAYS)).dropna()
     vol21 = (ret_1d.rolling(REGIME_FEATURE_WINDOW_DAYS).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).dropna()
 
@@ -224,6 +323,9 @@ def classify(
     hmm.transmat_ = sticky_trans.copy()
 
     hmm.fit(x_scaled)
+    # `fit` returns self and leaves the monitor on `hmm.monitor_`; it used to
+    # be discarded, so nothing in the payload said whether the fit converged.
+    model_convergence = _fit_convergence_disclosure(hmm)
     states = hmm.predict(x_scaled)
     posteriors = hmm.predict_proba(x_scaled)
 
@@ -245,6 +347,14 @@ def classify(
             "cagr": cagr,
             "ann_vol": ann_v,
             "days_pct": float(mask.mean() * 100),
+            # n_sub was computed here and never published, so `ann_ret` was a
+            # geometric mean over an undisclosed n. It is the same count
+            # `days_pct` is a percentage of, and the factor below is the
+            # extrapolation that turns it into a per-year figure.
+            "observations": int(n_sub),
+            "annualization_factor": (
+                round(TRADING_DAYS_PER_YEAR / n_sub, 4) if n_sub > 0 else None
+            ),
         })
     stats_df = pd.DataFrame(rows).set_index("state")
 
@@ -303,9 +413,16 @@ def classify(
                 "ann_ret": round(row.ann_ret, 4),
                 "ann_vol": round(row.ann_vol, 4),
                 "historical_days_pct": round(row.days_pct, 1),
+                "observations": int(row.observations),
+                "annualization_factor": (
+                    round(float(row.annualization_factor), 4)
+                    if row.annualization_factor is not None
+                    else None
+                ),
             }
             for row in stats_df.reset_index().itertuples(index=False)
         ],
+        "model_convergence": model_convergence,
         "recent_history": history,
         "all_regimes": all_regimes,
         "observations": int(len(common)),
@@ -443,9 +560,24 @@ def _regime_metadata(
             "states": REGIME_STATES,
             "state_labels": list(REGIME_LABELS_WORST_TO_BEST),
             "features": [
-                f"ret{REGIME_FEATURE_WINDOW_DAYS}_log_holding_return_{REGIME_FEATURE_WINDOW_DAYS}d",
+                f"ret{REGIME_FEATURE_WINDOW_DAYS}_log_benchmark_return_{REGIME_FEATURE_WINDOW_DAYS}d",
                 f"vol{REGIME_FEATURE_WINDOW_DAYS}_realized_vol_{REGIME_FEATURE_WINDOW_DAYS}d_annualized",
             ],
+            # The features above are log(close_t / close_{t-21}) and the
+            # rolling 21d std of daily returns, both taken from the BENCHMARK
+            # series passed to `classify`. `classify` has no holdings input at
+            # all, so nothing here describes this portfolio; the previous
+            # feature name said "log_holding_return" and invited exactly that
+            # reading.
+            "feature_source": "benchmark_series_not_portfolio_holdings",
+            "feature_source_detail": (
+                "both features are derived from the benchmark close/return "
+                "series (`classify` receives no holdings data), so the regime "
+                "classification, the transition matrix and the per-state "
+                "ann_ret describe the benchmark, not the book; the portfolio's "
+                "own behaviour in the current regime is the separate "
+                "portfolio_in_current_regime block"
+            ),
             "covariance_type": HMM_COVARIANCE_TYPE,
             "scaler": "standard_scaler_fitted_on_requested_window",
             "n_iter": HMM_N_ITER,
@@ -467,6 +599,17 @@ def _regime_metadata(
             "label_overrides.crash_veto_threshold": "fraction_log_return_21d",
             "states[].ann_ret": "annualized_fraction_geometric_cagr",
             "states[].ann_vol": "annualized_fraction",
+            "states[].observations": "count_trading_days",
+            "states[].annualization_factor": (
+                "ratio_trading_days_per_year_over_state_observations"
+            ),
+            "model_convergence.iterations_run": "count_em_iterations",
+            "model_convergence.iteration_cap": "count_em_iterations",
+            "model_convergence.tolerance": "log_likelihood_nats_per_iteration",
+            "model_convergence.final_log_likelihood": "log_likelihood_nats",
+            "model_convergence.final_log_likelihood_delta": (
+                "log_likelihood_nats_per_iteration"
+            ),
             "realtime_ewma_vol": "annualized_fraction",
             "realtime_parkinson_vol": "annualized_fraction",
             "portfolio_in_current_regime.ann_ret": "annualized_fraction_geometric_cagr",

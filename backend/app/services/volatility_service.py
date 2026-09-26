@@ -15,6 +15,89 @@ logger = setup_logger(__name__)
 
 DEFAULT_CONE_WINDOWS = [10, 21, 63, 126, 252]
 
+# A rolling-L realized-volatility series over T observations yields T-L+1
+# OVERLAPPING windows, consecutive ones sharing (L-1)/L of their data. The
+# count that therefore drives a percentile rank is (T-L+1)/L under iid
+# returns, not T-L+1. A 252-day cone built on 2486 daily returns is 2235
+# windows but only ~8.9 independent observations, and the 95% Wald half-width
+# on a percentile rank at that effective count is ~33 percentage points: a
+# published "1.9th percentile" off it is not distinguishable from 17, or 35.
+#
+# 30 is the threshold used by SI-7's fix direction. At effective_n = 30 the
+# worst-case half-width is ~18pp; below it the rank cannot separate the
+# middle of its own distribution from either tail, so no rank is published.
+# Fewer verdicts is the correct answer here, not a substitute number.
+MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE = 30.0
+
+#: Two-sided 95% Wald half-width on a percentile rank at the WORST case rank
+#: (p = 0.5): 1.96 * 100 * sqrt(0.25 / effective_n).
+PERCENTILE_RANK_HALF_WIDTH_Z = 1.96
+PERCENTILE_RANK_HALF_WIDTH_RULE = (
+    "worst-case 95% Wald half-width on a percentile rank: "
+    "1.96 * 100 * sqrt(0.25 / effective_n) percentage points, taken at p=0.5 "
+    "because the variance of a proportion is maximal there; a rank observed "
+    "near either tail is measured more precisely than this bound"
+)
+EFFECTIVE_N_RULE = (
+    "rolling windows are overlapping: consecutive windows of length L share "
+    "(L-1)/L of their returns, so effective_n = n_windows / window_days is the "
+    "count that supports a percentile rank, and n_windows is the raw count"
+)
+
+
+def _effective_window_count(n_windows: int, window_days: int) -> float:
+    """Independent-observation count behind `n_windows` overlapping windows."""
+    if window_days <= 0 or n_windows <= 0:
+        return 0.0
+    return float(n_windows) / float(window_days)
+
+
+def _percentile_rank_basis(n_windows: int, window_days: int) -> Dict[str, Any]:
+    """The counts and precision a percentile rank on this window rests on.
+
+    Returns `effective_n` (see :data:`EFFECTIVE_N_RULE`), the worst-case 95%
+    half-width on a rank at that count, and whether the count clears
+    :data:`MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE`. The half-width is
+    published even when the rank is withheld, so a reader can see how
+    uninformative the withheld verdict was rather than only seeing an absence.
+    """
+    effective_n = _effective_window_count(n_windows, window_days)
+    sufficient = effective_n >= MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE
+    half_width = (
+        float(PERCENTILE_RANK_HALF_WIDTH_Z * 100.0 * np.sqrt(0.25 / effective_n))
+        if effective_n > 0
+        else None
+    )
+    if sufficient:
+        withheld_reason = None
+    elif half_width is None:
+        withheld_reason = (
+            f"withheld: no overlapping windows at all over {int(window_days)}d, "
+            f"so there is no distribution to rank against. The quantiles in "
+            f"this row are null for the same reason; current_realized is "
+            f"measured when the window produced a value."
+        )
+    else:
+        withheld_reason = (
+            f"withheld: effective_n {effective_n:.2f} < "
+            f"{MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE:.0f} overlapping-window "
+            f"observations over {int(window_days)}d; the worst-case 95% half-width "
+            f"on a rank here is {half_width:.1f}pp, so the rank carries no usable "
+            f"information. The quantiles in this row still describe the observed "
+            f"overlapping-window sample; current_realized is measured."
+        )
+
+    return {
+        "n_windows": int(n_windows),
+        "effective_n": round(effective_n, 2) if effective_n > 0 else None,
+        "effective_n_rule": EFFECTIVE_N_RULE,
+        "minimum_effective_n_for_percentile_rank": MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE,
+        "percentile_rank_95pct_half_width_pct": round(half_width, 1) if half_width is not None else None,
+        "percentile_rank_half_width_rule": PERCENTILE_RANK_HALF_WIDTH_RULE,
+        "percentile_rank_sufficient_data": bool(sufficient),
+        "percentile_rank_withheld_reason": withheld_reason,
+    }
+
 
 class VolatilityService:
     """
@@ -206,6 +289,15 @@ class VolatilityService:
         Compute multi-window realized volatility quantiles (min, p25, median, p75, max, current)
         and overlay GARCH/EWMA volatility forecasts with valuation positioning ("cheap", "normal", "rich").
 
+        The rolling windows OVERLAP, so every row publishes the raw
+        ``n_windows``, the ``effective_n`` behind it, the worst-case 95%
+        half-width on a percentile rank, and — below
+        :data:`MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE` effective
+        observations — withholds ``percentile_rank`` with a reason instead of
+        emitting a number the sample cannot support. The quantile bounds are
+        descriptions of the observed overlapping sample and are still
+        published; only the rank is a verdict.
+
         Parameters
         ----------
         returns : pd.Series or np.ndarray
@@ -257,8 +349,17 @@ class VolatilityService:
                 p75_v = float(np.percentile(vol_values, 75))
                 max_v = float(np.max(vol_values))
                 curr_v = float(vol_values[-1])
-                # Quantile ranking of current realized vol (0 to 100)
-                rank = float(np.sum(vol_values <= curr_v) / len(vol_values) * 100.0)
+                # Quantile ranking of current realized vol (0 to 100). The
+                # windows overlap, so the rank is only published when the
+                # EFFECTIVE count behind it is large enough to support a
+                # verdict; below that it is withheld, not estimated.
+                rank_basis = _percentile_rank_basis(len(rolling_vol), int(w))
+                if rank_basis["percentile_rank_sufficient_data"]:
+                    rank = float(
+                        np.sum(vol_values <= curr_v) / len(vol_values) * 100.0
+                    )
+                else:
+                    rank = None
                 insufficient = False
             elif len(rolling_vol) == 1:
                 # Single observation: quantile bounds would be fabricated
@@ -267,6 +368,7 @@ class VolatilityService:
                 min_v = p25_v = med_v = p75_v = max_v = None
                 rank = None
                 insufficient = True
+                rank_basis = _percentile_rank_basis(len(rolling_vol), int(w))
             else:
                 # Window exceeds observations: no realized vol at all — nulls +
                 # flag, never synthetic multiples of an arbitrary baseline.
@@ -274,6 +376,7 @@ class VolatilityService:
                 min_v = p25_v = med_v = p75_v = max_v = None
                 rank = None
                 insufficient = True
+                rank_basis = _percentile_rank_basis(len(rolling_vol), int(w))
 
             # min <= p25 <= median <= p75 <= max holds by construction
             # (percentiles of the same array); no re-sorting needed.
@@ -288,6 +391,7 @@ class VolatilityService:
                 "current_realized": round(curr_v, 4) if curr_v is not None else None,
                 "percentile_rank": round(rank, 1) if rank is not None else None,
                 "insufficient_data": insufficient,
+                **rank_basis,
             })
 
         # Calculate forecast overlay
@@ -307,8 +411,22 @@ class VolatilityService:
         p25_bench = matching_window_stat["p25"]
         p75_bench = matching_window_stat["p75"]
 
-        if len(benchmark_vol_series) >= 2:
-            forecast_rank: float | None = float(np.sum(benchmark_vol_series.values <= ann_vol_forecast) / len(benchmark_vol_series) * 100.0)
+        # Same overlap correction on the forecast's own rank: it is ranked
+        # against the benchmark window's overlapping realized series, so it
+        # inherits that window's effective count and its gate.
+        forecast_rank_basis = _percentile_rank_basis(
+            len(benchmark_vol_series), int(target_w)
+        )
+        forecast_rank_basis["ranked_against_window_days"] = int(target_w)
+        if (
+            len(benchmark_vol_series) >= 2
+            and forecast_rank_basis["percentile_rank_sufficient_data"]
+        ):
+            forecast_rank: float | None = float(
+                np.sum(benchmark_vol_series.values <= ann_vol_forecast)
+                / len(benchmark_vol_series)
+                * 100.0
+            )
         else:
             forecast_rank = None
 
@@ -328,6 +446,7 @@ class VolatilityService:
             "horizon_days": int(forecast_horizon),
             "percentile_rank": round(forecast_rank, 1) if forecast_rank is not None else None,
             "valuation": valuation,
+            **forecast_rank_basis,
         }
 
         return {
