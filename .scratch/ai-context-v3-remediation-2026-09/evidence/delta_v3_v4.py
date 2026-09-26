@@ -117,7 +117,12 @@ def main() -> None:
         for t, tr in (d.get("trades") or {}).items():
             if tr.get("shares_delta") != 0 or abs(tr.get("amount") or 0) <= 0:
                 continue
-            if labelled_only and tr.get("status") not in {"below_minimum_notional", "price_unavailable"}:
+            # A 0-share trade is only a DEFECT when it is unlabelled: the
+            # notional is real, so it must say why it rounds to zero.
+            if labelled_only and tr.get("status") in {
+                "below_minimum_notional",
+                "price_unavailable",
+            }:
                 continue
             out.append(t)
         return out
@@ -130,13 +135,20 @@ def main() -> None:
     row("V3-04 0-share trades LABELLED below_minimum_notional", None, below,
         "notional preserved and flagged, not a silent zero")
 
-    # V3-07 summary nulls / risk delta
-    sra, srb = data(a, "summary"), data(b, "summary")
+    # V3-07 summary nulls / risk delta.
+    # `summary` and `risk_score` are DASHBOARD COMPONENTS, not top-level
+    # sections; reading sections['summary'] silently returns {} and would make
+    # every one of these look unchanged.
+    def comp(doc: dict, name: str) -> dict:
+        comps = ((doc.get("sections") or {}).get("dashboard") or {}).get("data", {})
+        return ((comps.get("components") or {}).get(name) or {}).get("data") or {}
+
+    sra, srb = comp(a, "summary"), comp(b, "summary")
     row("V3-07 summary.forecast_volatility", sra.get("forecast_volatility"), srb.get("forecast_volatility"),
         "linked from the canonical sibling")
     row("V3-07 summary.liquidity_score", sra.get("liquidity_score"), srb.get("liquidity_score"),
         "linked from the canonical sibling")
-    row("V3-07 risk_score.change", data(a, "risk_score").get("change"), data(b, "risk_score").get("change"),
+    row("V3-07 risk_score.change", comp(a, "risk_score").get("change"), comp(b, "risk_score").get("change"),
         "unmeasured, not a fake zero")
 
     # V3-08 sector rounding
@@ -158,9 +170,22 @@ def main() -> None:
 
     # V3-10 stress proxy
     ta_, tb_ = data(a, "stress_testing"), data(b, "stress_testing")
-    row("V3-10 stress confidence basis", None, (tb_.get("scenarios") or [{}])[0].get("confidence_basis")
-        if isinstance(tb_.get("scenarios"), list) and tb_.get("scenarios") else tb_.get("confidence_basis"),
+
+    def first_scenario_basis(payload: dict, field: str):
+        for key in ("scenarios", "results", "stress_scenarios"):
+            rows = payload.get(key)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                return rows[0].get(field)
+        return payload.get(field)
+
+    row("V3-10 stress confidence basis",
+        first_scenario_basis(ta_, "confidence_basis"),
+        first_scenario_basis(tb_, "confidence_basis"),
         "nominal label, not a simulated statistic")
+    row("V3-10 stress max_drawdown basis",
+        first_scenario_basis(ta_, "max_drawdown_basis"),
+        first_scenario_basis(tb_, "max_drawdown_basis"),
+        "declared a shock proxy")
 
     # V3-11 monte carlo
     ma, mb = data(a, "monte_carlo"), data(b, "monte_carlo")
