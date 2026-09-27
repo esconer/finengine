@@ -363,6 +363,32 @@ STRESS_VOL_MIN_OBSERVATIONS = 20
 STRESS_DRAWDOWN_UPLIFT = 1.15
 STRESS_CONFIDENCE_LABEL = 0.95
 
+#: The sector a holding lands in when the route supplied none.  The route fills
+#: `sectors` from `PortfolioPosition.sector`, so this is the UNCLASSIFIED bucket
+#: and NOT a statement that its members are exchange traded funds: a holding
+#: whose sector is NULL lands here whatever instrument it is -- a domestic
+#: broad index tracker, a domestic midcap tracker, an Indian IPO/small-cap
+#: fund and a US-listed mega-cap technology fund all share it.  The engine has
+#: no other classification for a holding, and nothing in this repository
+#: carries one (see `shock_inputs.bucket_disclosure`).
+STRESS_UNCLASSIFIED_SECTOR = "Exchange Traded Fund"
+
+#: The measured co-movement published beside the flat table entry, so the claim
+#: that one index sensitivity fits the whole bucket is CHECKABLE instead of
+#: asserted.  Fewer other holdings than this and the leave-one-out reference
+#: degenerates: on a two-name book each holding IS the other's reference, so
+#: the coefficient would be exactly 1.0 for both of them -- arithmetic, not a
+#: measurement.
+STRESS_CO_MOVEMENT_MIN_REFERENCE_LEGS = 3
+#: Paired daily observations the regression needs before it is a measurement.
+STRESS_CO_MOVEMENT_MIN_OBSERVATIONS = 30
+#: What the coefficient is, in one string.  It is deliberately NOT called a
+#: market beta: see `_stress_holding_co_movement` for why using it as the
+#: shock elasticity would publish a different statistic than the scenario's.
+STRESS_CO_MOVEMENT_BASIS = (
+    "measured_co_movement_with_the_rest_of_the_delivered_book_not_a_market_beta"
+)
+
 #: Risk points, on the 0-30 sub-score scale, per unit of measured average
 #: pairwise correlation. The sub-score is `min(30, POINTS * max(0, avg_corr))`.
 #: There is deliberately no "free" correlation baseline: the previous form,
@@ -371,6 +397,24 @@ STRESS_CONFIDENCE_LABEL = 0.95
 #: UNMEASURED leg publishes, so a real measurement shipped as an
 #: indistinguishable hard zero and dragged `overall_score` down (D-04).
 RISK_CORRELATION_POINTS_PER_UNIT = 50.0
+
+#: Lower bound of the 0-30 sub-score scale, and the reason a leg can publish
+#: exactly 0.0 for a MEASURED input.  The scale has no negative risk points: a
+#: negatively-correlated book is a real measurement, but "correlated" is not a
+#: signed risk quantity, so the only way to publish it on a 0-30 higher-is-
+#: riskier scale is to clamp it at zero.  That clamp is what used to be
+#: invisible -- `max(0, avg)` floored a measured -0.13 onto a sub-score of 0.0
+#: that reads exactly like a measured zero.  The cap has always been declared
+#: (:data:`RISK_SCORE_CAP`, plus the per-leg saturation state), so the floor is
+#: declared the same way: the bound, the input at which it binds, whether it
+#: bound for this score, and the number of points it added.
+#:
+#: The floor is deliberately NOT removed.  Letting a negative average
+#: correlation publish negative risk points would move `overall_score` and can
+#: flip `risk_level` -- a product decision, not an engineering one -- and it
+#: would break the 0-30 scale every other leg and the published methodology
+#: claim.  The clamp stays; what changes is that it is now legible.
+RISK_SCORE_FLOOR = 0.0
 
 # ---------------------------------------------------------------------------
 # risk-score composition disclosure (RL-3)
@@ -459,6 +503,22 @@ RISK_SCORE_LEG_SPECS: Dict[str, Dict[str, Any]] = {
         "cap_binding_input": RISK_SCORE_CAP / RISK_CORRELATION_POINTS_PER_UNIT,
         "cap_binds_when_input_is": ">= 0.60",
         "unpin_condition": "avg pairwise correlation < 0.60",
+        # The floor is reachable for this leg and for no other: it is the only
+        # leg whose expression can go negative. `cap_binding_input` /
+        # `unpin_condition` describe the ceiling; these describe the floor, and
+        # the per-leg state (`clamped_at_floor`, `floor_clamp_points`) says
+        # whether it bound for this score.
+        "floor_binding_input": RISK_SCORE_FLOOR,
+        "floor_binds_when_input_is": "<= 0.00 (a measured average correlation at or below zero)",
+        "floor_reason": (
+            "the 0-30 sub-score scale has no negative risk points, so a "
+            "measured average pairwise correlation at or below zero cannot be "
+            "published as negative risk and is clamped at "
+            f"{RISK_SCORE_FLOOR:g}. The measurement itself is not changed: "
+            "avg_pairwise_correlation and the input_statistic_value below are "
+            "the measured sign, and floor_clamp_points is how far the sub-score "
+            "was moved to express it on this scale"
+        ),
         "published_input_as": "avg_pairwise_correlation",
         "duplication_group": None,
     },
@@ -1330,6 +1390,7 @@ def _risk_score_audit(
     input_reasons: Mapping[str, str],
     input_samples: Mapping[str, Dict[str, Any]],
     input_series: Mapping[str, Optional[pd.Series]],
+    floor_clamps: Mapping[str, float],
     excluded: Sequence[str],
     excluded_reasons: Mapping[str, str],
     active_weights: Mapping[str, float],
@@ -1343,6 +1404,7 @@ def _risk_score_audit(
       * the input statistic, its units, and the rows it was measured over,
       * the formula, the nominal weight, the weight actually applied, the cap,
       * whether the leg is AT that cap and the input at which it would leave it,
+      * the scale's floor, whether it bound, and the points it added,
       * whether the leg's input is the same rows as another leg's, and why,
       * what share of the headline each leg is actually responsible for.
 
@@ -1400,6 +1462,14 @@ def _risk_score_audit(
         saturated = _is_saturated(name)
         weight = active_weights.get(name)
         sample = dict(input_samples.get(name) or {})
+        # The floor is a property of the scale, so it is published on every
+        # leg; whether it BOUND is per leg, and only a leg whose expression can
+        # go negative can ever bind it (see RISK_SCORE_FLOOR).
+        floor_clamp = (
+            round(float(floor_clamps.get(name, 0.0)), 6)
+            if measured and scores.get(name) is not None
+            else None
+        )
         entry: Dict[str, Any] = {
             "status": (
                 "saturated_at_cap"
@@ -1434,6 +1504,16 @@ def _risk_score_audit(
             "cap_binding_input": round(float(spec["cap_binding_input"]), 6),
             "cap_binds_when_input_is": spec["cap_binds_when_input_is"],
             "unpin_condition": spec["unpin_condition"],
+            "floor": RISK_SCORE_FLOOR,
+            "clamped_at_floor": bool(floor_clamp),
+            "floor_clamp_points": floor_clamp,
+            "floor_binding_input": (
+                round(float(spec["floor_binding_input"]), 6)
+                if "floor_binding_input" in spec
+                else None
+            ),
+            "floor_binds_when_input_is": spec.get("floor_binds_when_input_is"),
+            "floor_reason": spec.get("floor_reason"),
             "duplicate_of": duplicate_of[name],
             "duplicate_relation": duplicate_relation[name],
             "counts_as_independent_evidence": bool(measured and not duplicate_of[name]),
@@ -1500,6 +1580,10 @@ def _risk_score_audit(
         components[name] = entry
 
     saturated_legs = [n for n in RISK_SCORE_WEIGHTS if _is_saturated(n)]
+    floor_clamped_legs = [
+        n for n in RISK_SCORE_WEIGHTS
+        if n in included and components[n].get("clamped_at_floor")
+    ]
     duplicate_legs = [n for n in RISK_SCORE_WEIGHTS if duplicate_of[n]]
     independent_legs = [
         n
@@ -1610,6 +1694,32 @@ def _risk_score_audit(
         "excluded_components": list(excluded),
         "excluded_reasons": dict(excluded_reasons),
         "saturated_components": saturated_legs,
+        # The floor is the scale's other bound, declared the way the cap is:
+        # a leg clamped here published 0.0 for a MEASURED input, and without
+        # this block that 0.0 is indistinguishable from a measurement of no
+        # correlation at all.
+        "floor": RISK_SCORE_FLOOR,
+        "floor_reason": (
+            "the 0-30 scale has no negative risk points, so a measured input "
+            "that maps below zero is clamped rather than published as negative "
+            "risk; a clamped leg keeps its measured input_statistic_value and "
+            "publishes the points the floor added in floor_clamp_points. "
+            "Removing the floor would move overall_score and could flip "
+            "risk_level, which is a product decision"
+        ),
+        "floor_clamped_components": floor_clamped_legs,
+        "floor_clamp_detail": [
+            {
+                "component": n,
+                "input_statistic": components[n].get("input_statistic"),
+                "input_statistic_value": components[n].get("input_statistic_value"),
+                "clamp_points": components[n].get("floor_clamp_points"),
+                "binds_when_input_is": components[n].get(
+                    "floor_binds_when_input_is"
+                ),
+            }
+            for n in floor_clamped_legs
+        ],
         "duplicate_components": [
             {
                 "component": n,
@@ -1659,6 +1769,18 @@ def _risk_score_composition_alerts(audit: Mapping[str, Any]) -> List[str]:
             f"move if that input reached {detail.get('unpin_condition')}{share}"
         )
 
+    for leg in audit.get("floor_clamped_components") or []:
+        detail = components.get(leg) or {}
+        alerts.append(
+            f"{leg} is clamped at the {RISK_SCORE_FLOOR:g}-point floor: its input "
+            f"{detail.get('input_statistic')} = "
+            f"{detail.get('input_statistic_value')} is "
+            f"{detail.get('floor_binds_when_input_is')}, and the floor added "
+            f"{detail.get('floor_clamp_points')} points this scale cannot "
+            f"express as negative risk (the measurement itself is "
+            f"unchanged)"
+        )
+
     responsive = information.get("responsive_weight")
     if responsive is not None and responsive < 1.0 - 1e-9:
         alerts.append(
@@ -1668,6 +1790,114 @@ def _risk_score_composition_alerts(audit: Mapping[str, Any]) -> List[str]:
             f"unmeasured (see score_audit.effective_information)"
         )
     return alerts
+
+
+def _stress_holding_co_movement(returns: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """How far each holding actually co-moved with the rest of the book.
+
+    WHY THIS IS A DIAGNOSTIC AND NOT THE SHOCK'S ELASTICITY.
+
+    The scenario table's ``Exchange Traded Fund`` entry is a flat 1.00-1.05 for
+    every holding in that bucket, which asserts that a US-listed mega-cap
+    technology fund moves exactly as much as a domestic broad index tracker in
+    a -35% NIFTY crash.  The bucket is the route's *unclassified* bucket and
+    this repository carries no per-holding classification that could separate
+    its members, so a per-instrument constant would be a fabricated input
+    wearing a table's clothes -- the same defect in a new place.
+
+    The obvious cheap substitute is to regress each holding on the rest of the
+    book and use that coefficient as the elasticity.  It is measurable here, and
+    it is the WRONG statistic, and the reason is worth recording because it is
+    not obvious: this coefficient measures co-movement *within the delivered
+    book*, which is a diversification fact, not a market sensitivity.  On four
+    mutually uncorrelated holdings it returns 0.13, 0.02, 0.04 and -0.07, so
+    applying it to a -10% market shock publishes a ~0% loss on a market crash
+    and a GAIN on one of them.  A holding that happens not to co-move with the
+    rest of THIS book is not thereby insulated from the market; it may be more
+    exposed to it.  Substituting it for a market beta would ship a new
+    undeclared floor in place of an undeclared constant.
+
+    So it is published as what it is -- a measurement that makes the flat table
+    entry checkable, with the reference, the row count and the coefficient for
+    every holding -- and NOT applied to any shock.  A real per-holding market
+    beta needs a benchmark series delivered to `stress_test`, and separating the
+    members of the bucket by what they track needs a classification this
+    repository does not carry.  Both are reported, neither is guessed.
+
+    Leave-one-out on purpose: the reference is the equal-weighted mean of the
+    OTHER holdings, so a holding is never regressed on a reference containing
+    itself.  With fewer than
+    :data:`STRESS_CO_MOVEMENT_MIN_REFERENCE_LEGS` constituents the reference
+    degenerates -- on a two-name book each holding is the other's reference and
+    both coefficients are exactly 1.0 by construction -- so the value is
+    published unavailable with the reason rather than dressed up as measured.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
+        return result
+
+    for ticker in returns.columns:
+        others = [c for c in returns.columns if c != ticker]
+        entry: Dict[str, Any] = {
+            "co_movement": None,
+            "co_movement_basis": None,
+            "co_movement_unavailable_reason": None,
+            "reference": "equal_weighted_mean_of_the_other_holdings_returns",
+            "reference_leg_count": len(others),
+            "observations": int(returns[ticker].notna().sum()),
+        }
+        if len(others) < STRESS_CO_MOVEMENT_MIN_REFERENCE_LEGS:
+            entry["co_movement_unavailable_reason"] = (
+                f"only {len(others)} other holding(s) in the delivered frame, "
+                f"fewer than the {STRESS_CO_MOVEMENT_MIN_REFERENCE_LEGS} a "
+                f"reference needs; on a two-name book the leave-one-out "
+                f"coefficient is 1.0 by construction, which is arithmetic "
+                f"rather than a measurement"
+            )
+            result[ticker] = entry
+            continue
+
+        reference = returns[others].mean(axis=1, skipna=True)
+        paired = pd.concat(
+            [returns[ticker].rename("holding"), reference.rename("reference")],
+            axis=1,
+        ).dropna()
+        rows = int(len(paired))
+        entry["paired_observations"] = rows
+        if rows < STRESS_CO_MOVEMENT_MIN_OBSERVATIONS:
+            entry["co_movement_unavailable_reason"] = (
+                f"{rows} paired daily returns against a minimum of "
+                f"{STRESS_CO_MOVEMENT_MIN_OBSERVATIONS}"
+            )
+            result[ticker] = entry
+            continue
+
+        holding_values = paired["holding"].to_numpy(dtype=float)
+        reference_values = paired["reference"].to_numpy(dtype=float)
+        centred_holding = holding_values - holding_values.mean()
+        centred_reference = reference_values - reference_values.mean()
+        denominator = float(centred_reference @ centred_reference)
+        if not np.isfinite(denominator) or denominator <= 0.0:
+            entry["co_movement_unavailable_reason"] = (
+                "the reference series has no dispersion over the paired rows, "
+                "so a coefficient against it is not defined"
+            )
+            result[ticker] = entry
+            continue
+
+        coefficient = float((centred_holding @ centred_reference) / denominator)
+        if not np.isfinite(coefficient):
+            entry["co_movement_unavailable_reason"] = (
+                "the coefficient against the reference series is not a finite "
+                "number"
+            )
+            result[ticker] = entry
+            continue
+
+        entry["co_movement"] = round(coefficient, 4)
+        entry["co_movement_basis"] = STRESS_CO_MOVEMENT_BASIS
+        result[ticker] = entry
+    return result
 
 
 class AnalyticsEngine:
@@ -2222,9 +2452,16 @@ class AnalyticsEngine:
             sectors_map = sectors or {}
             instrument_overrides: Dict[str, Any] = {}
             volatility_adjustment: Dict[str, Any] = {}
+            sensitivity: Dict[str, Any] = {}
+            # One measured co-movement per holding, against the rest of THIS
+            # delivered book.  Published as a diagnostic, NOT applied to any
+            # shock: it measures diversification within the book, not
+            # sensitivity to the market the shock is defined on.  See
+            # `_stress_holding_co_movement`.
+            holding_co_movement = _stress_holding_co_movement(returns)
 
             for ticker, weight in weights.items():
-                sec = sectors_map.get(ticker, "Exchange Traded Fund")
+                sec = sectors_map.get(ticker, STRESS_UNCLASSIFIED_SECTOR)
                 sec_mult = sector_table.get(sec, 1.0)
                 elasticity_basis = (
                     "scenario_sector_table" if sec in sector_table
@@ -2248,6 +2485,41 @@ class AnalyticsEngine:
                         "sector_elasticity": sec_mult,
                         "basis": elasticity_basis,
                     }
+
+                # What the flat table entry is, per holding, beside the
+                # co-movement that was measured for the same holding.  The
+                # elasticity above is UNCHANGED: a per-holding market beta is
+                # not obtainable here (see
+                # `_stress_holding_co_movement`), and the cheap substitute is a
+                # different statistic whose use would publish a new undeclared
+                # floor.  So the number that shocked this holding is published
+                # with its basis, the measurement that contradicts the idea
+                # that one sensitivity fits a whole bucket is published beside
+                # it, and no fabricated per-instrument beta appears.
+                co_movement_entry = holding_co_movement.get(ticker) or {}
+                sensitivity[ticker] = {
+                    "sector": sec,
+                    "sector_is_unclassified_bucket": sec == STRESS_UNCLASSIFIED_SECTOR,
+                    "applied_elasticity": round(float(sec_mult), 4),
+                    "applied_elasticity_basis": elasticity_basis,
+                    "applied_elasticity_is_per_instrument": elasticity_basis.startswith(
+                        "instrument_override"
+                    ),
+                    "co_movement_with_rest_of_book": co_movement_entry.get(
+                        "co_movement"
+                    ),
+                    "co_movement_basis": co_movement_entry.get("co_movement_basis"),
+                    "co_movement_reference_leg_count": co_movement_entry.get(
+                        "reference_leg_count"
+                    ),
+                    "co_movement_paired_observations": co_movement_entry.get(
+                        "paired_observations"
+                    ),
+                    "co_movement_unavailable_reason": co_movement_entry.get(
+                        "co_movement_unavailable_reason"
+                    ),
+                    "co_movement_is_used_as_elasticity": False,
+                }
 
                 # Idiosyncratic volatility factor adjustment (bounded between 0.85 and 1.25)
                 vol_adj = 1.0
@@ -2281,6 +2553,75 @@ class AnalyticsEngine:
             portfolio_impact = round(weighted_impact, 4)
             max_drawdown = round(portfolio_impact * STRESS_DRAWDOWN_UPLIFT, 4)
 
+            # Who is in the unclassified bucket, what number was applied to all
+            # of them, and what was measured about each.  The bucket's NAME says
+            # exchange traded fund and its MEMBERSHIP says nothing of the kind:
+            # the route fills sectors from the position's stored sector and a
+            # NULL one lands here whatever the instrument is.  Publishing the
+            # membership, the applied value and the per-holding co-movement is
+            # what makes the flat table entry checkable instead of asserted.
+            unclassified_members = sorted(
+                ticker for ticker, entry in sensitivity.items()
+                if entry["sector_is_unclassified_bucket"]
+            )
+            bucket_static = sector_table.get(STRESS_UNCLASSIFIED_SECTOR)
+            bucket_static_text = (
+                f"this scenario's flat {float(bucket_static):g} table row for "
+                f"that bucket"
+                if bucket_static is not None
+                else f"the flat {1.0:g} default elasticity, this scenario "
+                     f"declares no table row for the bucket"
+            )
+            bucket_applied = sorted(
+                {
+                    entry["applied_elasticity"]
+                    for entry in sensitivity.values()
+                    if entry["sector_is_unclassified_bucket"]
+                }
+            )
+            bucket_co_movement = [
+                entry["co_movement_with_rest_of_book"]
+                for entry in sensitivity.values()
+                if entry["sector_is_unclassified_bucket"]
+                and entry["co_movement_with_rest_of_book"] is not None
+            ]
+            if len(bucket_applied) == 1:
+                bucket_applied_text = (
+                    f"Every one of them is shocked by the same "
+                    f"{bucket_applied[0]:g} elasticity ({bucket_static_text})"
+                )
+            else:
+                bucket_applied_text = (
+                    f"The elasticity applied to them is not one number: "
+                    f"{sorted(bucket_applied)}, because "
+                    f"{sum(1 for e in sensitivity.values() if e['applied_elasticity_is_per_instrument'])} "
+                    f"of them carry a named per-instrument override"
+                )
+            bucket_disclosure = (
+                f"'{STRESS_UNCLASSIFIED_SECTOR}' is this engine's UNCLASSIFIED "
+                f"sector, not a classification that its "
+                f"{len(unclassified_members)} member(s) are exchange traded "
+                f"funds: a holding whose stored sector is null lands in it "
+                f"whatever the instrument is. Those members are not one thing, "
+                f"and the engine publishes no per-holding market, index or "
+                f"currency exposure for any of them, so nothing in this payload "
+                f"says which market a member tracks. {bucket_applied_text}. "
+                + (
+                    f"The measured co-movement of the bucket's members with "
+                    f"the rest of this book ranges "
+                    f"{min(bucket_co_movement):g} to "
+                    f"{max(bucket_co_movement):g}, so the single elasticity is "
+                    f"not representative of all of them; that co-movement is "
+                    f"book diversification, not a market beta, and it is not "
+                    f"applied to the shock (see co_movement_is_not_a_market_beta)"
+                    if bucket_co_movement
+                    else "No member's co-movement with the rest of this book "
+                         "could be measured on the delivered frame, so nothing "
+                         "here contradicts the single elasticity with a "
+                         "measurement."
+                )
+            )
+
             # The published drawdown is a fixed 1.15 uplift on the same
             # deterministic factor proxy, and the confidence is a nominal
             # label: neither is a simulated statistic, so the inputs and units
@@ -2291,10 +2632,56 @@ class AnalyticsEngine:
                 "sector_elasticity_table": dict(sector_table),
                 "sector_elasticity_basis": "static_configured_table",
                 "sector_elasticity_default": 1.0,
-                "default_sector": "Exchange Traded Fund",
+                "default_sector": STRESS_UNCLASSIFIED_SECTOR,
+                "default_sector_meaning": (
+                    "the sector a holding is given when the route supplied "
+                    "none (a null stored sector), NOT an asset-class label"
+                ),
                 "instrument_overrides": instrument_overrides,
                 "position_impact_clip": [-0.75, -0.02],
                 "position_impact_clip_basis": "configured_bounds_not_simulated",
+                "bucket_disclosure": bucket_disclosure,
+                "unclassified_bucket_members": unclassified_members,
+                "unclassified_bucket_member_count": len(unclassified_members),
+                "unclassified_bucket_applied_elasticities": bucket_applied,
+                "sector_elasticity_is_one_number_for_the_bucket": (
+                    len(bucket_applied) == 1
+                ),
+                "co_movement": {
+                    "basis": STRESS_CO_MOVEMENT_BASIS,
+                    "is_applied_to_the_shock": False,
+                    "what_it_is": (
+                        "each holding's measured co-movement with the "
+                        "equal-weighted mean return of the OTHER holdings in "
+                        "this delivered frame (leave-one-out, so a holding is "
+                        "never regressed on a reference containing itself)"
+                    ),
+                    "co_movement_is_not_a_market_beta": (
+                        "it measures diversification WITHIN this book, not "
+                        "sensitivity to the market the shock is defined on. On "
+                        "four mutually uncorrelated holdings it returns "
+                        "0.13, 0.02, 0.04 and -0.07, so applying it to a -10% "
+                        "market shock would publish a ~0% loss on a market "
+                        "crash and a gain on one of them. A holding that does "
+                        "not co-move with the rest of THIS book is not thereby "
+                        "insulated from the market"
+                    ),
+                    "why_no_per_holding_elasticity_is_published": (
+                        "a per-holding market beta needs a benchmark series "
+                        "delivered to this function, and separating the "
+                        "bucket's members by what they track needs a per-"
+                        "position classification. Neither is an input here: "
+                        "stress_test is called with a price frame, weights and "
+                        "the stored sectors, and the benchmark is delivered to "
+                        "the risk-score and factor-exposure calls but not to "
+                        "this one. A per-ticker sensitivity table would be the "
+                        "same defect in a new place, so none is published"
+                    ),
+                    "reference": "equal_weighted_mean_of_the_other_holdings_returns",
+                    "min_reference_legs": STRESS_CO_MOVEMENT_MIN_REFERENCE_LEGS,
+                    "min_paired_observations": STRESS_CO_MOVEMENT_MIN_OBSERVATIONS,
+                    "by_ticker": sensitivity,
+                },
                 "volatility_adjustment": {
                     "basis": "measured_annualized_volatility_over_reference",
                     "reference_annualized_volatility": STRESS_VOL_REFERENCE,
@@ -2312,16 +2699,29 @@ class AnalyticsEngine:
                 "max_drawdown": "fraction_of_portfolio_value",
                 "recovery_time": "months",
                 "confidence_level": "unitless_nominal_label",
+                "co_movement.by_ticker.co_movement_with_rest_of_book": (
+                    "regression_slope_unitless_diagnostic_only"
+                ),
+                "co_movement.by_ticker.applied_elasticity": (
+                    "unitless_multiplier_on_market_shock"
+                ),
             }
             methodology = (
                 "Deterministic factor shock proxy; no path sampling and no simulation. "
-                "position_impact = market_shock * sector_elasticity (static scenario "
-                "table or a named instrument override) * volatility_adjustment "
+                "position_impact = market_shock * sector_elasticity (a named "
+                "instrument override, or this scenario's static table row for the "
+                "holding's sector, where an unclassified holding's row is a single "
+                "index sensitivity shared by every member of that bucket -- see "
+                "shock_inputs.bucket_disclosure) * volatility_adjustment "
                 "(measured annualized volatility divided by "
                 f"{STRESS_VOL_REFERENCE}, clipped to "
                 f"[{STRESS_VOL_ADJ_MIN}, {STRESS_VOL_ADJ_MAX}]) and clipped to "
-                "[-0.75, -0.02] for a negative shock; portfolio_impact = sum of "
-                "position_impact * weight; max_drawdown = portfolio_impact * 1.15, a "
+                "[-0.75, -0.02] for a negative shock; the per-holding "
+                "co-movement in shock_inputs.co_movement is measured, published "
+                "and NOT applied to any shock, because it is diversification "
+                "within this book and not a market beta; portfolio_impact = sum "
+                "of position_impact * weight; max_drawdown = portfolio_impact * "
+                "1.15, a "
                 "fixed uplift on that same proxy, not a simulated peak-to-trough "
                 "path; recovery_time is the scenario's configured month estimate, "
                 "not a simulated recovery path; confidence_level is a nominal 0.95 "
@@ -2874,6 +3274,10 @@ class AnalyticsEngine:
             # measurement, score the measurement, and null + exclude the leg
             # when there is nothing to measure.
             avg_correlation: Optional[float] = None
+            # Points the scale's zero floor added to this leg's sub-score. Zero
+            # when the floor did not bind; published per leg so a clamped 0.0 is
+            # not read as a measured zero.
+            correlation_floor_clamp = 0.0
             if len(returns.columns) > 1:
                 corr_values = returns.corr().to_numpy(dtype=float)
                 upper_triangle = corr_values[np.triu_indices_from(corr_values, k=1)]
@@ -2890,11 +3294,24 @@ class AnalyticsEngine:
             else:
                 # Risk points per unit of measured average pairwise correlation.
                 # The slope and the 30-point cap are unchanged; only the
-                # collapsing `max(0, . - 0.3)` floor is gone, so a book that
+                # collapsing `max(0, . - 0.3)` baseline is gone, so a book that
                 # measures positively-correlated still contributes to the score
                 # instead of reading as an unmeasured leg.
-                correlation_score = min(
-                    30.0, max(0.0, avg_correlation) * RISK_CORRELATION_POINTS_PER_UNIT
+                #
+                # What remains is the SCALE's floor at zero. A measured average
+                # correlation below zero is a real measurement that a 0-30
+                # higher-is-riskier scale cannot express as negative risk, so it
+                # is clamped -- and the clamp is measured here and published by
+                # `score_audit`, so a sub-score of 0.0 cannot be read as a
+                # measured zero correlation.
+                uncapped_correlation = (
+                    avg_correlation * RISK_CORRELATION_POINTS_PER_UNIT
+                )
+                correlation_score = min(RISK_SCORE_CAP, max(
+                    RISK_SCORE_FLOOR, uncapped_correlation
+                ))
+                correlation_floor_clamp = round(
+                    max(0.0, RISK_SCORE_FLOOR - uncapped_correlation), 6
                 )
             scores['correlation'] = correlation_score
             inputs['correlation'] = avg_correlation
@@ -3056,6 +3473,7 @@ class AnalyticsEngine:
                     'volatility': portfolio_returns,
                     'market_risk': recent_returns,
                 },
+                floor_clamps={'correlation': correlation_floor_clamp},
                 excluded=excluded,
                 excluded_reasons=excluded_reasons,
                 active_weights=active_weights,
@@ -3090,12 +3508,21 @@ class AnalyticsEngine:
             alerts.extend(_risk_score_composition_alerts(score_audit))
             
             return {
-                "overall_score": round(overall_score, 1),
+                # `float()` on the way out: `portfolio_returns.std()` is a numpy
+                # scalar, so `min(30, that * 100)` is one, and `round()` keeps it
+                # one. Harmless to today's serialiser, but a numpy scalar is not
+                # a plain number to anything that type-checks the payload, and a
+                # key added later would inherit it. Coerced here, on the two keys
+                # this function computes from `scores`, and nowhere else.
+                "overall_score": round(float(overall_score), 1),
                 "risk_level": risk_level,
                 "change": change,
                 "change_status": "unavailable",
                 "change_reason": "no_persisted_prior_score",
-                "components": {k: (round(v, 1) if v is not None else None) for k, v in scores.items()},
+                "components": {
+                    k: (round(float(v), 1) if v is not None else None)
+                    for k, v in scores.items()
+                },
                 # The measurement the correlation leg was scored from, so a low
                 # sub-score is explicable rather than a bare number. Null means
                 # the same thing it means on `factor_r_squared`: not measured.
