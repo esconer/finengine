@@ -53,6 +53,8 @@ Every section includes:
 - `error` **only when the section failed** — see [Errors](#errors)
 - `omitted_fields` when summary mode shortened raw series
 
+The dashboard section's `data.components` entries are pointers for the components that are also published as top-level sections, not second copies of them — see [Dashboard components are pointers, not second copies](#dashboard-components-are-pointers-not-second-copies).
+
 `base_currency` controls the portfolio snapshot. Analytics sections retain the monetary unit declared by their underlying endpoint (currently INR for most analytics); the top-level `currency_policy` makes this explicit. `generated_at` is the collection start, `completed_at` is the collection end, and `snapshot_consistency` is `best_effort` because live page endpoints can observe slightly different quote times during a full export.
 
 `snapshot_consistency` is a **collection mode** — `best_effort` or `frozen` — and says how the export was gathered. It does not say whether the prices that came back actually agreed. A v5 review counted 31 mismatching `(ticker, price)` pairs, up to 3.5% apart, across the same 14 holdings while the envelope still read `best_effort`, so the evidence now arrives beside the claim as `snapshot_consistency_measured` (`status`, `distinct_price_instants`, `distinct_delivered_bar_dates`, and both spreads). These are deliberately two keys: a `frozen` export whose clocks still disagree is a different finding from a `best_effort` one that happens to agree. The full block — per-ticker attribution under `per_position_price_as_of`, and a `what_this_invalidates` list — stays where it was measured, at `sections.portfolio.data.snapshot_consistency`.
@@ -145,6 +147,26 @@ Sections that can measure their freshness differently publish an `as_of_semantic
 ### Section behaviour notes
 
 The dashboard section composes the same canonical results used by its visible cards: portfolio, summary, performance history, realized/forecast/factor/concentration/liquidity/risk-score/regime/risk-contribution components. Performance history is requested with delivered-window metadata, so a series materially shorter or staler than the request is reported as `partial` with the requested-versus-delivered ranges named; a bare legacy series is treated as `unknown` freshness rather than assumed complete. The dashboard also publishes a `component_as_of` map, and its summary links `forecast_volatility` / `liquidity_score` from the canonical sibling sections (copied, never mutated) with a machine-readable `field_status` reason when a sibling is unusable. Risk Score publishes `change: null` with `change_status: unavailable` and `change_reason: no_persisted_prior_score` because no prior score is persisted — an unchanged `0` is never presented as a measured delta. The export may still observe different quote times between live endpoint calls; this is why the envelope is explicitly `best_effort`, not an atomic market-data snapshot.
+
+#### Dashboard components are pointers, not second copies
+
+Eight of the dashboard's eleven components — `portfolio`, `realized_risk`, `forecast_risk`, `factor_exposure`, `concentration`, `liquidity`, `regime`, `risk_contribution` — are also published as top-level sections. The component map does not inline those payloads a second time. Each such component carries:
+
+| key | meaning |
+| --- | --- |
+| `data_inline` | `false` when the payload lives elsewhere in this document; `true` when this component is its only publication |
+| `data_ref` | a dot-separated path into **this same document** naming the section that holds the payload — read `<data_ref>.data` |
+| `data_ref_status` | `referenced`: this component is a pointer, not a measurement |
+
+The remaining keys on a referenced component — `status`, `as_of`, `as_of_semantics`, `currency`, `detail`, `error`, `inputs`, `omitted_fields`, `warnings` — are **copied from the referenced section**, so the two paths cannot disagree about the same section. A component therefore never publishes a `data` key at all when it is referenced; the payload is at `<data_ref>.data`.
+
+`summary`, `risk_score` and `performance_history` have no standalone section, so they keep `data_inline: true` and carry their own `data`. They are the only publication of that payload, and a consumer that dereferences every `data_ref` still sees the whole document.
+
+`data_ref_status` is deliberately **not** named `data_status`: `data_status` is a declared contract key with its own normalized vocabulary (`available` / `partial` / `unavailable`) and reusing the name publishes a word outside that vocabulary.
+
+The convention is stated in the document itself, at `sections.dashboard.data.component_reference_policy`, so a consumer meets the explanation without this file. It lives there rather than as a top-level envelope key because `AIContextResponse` re-serializes the response against a declared model: an envelope key the exporter only adds at runtime is dropped from the HTTP wire, and `data` is the one place arbitrary keys are guaranteed to survive.
+
+This is not only a size decision. The duplicate copies had already drifted: the top-level `portfolio` section publishes `aggregates_not_produced` naming the book-level aggregates the endpoint never produces, and the dashboard's copy of the same section did not — so a consumer reading the portfolio through the dashboard saw a section that looked complete, with an omissions ledger that named none of the missing fields. One source per key makes that class of divergence unrepresentable.
 
 India market components expose the normalized `data_status` described above. The composite reports `component_inputs`, `component_coverage` and a per-component `component_as_of` map so heterogeneous components are never averaged into one claim: institutional flows are `scope: market_wide` with **no** ticker universe (and therefore no weight basis), delivery anomalies are symbol-scoped against the requested scrip roster, and only the portfolio-liquidity component carries ticker coverage. Section `universe_coverage` promotes the liquidity component with an explicit `source_component`; it is never populated from context tickers when liquidity is unavailable. `as_of` is the liquidity observation with `as_of_semantics: liquidity_component_only`, never the portfolio quote date. Missing FII/DII legs are `null` with `missing_categories` listed, never a measured zero, and an empty anomaly list is only a real zero-finding result when that component's status is `available`.
 

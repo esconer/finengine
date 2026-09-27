@@ -1641,6 +1641,97 @@ def _snapshot_consistency_measured(
     }
 
 
+#: Section-envelope keys a referenced dashboard component keeps inline.  These
+#: are the cheap, per-section facts a consumer needs to decide whether it wants
+#: the payload at all, and they are the keys on which the component and its twin
+#: are required to agree.
+COMPONENT_REFERENCE_METADATA = (
+    "as_of",
+    "as_of_semantics",
+    "currency",
+    "detail",
+    "error",
+    "inputs",
+    "omitted_fields",
+    "status",
+    "warnings",
+)
+
+COMPONENT_REFERENCE_POLICY = (
+    "A dashboard component with `data_inline: false` does not republish its "
+    "payload. Its `data` is the `data` of the section named by `data_ref`, "
+    "which is a dot-separated path into THIS document (read `<data_ref>.data`); "
+    "`data_ref_status: \"referenced\"` says the component is a pointer, not a "
+    "measurement. The component's own `status`, `as_of`, `as_of_semantics`, "
+    "`currency`, `detail`, `error`, `inputs`, `omitted_fields` and `warnings` "
+    "are copies of the referenced section's, so the two paths cannot disagree "
+    "about the same section. `data_inline: true` means the component is the only "
+    "publication of that payload in this document and its `data` is the data."
+)
+
+
+def _reference_dashboard_components(sections: Dict[str, Any]) -> None:
+    """Replace duplicated dashboard component payloads with pointers.
+
+    The default export already publishes eight of the dashboard's eleven
+    components as their own top-level sections, so inlining their payloads a
+    second time republished ~28% of the document byte-for-byte.  The component
+    map is a documented shape and a dashboard-shaped consumer depends on it, so
+    the map stays; only the duplicated bytes go.
+
+    Two things this must not do.  It must not point at anything: a component
+    whose twin is absent from the document (the risk score, the summary and
+    performance history have no standalone section) keeps its payload inline,
+    because a pointer to a section this export never published would be worse
+    than a duplicate.  And it must not let the two paths drift: the two copies
+    already had, and the drift cost a disclosure - `sections.portfolio.data`
+    carries `aggregates_not_produced` naming the book-level aggregates the
+    endpoint never produced, and the dashboard's copy of the same section did
+    not, so a consumer reading the portfolio through the dashboard saw a
+    section that looked complete with an empty omissions ledger.
+
+    The metadata is therefore copied FROM the referenced section rather than
+    left to the component, which makes the agreement structural: there is one
+    source for those keys, so no edit can make the two paths disagree.  This
+    runs after every section is built, so the dashboard's own status, currency,
+    freshness, coverage and warnings were all derived from the full payload and
+    none of them moves.
+    """
+    dashboard = sections.get("dashboard")
+    data = dashboard.get("data") if isinstance(dashboard, Mapping) else None
+    components = data.get("components") if isinstance(data, Mapping) else None
+    if not isinstance(components, Mapping):
+        return
+    for name, component in list(components.items()):
+        if not isinstance(component, dict):
+            continue
+        twin = sections.get(name)
+        if not isinstance(twin, Mapping) or "data" not in twin:
+            component["data_inline"] = True
+            continue
+        reference = f"sections.{name}"
+        # `data_ref_status`, never `data_status`: `data_status` is a declared
+        # contract key with its own normalized vocabulary (`available`,
+        # `partial`, `unavailable`) and a rule that audits every publication of
+        # it. Borrowing the name for "this is a pointer" put a word outside that
+        # vocabulary into the document.
+        projected = {
+            "data_inline": False,
+            "data_ref": reference,
+            "data_ref_status": "referenced",
+        }
+        for key in COMPONENT_REFERENCE_METADATA:
+            if key in twin:
+                projected[key] = twin[key]
+        if "status" not in projected:
+            # A twin that somehow publishes no status must not cost the
+            # component the status it already had.
+            projected["status"] = component.get("status", "unavailable")
+        components[name] = projected
+    if isinstance(data, dict):
+        data["component_reference_policy"] = COMPONENT_REFERENCE_POLICY
+
+
 class PortfolioContextService:
     """Collect the portfolio pages into one stable AI-facing document."""
 
@@ -1818,6 +1909,11 @@ class PortfolioContextService:
             environment["source_semantics"] = "primary_source is preference order, not per-observation vendor proof"
 
         completed_at = _now()
+        # Last, and only here: the dashboard's own status, currency, freshness,
+        # coverage, omissions and warnings were all derived above from the full
+        # component payloads, so dropping the duplicated copies cannot move any
+        # of them. This is the published-document step and nothing reads it back.
+        _reference_dashboard_components(sections)
         return {
             "schema_version": SCHEMA_VERSION,
             "export_id": f"portfolio-{uuid.uuid4().hex[:12]}",
