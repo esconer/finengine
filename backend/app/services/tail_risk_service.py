@@ -14,6 +14,179 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Fat-tail verdict: thresholds, sign convention, and the published rule.
+# --------------------------------------------------------------------------- #
+#
+# `is_fat_tailed` used to be a bare disjunction of three heterogeneous
+# measurements with nothing published saying which one fired:
+#
+#     xi_raw > 0.05  OR  excess_kurtosis > 0.5  OR  var_evt_loss > hist_var_loss
+#
+# A reader therefore saw `is_fat_tailed: true` published directly beside a
+# NEGATIVE `gpd_shape_xi` and had no way to tell that the third clause - a
+# comparison between two fitted loss numbers - was the one that had fired. A
+# confidently wrong boolean is a worse outcome than an absent one, so the
+# verdict is now derived under a stated rule, published with the basis that
+# produced it, and WITHHELD whenever the fitted shape contradicts it.
+#
+# Sign convention, stated explicitly because GPD shape signs are NOT universal
+# across parameterisations. This service fits the POT exceedances with
+# `scipy.stats.genpareto`, whose pdf is f(x, c) = (1 + c*x)**(-1 - 1/c) with
+# support "x >= 0 if c >= 0, and 0 <= x <= -1/c if c < 0", and for which
+# c = 0 reduces to the exponential and c = -1 to the uniform on [0, 1]
+# (SciPy 1.18 reference, scipy.stats.genpareto). Therefore in THIS
+# parameterisation:
+#
+#     c < 0  ->  the support is bounded above at x = -1/c: a FINITE right
+#                endpoint, so the tail is bounded and cannot be a fat tail
+#     c = 0  ->  exponential tail
+#     c > 0  ->  unbounded support with a power-law tail: a fat tail
+#
+# The same convention is corroborated from inside this service, not inferred
+# from the distribution name: `pot_moments` treats the first moment as
+# undefined at `shape >= 1.0`, which is only true of the standard
+# Pickands-Balkema-de Haan xi convention that genpareto's c already is.
+FAT_TAIL_SHAPE_THRESHOLD = 0.05
+FAT_TAIL_EXCESS_KURTOSIS_THRESHOLD = 0.5
+
+#: The shape clip the metrics are computed from. Its bounds straddle zero but
+#: neither can be reached from the far side, so `clip` never changes the sign
+#: of a fitted shape. A verdict therefore never has to guess whether the clip
+#: turned a thin fit into a fat one, and a clipped shape is never read as if it
+#: were the fitted value: the verdict reads `gpd_shape_xi_raw`.
+GPD_SHAPE_CLIP_LOW = -0.5
+GPD_SHAPE_CLIP_HIGH = 0.95
+
+GPD_SHAPE_SIGN_RULE = (
+    "sign convention is scipy.stats.genpareto, whose pdf is "
+    "f(x, c) = (1 + c*x)**(-1 - 1/c) with support x >= 0 for c >= 0 and "
+    "0 <= x <= -1/c for c < 0 (SciPy 1.18 reference, scipy.stats.genpareto). "
+    "In that parameterisation a negative shape c < 0 places a FINITE upper "
+    "endpoint -1/c on the tail, so a negative fitted shape is a BOUNDED tail "
+    "and is the opposite of a fat tail; c = 0 is exponential; c > 0 is a "
+    "power-law fat tail. The verdict below is read against that convention"
+)
+FAT_TAIL_VERDICT_RULE = (
+    "is_fat_tailed is published so that it can never contradict the "
+    "gpd_shape_xi_raw published beside it. Signals, each measured separately "
+    "and each published with its own value: (1) gpd_shape_xi_raw > 0.05 -> "
+    "fat, read from the RAW maximum-likelihood fit and never from the clipped "
+    "gpd_shape_xi_used that the moments were computed from; (2) "
+    "excess_kurtosis > 0.5 -> fat, a whole-sample central moment; (3) evt VaR "
+    "loss > historical VaR loss -> fat, a comparison of a fitted quantile "
+    "against an empirical one. These three measure different things (tail "
+    "shape above the POT threshold, whole-sample kurtosis, fitted-vs-empirical "
+    "quantile), so is_fat_tailed is: true when (1) or (2) fires and the shape "
+    "does not contradict it; false when nothing fired; and null when the "
+    "fitted shape is NEGATIVE and something else fired, because a bounded tail "
+    "cannot be a fat tail and the other signals cannot settle it. "
+    "is_fat_tailed_basis.fired_signals always names which signal or signals "
+    "produced the verdict, and is withheld only alongside the measured values "
+    "that made it uninformative. A shape inside +/-0.05 is recorded as "
+    "'unclassifiable_near_exponential' rather than counted as evidence. "
+    "Fewer verdicts is the correct answer here, not a substitute number"
+)
+
+
+def _fat_tail_shape_sign(xi_raw: Optional[float]) -> str:
+    """Classify a fitted GPD shape under :data:`GPD_SHAPE_SIGN_RULE`."""
+    if xi_raw is None:
+        return "not_fitted"
+    if xi_raw > FAT_TAIL_SHAPE_THRESHOLD:
+        return "positive_heavy_tail"
+    if xi_raw < -FAT_TAIL_SHAPE_THRESHOLD:
+        return "negative_bounded_tail"
+    return "unclassifiable_near_exponential"
+
+
+def _fat_tail_verdict(
+    *,
+    xi_raw: Optional[float],
+    xi_constrained: Optional[float],
+    excess_kurt: float,
+    var_evt_loss: float,
+    hist_var_loss: float,
+) -> Tuple[Optional[bool], Dict[str, Any]]:
+    """Return ``(verdict, basis)`` for the fat-tail flag.
+
+    ``verdict`` is ``None`` when the measurement does not support one, which is
+    the same contract the vol-cone uses for a percentile rank it cannot
+    resolve. ``basis`` is always populated - including when the verdict is
+    withheld - so a reader can see how uninformative the withheld verdict was
+    rather than seeing only an absence.
+    """
+    shape_sign = _fat_tail_shape_sign(xi_raw)
+    shape_fired = shape_sign == "positive_heavy_tail"
+    shape_contradicts = shape_sign == "negative_bounded_tail"
+    kurt_fired = bool(excess_kurt > FAT_TAIL_EXCESS_KURTOSIS_THRESHOLD)
+    var_fired = bool(var_evt_loss > hist_var_loss)
+    shape_clipped = bool(
+        xi_raw is not None
+        and xi_constrained is not None
+        and not np.isclose(xi_raw, xi_constrained)
+    )
+
+    fired: list[str] = []
+    if shape_fired:
+        fired.append("gpd_shape_xi_raw_above_threshold")
+    if kurt_fired:
+        fired.append("excess_kurtosis_above_threshold")
+    if var_fired:
+        fired.append("evt_var_exceeds_historical_var")
+
+    withheld_reason: Optional[str] = None
+    if shape_contradicts and fired:
+        # The parameter sitting beside the flag says the tail is bounded, and
+        # something else in the block says otherwise. Those signals measure
+        # different things and this block cannot resolve which is right, so
+        # withhold rather than assert either.
+        withheld_reason = (
+            f"withheld: the fitted GPD shape is negative "
+            f"(gpd_shape_xi_raw = {float(xi_raw):.8f}), which under the "
+            f"published scipy.stats.genpareto sign convention bounds the tail "
+            f"at a finite endpoint and so contradicts a fat-tail verdict, yet "
+            f"the other fat-tail signal(s) {', '.join(fired)} did fire. They "
+            f"measure different things - fitted tail shape above the POT "
+            f"threshold, whole-sample kurtosis, and fitted-vs-empirical "
+            f"quantile - and this block does not resolve the disagreement, so "
+            f"no verdict is published"
+        )
+        verdict: Optional[bool] = None
+    elif shape_fired or kurt_fired:
+        # Reached only when the shape is fat, or when it is unclassifiable near
+        # the exponential / absent entirely, so nothing published beside the
+        # flag contradicts it. `fired_signals` names which signal won.
+        verdict = True
+    else:
+        # Measured, and nothing fired. A False here rests on real numbers -
+        # the shape band and the kurtosis were both computed - and agrees with
+        # the shape published beside it, so it is not a stand-in for
+        # "not computed". Unfitness publishes shape_sign="not_fitted" so a
+        # reader can see the verdict rested on kurtosis alone.
+        verdict = False
+
+    basis: Dict[str, Any] = {
+        "rule": FAT_TAIL_VERDICT_RULE,
+        "sign_convention": GPD_SHAPE_SIGN_RULE,
+        "gpd_shape_xi_fitted": None if xi_raw is None else round(float(xi_raw), 8),
+        "gpd_shape_xi_fitted_field": "gpd_shape_xi_raw",
+        "gpd_shape_xi_used_for_metrics": (
+            None if xi_constrained is None else round(float(xi_constrained), 8)
+        ),
+        "gpd_shape_xi_was_clipped": shape_clipped,
+        "gpd_shape_sign": shape_sign,
+        "gpd_shape_xi_threshold": FAT_TAIL_SHAPE_THRESHOLD,
+        "excess_kurtosis": round(float(excess_kurt), 6),
+        "excess_kurtosis_threshold": FAT_TAIL_EXCESS_KURTOSIS_THRESHOLD,
+        "evt_var_exceeds_historical_var": var_fired,
+        "fired_signals": fired,
+        "verdict": verdict,
+        "withheld_reason": withheld_reason,
+    }
+    return verdict, basis
+
+
 class TailRiskService:
     """
     Institutional tail-risk suite implementing:
@@ -119,7 +292,9 @@ class TailRiskService:
                 # A finite ES requires xi < 1.  The lower bound is a
                 # stability guard for extreme heavy-tail extrapolation; it is
                 # deliberately separate from the raw fit and is disclosed.
-                xi_constrained = float(np.clip(xi_raw, -0.5, 0.95))
+                xi_constrained = float(
+                    np.clip(xi_raw, GPD_SHAPE_CLIP_LOW, GPD_SHAPE_CLIP_HIGH)
+                )
                 beta_constrained = float(max(beta_raw, 1e-6))
                 if not np.isclose(xi_constrained, xi_raw):
                     constraint_reasons.append("gpd_shape_clipped")
@@ -171,14 +346,13 @@ class TailRiskService:
             constraint_reasons.append("raw_first_moment_undefined")
 
         excess_kurt = float(stats.kurtosis(r)) if n_total > 4 else 0.0
-        if model_fitted:
-            is_fat_tailed = bool(
-                (xi_raw is not None and xi_raw > 0.05)
-                or excess_kurt > 0.5
-                or var_evt_loss > hist_var_loss
-            )
-        else:
-            is_fat_tailed = bool(excess_kurt > 0.5)
+        is_fat_tailed, fat_tail_basis = _fat_tail_verdict(
+            xi_raw=xi_raw if model_fitted else None,
+            xi_constrained=xi_constrained,
+            excess_kurt=excess_kurt,
+            var_evt_loss=var_evt_loss,
+            hist_var_loss=hist_var_loss,
+        )
 
         neutral = {
             "evt_pot_var": round(-float(var_evt_loss), 6),
@@ -243,6 +417,11 @@ class TailRiskService:
             "exceedances_count": int(n_u),
             "total_observations": int(n_total),
             "is_fat_tailed": is_fat_tailed,
+            # The flag is a verdict, so it ships with the measurement it was
+            # derived from. A reader can now check it against the shape beside
+            # it instead of having to guess which of three signals fired.
+            "is_fat_tailed_basis": fat_tail_basis,
+            "is_fat_tailed_withheld_reason": fat_tail_basis["withheld_reason"],
         }
 
         # Preserve the established 99%-named contract only for the actual 99%

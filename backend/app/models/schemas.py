@@ -646,7 +646,17 @@ class EVTPOTVarMetrics(BaseModel):
     model_fitted: bool = True
     exceedances_count: int
     total_observations: int
-    is_fat_tailed: bool
+    # RL-2: the service can now WITHHOLD this verdict, so `null` is a reachable
+    # value and a bare `bool` was a type lie. It happens when the fitted GPD
+    # shape contradicts the other fatness signals: the section will not assert
+    # "fat tailed" beside a bounded shape, and will not report `false` either,
+    # because false would read as a measurement when nothing was classified.
+    # The two new fields carry the reason and the basis. Optional-with-default
+    # rather than required, matching this file's convention that absent means
+    # "not recorded" and never "zero".
+    is_fat_tailed: Optional[bool] = None
+    is_fat_tailed_basis: Optional[Dict[str, Any]] = None
+    is_fat_tailed_withheld_reason: Optional[str] = None
 
 
 class HighTailRiskPair(BaseModel):
