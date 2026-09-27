@@ -217,6 +217,35 @@ UNCERTAINTY_KEY_TOKENS = (
     "t_critical",
 )
 
+#: Classifications under which a published number has NO sampling distribution,
+#: so a null beside a stated reason IS the complete and honest disclosure. A rule
+#: that demanded a figure in these cases would be demanding a fabricated one: a
+#: design constant cannot be resampled, and a deterministic function of an
+#: already-published input has no independent uncertainty. These are the labels
+#: ``score_audit.precision`` publishes for exactly that distinction.
+NON_ESTIMATE_CLASSIFICATIONS = frozenset(
+    {
+        "declared_constant",
+        "deterministic_derivation",
+        "derived_value",
+        "inherited_precision",
+    }
+)
+
+#: Key names that match an uncertainty token but are METHOD PARAMETERS rather
+#: than statements about precision. ``bootstrap_resamples: 1000`` says how many
+#: draws were taken; it says nothing about how tightly anything was estimated.
+#: Matched as whole-name fragments so a real figure that merely shares a prefix
+#: -- ``hac_se``, ``bootstrap_standard_error`` -- is not swept up with them.
+METHOD_PARAMETER_FRAGMENTS = (
+    "resample",
+    "maxlags",
+    "iterations",
+    "draws",
+    "seed",
+    "n_boot",
+)
+
 #: Key fragments that make a numeric field an ESTIMATED quantity (a fitted
 #: parameter or a ratio) rather than a measured level.  Deliberately excludes
 #: z-scores and p-values: a z-score is a measured level put on a scale, and a
@@ -574,6 +603,80 @@ def _keys_matching(node: dict[str, Any], tokens: tuple[str, ...]) -> set[str]:
         for key, value in node.items()
         if any(token in key.lower() for token in tokens) and _publishes_something(value)
     }
+
+
+def _is_method_parameter(key: str) -> bool:
+    """True when ``key`` names a knob of a method rather than a figure it produced."""
+    lowered = key.lower()
+    return any(fragment in lowered for fragment in METHOD_PARAMETER_FRAGMENTS)
+
+
+def _disclosure_figures(node: dict[str, Any]) -> set[str]:
+    """Token-matching keys in ``node`` that actually carry a NUMBER.
+
+    ``_keys_matching`` accepts any published value, which made this rule
+    satisfiable without a figure. Three shapes did it, all measured against
+    ``env_020`` directly:
+
+      ``standard_error: null`` beside ``standard_error_reason: "not computed"``
+      -- the reason key contains the token as a substring and publishes a
+         string, so *the explanation of why there is no figure* was read as
+         *a figure*. This is the worst of the three, because it inverts the
+         disclosure: the more honestly a section explains an absent number, the
+         more certainly the rule went green.
+
+      ``bootstrap_resamples: 1000`` -- a draw count, which is a method knob.
+
+      ``effective_n_basis: "the Quenouille formula ..."`` -- prose about a
+         figure that is published elsewhere, standing in for the figure here.
+
+    An interval counts as a figure, so ``conf_int: [1.7, 2.1]`` still passes.
+    """
+    figures: set[str] = set()
+    for key, value in node.items():
+        lowered = key.lower()
+        if not any(token in lowered for token in UNCERTAINTY_KEY_TOKENS):
+            continue
+        if _is_method_parameter(key):
+            continue
+        if _finite(value):
+            figures.add(key)
+        elif isinstance(value, (list, tuple)) and len(value) == 2 and all(_finite(v) for v in value):
+            figures.add(key)
+    return figures
+
+
+def _declared_absence(node: dict[str, Any]) -> set[str]:
+    """Token-matching keys in a node that declares a NON-ESTIMATE class and says why.
+
+    This is the shape that makes a null legitimate rather than hollow: the
+    classification says the number has no sampling distribution, and a reason
+    says so in words. Requiring all three - class, null, reason - is what
+    separates an explained absence from a missing figure.
+    """
+    classification = None
+    for key in ("classification", "precision_class", "value_class"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip().lower() in NON_ESTIMATE_CLASSIFICATIONS:
+            classification = value
+            break
+    if classification is None:
+        return set()
+    absent = {
+        key
+        for key, value in node.items()
+        if any(token in key.lower() for token in UNCERTAINTY_KEY_TOKENS)
+        and not _is_method_parameter(key)
+        and not _publishes_something(value)
+    }
+    reasons = {
+        key
+        for key, value in node.items()
+        if isinstance(value, str)
+        and value.strip()
+        and any(token in key.lower() for token in UNCERTAINTY_KEY_TOKENS)
+    }
+    return absent | reasons if absent and reasons else set()
 
 
 def _ancestor_paths(export: Export, path: str) -> list[str]:
@@ -1284,6 +1387,31 @@ def env_020_point_estimates_carry_uncertainty(export: Export) -> list[Finding]:
     ``observations: 174``), and counting the rows is not a statement about how
     precisely anything was estimated; letting a row count pass this rule would
     have made it green on an artifact that discloses no uncertainty at all.
+
+    The escape must be a FIGURE or an EXPLAINED ABSENCE, never a key name. It
+    used to be a key name, and three shapes satisfied it while the section
+    disclosed nothing - each measured against this rule rather than argued, and
+    documented in :func:`_disclosure_figures`:
+
+      ``{"sharpe_ratio": 1.9, "standard_error": null,
+        "standard_error_reason": "not applicable: a declared policy constant"}``
+      ``{"sharpe_ratio": 1.9, "bootstrap_resamples": 1000}``
+      ``{"sharpe_ratio": 1.9, "conf_int": null, "conf_int_reason": "inherited"}``
+
+    The first is the one that matters.  ``standard_error_reason`` contains the
+    token as a substring and publishes a string, so the rule read *the
+    explanation of why there is no figure* as *a figure*.  That inverts the
+    disclosure: the more carefully a section explains an absent number, the more
+    certainly this rule went green - and the more a reader should trust a green
+    gate that never checked anything.  A rule that cannot tell a stated absence
+    from a published number is not lenient, it is blind.
+
+    An explained absence is still accepted, but only in the shape that means it:
+    a node declaring a :data:`NON_ESTIMATE_CLASSIFICATIONS` class AND publishing
+    a reason.  That is what lets a declared constant or a deterministic
+    derivation state ``null`` honestly instead of fabricating an interval - the
+    alternative would be to invent precision figures for design choices, which is
+    the worse defect.
     """
     findings: list[Finding] = []
     for name, section in export.sections().items():
@@ -1295,7 +1423,8 @@ def env_020_point_estimates_carry_uncertainty(export: Export) -> list[Finding]:
         for path, node in _walk(section, prefix):
             if not isinstance(node, dict):
                 continue
-            uncertainty |= _keys_matching(node, UNCERTAINTY_KEY_TOKENS)
+            uncertainty |= _disclosure_figures(node)
+            uncertainty |= _declared_absence(node)
             estimates.extend(
                 f"{path}.{key}"
                 for key, value in node.items()
@@ -1311,8 +1440,9 @@ def env_020_point_estimates_carry_uncertainty(export: Export) -> list[Finding]:
                 prefix,
                 f"{len(estimates)} point estimate(s) {families[:8]} are published "
                 f"with no standard error, no interval and no effective-sample-size "
-                f"figure anywhere in this section; the only precision disclosure "
-                f"in 876 KB of export is one constant-multiple band",
+                f"figure anywhere in this section, and no node declaring why a "
+                f"figure is absent; a key name, a draw count and a reason string "
+                f"are not precision figures",
             )
         )
     return findings
