@@ -51,6 +51,7 @@ from app.services.analytics_engine import (
     UNCERTAINTY_CONFIDENCE_LEVEL,
     UNCERTAINTY_MIN_OBSERVATIONS,
     AnalyticsEngine,
+    RISK_SCORE_PAIRWISE_ROW_FILTER,
     ar1_autocorrelation,
     autocorrelation_disclosure,
     effective_sample_size,
@@ -59,6 +60,7 @@ from app.services.analytics_engine import (
     measure_estimate_uncertainty,
     moving_block_indices,
     moving_block_size,
+    pairwise_average_correlation_statistics,
     quantstats_ratio_statistics,
     quantstats_returns_look_like_prices,
 )
@@ -1002,4 +1004,196 @@ async def test_optimizer_route_single_holding_publishes_a_block(test_db):
     assert block["status"] == "computed"
     assert block["estimates"]["expected_sharpe"]["conf_int"] is not None
     assert "normal_theory_standard_error" in block["estimates"]["expected_annual_return"]
+
+
+# ---------------------------------------------------------------------------
+# the PAIRWISE row filter
+# ---------------------------------------------------------------------------
+# `measure_estimate_uncertainty` measures rows COMPLETE CASE by default: a row
+# survives only when every column is finite.  That is the right reading for a
+# statistic that is a function of the columns jointly, and it is the WRONG
+# reading for a statistic that is itself pairwise - a mean of pairwise Pearson
+# correlations is exactly what pandas' pairwise-complete `.corr()` measures, and
+# on a book with a leg that was listed part way through the window the
+# complete-case mean is a DIFFERENT number.  `row_filter` lets such a caller
+# name the rows its own point value was measured on.
+#
+# The two properties that matter, both asserted as causes:
+#   * the default is untouched, so every existing block keeps measuring the rows
+#     it measured before, and
+#   * a pairwise statistic handed a pairwise filter reproduces its published
+#     point, which is the only reason the filter may exist: without it the
+#     reproduction guard would refuse the band on a correct number.
+
+def _two_leg_frame(observations: int = 60, seed: int = 5) -> pd.DataFrame:
+    """A return frame whose second leg is unpriced for the first stretch."""
+    rng = np.random.default_rng(seed)
+    left = rng.normal(0.0004, 0.010, observations)
+    right = 0.6 * left + rng.normal(0.0, 0.008, observations)
+    frame = pd.DataFrame({"A": left, "B": right})
+    frame.loc[frame.index[: observations // 3], "B"] = np.nan
+    return frame
+
+
+def _gappy_frame(observations: int = 60, seed: int = 5) -> pd.DataFrame:
+    """Three legs whose gaps DIFFER, so no two pairs share a row set.
+
+    Two columns would not do: with a single pair, the pairwise-complete
+    correlation and the complete-case correlation are the same number, so a test
+    built on two columns could not tell the two populations apart at all.
+    """
+    rng = np.random.default_rng(seed)
+    common = rng.normal(0.0003, 0.010, observations)
+    frame = pd.DataFrame({
+        "A": common,
+        "B": 0.7 * common + rng.normal(0.0, 0.007, observations),
+        "C": 0.3 * common + rng.normal(0.0, 0.011, observations),
+    })
+    frame.loc[frame.index[: observations // 3], "B"] = np.nan
+    frame.loc[frame.index[observations // 2 :], "C"] = np.nan
+    return frame
+
+
+def _pairwise_mean(frame: pd.DataFrame) -> float:
+    values = frame.corr().to_numpy(dtype=float)
+    upper = values[np.triu_indices(len(frame.columns), k=1)]
+    finite = upper[np.isfinite(upper)]
+    return float(finite.mean())
+
+
+def test_the_default_row_filter_is_still_complete_case():
+    """No `row_filter` means every column finite, exactly as before."""
+    frame = _two_leg_frame()
+    complete = frame.dropna()
+
+    block = measure_estimate_uncertainty(
+        frame,
+        {"mean": lambda b: np.asarray(b, dtype=float)[:, :, 0].mean(axis=0)},
+        {"mean": float(complete["A"].mean())},
+        scope="probe",
+    )
+
+    assert block["observation_filter"] == "complete_case_all_columns_finite"
+    # The complete-case frame, not the delivered one: the 20 rows where B is
+    # unpriced are dropped, and the drop is COUNTED rather than silent.
+    assert block["observations"] == len(complete)
+    assert block["dropped_non_finite_observations"] == (
+        len(frame) - len(complete)
+    )
+    assert block["estimates"]["mean"]["conf_int"] is not None
+
+
+def test_a_pairwise_filter_measures_the_pair_wise_sample_not_the_complete_case():
+    """The whole point: with the pairwise filter the band belongs to the number."""
+    frame = _gappy_frame()
+    published = round(_pairwise_mean(frame), 4)
+    complete_case_mean = round(_pairwise_mean(frame.dropna()), 4)
+    # The two are genuinely different on this frame, so the test below is not
+    # asserting the distinction in the abstract.
+    assert abs(published - complete_case_mean) > 1e-6
+
+    pairwise = measure_estimate_uncertainty(
+        frame,
+        pairwise_average_correlation_statistics(),
+        {"avg_pairwise_correlation": published},
+        scope="probe",
+        point_tolerance=1e-4,
+        row_filter=RISK_SCORE_PAIRWISE_ROW_FILTER,
+        row_filter_basis="probe",
+        statistic_names={"avg_pairwise_correlation": "avg_pairwise_correlation"},
+    )
+    _assert_block_contract(pairwise)
+    assert pairwise["observation_filter"] == "caller_supplied_row_filter"
+    # Every row that carries a finite return for at least one leg survives; the
+    # pairwise statistic is defined on all of them.
+    assert pairwise["observations"] == len(frame)
+    assert pairwise["estimates"]["avg_pairwise_correlation"]["point_status"] == (
+        "reproduced_by_estimator"
+    )
+    assert pairwise["estimates"]["avg_pairwise_correlation"]["conf_int"] is not None
+
+    # Without the filter the SAME estimator measures the complete-case mean, the
+    # reproduction guard catches it, and the band is withheld with the
+    # discrepancy in the reason.  That is the failure the filter exists to avoid.
+    complete = measure_estimate_uncertainty(
+        frame,
+        pairwise_average_correlation_statistics(),
+        {"avg_pairwise_correlation": published},
+        scope="probe",
+        point_tolerance=1e-4,
+    )
+    assert complete["estimates"]["avg_pairwise_correlation"]["conf_int"] is None
+    assert complete["estimates"]["avg_pairwise_correlation"]["reason"]
+    # the POINT is retained, not nulled: a wrong estimator must not cost a
+    # reader a correct number.
+    assert complete["estimates"]["avg_pairwise_correlation"]["point"] == published
+
+
+def test_a_row_filter_of_the_wrong_length_refuses_the_block_instead_of_guessing():
+    frame = _two_leg_frame()
+    block = measure_estimate_uncertainty(
+        frame,
+        {"mean": lambda b: np.asarray(b, dtype=float)[:, :, 0].mean(axis=0)},
+        {"mean": float(frame.dropna()["A"].mean())},
+        scope="probe",
+        row_filter=lambda raw: np.ones(3, dtype=bool),
+    )
+    assert block["observations"] == 0
+    assert block["status"] == "not_computed"
+    assert "row filter" in block["autocorrelation"]["reason"]
+
+
+def test_a_raising_row_filter_degrades_with_a_reason_rather_than_a_crash():
+    frame = _two_leg_frame()
+
+    def _explode(raw):
+        raise ValueError("no mask for you")
+
+    block = measure_estimate_uncertainty(
+        frame,
+        {"mean": lambda b: np.asarray(b, dtype=float)[:, :, 0].mean(axis=0)},
+        {"mean": float(frame.dropna()["A"].mean())},
+        scope="probe",
+        row_filter=_explode,
+    )
+    assert block["observations"] == 0
+    assert "no mask for you" in block["autocorrelation"]["reason"]
+
+
+def test_the_pairwise_restatement_reproduces_pandas_corr_through_its_nan_gaps():
+    """The estimator is a restatement of `.corr()`, not a lookalike formula."""
+    frame = _gappy_frame(observations=90, seed=17)
+    values = frame.to_numpy(dtype=float)
+    draws = 7
+    resampled = np.repeat(values[:, None, :], draws, axis=1)
+
+    restated = pairwise_average_correlation_statistics()["avg_pairwise_correlation"](
+        resampled
+    )
+
+    assert restated.shape == (draws,)
+    for draw in range(draws):
+        assert restated[draw] == pytest.approx(_pairwise_mean(frame), abs=1e-12)
+    # a pair with a single shared row is not measurable, and a constant column
+    # has no correlation at all - both must come back absent, not as 0.0
+    degenerate = pd.DataFrame({"A": [1.0, 2.0, np.nan, 4.0], "B": [1.0, 1.0, 1.0, 1.0]})
+    assert np.isnan(
+        pairwise_average_correlation_statistics()["avg_pairwise_correlation"](
+            degenerate.to_numpy(dtype=float)[:, None, :]
+        )[0]
+    )
+
+
+def test_the_pairwise_restatement_is_chunk_invariant():
+    """Chunking bounds memory; it must not move a single draw."""
+    frame = _gappy_frame(observations=80, seed=23)
+    values = frame.to_numpy(dtype=float)
+    resampled = np.repeat(values[:, None, :], 9, axis=1)
+    one_shot = pairwise_average_correlation_statistics(10_000)[
+        "avg_pairwise_correlation"
+    ](resampled)
+    chunked = pairwise_average_correlation_statistics(2)["avg_pairwise_correlation"](
+        resampled
+    )
+    assert np.array_equal(one_shot, chunked)
 

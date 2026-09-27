@@ -548,6 +548,153 @@ RISK_SCORE_LEG_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 # ---------------------------------------------------------------------------
+# risk-score precision disclosure (SI-5 tail)
+# ---------------------------------------------------------------------------
+# `score_audit` above says what the headline is MADE OF.  It does not say how
+# precisely each ingredient is known, and the three ingredients are three
+# different kinds of number:
+#
+#   * an ESTIMATED STATISTIC - `avg_pairwise_correlation`, `factor_r_squared` -
+#     is measured from data, so it gets a resampling standard error, an interval
+#     and an effective-sample-size figure from `measure_estimate_uncertainty`.
+#   * a DERIVED SUB-SCORE - every leg's `min(30, <expression of one published
+#     input>)` - is a deterministic function of a number already on the payload.
+#     Its precision is INHERITED from that input, and it is given no interval of
+#     its own: an independent band for a function of a published value would be
+#     a second, fabricated estimate of something already published.
+#   * a DECLARED CONSTANT - the leg weights - is chosen by design.  It has no
+#     sampling distribution at all, so a standard error for it would be a
+#     statement about a design decision wearing the clothes of a measurement.
+#
+# Publishing the three differently is the whole disclosure.  A rule that cannot
+# tell a declared constant from an estimated parameter cannot be satisfied here
+# honestly, and that is a limitation of the rule rather than a licence to
+# manufacture a confidence interval for a weight somebody typed.
+RISK_SCORE_PRECISION_BASIS = (
+    "the numbers a risk score is made of are three different kinds of thing, "
+    "and a standard error is only a statement about one of them. Estimated "
+    "statistics are measured from data and carry a resampling standard error, "
+    "an interval and an effective-sample-size figure. Sub-scores are "
+    "deterministic functions of exactly one published input, so their precision "
+    "is INHERITED from that input and they carry no interval of their own. The "
+    "leg weights are declared policy constants: they have no sampling "
+    "distribution, so they carry no standard error at all."
+)
+
+#: Where the weight table lives, named so a reader can find the constants rather
+#: than take the payload's word that they are constants.
+RISK_SCORE_WEIGHT_TABLE = (
+    "app/services/analytics_engine.py: RISK_SCORE_WEIGHTS (the module-level "
+    "table this section's nominal weights and the applied weights are both read "
+    "from; one source, so a published weight cannot drift from the applied one)"
+)
+
+RISK_SCORE_DECLARED_CONSTANT_BASIS = (
+    "declared policy constant, not an estimated parameter. RISK_SCORE_WEIGHTS "
+    "is a design decision about how much of the headline each leg should carry; "
+    "it is chosen before any return series is measured and is not inferred from "
+    "one. A standard error would describe the sampling variability of a number "
+    "estimated from data, and there is no such variability here: re-running the "
+    "score on a different window changes the sub-scores but never the weight. "
+    "It is therefore published with no standard error and no interval, which is "
+    "a statement about the number rather than a gap in one."
+)
+
+#: What a rule that requires a standard error, an interval or an
+#: effective-sample-size figure would need in order to read this section
+#: correctly.  Recorded in the payload because the payload IS the audit
+#: surface: a consumer that treats a declared constant as a bare point estimate
+#: will keep reporting a defect that is not there.
+RISK_SCORE_RULE_LIMITATION = (
+    "a precision-disclosure rule keyed on key names alone cannot distinguish a "
+    "declared constant (a weight) from an estimated parameter (a correlation or "
+    "an R-squared), and cannot tell a derived value from a measured one. This "
+    "section therefore classifies every number it publishes (estimated / "
+    "deterministic_derivation / declared_constant) and gives each class the "
+    "disclosure that class admits, instead of giving all of them the same band."
+)
+
+#: Both estimated inputs this section publishes are rounded to 4 decimal
+#: places, so half a display step is 5e-5 and `measure_estimate_uncertainty` is
+#: held to 1e-4: the same margin the tear sheet uses for its own 4 dp betas.
+#: Wider would admit a restatement that measures a neighbouring statistic.
+RISK_SCORE_STATISTIC_DECIMALS = 4
+RISK_SCORE_PUBLISHED_DP_TOLERANCE = 1e-4
+
+#: Where each leg input's own precision is published, when it is.  A leg whose
+#: input is absent from this map has NO precision disclosure in this section,
+#: and the leg says so rather than borrowing one.
+RISK_SCORE_INPUT_PRECISION_AT: Dict[str, str] = {
+    "avg_pairwise_correlation": (
+        "score_audit.precision.estimated_statistics.avg_pairwise_correlation"
+        ".estimates.avg_pairwise_correlation"
+    ),
+    "benchmark_regression_r_squared": (
+        "score_audit.precision.estimated_statistics.factor_r_squared"
+        ".estimates.factor_r_squared"
+    ),
+    # The Herfindahl index is exact arithmetic on the weights - sum of squared
+    # active weights - so its precision is the weights' precision, which is nil
+    # because they are declared constants.  Saying that is more useful than
+    # publishing a "no disclosure" that reads as an oversight.
+    "herfindahl_index": "score_audit.precision.declared_constants",
+}
+
+RISK_SCORE_PAIRWISE_ESTIMATOR_BASIS = (
+    "pairwise_average_correlation_statistics: a vectorised restatement of this "
+    "section's own correlation leg - the mean of the finite upper-triangle "
+    "Pearson correlations of the constituent return frame, exactly as "
+    "returns.corr() computes it. The pair, the date and the frame are all the "
+    "published ones, so the interval belongs to the published number; the "
+    "reproduction guard in measure_estimate_uncertainty refuses the band if it "
+    "does not."
+)
+
+RISK_SCORE_PAIRWISE_RESAMPLE_RULE = (
+    "the resample count is the standard one on any book whose pairwise work "
+    "fits the budget, and is REDUCED - and published as bootstrap_resamples - on "
+    "a book too wide for the disclosure to fit in a request. The statistic costs "
+    "O(rows x draws x pairs), so a 200-name book at 1000 draws is two orders of "
+    "magnitude more work than a 14-name book. The reduction is a cost decision "
+    "about how many draws the interval is read from, not a change to the "
+    "estimator, the sample, or the published point"
+)
+
+#: Which rows the correlation statistic is measured on.  Every row is kept: the
+#: statistic is pairwise, so a row a single leg was unpriced on is still a row
+#: for every other pair.  Only a wholly non-finite row is dropped, and it is
+#: counted in dropped_non_finite_observations.
+def _pairwise_row_filter(raw: Any) -> np.ndarray:
+    values = np.asarray(raw, dtype=float)
+    if values.ndim != 2:
+        return np.zeros(0, dtype=bool)
+    return np.isfinite(values).any(axis=1)
+
+
+RISK_SCORE_PAIRWISE_ROW_FILTER = _pairwise_row_filter
+
+RISK_SCORE_PAIRWISE_ROW_FILTER_BASIS = (
+    "every row that carries a finite return for AT LEAST ONE constituent. The "
+    "published statistic is the mean of PAIRWISE correlations and pandas' .corr() "
+    "is pairwise complete, so a row unpriced for one leg is still a measurement "
+    "for every other pair; dropping it would measure the complete-case mean "
+    "instead, which is a different number on any book with a late-listed leg. "
+    "Rows with no finite return at all are dropped and counted."
+)
+
+#: Identity of the factor leg's own fit, so two fits of the "same" model over
+#: different windows are told apart rather than reported as contradicting.
+RISK_SCORE_ADJUSTED_R_SQUARED_BASIS = (
+    "risk_score factor leg: portfolio return regressed on a constant plus the "
+    "benchmark over the score's own holding-window price frame. It is a "
+    "DIFFERENT model from factor_exposure's full-exchange-history fit of the "
+    "same pair, and the two are expected to disagree; only a disagreement "
+    "between fits claiming THIS basis is a contradiction. This is statsmodels' "
+    "rsquared_adj from the same fit as the published factor_r_squared, at the "
+    "same observation count - a restatement of one fit, not a second estimate"
+)
+
+# ---------------------------------------------------------------------------
 # forecast tail contract (SI-3 / QM-3 / AD-2)
 # ---------------------------------------------------------------------------
 # The fitted GARCH/EGARCH models use `dist='normal'`, so their conditional
@@ -792,15 +939,40 @@ def _percentile_interval(
     return [float(low), float(high)]
 
 
-def _finite_observation_block(observations: Any) -> Tuple[np.ndarray, int]:
-    """``(n, k)`` float block with non-finite rows dropped, plus the drop count."""
+def _finite_observation_block(
+    observations: Any, row_filter: Optional[Any] = None
+) -> Tuple[np.ndarray, int]:
+    """``(n, k)`` float block with unusable rows dropped, plus the drop count.
+
+    The default filter is COMPLETE CASE: a row survives only if every column is
+    finite, which is the right reading for any statistic that is a function of
+    the columns jointly.  It is the WRONG reading for a statistic that is
+    itself pairwise - a mean of pairwise Pearson correlations, for instance, is
+    exactly what pandas' pairwise-complete `.corr()` measures, and dropping the
+    rows a leg was unpriced on would measure the mean over the complete-case
+    subset instead, i.e. a different number that the reproduction guard would
+    (correctly) refuse.  `row_filter` lets such a caller say which rows ITS
+    statistic is defined on; it must return a boolean mask over rows.  A filter
+    of the wrong length refuses the whole block rather than guessing.
+    """
     raw = np.asarray(observations, dtype=float)
     if raw.ndim == 1:
         raw = raw.reshape(-1, 1)
     elif raw.ndim != 2:
         return np.zeros((0, 0), dtype=float), 0
-    finite = np.isfinite(raw).all(axis=1)
-    return raw[finite], int(raw.shape[0] - int(finite.sum()))
+    if row_filter is None:
+        keep = np.isfinite(raw).all(axis=1)
+    else:
+        try:
+            keep = np.asarray(row_filter(raw), dtype=bool).ravel()
+        except Exception as exc:  # noqa: BLE001 - degrade, never guess
+            return np.zeros((0, 0), dtype=float), 0, str(exc)
+        if keep.shape[0] != raw.shape[0]:
+            return np.zeros((0, 0), dtype=float), 0, (
+                "the caller's row filter returned "
+                f"{keep.shape[0]} mask(s) for a {raw.shape[0]}-row frame"
+            )
+    return raw[keep], int(raw.shape[0] - int(keep.sum())), None
 
 
 def _uncertainty_entry(
@@ -921,7 +1093,7 @@ def _witness_verdicts(
     published_by_source = {source: field for field, source in source_field.items()}
     try:
         evaluate = _statistic_matrix_from(witness)
-        values, _ = _finite_observation_block(witness_observations)
+        values, _, _ = _finite_observation_block(witness_observations)
     except Exception as exc:  # noqa: BLE001 - degrade, never guess
         return {}, (
             "the independent witness could not be prepared on the published "
@@ -972,6 +1144,8 @@ def measure_estimate_uncertainty(
     witness_observations: Any = None,
     witness_tolerance: Optional[float] = None,
     witness_basis: Optional[str] = None,
+    row_filter: Optional[Any] = None,
+    row_filter_basis: Optional[str] = None,
     notes: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Precision disclosure for one block of published estimates.
@@ -983,6 +1157,11 @@ def measure_estimate_uncertainty(
     the same statistic, computed on each resample.  `published` maps every
     field this block is responsible for to the value the payload publishes, and
     EVERY key in it appears in the result, whatever happens next.
+
+    Rows are measured COMPLETE CASE by default (every column finite).  A
+    statistic that is itself PAIRWISE is defined on a different population, and
+    `row_filter` + `row_filter_basis` let such a caller name the rows its own
+    point value was measured on; both are published on the block.
 
     The safety property that makes the whole thing trustworthy: the estimator
     is also run on the ORIGINAL sample, and a field's interval is published
@@ -1029,7 +1208,9 @@ def measure_estimate_uncertainty(
     the published value - two independent derivations contradicting the payload,
     which is the one case where withholding is the honest answer.
     """
-    values, dropped = _finite_observation_block(observations)
+    values, dropped, filter_failure = _finite_observation_block(
+        observations, row_filter
+    )
     evaluate = _statistic_matrix_from(statistics)
     count = int(values.shape[0])
     width = int(values.shape[1])
@@ -1045,7 +1226,9 @@ def measure_estimate_uncertainty(
             "observations": 0,
             "naive_n_would_assume": None,
             "status": "not_computed",
-            "reason": "no finite observation was measured for this block",
+            "reason": filter_failure or (
+                "no finite observation was measured for this block"
+            ),
         }
     )
     effective_n = autocorrelation.get("effective_n")
@@ -1074,7 +1257,9 @@ def measure_estimate_uncertainty(
             )
             draws, own_point = {}, {}
     elif count == 0:
-        blocked_reason = "no finite observation was measured for this block"
+        blocked_reason = filter_failure or (
+            "no finite observation was measured for this block"
+        )
     else:
         blocked_reason = (
             f"{count} measured observation(s) is below the "
@@ -1230,6 +1415,19 @@ def measure_estimate_uncertainty(
         "confidence_level": level,
         "observations": count,
         "observation_columns": width,
+        "observation_filter": (
+            "caller_supplied_row_filter" if row_filter is not None
+            else "complete_case_all_columns_finite"
+        ),
+        "observation_filter_basis": row_filter_basis or (
+            "complete case: a row is measured only when every column is finite, "
+            "which is the right reading for a statistic that is a function of the "
+            "columns jointly. A pairwise statistic (a mean of pairwise Pearson "
+            "correlations) is defined on a different population - the rows on "
+            "which the PAIR is finite - and a caller with one passes row_filter "
+            "so the band is measured on the sample its point value was measured "
+            "on."
+        ),
         "dropped_non_finite_observations": dropped,
         "block_size": block_length,
         "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) "
@@ -1700,6 +1898,278 @@ def engine_risk_statistics(
     }
 
 
+#: Resampling draws evaluated per chunk by the pairwise-correlation
+#: restatement.  The statistic is O(rows x draws x columns^2), so a wide book
+#: would otherwise materialise a ``(draws, columns, columns)`` float array per
+#: accumulator - six of them - before the first percentile is taken.  Chunking
+#: bounds that peak without changing a single draw: the same resample indices,
+#: the same arithmetic, the same numbers.
+PAIRWISE_STATISTIC_DRAW_CHUNK = 100
+
+#: Draw-count ceiling for the pairwise restatement, expressed as the
+#: rows x draws x pairs work it is allowed.  At the book sizes this section
+#: actually sees (14 legs, 39 rows, 91 pairs) the standard
+#: :data:`UNCERTAINTY_BOOTSTRAP_RESAMPLES` is unchanged; the rule only bites on
+#: a book wide enough that the disclosure would cost more than the request
+#: budget.  Whatever count is used is published as `bootstrap_resamples` and the
+#: rule that chose it as `resample_count_rule`, so the band stays reproducible
+#: from the payload and a reduced count is visible rather than silent.
+PAIRWISE_STATISTIC_RESAMPLE_BUDGET = 400_000
+
+#: Floor on the reduced count.  Below this a percentile interval's own 2.5 %
+#: tail is estimated from a handful of draws, which is worse than a wider band.
+PAIRWISE_STATISTIC_MIN_RESAMPLES = 200
+
+
+def pairwise_resample_count(
+    pairs: int, budget: int = PAIRWISE_STATISTIC_RESAMPLE_BUDGET
+) -> int:
+    """Resamples the pairwise restatement may spend on `pairs` pairs."""
+    count = int(pairs)
+    if count <= 0:
+        return int(UNCERTAINTY_BOOTSTRAP_RESAMPLES)
+    return int(max(
+        PAIRWISE_STATISTIC_MIN_RESAMPLES,
+        min(
+            int(UNCERTAINTY_BOOTSTRAP_RESAMPLES),
+            int(budget) // count,
+        ),
+    ))
+
+
+def pairwise_average_correlation_statistics(
+    draw_chunk: int = PAIRWISE_STATISTIC_DRAW_CHUNK,
+) -> Any:
+    """Vectorised restatement of the risk-score correlation leg's own statistic.
+
+    The leg publishes the mean of the finite upper-triangle Pearson
+    correlations of the constituent return frame, i.e. of
+    ``returns.corr()`` - and pandas' `.corr()` is PAIRWISE COMPLETE: each pair
+    is measured on the rows where THAT pair is finite.  On a book with a leg
+    that was listed part way through the window (the live export has one at 22
+    return rows out of 39) the complete-case mean and the pairwise mean are
+    different numbers, so a complete-case estimator would fail
+    `measure_estimate_uncertainty`'s reproduction guard and the correct
+    published value would be left without a band.
+
+    So the pairwise population is reproduced here rather than approximated, with
+    the means and sums-of-squares taken over each PAIR's own overlapping rows:
+
+        r_ij = (P_ij - mi*Sxj - mj*Sxi + mi*mj*C_ij)
+               / sqrt((Q_ij - 2*mi*Sxi + mi^2*C_ij) * (Q_ij - 2*mj*Sxj + mj^2*C_ij))
+
+    over ``C_ij`` shared finite rows, with ``X`` the frame with non-finite
+    entries zeroed (so a non-finite entry contributes to no sum at all).  Every
+    one of the five accumulators is a batched ``(k, rows) @ (rows, k)`` product.
+    A pair with fewer than two shared rows, or no variation in either leg, is
+    NaN - pandas' own "not measurable" answer - and the mean skips it, exactly
+    as ``finite_pairs`` in the leg does.
+
+    `block` has shape ``(rows, draws, columns)``.
+    """
+    chunk = max(1, int(draw_chunk))
+
+    def _mean_upper_triangle(draws_first: np.ndarray) -> np.ndarray:
+        draws, rows, columns = draws_first.shape
+        if columns < 2 or rows < 1:
+            return np.full(draws, np.nan)
+        finite = np.isfinite(draws_first)
+        filled = np.where(finite, draws_first, 0.0)
+        indicator = finite.astype(float)
+        squared = filled * filled
+        # (draws, i, j) accumulators over the rows on which BOTH i and j are
+        # finite. `filled` is already zero wherever a column is not finite, so a
+        # plain product over it carries the pairwise mask for free.
+        overlap = np.matmul(indicator.transpose(0, 2, 1), indicator)
+        sum_i = np.matmul(filled.transpose(0, 2, 1), indicator)
+        sum_j = np.matmul(indicator.transpose(0, 2, 1), filled)
+        cross = np.matmul(filled.transpose(0, 2, 1), filled)
+        sum_sq_i = np.matmul(squared.transpose(0, 2, 1), indicator)
+        sum_sq_j = np.matmul(indicator.transpose(0, 2, 1), squared)
+        upper_index = np.triu_indices(columns, k=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_i = sum_i / overlap
+            mean_j = sum_j / overlap
+            covariance = (
+                cross - mean_i * sum_j - mean_j * sum_i + mean_i * mean_j * overlap
+            )
+            variance_i = (
+                sum_sq_i - 2.0 * mean_i * sum_i + mean_i * mean_i * overlap
+            )
+            variance_j = (
+                sum_sq_j - 2.0 * mean_j * sum_j + mean_j * mean_j * overlap
+            )
+            correlations = covariance / np.sqrt(variance_i * variance_j)
+            upper = correlations[:, upper_index[0], upper_index[1]]
+            # pandas' own "not measurable": a pair with fewer than two shared
+            # rows, or no variation, contributes nothing to the mean.
+            usable = np.isfinite(upper) & (
+                overlap[:, upper_index[0], upper_index[1]] >= 2
+            )
+            count = usable.sum(axis=1)
+            total = np.where(usable, np.nan_to_num(upper), 0.0).sum(axis=1)
+        return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+    def avg_pairwise_correlation(block: Any) -> np.ndarray:
+        values = np.asarray(block, dtype=float)
+        draws = int(values.shape[1]) if values.ndim == 3 else 0
+        if draws < 1:
+            return np.zeros(0, dtype=float)
+        out = np.empty(draws, dtype=float)
+        for start in range(0, draws, chunk):
+            stop = min(draws, start + chunk)
+            out[start:stop] = _mean_upper_triangle(
+                np.swapaxes(values[:, start:stop, :], 0, 1)
+            )
+        return out
+
+    return {"avg_pairwise_correlation": avg_pairwise_correlation}
+
+
+def regression_r_squared_statistics() -> Any:
+    """Vectorised R-squared of a simple regression on a two-column block.
+
+    The risk score's factor leg is ``min(30, (1 - r_squared) * 100)`` over a
+    statsmodels OLS fit of the portfolio return on a constant plus the
+    benchmark, and statsmodels' ``rsquared`` is
+    ``Sxy^2 / (Sxx * Syy)`` on centred sums - no ddof, because the ddof cancels
+    between numerator and denominator.  That is exactly what is computed here,
+    so a resampled draw's value belongs to the same statistic the payload
+    published.
+
+    `block` has shape ``(rows, draws, 2)``: column 0 is the regressand, column 1
+    the regressor, resampled JOINTLY so the co-movement that produces the
+    estimate survives the resampling.
+    """
+    def r_squared(block: Any) -> np.ndarray:
+        values = np.asarray(block, dtype=float)
+        if values.ndim != 3 or values.shape[2] < 2:
+            return np.zeros(int(values.shape[1]) if values.ndim == 3 else 0)
+        regressand = values[:, :, 0] - values[:, :, 0].mean(axis=0)
+        regressor = values[:, :, 1] - values[:, :, 1].mean(axis=0)
+        sum_xx = (regressor * regressor).sum(axis=0)
+        sum_yy = (regressand * regressand).sum(axis=0)
+        sum_xy = (regressor * regressand).sum(axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (sum_xy * sum_xy) / (sum_xx * sum_yy)
+
+    return {"factor_r_squared": r_squared}
+
+
+def _benchmark_return_series(benchmark_data: Any) -> pd.Series:
+    """The benchmark as RETURNS, by `factor_exposure_analysis`'s own rule.
+
+    A benchmark above 1.0 in absolute value is a PRICE series and is
+    differenced; anything else is taken as already being returns.  Duplicated
+    here rather than shared, because `_calculate_factor_exposures` receives the
+    converted series as a parameter and does not do the conversion itself - and
+    the frame this disclosure resamples has to be the frame the fit was handed.
+    """
+    if benchmark_data is None:
+        return pd.Series(dtype=float)
+    series = (
+        benchmark_data if isinstance(benchmark_data, pd.Series)
+        else pd.Series(benchmark_data)
+    )
+    if series.empty:
+        return pd.Series(dtype=float)
+    if bool(series.abs().gt(1.0).any()):
+        return series.pct_change(fill_method=None).dropna()
+    return series.dropna()
+
+
+#: `_calculate_factor_exposures` refuses to fit below this many paired rows
+#: twice (once on the common index, once on the published-portfolio subset).
+_FACTOR_FIT_MIN_ROWS = 10
+
+
+def _factor_regression_frame(
+    returns: pd.DataFrame, benchmark_data: Any, weights: Mapping[str, float]
+) -> Tuple[np.ndarray, Optional[str]]:
+    """The ``(n, 2)`` frame the factor leg's R-squared was fitted on.
+
+    Column 0 is the coverage-gated portfolio return, column 1 the benchmark,
+    paired BY DATE.  The population is re-derived through the same four steps
+    `_calculate_factor_exposures` runs - align on the shared index, aggregate
+    the portfolio over positive active weight, keep only dates the aggregate
+    actually published, intersect with the benchmark - because a bootstrap over
+    a different sample would measure a different regression.
+
+    Returns ``(frame, window, reason)``; `reason` is set when no usable frame
+    exists, and is published rather than absorbed, so a missing band is always
+    explained.  `window` is the fit's own first/last DATES, because a fit
+    statistic published without them cannot be compared with the same model's fit
+    over a different window.
+    """
+    empty = np.zeros((0, 2), dtype=float)
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
+        return empty, None, (
+            "no constituent return frame was delivered, so the regression's "
+            "sample does not exist"
+        )
+    normalized = {
+        key: float(value)
+        for key, value in dict(weights).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        and np.isfinite(float(value)) and float(value) > 0.0
+    }
+    total = sum(normalized.values())
+    if total > 0:
+        normalized = {key: value / total for key, value in normalized.items()}
+    benchmark = _benchmark_return_series(benchmark_data)
+    if len(benchmark) <= 10:
+        return empty, None, (
+            f"the benchmark contributes {len(benchmark)} usable return row(s), "
+            f"and the factor regression is not fitted on fewer than {_FACTOR_FIT_MIN_ROWS}"
+        )
+    common = returns.index.intersection(benchmark.index)
+    if len(common) <= 10:
+        return empty, None, (
+            f"the portfolio return frame and the benchmark share only "
+            f"{len(common)} date(s), and the factor regression is not fitted on "
+            f"fewer than {_FACTOR_FIT_MIN_ROWS}"
+        )
+    aligned = returns.loc[common]
+    coverage = active_return_coverage(aligned, normalized)
+    published_dates = coverage.index[coverage["published"]]
+    portfolio = aggregate_active_returns(aligned, normalized).dropna()
+    active = published_dates.intersection(benchmark.index).intersection(
+        portfolio.index
+    )
+    if len(active) < _FACTOR_FIT_MIN_ROWS:
+        return empty, None, (
+            f"only {len(active)} date(s) carried both a published portfolio "
+            f"return and a benchmark return, and the factor regression is not "
+            f"fitted on fewer than {_FACTOR_FIT_MIN_ROWS}"
+        )
+    frame = np.column_stack([
+        portfolio.loc[active].to_numpy(dtype=float),
+        benchmark.loc[active].to_numpy(dtype=float),
+    ])
+    return frame, _fit_window(active, int(len(active))), None
+
+
+def _iso_day(label: Any) -> Optional[str]:
+    """One index label as an ISO calendar day, or None if it is not a date."""
+    try:
+        return pd.Timestamp(label).date().isoformat()
+    except Exception:  # noqa: BLE001 - a non-date label is an absence, not a crash
+        return None
+
+
+def _fit_window(labels: Any, count: int) -> Dict[str, Any]:
+    """The fit's own `model_window` shape: first date, last date, row count."""
+    values = list(labels)
+    first = _iso_day(values[0]) if values else None
+    last = _iso_day(values[-1]) if values else None
+    return {
+        "start": first,
+        "end": last,
+        "days": int(count),
+        "declared": bool(first and last),
+    }
+
+
 def _liquidity_band(published_score: float) -> tuple[str, str]:
     """Band label and liquidation window for an ALREADY-ROUNDED published score."""
     for band, floor, window in LIQUIDITY_SCORE_BANDS:
@@ -1764,6 +2234,12 @@ def _risk_score_audit(
     excluded_reasons: Mapping[str, str],
     active_weights: Mapping[str, float],
     overall_score: float,
+    returns: Optional[pd.DataFrame] = None,
+    benchmark_data: Any = None,
+    weights: Optional[Mapping[str, float]] = None,
+    avg_pairwise_correlation_published: Optional[float] = None,
+    r_squared: Optional[float] = None,
+    factor_result: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Publish the composition of `overall_score`, leg by leg.
 
@@ -1775,7 +2251,9 @@ def _risk_score_audit(
       * whether the leg is AT that cap and the input at which it would leave it,
       * the scale's floor, whether it bound, and the points it added,
       * whether the leg's input is the same rows as another leg's, and why,
-      * what share of the headline each leg is actually responsible for.
+      * what share of the headline each leg is actually responsible for,
+      * and, under `precision`, how precisely each of those three kinds of
+        number is known.
 
     Nothing here changes a score, a weight or a cap.  If a leg's input cannot be
     established it is published as unavailable with the reason, never inferred.
@@ -1888,6 +2366,14 @@ def _risk_score_audit(
             "counts_as_independent_evidence": bool(measured and not duplicate_of[name]),
             "exclusion_reason": excluded_reasons.get(name),
             "published_input_as": spec["published_input_as"],
+            # How this sub-score's PRECISION is known, which is a different
+            # question from how its value was derived: the value is a
+            # deterministic function of one published input, so the sub-score
+            # never carries an independent standard error. The pointer says
+            # which input's disclosure it inherits.
+            "precision_classification": "deterministic_derivation",
+            "precision_inherits_from": spec["input_statistic"],
+            "precision_disclosure_at": f"score_audit.precision.derived_values.{name}",
         }
         if duplicate_of[name] == "volatility":
             # The one duplication this table can produce, explained by the
@@ -2102,6 +2588,355 @@ def _risk_score_audit(
         "independent_components": independent_legs,
         "components": components,
         "effective_information": effective_information,
+        "precision": _risk_score_precision(
+            returns=returns,
+            benchmark_data=benchmark_data,
+            weights=weights,
+            audit_components=components,
+            avg_pairwise_correlation=avg_pairwise_correlation_published,
+            factor_r_squared=r_squared,
+            factor_result=factor_result,
+        ),
+    }
+
+
+#: Why a derived sub-score gets no interval of its own.  Published as data
+#: rather than as a comment so a consumer that reads only the numbers cannot
+#: mistake the absence for an oversight.
+RISK_SCORE_DERIVED_NO_INTERVAL_REASON = (
+    "not computed: this sub-score is a deterministic function of one published "
+    "input ({input_statistic} = {input_value}), not an independent estimate. Its "
+    "precision is entirely INHERITED from that input's own disclosure, published "
+    "at {inherits_at}. A second resampling interval here would describe a "
+    "function of an already-published number, not the uncertainty of anything "
+    "this sub-score measured, and a reader could not tell the two apart."
+)
+
+RISK_SCORE_DECLARED_NO_STANDARD_ERROR_REASON = (
+    "not applicable: this is a declared policy constant read from "
+    f"{RISK_SCORE_WEIGHT_TABLE}. It is not estimated from data and has no "
+    "sampling distribution, so there is no standard error to report."
+)
+
+
+def _risk_score_precision(
+    *,
+    returns: Optional[pd.DataFrame],
+    benchmark_data: Any,
+    weights: Optional[Mapping[str, float]],
+    audit_components: Mapping[str, Mapping[str, Any]],
+    avg_pairwise_correlation: Optional[float],
+    factor_r_squared: Optional[float],
+    factor_result: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """How precisely each number behind `overall_score` is known.
+
+    Three classes, three different answers, and no band that does not belong to
+    the number printed beside it:
+
+      * `estimated_statistics` - the two inputs that are measured from data.
+        Each gets its own `measure_estimate_uncertainty` block over the sample it
+        was actually measured on, which is why they are two blocks and not one:
+        `avg_pairwise_correlation` is a mean over the constituent return frame
+        and `factor_r_squared` is a regression on the portfolio/benchmark pair,
+        and a single bootstrap cannot resample both populations at once.
+
+      * `derived_values` - every leg's sub-score.  A pointer to the input whose
+        precision it inherits, and a `null` standard error and interval with the
+        reason attached.
+
+      * `declared_constants` - the leg weights, with the table they come from.
+    """
+    estimated: Dict[str, Any] = {}
+    frame = returns if isinstance(returns, pd.DataFrame) else pd.DataFrame()
+    columns = [str(column) for column in frame.columns]
+
+    # --- the correlation leg's input, measured on the constituent return frame
+    correlation_block: Dict[str, Any]
+    if avg_pairwise_correlation is None or len(columns) < 2:
+        correlation_block = measure_estimate_uncertainty(
+            np.zeros((0, 0), dtype=float),
+            pairwise_average_correlation_statistics(),
+            {"avg_pairwise_correlation": avg_pairwise_correlation},
+            scope=(
+                "risk_score.avg_pairwise_correlation: the finite upper-triangle "
+                "Pearson correlations of this section's own constituent return "
+                "frame"
+            ),
+            point_tolerance=RISK_SCORE_PUBLISHED_DP_TOLERANCE,
+            not_computed={
+                "avg_pairwise_correlation": (
+                    "not computed: no average pairwise correlation was measured "
+                    "for this score, so there is no number to put an interval "
+                    "around. A single-leg book has no pair to correlate, and an "
+                    "unmeasured leg is excluded from the weighted score rather "
+                    "than scored zero (see score_audit.excluded_reasons)"
+                )
+            },
+            notes={"estimator": RISK_SCORE_PAIRWISE_ESTIMATOR_BASIS},
+        )
+    else:
+        correlation_block = measure_estimate_uncertainty(
+            frame.to_numpy(dtype=float),
+            pairwise_average_correlation_statistics(),
+            {"avg_pairwise_correlation": avg_pairwise_correlation},
+            scope=(
+                "risk_score.avg_pairwise_correlation: the finite upper-triangle "
+                "Pearson correlations of this section's own constituent return "
+                "frame"
+            ),
+            # Published at RISK_SCORE_STATISTIC_DECIMALS dp, so half a display
+            # step is the floor; the margin above it absorbs the restatement's
+            # float noise without admitting a different estimator.
+            point_tolerance=RISK_SCORE_PUBLISHED_DP_TOLERANCE,
+            # The pairwise restatement is O(rows x draws x pairs), so a very wide
+            # book reduces the DRAW COUNT rather than being measured at any
+            # cost.  The count is published as bootstrap_resamples, so a reduced
+            # one is visible and the band stays reproducible.
+            resamples=pairwise_resample_count(len(columns) * (len(columns) - 1) // 2),
+            # The leg's own statistic is PAIRWISE COMPLETE, because that is what
+            # `returns.corr()` is.  The default complete-case filter would drop
+            # every row a late-listed leg was unpriced on and measure the mean
+            # over the remaining subset - a different number, which the
+            # reproduction guard would then (correctly) refuse to band.
+            row_filter=RISK_SCORE_PAIRWISE_ROW_FILTER,
+            row_filter_basis=RISK_SCORE_PAIRWISE_ROW_FILTER_BASIS,
+            notes={
+                "estimator": RISK_SCORE_PAIRWISE_ESTIMATOR_BASIS,
+                "pair_count": len(columns) * (len(columns) - 1) // 2,
+                "resample_count_rule": RISK_SCORE_PAIRWISE_RESAMPLE_RULE,
+                "constituent_count": len(columns),
+                "constituents": columns,
+                "constituent_finite_observations": {
+                    str(column): int(np.isfinite(
+                        frame[column].to_numpy(dtype=float)
+                    ).sum())
+                    for column in frame.columns
+                },
+                "effective_n_basis_note": (
+                    "effective_n is this payload's payload-wide Quenouille/Bartlett "
+                    "AR(1) adjustment, measured on the FIRST column of the block "
+                    f"({columns[0] if columns else None}) by the shared "
+                    "convention in autocorrelation_disclosure. The resampling "
+                    "interval above already accounts for serial dependence "
+                    "directly, because contiguous blocks are resampled; "
+                    "effective_n is the naive-n comparison, not the interval's "
+                    "width"
+                ),
+            },
+        )
+    estimated["avg_pairwise_correlation"] = correlation_block
+
+    # --- the factor leg's input, measured on the regression's own sample
+    regression_frame, fit_window, frame_reason = _factor_regression_frame(
+        frame, benchmark_data, dict(weights or {})
+    )
+    fit_observations = None
+    if isinstance(factor_result, Mapping):
+        portfolio_fit = factor_result.get("portfolio")
+        if isinstance(portfolio_fit, Mapping):
+            fit_observations = portfolio_fit.get("observations")
+    factor_notes: Dict[str, Any] = {
+        "estimator": (
+            "regression_r_squared_statistics: Sxy^2 / (Sxx * Syy) on centred "
+            "sums, which is what statsmodels' rsquared is for a simple "
+            "regression with an intercept, so the resampled values belong to "
+            "the published R-squared"
+        ),
+        "sample": (
+            "the (portfolio return, benchmark return) pairs the fit was run on, "
+            "paired BY DATE through the same alignment the factor regression "
+            "uses: the shared index, the coverage-gated portfolio aggregate, "
+            "and only dates that aggregate actually published"
+        ),
+        "fit_observation_count": fit_observations,
+        "fit_observation_count_scope": "portfolio_vs_benchmark_ols_rows",
+        "fit_observation_count_matches_frame": (
+            None if fit_observations is None
+            else bool(int(fit_observations) == int(regression_frame.shape[0]))
+        ),
+        "fit_window": fit_window,
+    }
+    if frame_reason:
+        factor_notes["frame_unavailable_reason"] = frame_reason
+    if isinstance(factor_result, Mapping) and factor_result.get("adjusted_r_squared") is not None:
+        # The SAME fit's adjusted R-squared, published beside the band: it needs
+        # no resampling of its own to be a real measurement, and at this sample
+        # size it is the number that says whether the fit is more than the
+        # intercept. It is published as a mapping that DECLARES its own window
+        # and observation count rather than as a bare number, because a fit
+        # statistic without the sample it was fitted on cannot be compared with
+        # the same model's fit over a different window - which is the whole
+        # reason the adjusted value is worth publishing at all.
+        factor_notes["adjusted_r_squared_fit"] = {
+            "adjusted_r_squared": factor_result.get("adjusted_r_squared"),
+            "model_window": fit_window if (fit_window or {}).get("declared") else None,
+            "model_observation_count": fit_observations,
+            "model_observation_count_scope": "portfolio_vs_benchmark_ols_rows",
+            "basis": RISK_SCORE_ADJUSTED_R_SQUARED_BASIS,
+            "same_fit_as": (
+                "score_audit.precision.estimated_statistics.factor_r_squared"
+            ),
+        }
+    if isinstance(factor_result, Mapping):
+        portfolio_fit = factor_result.get("portfolio")
+        if isinstance(portfolio_fit, Mapping) and portfolio_fit.get("market_std_error") is not None:
+            factor_notes["market_beta_std_error"] = portfolio_fit.get("market_std_error")
+            factor_notes["market_beta_std_error_basis"] = (
+                f"the fit's own coefficient standard error ({portfolio_fit.get('std_error_basis')}"
+                f"{', robust' if portfolio_fit.get('std_error_robust') else ''}), "
+                "published here because it is the only standard error this "
+                "regression computed. It belongs to the beta coefficient, NOT "
+                "to R-squared: no standard error for R-squared itself is "
+                "published, and none is invented from the coefficient's"
+            )
+    # Declared absences are declared per FIELD and only for a field with no
+    # point: a reason attached to a field that WAS measured would suppress its
+    # band and mislabel a real measurement as an unmeasured one.
+    declared_factor: Dict[str, str] = {}
+    if factor_r_squared is None:
+        declared_factor["factor_r_squared"] = frame_reason or (
+            "not computed: no benchmark R-squared was measured for this score, "
+            "so there is no number to put an interval around. The leg is "
+            "excluded from the weighted score and the remaining legs "
+            "renormalized rather than scored from an assumed R-squared of zero "
+            "(see score_audit.excluded_reasons)"
+        )
+    estimated["factor_r_squared"] = measure_estimate_uncertainty(
+        regression_frame,
+        regression_r_squared_statistics(),
+        {"factor_r_squared": factor_r_squared},
+        scope=(
+            "risk_score.factor_r_squared: the portfolio-vs-benchmark OLS fit's "
+            "own paired sample, resampled jointly"
+        ),
+        point_tolerance=RISK_SCORE_PUBLISHED_DP_TOLERANCE,
+        not_computed=declared_factor,
+        notes=factor_notes,
+    )
+
+    # --- the legs: derived from one published input, so they inherit
+    derived: Dict[str, Any] = {}
+    for name in RISK_SCORE_WEIGHTS:
+        spec = RISK_SCORE_LEG_SPECS[name]
+        input_statistic = str(spec["input_statistic"])
+        entry = audit_components.get(name) or {}
+        inherits_at = RISK_SCORE_INPUT_PRECISION_AT.get(input_statistic)
+        derived[name] = {
+            "classification": "deterministic_derivation",
+            "published_value_at": f"components.{name}",
+            "sub_score": entry.get("sub_score"),
+            "formula": spec["formula"],
+            "input_statistic": input_statistic,
+            "input_statistic_value": entry.get("input_statistic_value"),
+            "input_statistic_provenance": entry.get("input_statistic_provenance"),
+            "inherits_precision_from": input_statistic,
+            "inherits_precision_at": inherits_at,
+            "standard_error": None,
+            "standard_error_reason": RISK_SCORE_DERIVED_NO_INTERVAL_REASON.format(
+                input_statistic=input_statistic,
+                input_value=entry.get("input_statistic_value"),
+                inherits_at=inherits_at or (
+                    "no precision disclosure for this input is published in this "
+                    "section (see the input's own row in score_audit.components."
+                    f"{name}.input_sample); the sub-score's precision is "
+                    "therefore declared unstated rather than asserted"
+                ),
+            ),
+            "conf_int": None,
+            "conf_int_reason": (
+                RISK_SCORE_DERIVED_NO_INTERVAL_REASON.format(
+                    input_statistic=input_statistic,
+                    input_value=entry.get("input_statistic_value"),
+                    inherits_at=inherits_at or (
+                        "no precision disclosure for this input is published in "
+                        f"this section (score_audit.components.{name})"
+                    ),
+                )
+            ),
+        }
+
+    declared = {
+        "classification": "declared_constant",
+        "table": RISK_SCORE_WEIGHT_TABLE,
+        "table_identifier": "RISK_SCORE_WEIGHTS",
+        "published_at": [
+            "score_audit.nominal_weights",
+            "score_audit.nominal_weight_total",
+            "score_audit.components.<component>.nominal_weight",
+            "score_audit.components.<component>.effective_weight",
+        ],
+        "basis": RISK_SCORE_DECLARED_CONSTANT_BASIS,
+        "nominal_weights": dict(RISK_SCORE_WEIGHTS),
+        "effective_weights": {
+            name: (audit_components.get(name) or {}).get("effective_weight")
+            for name in RISK_SCORE_WEIGHTS
+        },
+        "renormalization": (
+            "a leg that could not be measured is dropped and the remaining "
+            "weights are renormalized, so an effective weight is the nominal "
+            "weight of a MEASURED leg rescaled; it is still a declared "
+            "constant, and it moves only when a leg is excluded"
+        ),
+        "standard_error": None,
+        "standard_error_reason": RISK_SCORE_DECLARED_NO_STANDARD_ERROR_REASON,
+        "conf_int": None,
+        "conf_int_reason": RISK_SCORE_DECLARED_NO_STANDARD_ERROR_REASON,
+    }
+
+    attribution = {
+        "classification": "deterministic_derivation",
+        "published_at": (
+            "score_audit.effective_information.headline_attribution"
+        ),
+        "formula": (
+            "unrounded sub_score x effective_weight (see "
+            "score_audit.effective_information.headline_attribution_note)"
+        ),
+        "inherits_precision_from": [
+            f"score_audit.components.{name}.sub_score" for name in RISK_SCORE_WEIGHTS
+        ] + [
+            f"score_audit.nominal_weights.{name}" for name in RISK_SCORE_WEIGHTS
+        ],
+        "standard_error": None,
+        "standard_error_reason": (
+            "not computed: a headline contribution is a product of a derived "
+            "sub-score and a declared weight, so its precision is the "
+            "sub-score's (inherited, see score_audit.precision.derived_values) "
+            "and the weight's is nil. It is arithmetic on two published "
+            "numbers, not a third measurement, and it is published at full "
+            "precision because the payload is expected to be exactly "
+            "recomputable from its inputs"
+        ),
+        "conf_int": None,
+        "conf_int_reason": (
+            "not computed: see standard_error_reason - a product of two "
+            "published numbers has no sampling distribution of its own"
+        ),
+    }
+
+    return {
+        "basis": RISK_SCORE_PRECISION_BASIS,
+        "classes": {
+            "estimated_statistics": (
+                "measured from data on this section's own sample; carries a "
+                "resampling standard error, an interval and an effective n"
+            ),
+            "deterministic_derivation": (
+                "a published function of published numbers; carries no "
+                "standard error of its own and inherits the precision of the "
+                "input it names"
+            ),
+            "declared_constant": (
+                "chosen by design; carries no standard error and no interval, "
+                "because it was never estimated"
+            ),
+        },
+        "estimated_statistics": estimated,
+        "derived_values": derived,
+        "declared_constants": declared,
+        "headline_attribution": attribution,
+        "rule_limitation": RISK_SCORE_RULE_LIMITATION,
     }
 
 
@@ -3684,6 +4519,15 @@ class AnalyticsEngine:
                 )
             scores['correlation'] = correlation_score
             inputs['correlation'] = avg_correlation
+            # The PUBLISHED precision of the measurement, hoisted out of the
+            # response dict below so the disclosure block and the published key
+            # are the same number by construction rather than by two copies of
+            # one expression agreeing.
+            avg_pairwise_correlation_published = (
+                round(avg_correlation, RISK_SCORE_STATISTIC_DECIMALS)
+                if avg_correlation is not None
+                else None
+            )
             input_reasons['correlation'] = (
                 "mean of the finite upper-triangle pairwise Pearson correlations "
                 "of the constituent return frame"
@@ -3694,6 +4538,7 @@ class AnalyticsEngine:
             # Factor risk (25% weight) — only with a real benchmark. Calling
             # factor_exposure_analysis without one yields R²=0 always, which
             # would pin this leg at max risk, so exclude + renormalize instead.
+            factor_result: Optional[Dict[str, Any]] = None
             if benchmark_data is not None and not benchmark_data.empty:
                 factor_result = await self.factor_exposure_analysis(
                     price_data, benchmark_data=benchmark_data, weights=weights
@@ -3713,6 +4558,19 @@ class AnalyticsEngine:
                 factor_score = None
                 excluded.append('factor_risk')
                 excluded_reasons['factor_risk'] = "no benchmark supplied"
+            # The regression's OWN row count, taken from the fit rather than
+            # re-measured here, so the sample an R-squared was estimated on is
+            # the sample the disclosure says it was estimated on.
+            portfolio_fit = (
+                factor_result.get("portfolio") if isinstance(factor_result, dict)
+                else None
+            )
+            factor_fit_observations = (
+                portfolio_fit.get("observations")
+                if isinstance(portfolio_fit, dict)
+                and isinstance(portfolio_fit.get("observations"), int)
+                else None
+            )
             scores['factor_risk'] = factor_score
             inputs['factor_risk'] = (
                 float(r_squared)
@@ -3726,9 +4584,10 @@ class AnalyticsEngine:
                 )
             else:
                 input_reasons['factor_risk'] = (
-                    "R-squared of the portfolio-vs-benchmark OLS fit; the fit's "
-                    "own row count is measured by the route and published as "
-                    "model_observation_count"
+                    "R-squared of the portfolio-vs-benchmark OLS fit over the "
+                    f"{factor_fit_observations} paired return rows the fit kept; "
+                    "the route measures the same population from the published "
+                    "inputs and publishes it as model_observation_count"
                 )
 
             # Market risk (10% weight) - based on recent volatility. Same
@@ -3824,6 +4683,13 @@ class AnalyticsEngine:
                     },
                     'factor_risk': {
                         'row_kind': 'regression_rows',
+                        # Left exactly as it was: this row count is the ROUTE's
+                        # measurement to make. The engine's own fit count is
+                        # published where it belongs for the precision question,
+                        # at score_audit.precision.estimated_statistics
+                        # .factor_r_squared.notes.fit_observation_count; moving it
+                        # here would move a disclosure another wave's test pins,
+                        # for no gain.
                         'rows': None,
                         'rows_reason': (
                             "the engine fits the regression from price_data and the "
@@ -3847,6 +4713,12 @@ class AnalyticsEngine:
                 excluded_reasons=excluded_reasons,
                 active_weights=active_weights,
                 overall_score=overall_score,
+                returns=returns,
+                benchmark_data=benchmark_data,
+                weights=weights,
+                avg_pairwise_correlation_published=avg_pairwise_correlation_published,
+                r_squared=r_squared,
+                factor_result=factor_result,
             )
             
             # Generate alerts
@@ -3895,9 +4767,9 @@ class AnalyticsEngine:
                 # The measurement the correlation leg was scored from, so a low
                 # sub-score is explicable rather than a bare number. Null means
                 # the same thing it means on `factor_r_squared`: not measured.
-                "avg_pairwise_correlation": (
-                    round(avg_correlation, 4) if avg_correlation is not None else None
-                ),
+                # The precision disclosure for it lives at
+                # `score_audit.precision.estimated_statistics.avg_pairwise_correlation`.
+                "avg_pairwise_correlation": avg_pairwise_correlation_published,
                 "alerts": alerts,
                 "excluded_components": excluded,
                 # Siblings of `excluded_components`, same level and vocabulary: a

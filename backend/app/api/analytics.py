@@ -43,6 +43,9 @@ from app.services.analytics_engine import (
     GlobalAnalyticsEngine,
     AnalyticsEngine,
     aggregate_active_returns,
+    ar1_autocorrelation,
+    effective_sample_size,
+    engine_risk_statistics,
     market_model_statistics,
     market_model_witness,
     measure_estimate_uncertainty,
@@ -1489,6 +1492,39 @@ def _full_history_evidence(
 CONTRIBUTION_UNIT = "fraction_of_portfolio_risk"
 CONTRIBUTION_DECIMALS = 6
 
+# ---------------------------------------------------------------------------
+# SI-5 -- precision of this section's two tail estimates
+# ---------------------------------------------------------------------------
+# `portfolio_var_95_daily` and `portfolio_cvar_95_daily` are order statistics of
+# the published portfolio return series: a 5 % quantile, and the mean of the
+# days at or below it.  Neither is a stable function of the window, so both
+# carry a resampling standard error and interval - and the sample that supports
+# them is the TAIL, not the window, which is stated rather than left for a
+# reader to guess from a row count.
+RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE = (
+    "portfolio_return_days_at_or_below_the_published_var_95"
+)
+RISK_CONTRIBUTION_TAIL_SUPPORT_BASIS = (
+    "the number of published portfolio return days at or below this section's "
+    "own 5th percentile - the days the quantile is an order statistic OF, and "
+    "the days the expected shortfall is the mean OF. It is not the window "
+    "length: a 5 % quantile gains no information from the 95 % of days above "
+    "it beyond the fact that they are above it, and a reader who priced a "
+    "VaR as if it were estimated from 172 independent days would overstate its "
+    "precision by roughly the square root of the ratio"
+)
+RISK_CONTRIBUTION_TAIL_EFFECTIVE_N_BASIS = (
+    "the Quenouille/Bartlett AR(1) variance-inflation adjustment n * (1 - ar1) "
+    "/ (1 + ar1) applied to the TAIL sample rather than to the window, because "
+    "the tail is the sample this estimate was measured on, and then bounded by "
+    "the tail count: the adjustment removes redundancy, and a 5 % order "
+    "statistic cannot be informed by more days than the tail contains, so a "
+    "negative AR(1) cannot inflate it past its own support (the uncapped figure "
+    "is published as effective_n_uncapped). The window-level figure is "
+    "published beside it at tail_support.window_effective_n and describes the "
+    "resampling frame instead"
+)
+
 
 def _contribution_basis_block(
     positions: Mapping[str, Any],
@@ -1549,6 +1585,189 @@ def _contribution_basis_block(
             "total portfolio risk, annualized or not."
         ),
     }
+
+
+def _risk_contribution_tail_uncertainty(
+    portfolio_returns: Any,
+    *,
+    var_95: Any,
+    tail_mask: Any,
+    published: Mapping[str, Any],
+    scope: str,
+) -> Dict[str, Any]:
+    """Precision disclosure for this section's two tail estimates (SI-5).
+
+    `portfolio_var_95_daily` is the 5th percentile of the portfolio's published
+    daily return series and `portfolio_cvar_95_daily` is the mean of the days at
+    or below it.  Both are order statistics of that series, and both were
+    published as bare point estimates: a 5 % tail quantile read to six decimals
+    off 172 autocorrelated daily returns, with nothing said about how much of
+    that precision is real.
+
+    THE BOOTSTRAP RESAMPLES THE WINDOW, THE EFFECTIVE n IS THE TAIL.  These are
+    different populations and conflating them is the trap:
+
+      * the resampling frame is the whole published portfolio series, because
+        the statistic being resampled is the 5th percentile OF THAT SERIES.  A
+        bootstrap over the tail days alone would measure the 5th percentile of
+        the tail - a different number - and `measure_estimate_uncertainty`'s
+        reproduction guard would refuse the band, correctly.
+      * the effective sample size is the number of days that actually support
+        the estimate: the tail.  A 5 % quantile cannot learn anything from the
+        95 % of days that are above it, and the expected shortfall is literally
+        the mean of the tail days and nothing else.  The entry's `effective_n` is
+        therefore the AR(1)-adjusted TAIL count, and the window-level figure
+        stays published beside it as `autocorrelation.effective_n` so the two
+        cannot be confused for one another.
+
+    `tail_mask` is the section's OWN mask - the same `port_ret <= var_95` that
+    decided which days went into the expected shortfall - so the tail count here
+    is the count that number was measured on and not a re-derived one.
+    """
+    series = (
+        portfolio_returns.to_numpy(dtype=float).ravel()
+        if hasattr(portfolio_returns, "to_numpy")
+        else np.asarray(portfolio_returns, dtype=float).ravel()
+    )
+    series = series[np.isfinite(series)]
+    if tail_mask is None or var_95 is None:
+        tail_values = np.zeros(0, dtype=float)
+    else:
+        mask = np.asarray(tail_mask, dtype=bool).ravel()
+        if mask.shape[0] == series.shape[0]:
+            tail_values = series[mask]
+        else:
+            tail_values = np.zeros(0, dtype=float)
+    tail_count = int(tail_values.size)
+    tail_ar1 = ar1_autocorrelation(tail_values) if tail_count else None
+    tail_effective_raw = effective_sample_size(tail_count, tail_ar1)
+    # The Quenouille/Bartlett adjustment is a REDUNDANCY correction: a negative
+    # AR(1) inflates it above n, which is real for the mean of a stationary
+    # series and meaningless here. A 5 % order statistic cannot be informed by
+    # more days than the tail contains, so the published figure is bounded by
+    # the support and the uncapped one is published beside it. Both are shown;
+    # neither is hidden.
+    tail_effective = (
+        None if tail_effective_raw is None
+        else float(min(tail_effective_raw, float(tail_count)))
+    )
+    tail_reason = (
+        None if tail_effective is not None else (
+            f"the tail this estimate rests on is {tail_count} day(s) of a "
+            f"{int(series.size)}-day window, which is too short - or has too "
+            "little variation in the lagged series - to fit an AR(1) slope, so "
+            "no effective sample size is published for it. The tail count above "
+            "is the honest one; the AR(1)-adjusted figure is withheld rather "
+            "than assumed to equal it"
+        )
+    )
+    # The restatements are the engine's own `var_95` / `cvar_95`, which are
+    # already vectorised versions of exactly the two expressions above
+    # (`np.percentile(r, 5)` and the mean of `r <= var_95`).
+    restatements = engine_risk_statistics(0.0)
+    block = measure_estimate_uncertainty(
+        series,
+        {name: restatements[name] for name in ("var_95", "cvar_95")},
+        dict(published),
+        scope=scope,
+        # Both points are published at 6 dp, so half a display step is 5e-7;
+        # the margin above it absorbs the restatement's float noise.
+        point_tolerance=1e-5,
+        # One pair of estimators, two published names: this section publishes
+        # the quantile and the shortfall under portfolio-prefixed keys.
+        statistic_names={
+            "portfolio_var_95_daily": "var_95",
+            "portfolio_cvar_95_daily": "cvar_95",
+        },
+        not_applicable={
+            field: reason
+            for field, reason in (
+                (
+                    "portfolio_var_95_daily",
+                    None
+                    if published.get("portfolio_var_95_daily") is not None
+                    else "not applicable: no 5th percentile was published for "
+                    "this book, so there is no quantile to put an interval "
+                    "around",
+                ),
+                (
+                    "portfolio_cvar_95_daily",
+                    None
+                    if published.get("portfolio_cvar_95_daily") is not None
+                    else "not applicable: the portfolio series published no day "
+                    "at or below its own 5th percentile, so the expected "
+                    "shortfall is undefined rather than zero",
+                ),
+            )
+            if reason
+        },
+        notes={
+            "estimator": (
+                "engine_risk_statistics' var_95 / cvar_95: vectorised "
+                "restatements of this section's own expressions - "
+                "np.percentile(portfolio_returns, 5) and the mean of the days "
+                "at or below it - so the band belongs to the published numbers"
+            ),
+            "tail_support_basis": RISK_CONTRIBUTION_TAIL_SUPPORT_BASIS,
+            "tail_support_scope": RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE,
+        },
+    )
+    # `effective_n` is replaced per entry, never silently: the block-level
+    # `autocorrelation.effective_n` stays the WINDOW figure, and each entry says
+    # which population its own number describes.
+    for field, entry in (block.get("estimates") or {}).items():
+        entry["effective_n"] = (
+            round(tail_effective, 4) if tail_effective is not None else None
+        )
+        entry["effective_n_basis"] = RISK_CONTRIBUTION_TAIL_EFFECTIVE_N_BASIS
+        entry["effective_n_uncapped"] = (
+            round(tail_effective_raw, 4)
+            if tail_effective_raw is not None
+            else None
+        )
+        entry["effective_n_reason"] = tail_reason
+        entry["support_observations"] = tail_count
+        entry["support_scope"] = RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE
+        entry["resampling_observations"] = entry.get("observations")
+        entry["resampling_scope"] = (
+            "the whole published portfolio return series: the statistic being "
+            "resampled is the 5th percentile OF that series, so the resampling "
+            "frame is the series, not its tail"
+        )
+    block["tail_support"] = {
+        "scope": RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE,
+        "basis": RISK_CONTRIBUTION_TAIL_SUPPORT_BASIS,
+        "tail_observations": tail_count,
+        "window_observations": int(series.size),
+        "ar1": round(tail_ar1, 6) if tail_ar1 is not None else None,
+        "ar1_basis": (
+            "OLS slope of r_t on r_(t-1) over the TAIL sample, not the window"
+        ),
+        "effective_n": round(tail_effective, 4) if tail_effective is not None else None,
+        "effective_n_uncapped": (
+            round(tail_effective_raw, 4)
+            if tail_effective_raw is not None
+            else None
+        ),
+        "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+        "effective_n_bound": (
+            "the adjustment is a redundancy correction, so it is applied and then "
+            "bounded by the tail: an order statistic cannot be informed by more "
+            "days than the tail contains, whatever the tail's own AR(1) says. A "
+            "negative AR(1) inflates the raw figure above the tail, and the raw "
+            "figure is published as effective_n_uncapped rather than dropped"
+        ),
+        "effective_n_reason": tail_reason,
+        "window_effective_n": (
+            (block.get("autocorrelation") or {}).get("effective_n")
+        ),
+        "window_effective_n_basis": (
+            "the same adjustment applied to the WINDOW, published as the "
+            "autocorrelation block above. It describes the resampling frame, "
+            "not the support of either estimate"
+        ),
+    }
+    return block
 
 
 def _model_history_coverage(
@@ -7250,6 +7469,17 @@ async def get_risk_contribution(
             "volatility": sorted(vol_assets),
             "cvar_tail": sorted(cvar_rc),
         }
+        # SI-5: the two tail estimates are order statistics, so their precision
+        # is disclosed over the sample that supports them - the tail days - and
+        # the bootstrap itself runs on the whole series those days are drawn
+        # from. Built from the SAME `var_95` and `tail` the two published points
+        # were computed from, so the band cannot belong to a different quantile.
+        published_tail = {
+            "portfolio_var_95_daily": round(var_95, 6),
+            "portfolio_cvar_95_daily": (
+                round(float(port_ret[tail].mean()), 6) if tail.any() else None
+            ),
+        }
         result = {
             "window": {"start": start, "end": end},
             "positions": {
@@ -7270,8 +7500,19 @@ async def get_risk_contribution(
                 "cvar_tail": sorted(cvar_excluded_assets),
             },
             "portfolio_volatility_annualized": round(sigma_p, 4),
-            "portfolio_var_95_daily": round(var_95, 6),
-            "portfolio_cvar_95_daily": round(float(port_ret[tail].mean()), 6) if tail.any() else None,
+            "portfolio_var_95_daily": published_tail["portfolio_var_95_daily"],
+            "portfolio_cvar_95_daily": published_tail["portfolio_cvar_95_daily"],
+            "estimate_uncertainty": _risk_contribution_tail_uncertainty(
+                port_ret,
+                var_95=var_95,
+                tail_mask=tail,
+                published=published_tail,
+                scope=(
+                    "risk_contribution: portfolio_var_95_daily and "
+                    "portfolio_cvar_95_daily, measured on the same published "
+                    "portfolio return series and its own tail"
+                ),
+            ),
             "full_history": full_history,
             "history_coverage": history_coverage,
             "methodology": "Euler decomposition (volatility) + historical tail attribution (CVaR)",
