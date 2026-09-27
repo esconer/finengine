@@ -660,6 +660,353 @@ def _tear_sheet_relative_uncertainty(
     )
 
 
+# ---------------------------------------------------------------------------
+# QM-2 -- which window each `relative_vs_nifty` field was measured on
+# ---------------------------------------------------------------------------
+# The block is not one sample, and it is published as if it were. Before this
+# disclosure:
+#
+#   beta_vs_nifty / alpha_annualized  the holding-window portfolio returns and
+#                                     the benchmark returns on their COMMON
+#                                     dates -- a joint fit, so each side is
+#                                     measured only where both were observed
+#   benchmark_sharpe / _volatility /  the benchmark's own series over the
+#   _max_drawdown / _total_return      REQUESTED window, bounded by how much
+#                                     benchmark history is actually cached
+#   (metrics, one level up)            the holding-window whole-book complete
+#                                     return rows
+#
+# Three samples, one flat object, and a single `overlap_days` naming only the
+# first of them. So a reader comparing `alpha_annualized` with the Sharpe beside
+# it was comparing periods with nothing on the face of the block to say so.
+#
+# NONE of the three is recomputed here, and that is a decision, not an
+# omission. The index has no holding period, so its standalone statistics have
+# no holding window to be aligned to: slicing NIFTY down to the days *this
+# user* owned the book answers a different question ("how did the index do
+# while I held this?"), and on a 20-session holding window it annualises a
+# handful of sessions into a Sharpe of -7. The four `benchmark_*` values are
+# correct on the window they are already measured on, and re-slicing them
+# would move four published numbers to make a block look tidy. What was missing
+# is the answer to "over what window, on how many observations, aligned with
+# what", per field -- so that is what this block publishes, and nothing else.
+#
+# A window that cannot be declared is a stated absence. This block never invents
+# a window, never imputes an observation and never silences a field to make the
+# object tidy: a `null` value with a reason beats a number with a hidden basis.
+
+#: Key under which the disclosure travels, inside `relative_vs_nifty`.
+RELATIVE_WINDOW_DISCLOSURE_KEY = "measurement_windows"
+
+#: The three samples. Stable ids, so a consumer resolves a field to a window
+#: without parsing prose.
+RELATIVE_HOLDING_WINDOW_REF = "holding_window_metrics"
+RELATIVE_MARKET_MODEL_WINDOW = "portfolio_benchmark_overlap"
+RELATIVE_BENCHMARK_WINDOW = "requested_window_benchmark"
+
+#: Which published field is measured on which sample. Kept as module constants
+#: (rather than inline tuples at each use) so a field added to the statistics
+#: without a window declaration is a missing mapping key, not a silent
+#: unlabelled number.
+RELATIVE_MARKET_MODEL_FIELDS = ("beta_vs_nifty", "alpha_annualized")
+RELATIVE_BENCHMARK_FIELDS = (
+    "benchmark_sharpe",
+    "benchmark_volatility",
+    "benchmark_max_drawdown",
+    "benchmark_total_return",
+)
+
+_BENCHMARK_STATISTIC_NAMES = {
+    "benchmark_sharpe": "sharpe",
+    "benchmark_volatility": "volatility",
+    "benchmark_max_drawdown": "max_drawdown",
+    "benchmark_total_return": "total_return",
+}
+
+#: Why the index's own statistics stay on the requested window. Stated on the
+#: face of the block, not only in a comment, because a reader comparing
+#: `metrics.sharpe` with `benchmark_sharpe` deserves the answer to "is that
+#: like for like?" before they do it.
+RELATIVE_BENCHMARK_WINDOW_REASON = (
+    "The index itself has no holding period, so its standalone statistics have "
+    "no holding window to be aligned to. This sample is the requested window "
+    "sliced back to the requested start and bounded by the benchmark history "
+    "actually cached, which is generally LONGER than the holding window. "
+    "Slicing it to the holding window instead would answer a different "
+    "question - how the index performed on the days this book was held - and "
+    "on a short holding window it would annualise a handful of sessions. The "
+    "values are therefore published on the window they are correct on, not "
+    "recomputed onto the window of the metrics block beside them."
+)
+
+_RELATIVE_COMPARISON_NOTE = (
+    "This block is not on a single window. Compare a field only with a field "
+    "whose `window_ref` matches: `metrics` and this block's holding-window "
+    "sample are like for like, and nothing else here is. In particular a "
+    "`metrics` ratio and a `benchmark_*` value are measured over different "
+    "periods and their difference is not a skill gap."
+)
+
+_RELATIVE_NO_BENCHMARK_REASON = (
+    "not computed: the benchmark return series was unavailable or too short to "
+    "measure, so no portfolio/benchmark overlap and no index statistics exist. "
+    "No window is declared because none was measured. The holding-window sample "
+    "the metrics block was measured from is still declared below."
+)
+
+
+def _series_window_record(
+    frame: Any,
+    *,
+    basis: str,
+    description: str,
+) -> Dict[str, Any]:
+    """Window, observation count and date bounds of the series actually used.
+
+    Built from the frame the estimates were computed from, so the published
+    count cannot drift from the count the statistics saw.
+    """
+    index = getattr(frame, "index", None)
+    observations = int(len(index)) if index is not None else 0
+    first, last = _observation_bounds(frame)
+    return {
+        "basis": basis,
+        "description": description,
+        "observations": observations,
+        "observation_count": observations,
+        "window": {"start": first, "end": last, "days": observations},
+    }
+
+
+def _same_observations(left: Any, right: Any) -> bool:
+    """True when two series are literally the same dated observations.
+
+    Compares the index, not the counts: a benchmark window of the same LENGTH
+    as the holding window is still a different sample, and telling a reader
+    otherwise would be exactly the confusion this block exists to remove.
+    """
+    left_index = getattr(left, "index", None)
+    right_index = getattr(right, "index", None)
+    if left_index is None or right_index is None:
+        return False
+    if len(left_index) != len(right_index) or len(left_index) == 0:
+        return False
+    return bool(left_index.equals(right_index))
+
+
+def _relative_window_disclosure(
+    *,
+    metrics_series: Any,
+    metrics_basis: str,
+    metrics_description: str,
+    benchmark_series: Any,
+    benchmark_window: Any,
+    overlap_series: Any,
+    overlap_observations: int,
+    benchmark_available: bool,
+    published_fields: Optional[Iterable[str]] = None,
+    requested_window: Optional[Mapping[str, Any]] = None,
+    metrics_block_path: str = "tear_sheet.metrics",
+    observation_count_path: str = "tear_sheet.measured_window.observation_count",
+) -> Dict[str, Any]:
+    """Per-field window and observation count for a `relative_vs_nifty` block.
+
+    Returns the disclosure only; the caller stores it under
+    `RELATIVE_WINDOW_DISCLOSURE_KEY` so the estimates beside it keep their
+    existing keys and values untouched.
+
+    `published_fields` bounds the disclosure to the statistics the block
+    actually carries. The full-history sibling publishes no `benchmark_*` field,
+    and declaring four field records there would be a worse version of the
+    defect this block removes: a reader would find a window for a number that
+    was never measured. So a field with no published value is not described,
+    and neither is a window no published field uses.
+
+    `metrics_block_path` and `observation_count_path` are the JSON paths a
+    reader can check this record against. They are parameters, not constants,
+    because the full-depth sibling's counts are published at
+    `tear_sheet.full_history.metrics.days` -- NOT at
+    `tear_sheet.full_history.window`, which is a per-ticker price-frame row
+    count over a different frame entirely and would send a reader to a number
+    that does not match the window described here.
+    """
+    labelled = set(
+        published_fields
+        if published_fields is not None
+        else RELATIVE_MARKET_MODEL_FIELDS + RELATIVE_BENCHMARK_FIELDS
+    )
+    metrics_record = _series_window_record(
+        metrics_series,
+        basis=metrics_basis,
+        description=metrics_description,
+    )
+    metrics_record["same_sample_as"] = metrics_block_path
+    metrics_record["published_also_at"] = observation_count_path
+
+    if not benchmark_available:
+        # No benchmark: nothing was measured against one. Publishing a window
+        # with a zero count and no reason would read as "measured, found
+        # nothing"; stating the absence reads as what it is.
+        return {
+            "status": "withheld",
+            "reason": _RELATIVE_NO_BENCHMARK_REASON,
+            "windows": {RELATIVE_HOLDING_WINDOW_REF: metrics_record},
+            "fields": {},
+            "comparison_note": _RELATIVE_COMPARISON_NOTE,
+        }
+
+    metrics_observations = int(metrics_record["observations"])
+
+    benchmark_record = _series_window_record(
+        benchmark_window,
+        basis=RELATIVE_BENCHMARK_WINDOW,
+        description=(
+            "the benchmark's own daily return series, from the requested "
+            "window start to the requested end, bounded by the benchmark "
+            "history actually cached"
+        ),
+    )
+    benchmark_record["reason_not_recomputed"] = RELATIVE_BENCHMARK_WINDOW_REASON
+    if requested_window is not None:
+        benchmark_record["requested_window"] = dict(requested_window)
+    benchmark_record["shares_metrics_sample"] = _same_observations(
+        benchmark_window, metrics_series
+    )
+    # The requested window is a request, and the cached benchmark history is
+    # usually SHORTER than it (a 365-day request over 245 cached sessions).
+    # Stating the shortfall is the difference between "measured over the
+    # requested window" and "measured over what the cache could supply", and
+    # the two are different claims.
+    requested_start = (requested_window or {}).get("start")
+    cached_first, _ = _observation_bounds(benchmark_series)
+    try:
+        truncated = bool(
+            requested_start
+            and cached_first
+            and cached_first > str(requested_start)[:10]
+        )
+    except TypeError:
+        truncated = False
+    benchmark_record["truncated_by_cached_benchmark_depth"] = truncated
+    if truncated:
+        benchmark_record["cached_depth_start"] = cached_first
+        benchmark_record["truncation_basis"] = (
+            "the benchmark history cached from this date is shorter than the "
+            "requested window, so the window above is what the cache could "
+            "supply and not the whole requested span"
+        )
+
+    overlap_frame: Any = overlap_series
+    overlap_count = int(overlap_observations)
+    overlap_record = _series_window_record(
+        overlap_frame,
+        basis=RELATIVE_MARKET_MODEL_WINDOW,
+        description=(
+            "the portfolio returns and the benchmark returns on their COMMON "
+            "dates only; beta and alpha are a joint covariance fit, so each "
+            "side contributes only on dates both were observed"
+        ),
+    )
+    # The overlap count is the gated quantity, so it must not be re-derived
+    # from a frame that may hold more rows than were used.
+    overlap_record["observations"] = overlap_count
+    overlap_record["observation_count"] = overlap_count
+    overlap_record["window"]["days"] = overlap_count
+    overlap_record["minimum_observations_required"] = MIN_ANNUALIZE_DAYS
+    overlap_record["below_minimum_observations_required"] = bool(
+        overlap_count < MIN_ANNUALIZE_DAYS
+    )
+    overlap_record["gate_effect"] = (
+        "withheld: fewer overlapping observations than the annualization "
+        "policy requires, so beta and alpha are null and the point estimate "
+        "is absent rather than annualised from a short sample"
+        if overlap_count < MIN_ANNUALIZE_DAYS
+        else "reported: the overlap clears the annualization policy minimum"
+    )
+    shares = _same_observations(overlap_frame, metrics_series)
+    overlap_record["shares_metrics_sample"] = shares
+    # The relation to the metrics sample is a property of the WINDOW, not of
+    # each field measured on it, so it is stated once here rather than repeated
+    # on every field record (which would be two sources of truth for one fact,
+    # free to drift apart).
+    overlap_record["relation_to_metrics_window_basis"] = (
+        "every holding-window portfolio return observation also has a "
+        "benchmark return, so a field fitted here uses exactly the rows the "
+        "metrics block was measured from"
+        if shares
+        else "the benchmark was not observed on every holding-window session, "
+        "so the joint fit is restricted to the common dates and is a SHORTER "
+        "sample than the metrics block"
+    )
+    benchmark_record["relation_to_metrics_window_basis"] = (
+        "the index series happens to carry the same dated observations as the "
+        "metrics block"
+        if benchmark_record["shares_metrics_sample"]
+        else "the index series is a different, usually much longer, sample than "
+        "the metrics block; a value measured here must not be compared with a "
+        "`metrics` ratio as though it covered the holding window"
+    )
+
+    fields: Dict[str, Any] = {}
+    for name in RELATIVE_MARKET_MODEL_FIELDS:
+        if name not in labelled:
+            continue
+        fields[name] = {
+            "window_ref": RELATIVE_MARKET_MODEL_WINDOW,
+            "observations": overlap_count,
+            "observations_short_of_metrics_window": (
+                None if shares else max(0, metrics_observations - overlap_count)
+            ),
+            "shares_metrics_window": shares,
+        }
+    for name in RELATIVE_BENCHMARK_FIELDS:
+        if name not in labelled:
+            continue
+        shares_bench = bool(benchmark_record["shares_metrics_sample"])
+        fields[name] = {
+            "window_ref": RELATIVE_BENCHMARK_WINDOW,
+            "observations": int(benchmark_record["observations"]),
+            "observations_short_of_metrics_window": (
+                None
+                if shares_bench
+                else int(benchmark_record["observations"]) - metrics_observations
+            ),
+            "shares_metrics_window": shares_bench,
+        }
+
+    # Only the windows a published field actually rests on, plus the metrics
+    # sample they are being compared against.
+    records = {
+        RELATIVE_HOLDING_WINDOW_REF: metrics_record,
+        RELATIVE_MARKET_MODEL_WINDOW: overlap_record,
+        RELATIVE_BENCHMARK_WINDOW: benchmark_record,
+    }
+    used = {record["window_ref"] for record in fields.values()}
+    declared = sorted(used)
+    windows = {
+        ref: record
+        for ref, record in records.items()
+        if ref in used or ref == RELATIVE_HOLDING_WINDOW_REF
+    }
+    return {
+        "status": "computed",
+        "reason": None,
+        "windows": windows,
+        "fields": fields,
+        "distinct_windows": len(windows),
+        "windows_fields_rest_on": len(declared),
+        "fields_sharing_the_metrics_window": sorted(
+            name for name, record in fields.items() if record["shares_metrics_window"]
+        ),
+        "fields_not_on_the_metrics_window": sorted(
+            name
+            for name, record in fields.items()
+            if not record["shares_metrics_window"]
+        ),
+        "comparison_note": _RELATIVE_COMPARISON_NOTE,
+    }
+
+
 def _price_series(df: pd.DataFrame) -> Optional[pd.Series]:
     """Extract the close-price series indexed by DATE from any DataService shape.
 
@@ -6175,18 +6522,49 @@ async def get_tear_sheet(
         )
 
         full_relative: Dict[str, Any] = {}
-        if bench_ret is not None and len(bench_ret) > 20:
+        full_bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
+        full_overlap_p: Optional[pd.Series] = None
+        full_overlap_days = 0
+        if full_bench_available:
             common_full = full_port_ret.index.intersection(bench_ret.index)
-            if len(common_full) >= MIN_ANNUALIZE_DAYS:
-                p, b = full_port_ret.loc[common_full], bench_ret.loc[common_full]
+            full_overlap_days = int(len(common_full))
+            # The intersection frames are built whether or not the gate passes:
+            # the disclosure below has to name the sample the gate judged, and a
+            # window can only be described from the rows it would have used.
+            full_overlap_p = full_port_ret.loc[common_full]
+            full_overlap_b = bench_ret.loc[common_full]
+            if full_overlap_days >= MIN_ANNUALIZE_DAYS:
+                p, b = full_overlap_p, full_overlap_b
                 var_b = float(b.var())
                 beta = float(p.cov(b) / var_b) if var_b > 0 else None
                 alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
                 full_relative = {
                     "beta_vs_nifty": round(beta, 4) if beta is not None else None,
                     "alpha_annualized": round(alpha_ann, 4) if beta is not None else None,
-                    "overlap_days": int(len(common_full)),
+                    "overlap_days": full_overlap_days,
                 }
+        # QM-2: this leg publishes only beta and alpha, but it is still a
+        # two-sample block (the full-depth series and the joint overlap), so it
+        # carries the same per-field disclosure. It declares no benchmark-window
+        # record because it publishes no `benchmark_*` field, and a declared
+        # window no field uses is one a reader will trust by mistake.
+        full_relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
+            metrics_series=full_port_ret,
+            metrics_basis=FULL_HISTORY_BASIS,
+            metrics_description=(
+                "the hypothetical-current-weights portfolio return series over "
+                "the full cache depth, which is the same sample the "
+                "full_history metrics block was measured from"
+            ),
+            benchmark_series=bench_ret,
+            benchmark_window=bench_ret,
+            overlap_series=full_overlap_p,
+            overlap_observations=full_overlap_days,
+            benchmark_available=full_bench_available,
+            published_fields=RELATIVE_MARKET_MODEL_FIELDS,
+            metrics_block_path="tear_sheet.full_history.metrics",
+            observation_count_path="tear_sheet.full_history.metrics.days",
+        )
 
         # Three different samples live in `relative_vs_nifty` and its full-
         # history sibling: the ALIGNED portfolio/benchmark pair, the benchmark
@@ -6213,29 +6591,24 @@ async def get_tear_sheet(
             ),
             "benchmark": _tear_sheet_uncertainty(
                 None,
-                {
-                    field: None for field in (
-                        "benchmark_sharpe", "benchmark_volatility",
-                        "benchmark_max_drawdown", "benchmark_total_return",
-                    )
-                },
+                {field: None for field in RELATIVE_BENCHMARK_FIELDS},
                 scope=(
                     "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
                     "return series sliced back to the requested window"
                 ),
-                statistic_names={
-                    "benchmark_sharpe": "sharpe",
-                    "benchmark_volatility": "volatility",
-                    "benchmark_max_drawdown": "max_drawdown",
-                    "benchmark_total_return": "total_return",
-                },
+                statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
             ),
         }
-        if bench_ret is not None and len(bench_ret) > 20:
+        bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
+        bench_window: Any = None
+        holding_overlap_p: Optional[pd.Series] = None
+        overlap_days = 0
+        if bench_available:
             # Holding leg stays on the requested window: slice the (possibly
             # deeper) benchmark back down. Benchmark standalone stats describe
             # the index over the requested window (no holding concept applies
-            # to NIFTY itself).
+            # to NIFTY itself) -- which is why QM-2 labels that window rather
+            # than re-slicing the index onto this book's holding window.
             bench_window = bench_ret
             try:
                 bench_window = bench_ret[bench_ret.index >= start]
@@ -6252,9 +6625,14 @@ async def get_tear_sheet(
             # Beta/alpha genuinely need joint history: gate on the common
             # window so a handful of overlapping days never annualizes noise.
             common = port_ret.index.intersection(bench_ret.index)
+            overlap_days = int(len(common))
+            # The intersection slice is taken unconditionally: even when the
+            # gate withholds the point estimate, the reader is owed the window
+            # the gate judged and how far short of the policy minimum it fell.
+            holding_overlap_p = port_ret.loc[common]
             aligned_p = aligned_b = None
-            if len(common) >= MIN_ANNUALIZE_DAYS:
-                p, b = port_ret.loc[common], bench_ret.loc[common]
+            if overlap_days >= MIN_ANNUALIZE_DAYS:
+                p, b = holding_overlap_p, bench_ret.loc[common]
                 # The frames the interval will be built from are exactly the
                 # frames the estimate was fitted on. When the gate withholds
                 # beta/alpha they stay None, and the block then says the point
@@ -6265,7 +6643,7 @@ async def get_tear_sheet(
                 alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
                 relative["beta_vs_nifty"] = round(beta, 4) if beta is not None else None
                 relative["alpha_annualized"] = round(alpha_ann, 4) if alpha_ann is not None else None
-            relative["overlap_days"] = int(len(common))
+            relative["overlap_days"] = overlap_days
             relative_uncertainty["market_model"] = _tear_sheet_relative_uncertainty(
                 aligned_p, aligned_b,
                 {
@@ -6279,23 +6657,34 @@ async def get_tear_sheet(
             )
             relative_uncertainty["benchmark"] = _tear_sheet_uncertainty(
                 bench_window,
-                {
-                    field: relative.get(field) for field in (
-                        "benchmark_sharpe", "benchmark_volatility",
-                        "benchmark_max_drawdown", "benchmark_total_return",
-                    )
-                },
+                {field: relative.get(field) for field in RELATIVE_BENCHMARK_FIELDS},
                 scope=(
                     "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
                     "return series sliced back to the requested window"
                 ),
-                statistic_names={
-                    "benchmark_sharpe": "sharpe",
-                    "benchmark_volatility": "volatility",
-                    "benchmark_max_drawdown": "max_drawdown",
-                    "benchmark_total_return": "total_return",
-                },
+                statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
             )
+        # QM-2: the block publishes three different samples (the joint
+        # portfolio/benchmark overlap, the index over the requested window, and
+        # -- one level up -- the holding-window `metrics` block), and before
+        # this disclosure the only one named was the first, via `overlap_days`.
+        # No value above changed to get here: the estimates are computed on the
+        # series they were always computed on, and this only says which.
+        relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
+            metrics_series=port_ret,
+            metrics_basis=MEASURED_WINDOW_COVERED_DAYS_SCOPE,
+            metrics_description=(
+                "the holding-window portfolio return series, measured on the "
+                "whole-book complete return rows; this is the same sample the "
+                "tear sheet's `metrics` block was measured from"
+            ),
+            benchmark_series=bench_ret,
+            benchmark_window=bench_window,
+            overlap_series=holding_overlap_p,
+            overlap_observations=overlap_days,
+            benchmark_available=bench_available,
+            requested_window={"start": start, "end": end},
+        )
 
         monthly: Dict[str, Dict[str, float]] = {}
         try:
