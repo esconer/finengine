@@ -902,10 +902,29 @@ async def test_sizing_publishes_one_budget_with_its_rounding_and_its_price_date(
     )
     # The sizing price date is the freshness of the trade list, and its staleness
     # against the newest delivered bar is measured, not asserted.
+    #
+    # This used to assert two literals -- `sizing_price_as_of == "2026-09-22"` and
+    # `sizing_price_calendar_days_behind == 3` -- which contradicted the sentence
+    # directly above them. The fixtures are deliberately anchored to
+    # `datetime.now()` (END, at the top of this file, explains why: a hard-coded
+    # end date falls outside the canonical holding evidence window), and
+    # `calendar_days_behind` is a CALENDAR count, so a fixed number of business
+    # days back spans a different number of calendar days depending on the
+    # weekday. Measured over 14 consecutive run dates: the old assertion held on
+    # 8 of 14 (Thu-Sun) and failed on 6 (Mon-Wed). So it was flaky, not slowly
+    # drifting, and no single replacement number would have fixed it.
+    #
+    # Assert the measurement, which is what the comment always claimed.
     freshness = result["sizing_basis"]["price_freshness"]
-    assert freshness["sizing_price_as_of"] == "2026-09-22"
+    delivered_index = market.frames["A"].index.append(market.frames["B"].index)
+    latest = pd.Timestamp(result["latest_observation_date"])
+    sizing_as_of = pd.Timestamp(freshness["sizing_price_as_of"])
+    # A genuinely delivered bar, and strictly older than the newest one.
+    assert sizing_as_of in delivered_index
+    assert sizing_as_of < latest
+    assert latest == delivered_index.max()
     assert freshness["latest_delivered_observation"] == result["latest_observation_date"]
-    assert freshness["sizing_price_calendar_days_behind"] == 3
+    assert freshness["sizing_price_calendar_days_behind"] == (latest - sizing_as_of).days
     assert freshness["sizing_price_as_of_status"] == "measured"
     # The drift between the sizing price and the position's own last_price.
     comparison = result["sizing_basis"]["position_last_price_comparison"]
