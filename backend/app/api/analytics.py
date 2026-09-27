@@ -1813,8 +1813,12 @@ RETURN_FRAME_COUNT_UNITS = {
         "are the same population in the same unit. masked_days and "
         "holding_window_return_observations are that population cut to the "
         "canonical holding window, so raw_days - masked_days = the aligned return "
-        "rows OUTSIDE the window. The block's covered_days counts the PORTFOLIO "
-        "series inside the window and is not a sum of the per-ticker rows."
+        "rows OUTSIDE the window. The block's covered_days counts the WIDE "
+        "per-leg frame inside the window - the same population covered_days_scope "
+        "declares - and is not a sum of the per-ticker rows: a leg that is "
+        "unpriced on a date still contributes that date to covered_days, so "
+        "covered_days can exceed the whole-book complete return rows the "
+        "covariance and tail models consumed."
     ),
     "holding_window_return_observations": (
         "aligned_return_rows_inside_the_canonical_holding_window"
@@ -6849,13 +6853,31 @@ async def get_risk_contribution(
             data_service, holdings, _active_weight_tickers(weights), end=end,
         )
         start_detail = provenance["detail"]
-        # The holding-context window is measured on the delivered portfolio
-        # return series against the canonical intersection start, so
-        # `covered_days` there describes the holding tenure (return
-        # observations two held prices can produce) instead of repeating the
-        # model's own observation count or the route's own date.
+        # The holding-context window is measured against the canonical
+        # intersection start, so `covered_days` there describes the holding
+        # tenure (return observations two held prices can produce) instead of
+        # repeating the model's own observation count or the route's own date.
+        #
+        # It is measured on `returns_df`, the frame the per-ticker counts below
+        # are cut from, because that is what `covered_days_scope` declares this
+        # block measures (`HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE`) and what
+        # `factor_exposure` - the other block carrying that scope - measures.
+        # Measuring it on `port_ret` instead was not a slower path to the same
+        # number: `port_ret.index` is a strict SUBSET of `returns_df.index` by
+        # design, because `aggregate_active_returns` refuses every date whose
+        # surviving positive weight did not cover the whole declared book while
+        # the wide frame deliberately RETAINS those dates as NaN (the per-leg
+        # truth contract, see `_build_wide_returns`). On a book with a single
+        # leg that has a price gap the two indexes differ, and the boolean mask
+        # built on `port_ret` cannot index `returns_df` at all: pandas raised
+        # `IndexingError: Unalignable boolean Series provided as indexer`, the
+        # blanket handler at the foot of this function turned it into a bare
+        # 500, and the section has published `unavailable` with no data in every
+        # export since the project began. The frame is NOT narrowed to make the
+        # two agree - that would discard exactly the partially-covered dates the
+        # wide frame exists to carry.
         holding_days, holding_mask = holding_window_observation_count(
-            port_ret, provenance["start"],
+            returns_df, provenance["start"],
         )
         # `returns_df` is already a RETURN frame here, so a ticker's own
         # observation count is its non-null return rows. Taking it through
@@ -6972,7 +6994,21 @@ async def get_risk_contribution(
         tail = port_ret <= var_95
         cvar_rc = {}
         if tail.any():
-            tail_returns = returns_df.loc[tail]
+            # The tail is a PORTFOLIO question - the whole book's worst days
+            # against the portfolio's own 5th percentile - so the population
+            # stays exactly `port_ret`'s and is selected here BY LABEL. It used
+            # to be `returns_df.loc[tail]`, a boolean mask carrying
+            # `port_ret`'s index used to index the wide frame; the same
+            # unalignable-index defect as the holding-window mask above, so the
+            # same books never reached this line. Selecting by label rather
+            # than by mask is also what keeps a date the aggregate refused from
+            # silently entering the tail: it is absent from `port_ret`, so it is
+            # not a portfolio day and cannot become a tail day. The wide frame
+            # is still read whole - only these rows are cut from it, and a leg
+            # unpriced on a tail day stays NaN below rather than contributing a
+            # zero loss.
+            tail_dates = port_ret.index[port_ret <= var_95]
+            tail_returns = returns_df.loc[returns_df.index.isin(tail_dates)]
             weight_frame = pd.Series({a: float(w[i]) for i, a in enumerate(assets)})
             weight_frame = weight_frame.where(np.isfinite(weight_frame) & (weight_frame > 0.0), 0.0)
             active_weight = tail_returns.notna().mul(weight_frame, axis=1).sum(axis=1)
