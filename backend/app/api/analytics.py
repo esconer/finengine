@@ -44,6 +44,7 @@ from app.services.analytics_engine import (
     AnalyticsEngine,
     aggregate_active_returns,
     market_model_statistics,
+    market_model_witness,
     measure_estimate_uncertainty,
     quantstats_ratio_statistics,
     quantstats_returns_look_like_prices,
@@ -613,6 +614,44 @@ def _tear_sheet_uncertainty(
     )
 
 
+def _paired_return_columns(portfolio: Any, benchmark: Any) -> np.ndarray:
+    """The ``(n, 2)`` market-model block, paired on DATE and never on position.
+
+    `measure_estimate_uncertainty` drops rows where EITHER column is non-finite
+    (`_finite_observation_block`), so all this has to do is put the two columns
+    on one shared index and hand them over whole.
+
+    It used to truncate both series to their common LENGTH and stack them
+    positionally. Two series of different length then paired row-for-row as if
+    they shared a calendar: the 307-session portfolio series against the OLDEST
+    307 sessions of a 2620-session benchmark, roughly eight and a half years
+    apart, and every resample described that other decade. The published point
+    was never affected — the caller fits it on the same date intersection this
+    block is now built from — but the BAND was, and the identity check in
+    `measure_estimate_uncertainty` refused to publish it. An unlabelled
+    position is not a weaker alignment; it is a different one, so it is gone.
+
+    Two blocks with no index to align on can only be paired by position, so a
+    length mismatch there yields no frame at all and the caller publishes the
+    absence with the engine's own reason. Nothing is guessed.
+    """
+    if isinstance(portfolio, pd.Series) and isinstance(benchmark, pd.Series):
+        if not portfolio.index.equals(benchmark.index):
+            common = portfolio.index.intersection(benchmark.index)
+            portfolio = portfolio.reindex(common)
+            benchmark = benchmark.reindex(common)
+        left = portfolio.to_numpy(dtype=float).ravel()
+        right = benchmark.to_numpy(dtype=float).ravel()
+    else:
+        left = _finite_return_values(portfolio).ravel()
+        right = _finite_return_values(benchmark).ravel()
+        if left.size != right.size:
+            return np.zeros((0, 2), dtype=float)
+    if left.size == 0:
+        return np.zeros((0, 2), dtype=float)
+    return np.column_stack([left, right])
+
+
 def _tear_sheet_relative_uncertainty(
     portfolio: Any,
     benchmark: Any,
@@ -625,15 +664,26 @@ def _tear_sheet_relative_uncertainty(
     The pair is resampled jointly, so the co-movement that produces the
     estimate survives the resampling; resampling the two series separately would
     destroy the very covariance `beta_vs_nifty` is made of.
+
+    The block is also handed an INDEPENDENT WITNESS: `market_model_witness`
+    re-derives the published beta and alpha by `np.linalg.lstsq` on the
+    `[1, b]` design matrix, which shares no arithmetic with the estimator's
+    `cov(p, b) / var(b)`. When the two disagree, the witness says which side
+    failed instead of the reason text accusing the published point.
+
+    Both frames handed over are the SAME date-aligned block, and that is the
+    point rather than a convenience. `witness_observations` defaults to
+    `observations`, and on this route the estimator's frame IS the one a
+    mis-pairing would corrupt, so the default would derive the witness from the
+    very frame under suspicion: the witness would then agree with a mis-aligned
+    ESTIMATOR rather than with the published point, the block would take the
+    two-derivations-disagree branch, and a correct `beta_vs_nifty` would be
+    published as `null`. Passing the same aligned frame explicitly makes the
+    default and the explicit value agree, so the trap cannot be re-armed by
+    forgetting an argument — the misalignment is fixed in the frame itself, at
+    `_paired_return_columns`, and the witness only has to confirm the result.
     """
-    p_values = _finite_return_values(portfolio).ravel()
-    b_values = _finite_return_values(benchmark).ravel()
-    aligned = min(p_values.size, b_values.size)
-    frame = (
-        np.column_stack([p_values[:aligned], b_values[:aligned]])
-        if aligned
-        else np.zeros((0, 2), dtype=float)
-    )
+    frame = _paired_return_columns(portfolio, benchmark)
     return measure_estimate_uncertainty(
         frame,
         market_model_statistics(252),
@@ -643,6 +693,13 @@ def _tear_sheet_relative_uncertainty(
         # the margin above it absorbs the restatement's float noise.
         point_tolerance=1e-4,
         statistic_names={"beta_vs_nifty": "beta"},
+        witness=market_model_witness(252),
+        witness_observations=frame,
+        witness_basis=(
+            "np.linalg.lstsq on the [1, b] design matrix, evaluated on the same "
+            "date-aligned frame the resampling estimator was handed, which is "
+            "the frame beta_vs_nifty and alpha_annualized were published from"
+        ),
         notes={
             "estimator": (
                 "market_model_statistics: the tear sheet's own closed form, "
@@ -654,6 +711,19 @@ def _tear_sheet_relative_uncertainty(
                 "the portfolio and benchmark are resampled on the SAME index "
                 "draw, so the joint distribution the covariance is estimated "
                 "from is preserved inside every block"
+            ),
+            "alignment_basis": (
+                "the two columns are paired on their shared DATE index and are "
+                "never truncated to a common length, so a row of the frame is "
+                "one session for both legs"
+            ),
+            "witness": (
+                "market_model_witness: np.linalg.lstsq on the [1, b] design "
+                "matrix, which shares no arithmetic with the estimator's closed "
+                "form, evaluated on the same date-aligned frame. When the "
+                "estimator's own point value misses the published one, this "
+                "block names which side failed instead of asserting the "
+                "published point is wrong; see estimates.<field>.point_status"
             ),
             "annualization_periods": 252,
         },
@@ -1286,6 +1356,7 @@ def _full_history_evidence(
     requested_end: Optional[str],
     declared_limited: Optional[Mapping[str, bool]] = None,
     coverage_reasons: Optional[Mapping[str, Optional[str]]] = None,
+    metrics_series: Any = None,
 ) -> Dict[str, Any]:
     """Self-describing evidence for a model measured on full exchange history.
 
@@ -1297,6 +1368,26 @@ def _full_history_evidence(
     annualization flag. Sparse or late-listed legs are published with their own
     usable observation count and limited-history flag instead of being averaged
     away by the rest of the book.
+
+    `metrics_series` is the series the block's `metrics` were measured on, and
+    it is almost never the frame above. This block is described by the WIDE
+    per-ticker frame, whose row count is every date on which ANY leg was
+    measurable, while the metrics beside it are computed from one portfolio
+    return series that exists only on dates where the whole positive-weight book
+    cleared coverage. Those are different populations and different lengths --
+    2486 against 307 in the reviewed export -- so the block used to declare a
+    2486-day window over metrics annualised on 307 days, and recomputing CAGR
+    from the declared window was wrong by 9.11x. The frame is still what the
+    window describes, so the frame keeps `window`/`observation_count`; the
+    metrics' own count and bounds are published beside them as
+    `metrics_observation_count` / `metrics_window` so the two can never be read
+    as one sample.
+
+    `annualized` is a statement about the FRAME's population -- the frame row
+    count and the smallest per-ticker return count -- because that is what the
+    flag has always tested. It is published with the two counts it tested rather
+    than as a bare boolean, so a reader who takes it as a licence to annualize
+    the `metrics` beside it can see that it never looked at those.
     """
     frame = returns_frame if isinstance(returns_frame, pd.DataFrame) else pd.DataFrame()
     clean = frame.replace([np.inf, -np.inf], np.nan) if not frame.empty else frame
@@ -1328,12 +1419,13 @@ def _full_history_evidence(
             ),
             "coverage_reason": reasons.get(ticker),
         }
+    min_ticker_count = int(min(counts.values())) if counts else None
     meets = bool(
         observations >= MIN_ANNUALIZE_DAYS
         and counts
-        and min(counts.values()) >= MIN_ANNUALIZE_DAYS
+        and min_ticker_count >= MIN_ANNUALIZE_DAYS
     )
-    return {
+    evidence = {
         "basis": FULL_HISTORY_BASIS,
         "scope": "full_exchange_history",
         "truncated_to_holding_window": False,
@@ -1345,11 +1437,45 @@ def _full_history_evidence(
         "observation_count": observations,
         "per_ticker_return_observations": counts,
         "annualized": meets,
+        "annualized_population": (
+            "the wide per-ticker return frame: True when the frame itself has at "
+            f"least {MIN_ANNUALIZE_DAYS} rows AND every ticker's own return "
+            "observation count reaches that minimum. It is NOT a statement "
+            "about the `metrics` block beside it, which is measured on a "
+            "different and usually far shorter series -- read "
+            "metrics_observation_count for that population."
+        ),
+        "annualization_tested_frame_observations": observations,
+        "annualization_tested_minimum_ticker_return_observations": min_ticker_count,
         "minimum_observations_required": MIN_ANNUALIZE_DAYS,
         "model_used_tickers": [str(c) for c in frame.columns],
         "tickers": tickers,
         "holding_context_note": FULL_HISTORY_RELATION,
     }
+    if metrics_series is not None:
+        metrics_observations = int(len(metrics_series))
+        metrics_first, metrics_last = _observation_bounds(metrics_series)
+        evidence["metrics_observation_count"] = metrics_observations
+        evidence["metrics_window"] = {
+            "start": metrics_first,
+            "end": metrics_last,
+            "days": metrics_observations,
+        }
+        evidence["metrics_observation_count_basis"] = (
+            "the portfolio return series this block's `metrics` were measured "
+            "on, which is a DIFFERENT and usually far shorter population than "
+            "observation_count above: that counts every date ANY leg was "
+            "measurable on, this counts the dates the whole positive-weight "
+            "book cleared coverage on. CAGR, Sharpe, Sortino, Calmar and "
+            "volatility are annualised on THIS count, so "
+            "(1 + total_return) ** (252 / metrics_observation_count) - 1 "
+            "reproduces `metrics.cagr` and the same expression on "
+            "observation_count does not."
+        )
+        evidence["metrics_meet_minimum_observations"] = bool(
+            metrics_observations >= MIN_ANNUALIZE_DAYS
+        )
+    return evidence
 
 
 # --- Risk contribution: what `positions.*` is a number OF --------------------
@@ -6485,7 +6611,7 @@ async def get_tear_sheet(
         # cache depth (see full_start above). Realized P&L above stays
         # holding-truthed. The second build is cache-served (same frames as
         # the masked call).
-        full_returns_df, full_port_ret, _ = await _build_wide_returns(
+        full_returns_df, full_port_ret, full_leg_coverage = await _build_wide_returns(
             ticker_list, weights, full_start, end, data_service,
         )
         full_metrics = {
@@ -6521,13 +6647,47 @@ async def get_tear_sheet(
         # full-history leg carries its own window, observation count, scope and
         # truncation flag, so it can never be read as the holding window and
         # the holding window can never be read as this model's sample.
+        #
+        # NEW-7: the shape was the problem. This block is described by
+        # `full_returns_df` (2486 rows, every date ANY leg was measurable on)
+        # while `full_metrics` above is measured on `full_port_ret` (307 rows,
+        # every date the WHOLE positive-weight book cleared coverage). Declaring
+        # the 2486-day window and annualising on 307 is a 9.11x recompute error
+        # for anyone who trusts the declared window, so the block now publishes
+        # the metrics' own count and bounds, and the coverage leg this route used
+        # to discard into `_` explains exactly which dates the difference is.
         full_history_evidence = _full_history_evidence(
-            full_returns_df, requested_start=start, requested_end=end,
+            full_returns_df,
+            requested_start=start,
+            requested_end=end,
+            metrics_series=full_port_ret,
+        )
+        if isinstance(full_leg_coverage, Mapping):
+            for key in (
+                "measurable_return_rows",
+                "partial_coverage_days",
+                "partial_coverage_days_reason",
+            ):
+                if full_leg_coverage.get(key) is not None:
+                    full_history_evidence[key] = full_leg_coverage[key]
+        full_history_evidence["measurement_frame_note"] = (
+            "`window`/`observation_count` describe the wide per-ticker return "
+            "frame. `metrics_observation_count`/`metrics_window` describe the "
+            "shorter portfolio return series the `metrics` block was measured "
+            "on. The difference between the two counts is "
+            "`partial_coverage_days`: dates on which the surviving "
+            "positive-weight constituents did not cover 100% of gross weight, "
+            "which were refused rather than renormalised into a partial-basket "
+            "portfolio return."
         )
 
         full_relative: Dict[str, Any] = {}
         full_bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
+        # Both legs are pre-declared, not just the portfolio: the uncertainty
+        # block below is handed the PAIR, and a benchmark that never arrived
+        # must reach it as an explicit absence rather than an unbound name.
         full_overlap_p: Optional[pd.Series] = None
+        full_overlap_b: Optional[pd.Series] = None
         full_overlap_days = 0
         if full_bench_available:
             common_full = full_port_ret.index.intersection(bench_ret.index)
@@ -6576,8 +6736,15 @@ async def get_tear_sheet(
         # the full cache depth. Each gets its own block, because an interval
         # whose n belongs to a different window than its point estimate is the
         # defect this block exists to remove.
+        #
+        # The pair handed over is the SAME `common_full` intersection beta and
+        # alpha were fitted on, not the full-depth series beside the full-depth
+        # benchmark. Those are 307 against 2620 rows on disjoint calendars, so
+        # the interval belonged to a different decade than the estimate it sat
+        # beside. Both series are `None` when the benchmark is unavailable, and
+        # the block then reports the absence rather than a band.
         full_relative_uncertainty = _tear_sheet_relative_uncertainty(
-            full_port_ret, bench_ret, full_relative,
+            full_overlap_p, full_overlap_b, full_relative,
             scope=(
                 "tear_sheet full_history relative_vs_nifty: beta and alpha over "
                 "the full-depth portfolio/benchmark overlap"
