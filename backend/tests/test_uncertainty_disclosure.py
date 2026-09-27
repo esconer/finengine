@@ -852,7 +852,16 @@ def test_block_publishes_the_design_that_produced_its_numbers():
     assert block["block_size"] == moving_block_size(block["observations"])
     assert "Politis" in block["block_size_basis"]
     assert "Politis & Romano" in block["method_basis"]
-    assert "reproduces the published point value" in block["point_tolerance_basis"]
+    # Renamed from `point_tolerance_basis`: the key used to read as a proof that
+    # the published value was CORRECT, which it never was. It is a
+    # band-provenance test, and the renamed text says so.
+    assert "point_tolerance_basis" not in block
+    assert "BAND-PROVENANCE test, not a truth test" in (
+        block["band_provenance_tolerance_basis"]
+    )
+    assert "cannot tell which of the two is wrong" in (
+        block["band_provenance_tolerance_basis"]
+    )
     entry = block["estimates"]["sharpe_ratio"]
     assert entry["status"] == "computed"
     assert str(block["observations"]) in entry["conf_int_basis"]

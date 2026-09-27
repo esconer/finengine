@@ -622,10 +622,41 @@ UNCERTAINTY_MIN_OBSERVATIONS = 20
 #: How far the resampling estimator's OWN point value may sit from the value
 #: the payload publishes before the band is withheld.  An interval for a
 #: neighbouring function is a fabricated precision, not a wider honest one.
+#:
+#: This is a BAND-PROVENANCE test, not a truth test.  It can only ever say "these
+#: two numbers disagree"; on its own it cannot say which of them is wrong, and
+#: for most of this module's history it did not try - it withheld the band and
+#: published a point that might have been correct, under a reason string that
+#: asserted the point was the wrong one.  `measure_estimate_uncertainty` now
+#: adjudicates that disagreement against an independent witness; see
+#: POINT_STATUS_VALUES.
 UNCERTAINTY_POINT_TOLERANCE = 1e-6
 #: Display rounding for a standard error or interval bound.  Half a 6-decimal
 #: step, so a reader recomputing from the published numbers lands inside 1e-6.
 UNCERTAINTY_DECIMALS = 6
+
+#: The closed vocabulary of `estimates.<field>.point_status`: what happened to
+#: the POINT VALUE, which is a different question from `status` (whether a band
+#: was published).  Every value here describes a point the payload still
+#: carries, except POINT_NOT_REPRODUCED_BY_ANY_WITNESS - the only branch in this
+#: module that withholds a POINT rather than a band, and one no live data
+#: currently reaches.
+POINT_REPRODUCED_BY_ESTIMATOR = "reproduced_by_estimator"
+POINT_VERIFIED_BY_WITNESS = "verified_against_independent_witness"
+POINT_REPRODUCED_BY_WITNESS_ONLY = (
+    "published_point_reproduced_by_independent_witness"
+)
+POINT_NOT_REPRODUCED_BY_ANY_WITNESS = (
+    "published_point_not_reproduced_by_independent_witness"
+)
+POINT_UNVERIFIED = "unverified"
+POINT_STATUS_VALUES = frozenset({
+    POINT_REPRODUCED_BY_ESTIMATOR,
+    POINT_VERIFIED_BY_WITNESS,
+    POINT_REPRODUCED_BY_WITNESS_ONLY,
+    POINT_NOT_REPRODUCED_BY_ANY_WITNESS,
+    POINT_UNVERIFIED,
+})
 
 BOOTSTRAP_METHOD = "circular_moving_block_bootstrap_percentile"
 BOOTSTRAP_METHOD_BASIS = (
@@ -780,6 +811,7 @@ def _uncertainty_entry(
     reason: Optional[str],
     observations: Optional[int],
     effective_n: Optional[float],
+    point_status: str,
     standard_error: Optional[float] = None,
     conf_int: Optional[List[float]] = None,
     method: Optional[str] = None,
@@ -791,6 +823,15 @@ def _uncertainty_entry(
     that simply omits the key leaves a consumer unable to tell "no interval was
     computed" from "this field has no uncertainty", which is the ambiguity this
     whole block exists to remove.
+
+    `point_status` is required rather than defaulted, because the guard that
+    decides it is the one place in this module that can silently become
+    one-sided. It says what was done to the POINT, which `status` does not: a
+    field can be `not_computed` (no band) and still carry a fully believed point
+    value, and before this key existed nothing in the payload separated "this
+    number is settled" from "this number survived because withholding it was
+    the safer default". The vocabulary is closed and is asserted by
+    `POINT_STATUS_VALUES`.
 
     `point_within_conf_int` is published because a percentile bootstrap does NOT
     guarantee the observed value lies inside its own interval. It does not, for
@@ -828,6 +869,7 @@ def _uncertainty_entry(
         ),
         "observations": observations,
         "effective_n": effective_n,
+        "point_status": point_status,
         "status": status,
         "reason": reason,
     }
@@ -850,6 +892,69 @@ def _statistic_matrix_from(statistics: Any) -> Any:
     return statistics
 
 
+def _witness_verdicts(
+    witness: Any,
+    witness_observations: Any,
+    source_field: Mapping[str, str],
+) -> Tuple[Dict[str, Optional[float]], Optional[str], Optional[Tuple[int, int]]]:
+    """The independent re-derivations, keyed by PUBLISHED field name.
+
+    Returns ``(verdicts, failure, shape)``.  `verdicts[field]` is a finite float
+    the witness derived for that published field, or ``None`` when it produced
+    nothing usable.  `failure` is a single human-readable string explaining why
+    the witness could not run at all, and it is deliberately a FAILURE rather
+    than a verdict: a witness that could not be evaluated leaves the published
+    point RETAINED and flagged `unverified`, because the cost of a bad witness
+    must never be a correct number removed.  `shape` is the witness frame's
+    ``(rows, columns)``, published so a reader can see that the two sides of
+    the adjudication were measured on different frames.
+
+    The witness is evaluated with a single column - one evaluation of the
+    caller's callable over ``(n, 1, k)`` - so it re-derives a point value and
+    never a resampling distribution.  Keys are read through `source_field` so a
+    caller may key the witness by either the published name (`beta_vs_nifty`)
+    or the source name (`beta`), which is the same aliasing `statistic_names`
+    already does for `statistics`.
+    """
+    if witness is None:
+        return {}, "no independent witness was supplied for this block", None
+    published_by_source = {source: field for field, source in source_field.items()}
+    try:
+        evaluate = _statistic_matrix_from(witness)
+        values, _ = _finite_observation_block(witness_observations)
+    except Exception as exc:  # noqa: BLE001 - degrade, never guess
+        return {}, (
+            "the independent witness could not be prepared on the published "
+            f"sample ({type(exc).__name__}: {exc})"
+        ), None
+    count = int(values.shape[0])
+    shape = (count, int(values.shape[1]))
+    if count == 0:
+        return {}, (
+            "the independent witness was handed no finite observation of the "
+            "published sample"
+        ), shape
+    try:
+        raw = evaluate(values[:, None, :])
+        if not isinstance(raw, Mapping):
+            raw = {"": raw}
+    except Exception as exc:  # noqa: BLE001 - degrade, never guess
+        return {}, (
+            "the independent witness raised while re-deriving the published "
+            f"point value ({type(exc).__name__}: {exc})"
+        ), shape
+    verdicts: Dict[str, Optional[float]] = {}
+    for key, value in raw.items():
+        field = source_field.get(str(key), published_by_source.get(str(key)))
+        if field is None:
+            continue
+        try:
+            verdicts[field] = _scalar_or_none(value)
+        except Exception:  # noqa: BLE001 - an unusable witness is a failure
+            verdicts[field] = None
+    return verdicts, None, shape
+
+
 def measure_estimate_uncertainty(
     observations: Any,
     statistics: Any,
@@ -863,6 +968,10 @@ def measure_estimate_uncertainty(
     not_computed: Optional[Mapping[str, str]] = None,
     not_applicable: Optional[Mapping[str, str]] = None,
     statistic_names: Optional[Mapping[str, str]] = None,
+    witness: Any = None,
+    witness_observations: Any = None,
+    witness_tolerance: Optional[float] = None,
+    witness_basis: Optional[str] = None,
     notes: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Precision disclosure for one block of published estimates.
@@ -881,6 +990,44 @@ def measure_estimate_uncertainty(
     `point_tolerance`.  A statistic that quietly measures something else gets
     `not_computed` with the discrepancy in the reason, instead of lending the
     published number a band that was never its own.
+
+    ADJUDICATION.  That test compares two numbers, so on its own it cannot say
+    WHICH of them is wrong - and for a long time it did not try.  It withheld
+    the band, kept the point, and wrote a reason that read as an accusation
+    against the point, so a payload could sit there publishing a number nobody
+    had checked next to a sentence saying that number was wrong.  In the live
+    case that deleted nothing but mislabelled everything: the published
+    `beta_vs_nifty` was correct and the ESTIMATOR was the side that had been
+    handed a mis-aligned frame.
+
+    `witness` closes that.  It is a SECOND derivation of `published` by a
+    genuinely different code path - for beta and alpha that is `np.linalg.lstsq`
+    on the design matrix, against the estimator's `cov(p, b) / var(b)` closed
+    form - and it is evaluated on `witness_observations`, which is the frame
+    the PUBLISHED value was measured on, not necessarily the frame the
+    estimator was handed.  When the estimator's own point value misses the
+    published one, the witness is the third number that decides which side is
+    lying.
+
+    `witness_observations` defaults to `observations`.  That default is the
+    trap this design exists to avoid: a witness run over a mis-aligned frame
+    agrees with the mis-aligned ESTIMATOR, not with the published point, and
+    would take the withholding branch and delete a correct number.  So a caller
+    whose published value came from a differently-aligned frame must pass that
+    frame here explicitly.  The witness is evaluated with a single column
+    (one evaluation, never resampled) - it re-derives a point, it does not
+    produce a distribution.
+
+    THE ASYMMETRY IS DELIBERATE.  On a witness that cannot be run - it raises,
+    it returns a non-finite value, it is absent, it is handed no finite
+    observation - the point is RETAINED and flagged `unverified`.  It is never
+    nulled.  A wrong witness must never cost a reader a correct number, because
+    the failure mode being fixed here is publishing a number nobody checked,
+    and a fix that traded it for hiding a number that was right would have
+    replaced one defect with a worse one.  `point: null` is reachable only when
+    the witness runs, produces a finite verdict, and that verdict also misses
+    the published value - two independent derivations contradicting the payload,
+    which is the one case where withholding is the honest answer.
     """
     values, dropped = _finite_observation_block(observations)
     evaluate = _statistic_matrix_from(statistics)
@@ -941,6 +1088,18 @@ def measure_estimate_uncertainty(
     #: it exists because one payload field (`benchmark_sharpe`) is one
     #: estimator (`sharpe`) under a section-specific name.
     source_field = {field: (statistic_names or {}).get(field, field) for field in published}
+    witness_point, witness_failure, witness_shape = _witness_verdicts(
+        witness, witness_observations, source_field
+    )
+    #: How close the witness's own verdict must sit to the published value for
+    #: the witness to be treated as corroborating it.  Defaults to the same
+    #: tolerance the estimator is held to, because a witness that only agrees
+    #: to a looser tolerance is not corroborating anything.
+    witness_limit = (
+        float(point_tolerance)
+        if witness_tolerance is None
+        else float(witness_tolerance)
+    )
     estimates: Dict[str, Any] = {}
     for field, published_value in published.items():
         point = (
@@ -955,6 +1114,7 @@ def measure_estimate_uncertainty(
                 field, point=point, status="not_applicable",
                 reason=declared_not_applicable[field], observations=count or None,
                 effective_n=effective_n,
+                point_status=POINT_UNVERIFIED,
             )
             continue
         if field in declared_not_computed:
@@ -962,6 +1122,7 @@ def measure_estimate_uncertainty(
                 field, point=point, status="not_computed",
                 reason=declared_not_computed[field], observations=count or None,
                 effective_n=effective_n,
+                point_status=POINT_UNVERIFIED,
             )
             continue
         if point is None:
@@ -973,6 +1134,7 @@ def measure_estimate_uncertainty(
                     "there is no number to put an interval around"
                 ),
                 observations=count or None, effective_n=effective_n,
+                point_status=POINT_UNVERIFIED,
             )
             continue
         source = source_field[field]
@@ -994,21 +1156,22 @@ def measure_estimate_uncertainty(
                 field, point=point, status="not_computed",
                 reason=blocked_reason or missing_reason,
                 observations=count or None, effective_n=effective_n,
+                point_status=POINT_UNVERIFIED,
             )
             continue
         difference = abs(float(reproduced) - point)
         if difference > float(point_tolerance):
-            estimates[field] = _uncertainty_entry(
-                field, point=point, status="not_computed",
-                reason=(
-                    f"the resampling estimator's own point value "
-                    f"({reproduced:.12g}) does not reproduce the published "
-                    f"{field} ({point:.12g}); difference {difference:.3g} "
-                    f"exceeds the {point_tolerance:g} identity tolerance. The "
-                    "band would describe a different statistic, so it is "
-                    "withheld."
-                ),
-                observations=count, effective_n=effective_n,
+            estimates[field] = _adjudicated_entry(
+                field,
+                point=point,
+                reproduced=float(reproduced),
+                difference=float(difference),
+                point_tolerance=float(point_tolerance),
+                witness_tolerance=witness_limit,
+                witness_verdict=witness_point.get(field),
+                witness_failure=witness_failure,
+                observations=count,
+                effective_n=effective_n,
             )
             continue
         interval = _percentile_interval(distribution, level)
@@ -1021,6 +1184,11 @@ def measure_estimate_uncertainty(
                     "finite value, too few for a percentile interval"
                 ),
                 observations=count, effective_n=effective_n,
+                point_status=(
+                    POINT_VERIFIED_BY_WITNESS
+                    if witness_point.get(field) is not None
+                    else POINT_REPRODUCED_BY_ESTIMATOR
+                ),
             )
             continue
         finite = distribution[np.isfinite(distribution)]
@@ -1028,6 +1196,11 @@ def measure_estimate_uncertainty(
         estimates[field] = _uncertainty_entry(
             field, point=point, status="computed", reason=None,
             observations=count, effective_n=effective_n,
+            point_status=(
+                POINT_VERIFIED_BY_WITNESS
+                if witness_point.get(field) is not None
+                else POINT_REPRODUCED_BY_ESTIMATOR
+            ),
             standard_error=(
                 None if standard_error is None
                 else round(standard_error, UNCERTAINTY_DECIMALS)
@@ -1065,10 +1238,44 @@ def measure_estimate_uncertainty(
         "resample_seed": int(seed),
         "resampling_basis": BOOTSTRAP_RESAMPLING_BASIS,
         "point_tolerance": float(point_tolerance),
-        "point_tolerance_basis": (
-            "an interval is published only after the resampling estimator "
-            "reproduces the published point value to within this tolerance, so "
-            "the band provably belongs to the statistic the reader can see"
+        "band_provenance_tolerance_basis": (
+            "a BAND-PROVENANCE test, not a truth test. An interval is published "
+            "only after the resampling estimator's own point value reproduces "
+            "the published value to within this tolerance, which is what makes "
+            "the band belong to the statistic the reader can see. It says "
+            "nothing about whether either number is CORRECT: on its own the "
+            "test cannot tell which of the two is wrong. A disagreement is "
+            "adjudicated against an independent witness - see "
+            "estimates.<field>.point_status, which states which side failed, "
+            "and witness_status / witness_tolerance on this block."
+        ),
+        "witness_tolerance": witness_limit,
+        "witness_status": (
+            "witness_ran" if witness_failure is None and witness else
+            "not_supplied" if witness is None else "witness_failed"
+        ),
+        "witness_status_basis": (
+            "an independent second derivation of the published point value, by "
+            "a different code path over the sample the point was published "
+            "from, used ONLY to decide which side of a failed reproduction test "
+            "is wrong. It never produces an interval: the band still comes from "
+            "the resampling estimator, and it is withheld whenever the "
+            "estimator's own point value misses the published one."
+            + (
+                f" The witness was evaluated over {witness_shape[0]} finite "
+                f"observation(s) and {witness_shape[1]} column(s) - the sample "
+                "the PUBLISHED value was measured on, which is not necessarily "
+                "the frame the resampling estimator was handed "
+                f"({count} observation(s), {width} column(s), published above as "
+                "observation_columns). A witness run over a mis-aligned frame "
+                "would agree with a mis-aligned ESTIMATOR rather than with the "
+                "published value and would withhold a correct point, which is "
+                "why the two frame sizes are published side by side."
+                if witness_shape is not None
+                else ""
+            )
+            + (f" Caller's basis: {witness_basis}." if witness_basis else "")
+            + (f" Not available: {witness_failure}." if witness_failure else "")
         ),
         "autocorrelation": autocorrelation,
         "estimates": estimates,
@@ -1076,6 +1283,110 @@ def measure_estimate_uncertainty(
     if notes:
         block["notes"] = dict(notes)
     return block
+
+
+def _adjudicated_entry(
+    field: str,
+    *,
+    point: float,
+    reproduced: float,
+    difference: float,
+    point_tolerance: float,
+    witness_tolerance: float,
+    witness_verdict: Optional[float],
+    witness_failure: Optional[str],
+    observations: int,
+    effective_n: Optional[float],
+) -> Dict[str, Any]:
+    """The identity test failed. Decide which of the two values is the liar.
+
+    The test itself is unchanged and still does its original job: the band is
+    withheld in every branch below, because an interval for a neighbouring
+    statistic is a fabricated precision. What changed is what happens to the
+    POINT, and the reason text, which used to assert that the published value
+    was the wrong one when it had no way of knowing.
+
+    Three outcomes, in the order they are tested:
+
+    1. The witness reproduced the published value. Then the published point is
+       corroborated by a second, independent code path and the ESTIMATOR is the
+       failing side - the frame the resampler was handed is not the sample the
+       point was measured on. The point is RETAINED.
+    2. The witness ran and also missed the published value. Then two
+       independent derivations contradict the payload and the point is
+       UNVERIFIED, so it is withheld (`point: null`) rather than published as a
+       number no code path in this module can produce. This branch is
+       unreachable on today's data; it exists so the guard is not one-sided.
+    3. Otherwise - no witness, or the witness raised, produced a non-finite
+       value, or was handed an empty frame - the point is RETAINED and flagged
+       `unverified`. NEVER withheld. A witness that cannot deliver a verdict
+       must not cost a reader a correct number, because the failure mode being
+       fixed is publishing a number nobody checked, and a fix that traded that
+       for hiding a number that was right would have replaced one defect with a
+       worse one.
+    """
+    discrepancy = (
+        f"the resampling estimator's own point value ({reproduced:.12g}) does "
+        f"not reproduce the published {field} ({point:.12g}); difference "
+        f"{difference:.3g} exceeds the {point_tolerance:g} band-provenance "
+        "tolerance. The band would describe a different statistic, so it is "
+        "withheld."
+    )
+    if witness_verdict is None:
+        return _uncertainty_entry(
+            field,
+            point=point,
+            status="not_computed",
+            reason=(
+                f"{discrepancy} The published point is RETAINED and flagged "
+                f"unverified: this guard holds two numbers and cannot say which "
+                f"is wrong without a third, and none could be produced - "
+                f"{witness_failure}. An independent re-derivation of the "
+                "published value on the sample it was published from is what "
+                "settles which side failed, and withholding a point on the "
+                "strength of a bare disagreement would have deleted correct "
+                "numbers - including this one if the estimator, not the point, "
+                "is the side that was handed a mis-aligned frame."
+            ),
+            observations=observations,
+            effective_n=effective_n,
+            point_status=POINT_UNVERIFIED,
+        )
+    witness_gap = abs(float(witness_verdict) - float(point))
+    if witness_gap <= float(witness_tolerance):
+        return _uncertainty_entry(
+            field,
+            point=point,
+            status="not_computed",
+            reason=(
+                f"{discrepancy} The ESTIMATOR is the failing side: the published "
+                f"{field} ({point:.12g}) IS reproduced ({witness_verdict:.12g}, "
+                f"difference {witness_gap:.3g}) by an independent re-derivation "
+                f"on the sample the point was published from, so the frame the "
+                f"resampling estimator was handed is not that sample. The point "
+                "is RETAINED as published."
+            ),
+            observations=observations,
+            effective_n=effective_n,
+            point_status=POINT_REPRODUCED_BY_WITNESS_ONLY,
+        )
+    return _uncertainty_entry(
+        field,
+        point=None,
+        status="not_computed",
+        reason=(
+            f"{discrepancy} The published {field} ({point:.12g}) is ALSO not "
+            f"reproduced by the independent re-derivation "
+            f"({witness_verdict:.12g}, difference {witness_gap:.3g} against the "
+            f"{witness_tolerance:g} witness tolerance), so two independent code "
+            "paths contradict the value the payload publishes. The point is "
+            "withheld rather than published as a number no available "
+            "derivation can produce."
+        ),
+        observations=observations,
+        effective_n=effective_n,
+        point_status=POINT_NOT_REPRODUCED_BY_ANY_WITNESS,
+    )
 
 
 def _scalar_or_none(value: Any) -> Optional[float]:
@@ -1250,6 +1561,64 @@ def market_model_statistics(periods: int = 252) -> Any:
 
     def alpha_annualized(block: Any) -> np.ndarray:
         return _beta_alpha(block)[1]
+
+    return {"beta": beta, "alpha_annualized": alpha_annualized}
+
+
+def market_model_witness(periods: int = 252) -> Dict[str, Any]:
+    """A SECOND, independent derivation of beta and alpha, by least squares.
+
+    This is the `witness` for the market-model block, and it exists to answer
+    one question `market_model_statistics` structurally cannot: when the
+    resampling estimator's own point value misses the published value, WHICH of
+    the two is the liar?  A witness that restated the same expression would
+    always agree with the estimator and would be worthless as an arbiter, so
+    this deliberately shares no arithmetic with it:
+
+      * `market_model_statistics` uses the tear sheet's closed form,
+        `cov(p, b) / var(b)`, with both terms on ddof=1, and gets alpha by
+        subtracting `beta * b.mean()` from `p.mean()`.  It divides by a variance,
+        so a degenerate benchmark column makes it `0 / 0`.
+      * this solves the normal equations directly with `np.linalg.lstsq` on the
+        design matrix `[1, b]` and reads the slope and the intercept straight out
+        of the solution vector.  No covariance, no variance, no ddof.  The
+        intercept IS the daily Jensen alpha, so `alpha_annualized` is that
+        intercept scaled by `periods` rather than the mean subtraction restated.
+
+    The two are algebraically equivalent where both are well defined, so on a
+    correctly aligned frame they agree to floating-point noise - which is what
+    makes agreement meaningful evidence.  Where the closed form is not defined
+    they are not equivalent at all: on a rank-deficient design `lstsq` returns
+    the minimum-norm solution where the closed form returns a non-finite value,
+    and that divergence is the proof that these are two different code paths and
+    not one expression written twice.
+
+    `block` is ``(n, draws, 2)``, column 0 the portfolio and column 1 the
+    benchmark, exactly as for `market_model_statistics`.
+    """
+    scale = float(periods)
+
+    def _solve(block: Any) -> Tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(block, dtype=float)
+        rows, draws = int(values.shape[0]), int(values.shape[1])
+        # [intercept, benchmark] - the design matrix a regression on a constant
+        # column is actually solving, assembled rather than assumed.
+        design = np.empty((rows, 2), dtype=float)
+        design[:, 0] = 1.0
+        design[:, 1] = values[:, 0, 1]
+        slopes = np.empty(draws, dtype=float)
+        intercepts = np.empty(draws, dtype=float)
+        for draw in range(draws):
+            solution, *_ = np.linalg.lstsq(design, values[:, draw, 0], rcond=None)
+            slopes[draw] = float(solution[1])
+            intercepts[draw] = float(solution[0])
+        return slopes, intercepts
+
+    def beta(block: Any) -> np.ndarray:
+        return _solve(block)[0]
+
+    def alpha_annualized(block: Any) -> np.ndarray:
+        return _solve(block)[1] * scale
 
     return {"beta": beta, "alpha_annualized": alpha_annualized}
 
