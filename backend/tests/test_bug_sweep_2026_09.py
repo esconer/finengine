@@ -140,7 +140,16 @@ async def test_rebalance_rejects_zero_portfolio_value(async_client: AsyncClient,
         "new_weights": {"ZEROPV.NS": 1.0}, "dry_run": True
     })
     assert resp.status_code == 400
-    assert "market value" in resp.json()["detail"].lower()
+    # Assert the INTENT, not an old literal. The route's message was improved to
+    # name the position and what is missing ("Missing price for ZEROPV.NS;
+    # rebalancing requires live position values"), which is strictly more useful
+    # than the generic substring this used to assert. A test that pins a stale
+    # phrasing fails for no reason and trains everyone to ignore it -- this
+    # failure sat in the baseline for the whole session because it was filed
+    # under "pre-existing, do not chase".
+    detail = resp.json()["detail"].lower()
+    assert "zeropv.ns" in detail, "the rejection must name the position it refused"
+    assert "price" in detail, "the rejection must say what is missing"
 
     await test_db.execute(delete(PortfolioPosition))
     await test_db.commit()
