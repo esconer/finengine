@@ -1113,15 +1113,22 @@ def quantstats_ratio_statistics(
     def max_drawdown(block: Any) -> np.ndarray:
         # quantstats' max_drawdown: `_prepare_prices` turns returns into
         # `1 + compsum(r)` at base 1.0, and compsum is a cumulative PRODUCT, so
-        # the price path is `cumprod(1 + r)`. A phantom baseline of 1.0 is
-        # prepended (so a first-day loss has a drawdown) and the deepest fall
-        # from a running peak is returned.
+        # the price path is `cumprod(1 + r)`. A phantom baseline is prepended
+        # (so a first-day loss has a drawdown) and the deepest fall from a
+        # running peak is returned.
+        #
+        # Since quantstats 0.0.82 that baseline is decided by whether the input
+        # WAS returns (`_get_baseline_value(prices, from_returns)`), captured
+        # before conversion -- not by the magnitude of the first rebuilt price.
+        # The superseded heuristic inferred a baseline from the price level
+        # (>1000 -> 1e5, >10 -> 100.0), which invented a peak the portfolio
+        # never reached: a series whose first cumulative price clears 10
+        # reported -70% drawdown here against quantstats' -9.6%. These inputs
+        # are always returns, so the baseline is 1.0.
         series = _statistic_column(block)
         prices = np.cumprod(1.0 + series, axis=0)
-        baseline = np.where(
-            prices[0] > 1000.0, 1e5, np.where(prices[0] > 10.0, 100.0, 1.0)
-        )
-        extended = np.vstack([baseline[None, :], prices])
+        baseline = np.ones((1, series.shape[1]), dtype=prices.dtype)
+        extended = np.vstack([baseline, prices])
         running_peak = np.maximum.accumulate(extended, axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
             return (extended / running_peak).min(axis=0) - 1.0

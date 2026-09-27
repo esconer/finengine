@@ -6,10 +6,10 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
@@ -329,7 +329,7 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "quantlib", specifier = ">=1.40" },
-    { name = "quantstats" },
+    { name = "quantstats", specifier = ">=0.0.85" },
     { name = "requests" },
     { name = "responses", marker = "extra == 'dev'", specifier = "==0.25.0" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
@@ -3047,7 +3047,7 @@ wheels = [
 
 [[package]]
 name = "quantstats"
-version = "0.0.81"
+version = "0.0.85"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
@@ -3059,9 +3059,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "yfinance" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/a8/33f31a0d179b6c4ffefa1a4318a78075ea96f7ace7292663f1a99acebdd6/quantstats-0.0.81.tar.gz", hash = "sha256:91f44895e4481167255384c2297193233255b427e3a09a3fa111a5ce77e9b44a", size = 87569, upload-time = "2026-01-13T18:18:20.005Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/ed/d5557546565a463c4de100f91d12be2d9ea209211a1f823c65dcd8723df6/quantstats-0.0.85.tar.gz", hash = "sha256:f7440e456f7f79a2f9b7c523353d2c71b2756ba2006857b6a4589f7e5f5e13a0", size = 98074, upload-time = "2026-09-26T20:10:57.048Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1a/d4/484041d5c5a5d3ec8df5c74fef3054fec004dab554f6c3c00187888f8cc1/quantstats-0.0.81-py3-none-any.whl", hash = "sha256:6af2b501f61917c8c960faaf8007eb858d970ab02a3cf0d7dc19f048953e15f3", size = 90067, upload-time = "2026-01-13T18:18:18.451Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/82/2eaa965376c16c5411b567e4cd62d7e4f16f761d299d0dcaf7921630336e/quantstats-0.0.85-py3-none-any.whl", hash = "sha256:0ad4f65bb4b1b6426a33bb1ca7dd2cf6b8db44a6e7bc17e5503313607fdc7d4e", size = 96283, upload-time = "2026-09-26T20:10:55.745Z" },
 ]
 
 [[package]]
