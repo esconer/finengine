@@ -419,7 +419,18 @@ CONCENTRATION_DIVERSIFICATION_SCALE = {
     "holdings_basis": (
         "n_holdings counts the rows with a strictly positive, finite weight "
         "AFTER the weights are normalized to sum to 1. Zero, negative and "
-        "non-finite rows are not holdings and are excluded before the count"
+        "non-finite rows are not holdings and are excluded before the count. "
+        "Each holding is counted ONCE, at its own weight, with no look-through "
+        "into its own constituents: a holding that is itself a fund is one row "
+        "here and is never decomposed into what it holds. That is a LIMITATION "
+        "of this measure rather than a claim about it - the concentration inside "
+        "a single holding is not measured here, is not in n_holdings, and is not "
+        "in herfindahl_index. On a book of Indian listings that means a US "
+        "megacap-technology fund is ONE of fourteen holdings, so the book reads "
+        "as fourteen-way diversified while the technology exposure inside that "
+        "one row is unmeasured, and any currency the holding trades in a currency "
+        "other than the book's is likewise not represented anywhere in this "
+        "block"
     ),
 }
 
@@ -437,7 +448,21 @@ CONCENTRATION_DIVERSIFICATION_RATIO_FORMULA = (
     "from diversification_score, not a second expression of it: the ratio "
     "coincides with the score (as a fraction) only at equal weight, and it "
     "falls as the book concentrates while the score is normalized against "
-    "n_holdings. The two are not expected to agree and are not reconciled here"
+    "n_holdings. The two are not expected to agree and are not reconciled here. "
+    "ORIENTATION, because the two run on different scales and reading one as the "
+    "other makes a single book look self-contradictory: the ratio's MAXIMUM is "
+    "1.0, at equal weight, which is exactly where diversification_score is at "
+    "its 100, and the ratio's MINIMUM is 1 / n_holdings, at one holding "
+    "carrying the whole book, which is exactly where diversification_score is at "
+    "its 0. Both therefore point the same way - larger is better diversified - "
+    "so the ratio reads as the fraction of the book that behaves as if it were "
+    "independently and equally weighted (a ratio of r on a book of n holdings "
+    "is a book behaving as if it held about r * n equal names), while the score "
+    "reads as the percentage of the way from one holding to equal weight. A "
+    "book can and does publish a ratio near 0.8 next to a score near 100: those "
+    "are the same concentration on two scales, not two numbers that disagree, "
+    "and the ratio is not a percentage of diversification to be compared with "
+    "the score"
 )
 
 #: `effective_positions` is built from the UNROUNDED Herfindahl index while
@@ -690,6 +715,20 @@ RISK_SCORE_PUBLISHED_DP_TOLERANCE = 1e-4
 #: Where each leg input's own precision is published, when it is.  A leg whose
 #: input is absent from this map has NO precision disclosure in this section,
 #: and the leg says so rather than borrowing one.
+#:
+#: EVERY value here must resolve to a node that actually carries a standard error
+#: or an interval.  That is the whole contract, and it is not decorative: this
+#: map used to carry `"herfindahl_index": "score_audit.precision.declared_constants"`,
+#: which pointed a MEASURED input (`input_statistic_provenance: "measured"`) at
+#: the weight table - a node whose own class definition says it "was never
+#: estimated" and whose `standard_error` and `conf_int` are both `null`.  The
+#: sub-score therefore claimed to inherit a precision from a node that declares
+#: it has none, and the node it should have pointed at
+#: (`score_audit.precision.estimated_statistics`) holds only the two estimated
+#: statistics, so there was no Herfindahl disclosure anywhere in the block.  A
+#: null pointer with the reason is strictly more informative than a pointer to
+#: nothing, and `test_every_inherits_precision_pointer_resolves_to_a_real_figure`
+#: is the general form that catches the whole class.
 RISK_SCORE_INPUT_PRECISION_AT: Dict[str, str] = {
     "avg_pairwise_correlation": (
         "score_audit.precision.estimated_statistics.avg_pairwise_correlation"
@@ -699,11 +738,6 @@ RISK_SCORE_INPUT_PRECISION_AT: Dict[str, str] = {
         "score_audit.precision.estimated_statistics.factor_r_squared"
         ".estimates.factor_r_squared"
     ),
-    # The Herfindahl index is exact arithmetic on the weights - sum of squared
-    # active weights - so its precision is the weights' precision, which is nil
-    # because they are declared constants.  Saying that is more useful than
-    # publishing a "no disclosure" that reads as an oversight.
-    "herfindahl_index": "score_audit.precision.declared_constants",
 }
 
 RISK_SCORE_PAIRWISE_ESTIMATOR_BASIS = (
@@ -1002,6 +1036,79 @@ def effective_sample_size(
     return float(int(observations)) * (1.0 - rho) / (1.0 + rho)
 
 
+#: The PUBLISHED precision of both numbers on an `autocorrelation_disclosure`
+#: block, declared rather than left implicit in a `round()` call.
+#:
+#: This was a real and separate defect, not a style one.  `ar1` was published
+#: rounded to 6 decimals and `effective_n` rounded to 4, but `effective_n` was
+#: COMPUTED from the unrounded `ar1`.  The block publishes the formula
+#: `n * (1 - ar1) / (1 + ar1)` next to both figures, so a reader who does what the
+#: payload invites - substitute the published `ar1` and the published `n` - gets
+#: a different `effective_n` than the one printed.  On the v26 book that
+#: happened on 19 of the 40 blocks carrying all three numbers, worst at
+#: `positions.MOTILALOFS.NS` (n = 173, ar1 = -0.090892, published
+#: effective_n 207.5926) where recomputation gives 207.5928449.
+#:
+#: WHY A SHARED DECIMAL COUNT IS NOT THE FIX, stated because it looks like the
+#: fix and is not.  Rounding `ar1` to `d` decimals moves `effective_n` by at
+#: most `2n / (1 + ar1)^2 * 0.5 * 10^-d`.  For n = 173 and ar1 = -0.09 that is
+#: 385 * 0.5 * 10^-d, and the half-ulp of a 4-decimal `effective_n` is 5e-5, so
+#: agreement to the last published place would need `d >= 8` - on a book of
+#: several hundred names, `d >= 10`.  Publishing noise digits to make a formula
+#: line up is the wrong trade, and moving `effective_n` to match the published
+#: `ar1` would move a published number to flatter a formula.
+#:
+#: So the DECLARATION is the fix: both precisions are published, and the block
+#: publishes the agreement it actually has, as a bound a reader can recompute
+#: from `n`, `ar1` and the two declared decimals.  See
+#: `effective_n_reproducibility_bound`.
+AUTOCORRELATION_AR1_DECIMALS = UNCERTAINTY_DECIMALS
+AUTOCORRELATION_EFFECTIVE_N_DECIMALS = 4
+
+AUTOCORRELATION_EFFECTIVE_N_REPRODUCIBILITY_BASIS = (
+    "effective_n is computed from the UNROUNDED ar1 and ar1 is published "
+    "rounded, so substituting the published ar1 and the published n into the "
+    "published formula does not return the published effective_n exactly. The "
+    "difference is bounded by the half-ulp of effective_n's own last published "
+    "place plus the ar1 rounding amplified through the formula's sensitivity "
+    "d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound "
+    "published here. That bound is a statement about the rounding, not an "
+    "error: neither figure was moved to make the other agree, and a reader who "
+    "recomputes from the published inputs will land inside the bound rather than "
+    "on the last digit"
+)
+
+
+def effective_n_reproducibility_bound(
+    observations: Optional[int], published_ar1: Optional[float]
+) -> Optional[float]:
+    """The worst-case disagreement between the published figure and a recomputation.
+
+    Computed from PUBLISHED inputs only - ``n``, the rounded ``ar1`` and the two
+    declared decimal counts - so a reader can reproduce the bound itself rather
+    than take it on trust.
+
+    ``effective_n = f(n, ar1)`` is smooth with ``f'(rho) = -2n / (1 + rho)^2``, so
+    by the mean value theorem the error from a half-step of `ar1` rounding is at
+    most ``|f'| * half_step``, evaluated where ``|f'|`` is largest - at the small
+    ``1 + rho`` end of the rounding interval.  Added to that is the half-ulp of
+    `effective_n`'s own rounding.  The two terms are the whole story.
+    """
+    if observations is None or published_ar1 is None:
+        return None
+    count = int(observations)
+    rho = float(published_ar1)
+    if count <= 0 or not np.isfinite(rho):
+        return None
+    ar1_half_step = 0.5 * 10.0 ** (-AUTOCORRELATION_AR1_DECIMALS)
+    effective_half_step = 0.5 * 10.0 ** (-AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
+    # The worst `|f'|` sits at the smallest `1 + rho` the rounding interval can
+    # reach.  Clamped at the stationary boundary, where `f` is not defined.
+    worst_rho = max(rho - ar1_half_step, -1.0 + 1e-9)
+    amplification = 2.0 * count / (1.0 + worst_rho) ** 2
+    return float(effective_half_step + amplification * ar1_half_step)
+
+
 def autocorrelation_disclosure(observations: Any) -> Dict[str, Any]:
     """`ar1` / `effective_n` for a block, or the reason neither exists."""
     values = np.asarray(observations, dtype=float)
@@ -1010,12 +1117,28 @@ def autocorrelation_disclosure(observations: Any) -> Dict[str, Any]:
     ar1 = ar1_autocorrelation(series)
     effective = effective_sample_size(count, ar1)
     computed = ar1 is not None and effective is not None
+    published_ar1 = (
+        round(ar1, AUTOCORRELATION_AR1_DECIMALS) if ar1 is not None else None
+    )
+    published_effective = (
+        round(effective, AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
+        if effective is not None else None
+    )
+    # Recomputed from the PUBLISHED inputs, exactly as a reader would, so the
+    # agreement this block claims is measured rather than asserted.
+    recomputed = effective_sample_size(count, published_ar1)
+    deviation = (
+        abs(recomputed - published_effective)
+        if recomputed is not None and published_effective is not None
+        else None
+    )
+    bound = effective_n_reproducibility_bound(count, published_ar1)
     return {
-        "ar1": round(ar1, UNCERTAINTY_DECIMALS) if ar1 is not None else None,
+        "ar1": published_ar1,
+        "ar1_decimals": AUTOCORRELATION_AR1_DECIMALS,
         "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
-        "effective_n": (
-            round(effective, 4) if effective is not None else None
-        ),
+        "effective_n": published_effective,
+        "effective_n_decimals": AUTOCORRELATION_EFFECTIVE_N_DECIMALS,
         "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
         "effective_n_basis": (
             "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to "
@@ -1023,6 +1146,18 @@ def autocorrelation_disclosure(observations: Any) -> Dict[str, Any]:
             "carries the same information about the mean as the measured n; "
             "below n whenever the returns are positively autocorrelated."
         ),
+        "effective_n_reproducibility": {
+            "recomputes_from_published_ar1": (
+                None if deviation is None else bool(deviation == 0.0)
+            ),
+            "recomputation_deviation": deviation,
+            "recomputation_deviation_bound": bound,
+            "bound_basis": (
+                AUTOCORRELATION_EFFECTIVE_N_REPRODUCIBILITY_BASIS
+                if computed
+                else None
+            ),
+        },
         "observations": count,
         "naive_n_would_assume": "independent observations, which the measured "
         "AR(1) does not support",
@@ -1377,11 +1512,23 @@ def measure_estimate_uncertainty(
         autocorrelation_disclosure(values)
         if count
         else {
+            # Same shape as the computed branch, so a consumer reads one block.
+            # The two DECLARED keys are the convention itself and are published
+            # even with nothing to apply them to: the precision a figure would
+            # be published at is a property of the convention, not of the data.
             "ar1": None,
+            "ar1_decimals": AUTOCORRELATION_AR1_DECIMALS,
             "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
             "effective_n": None,
+            "effective_n_decimals": AUTOCORRELATION_EFFECTIVE_N_DECIMALS,
             "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
             "effective_n_basis": None,
+            "effective_n_reproducibility": {
+                "recomputes_from_published_ar1": None,
+                "recomputation_deviation": None,
+                "recomputation_deviation_bound": None,
+                "bound_basis": None,
+            },
             "observations": 0,
             "naive_n_would_assume": None,
             "status": "not_computed",
@@ -2898,6 +3045,15 @@ def _risk_score_audit(
 #: Why a derived sub-score gets no interval of its own.  Published as data
 #: rather than as a comment so a consumer that reads only the numbers cannot
 #: mistake the absence for an oversight.
+#:
+#: TWO forms, not one form with a hole in it.  The single-template version had a
+#: null `inherits_precision_at` substituted into the middle of a sentence, which
+#: produced "... published at no precision disclosure for this input is published
+#: in this section ..." - a clause spliced into a clause, published on the
+#: `volatility` and `market_risk` legs.  The two branches below share the same
+#: opening and the same closing sentence, so a reader sees one shape; only the
+#: middle sentence differs, because a pointer and its absence are different facts
+#: and only one of them can end a sentence.
 RISK_SCORE_DERIVED_NO_INTERVAL_REASON = (
     "not computed: this sub-score is a deterministic function of one published "
     "input ({input_statistic} = {input_value}), not an independent estimate. Its "
@@ -2906,6 +3062,55 @@ RISK_SCORE_DERIVED_NO_INTERVAL_REASON = (
     "function of an already-published number, not the uncertainty of anything "
     "this sub-score measured, and a reader could not tell the two apart."
 )
+
+#: The same reason for a leg whose input is MEASURED but has no precision block
+#: in this section.  A measured input is not a declared constant: it has a real
+#: sampling distribution, and the honest statement is that this section does not
+#: publish a band for it and names where such a band would go - not that one was
+#: asked for and does not exist.
+RISK_SCORE_DERIVED_UNPUBLISHED_INPUT_REASON = (
+    "not computed: this sub-score is a deterministic function of one published "
+    "input ({input_statistic} = {input_value}), not an independent estimate. That "
+    "input is {provenance}, so it has a real sampling distribution, and this "
+    "section publishes no standard error or interval for it: the measured inputs "
+    "that DO carry a band are published under "
+    "score_audit.precision.estimated_statistics, and this input has no block "
+    "there. Its precision is therefore declared UNSTATED rather than asserted, "
+    "and the input's own row in score_audit.components.{leg}.input_sample is the "
+    "sample any such band would be measured on. A second resampling interval "
+    "here would describe a function of an already-published number, not the "
+    "uncertainty of anything this sub-score measured, and a reader could not "
+    "tell the two apart."
+)
+
+
+def _risk_score_derived_no_interval_reason(
+    *,
+    leg: str,
+    input_statistic: str,
+    input_value: Any,
+    provenance: Any,
+    inherits_at: Optional[str],
+) -> str:
+    """The one reason for a derived sub-score, in whichever of its two forms.
+
+    Kept as a function rather than a second `.format()` at the call site so the
+    branch is chosen in exactly one place: an `inherits_precision_at` that is
+    `None` cannot be substituted into the resolved-pointer sentence, and the
+    earlier template did exactly that.
+    """
+    if inherits_at:
+        return RISK_SCORE_DERIVED_NO_INTERVAL_REASON.format(
+            input_statistic=input_statistic,
+            input_value=input_value,
+            inherits_at=inherits_at,
+        )
+    return RISK_SCORE_DERIVED_UNPUBLISHED_INPUT_REASON.format(
+        input_statistic=input_statistic,
+        input_value=input_value,
+        provenance=provenance or "not classified",
+        leg=leg,
+    )
 
 RISK_SCORE_DECLARED_NO_STANDARD_ERROR_REASON = (
     "not applicable: this is a declared policy constant read from "
@@ -3117,6 +3322,17 @@ def _risk_score_precision(
         input_statistic = str(spec["input_statistic"])
         entry = audit_components.get(name) or {}
         inherits_at = RISK_SCORE_INPUT_PRECISION_AT.get(input_statistic)
+        # One reason string, built once, and used for BOTH the standard error and
+        # the interval.  The two were previously formatted separately from the
+        # same template with different fallbacks, so a leg could publish two
+        # differently-worded statements about the same absent interval.
+        no_interval_reason = _risk_score_derived_no_interval_reason(
+            leg=name,
+            input_statistic=input_statistic,
+            input_value=entry.get("input_statistic_value"),
+            provenance=entry.get("input_statistic_provenance"),
+            inherits_at=inherits_at,
+        )
         derived[name] = {
             "classification": "deterministic_derivation",
             "published_value_at": f"components.{name}",
@@ -3128,27 +3344,9 @@ def _risk_score_precision(
             "inherits_precision_from": input_statistic,
             "inherits_precision_at": inherits_at,
             "standard_error": None,
-            "standard_error_reason": RISK_SCORE_DERIVED_NO_INTERVAL_REASON.format(
-                input_statistic=input_statistic,
-                input_value=entry.get("input_statistic_value"),
-                inherits_at=inherits_at or (
-                    "no precision disclosure for this input is published in this "
-                    "section (see the input's own row in score_audit.components."
-                    f"{name}.input_sample); the sub-score's precision is "
-                    "therefore declared unstated rather than asserted"
-                ),
-            ),
+            "standard_error_reason": no_interval_reason,
             "conf_int": None,
-            "conf_int_reason": (
-                RISK_SCORE_DERIVED_NO_INTERVAL_REASON.format(
-                    input_statistic=input_statistic,
-                    input_value=entry.get("input_statistic_value"),
-                    inherits_at=inherits_at or (
-                        "no precision disclosure for this input is published in "
-                        f"this section (score_audit.components.{name})"
-                    ),
-                )
-            ),
+            "conf_int_reason": no_interval_reason,
         }
 
     declared = {
@@ -6270,7 +6468,14 @@ FORECAST_PORTFOLIO_REFIT_RESAMPLES = UNCERTAINTY_BOOTSTRAP_RESAMPLES
 #: re-running the ARCH optimiser once per draw - a full fit, not a vectorised
 #: reduction - so a book of N legs costs N times what one costs.  Measured on the
 #: real 14-position book: 1001 refits for the portfolio leg cost 17.3 s, and 200
-#: per leg across the fourteen legs cost a further 51.3 s, 3800 fits in total.  On
+#: per leg across the fourteen legs cost a further 51.3 s - 3801 fits in total,
+#: and the arithmetic is the point: the 1001 is the
+#: :data:`FORECAST_PORTFOLIO_REFIT_RESAMPLES` RESAMPLED fits plus the one original
+#: fit the section measured, so it is `RESAMPLES + 1` and not a round number, and
+#: `1001 + 200 * 14 = 3801`.  An earlier version of this comment said "3800 fits
+#: in total" beside those same two parts, which is the arithmetic defect the
+#: `measurements_withheld.why_not_measured` prose still carries on the route
+#: module.  On
 #: a host a few times slower that is more than this section's 180 s assembly
 #: budget (`ai_context_service._SECTION_TIMEOUT_SECONDS`), and a section that
 #: overruns its budget is not merely slow: `asyncio.wait_for` cancels the

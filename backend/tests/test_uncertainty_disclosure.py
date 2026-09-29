@@ -46,14 +46,18 @@ from app.debugging.context_audit import (
     UNCERTAINTY_KEY_TOKENS,
 )
 from app.services.analytics_engine import (
+    AUTOCORRELATION_AR1_DECIMALS,
+    AUTOCORRELATION_EFFECTIVE_N_DECIMALS,
     UNCERTAINTY_BOOTSTRAP_RESAMPLES,
     UNCERTAINTY_BOOTSTRAP_SEED,
     UNCERTAINTY_CONFIDENCE_LEVEL,
+    UNCERTAINTY_DECIMALS,
     UNCERTAINTY_MIN_OBSERVATIONS,
     AnalyticsEngine,
     RISK_SCORE_PAIRWISE_ROW_FILTER,
     ar1_autocorrelation,
     autocorrelation_disclosure,
+    effective_n_reproducibility_bound,
     effective_sample_size,
     engine_risk_statistics,
     market_model_statistics,
@@ -703,6 +707,199 @@ def test_effective_n_travels_with_every_published_interval():
         assert entry["effective_n"] == pytest.approx(
             block["autocorrelation"]["effective_n"], abs=1e-6
         )
+
+
+# ---------------------------------------------------------------------------
+# the PUBLISHED formula has to reproduce the PUBLISHED figure
+# ---------------------------------------------------------------------------
+
+def _autocorrelation_blocks(node, path="", found=None):
+    """Every `autocorrelation_disclosure` block in a payload, by identity."""
+    found = {} if found is None else found
+    if isinstance(node, dict):
+        if {"ar1", "effective_n", "effective_n_formula"} <= set(node):
+            found.setdefault(path or "root", node)
+        for key, value in node.items():
+            _autocorrelation_blocks(value, f"{path}.{key}" if path else key, found)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            _autocorrelation_blocks(value, f"{path}[{index}]", found)
+    return found
+
+
+def _recompute_from_published_inputs(block):
+    """What a reader gets by doing what the payload invites.
+
+    Substitute the PUBLISHED ``ar1`` and the PUBLISHED ``n`` into the PUBLISHED
+    formula.  Deliberately not the module's own ``effective_sample_size``: the
+    point is to be an outside reader, and the two differ by exactly the amount
+    this test is about.
+    """
+    n = float(block["observations"])
+    ar1 = float(block["ar1"])
+    return n * (1.0 - ar1) / (1.0 + ar1)
+
+
+def _assert_formula_reproduces_figure(block, where: str) -> None:
+    if block["effective_n"] is None or block["ar1"] is None:
+        return
+    assert block["effective_n_formula"] == "n * (1 - ar1) / (1 + ar1)", where
+    # 1. the two PRECISIONS are declared, not implicit in a round() call
+    assert block["ar1_decimals"] == AUTOCORRELATION_AR1_DECIMALS, where
+    assert block["effective_n_decimals"] == AUTOCORRELATION_EFFECTIVE_N_DECIMALS, where
+    # 2. the declared precision is the one the figures actually carry
+    assert round(float(block["ar1"]), AUTOCORRELATION_AR1_DECIMALS) == block["ar1"], where
+    assert round(float(block["effective_n"]), AUTOCORRELATION_EFFECTIVE_N_DECIMALS) == (
+        block["effective_n"]
+    ), where
+    # 3. the block states the agreement it has, in a bound a reader can recompute
+    reproducibility = block["effective_n_reproducibility"]
+    deviation = abs(_recompute_from_published_inputs(block) - float(block["effective_n"]))
+    assert reproducibility["recomputation_deviation"] == pytest.approx(deviation, abs=0.0), (
+        f"{where}: the published deviation is not the real one"
+    )
+    assert reproducibility["recomputes_from_published_ar1"] == (deviation == 0.0), where
+    # 4. and the real deviation is inside the published bound, recomputed here
+    #    from PUBLISHED inputs only - n, ar1 and the two declared decimals
+    assert reproducibility["recomputation_deviation_bound"] == pytest.approx(
+        effective_n_reproducibility_bound(block["observations"], block["ar1"]), abs=0.0
+    ), where
+    assert deviation <= float(reproducibility["recomputation_deviation_bound"]) + 1e-12, (
+        f"{where}: recomputing the published formula from the published ar1 "
+        f"and n misses the published effective_n by {deviation:.3e}, outside the "
+        f"published bound {reproducibility['recomputation_deviation_bound']:.3e}"
+    )
+    assert reproducibility["bound_basis"], where
+
+
+class TestEffectiveNReproducesFromItsOwnPublishedInputs:
+    """The general form: the formula, the inputs and the figure all on one block.
+
+    The defect: ``ar1`` was published at 6 decimals and ``effective_n`` at 4,
+    while ``effective_n`` was computed from the UNROUNDED ``ar1``.  So the
+    published formula did not reproduce the published figure from the published
+    inputs - on 19 of the 40 blocks in the v26 artifact that carry all three
+    numbers, worst by 2.4e-4.  Nothing declared a precision anywhere, so a
+    reader had no way to know which of the two numbers to believe.
+
+    Neither figure is moved here.  The fix is the DECLARATION, plus the
+    agreement the block actually has - and the test recomputes the bound from
+    published inputs, so the disclosure cannot be a promise nobody checked.
+    """
+
+    def test_the_disclosure_declares_both_precisions_on_a_computed_block(self):
+        block = autocorrelation_disclosure(_positive_autocorrelated(n=400, rho=0.5))
+        _assert_formula_reproduces_figure(block, "autocorrelation_disclosure")
+
+    def test_the_absent_block_declares_the_same_precisions_and_claims_nothing(self):
+        flat = autocorrelation_disclosure(np.zeros(60))
+        assert flat["status"] == "not_computed"
+        # the precision is a property of the CONVENTION, so it is published
+        # even where there is nothing to apply it to
+        assert flat["ar1_decimals"] == AUTOCORRELATION_AR1_DECIMALS
+        assert flat["effective_n_decimals"] == AUTOCORRELATION_EFFECTIVE_N_DECIMALS
+        reproducibility = flat["effective_n_reproducibility"]
+        assert reproducibility["recomputation_deviation"] is None
+        assert reproducibility["recomputation_deviation_bound"] is None
+        assert reproducibility["recomputes_from_published_ar1"] is None
+        assert reproducibility["bound_basis"] is None
+        assert effective_n_reproducibility_bound(0, None) is None
+        assert effective_n_reproducibility_bound(400, None) is None
+
+    @pytest.mark.parametrize("rho", [-0.3, -0.05, 0.0, 0.05, 0.4, 0.8])
+    @pytest.mark.parametrize("n", [39, 173, 400])
+    def test_every_shape_of_window_reproduces_to_its_declared_precision(self, n, rho):
+        values = _positive_autocorrelated(n=n, rho=rho)
+        block = autocorrelation_disclosure(values)
+        assert block["status"] == "computed"
+        _assert_formula_reproduces_figure(block, f"n={n} rho={rho}")
+
+    def test_the_declared_precision_is_what_the_figures_carry(self):
+        """Not a promise about the future: an assertion about these values."""
+        seen = set()
+        for n, rho in ((39, 0.107), (120, -0.2), (173, -0.0908), (400, 0.5)):
+            block = autocorrelation_disclosure(_positive_autocorrelated(n=n, rho=rho))
+            assert len(str(block["ar1"]).split(".")[1]) <= AUTOCORRELATION_AR1_DECIMALS
+            assert len(str(block["effective_n"]).split(".")[1]) <= (
+                AUTOCORRELATION_EFFECTIVE_N_DECIMALS
+            )
+            seen.add((block["ar1_decimals"], block["effective_n_decimals"]))
+        assert seen == {(AUTOCORRELATION_AR1_DECIMALS,
+                         AUTOCORRELATION_EFFECTIVE_N_DECIMALS)}
+
+    def test_declaring_the_precision_did_not_move_either_figure(self):
+        """The fix is disclosure-only, and this is the proof rather than a claim.
+
+        The figures were `round(ar1, 6)` and `round(effective_n, 4)` before the
+        precision was published.  `AUTOCORRELATION_AR1_DECIMALS` is bound to
+        `UNCERTAINTY_DECIMALS` - the same 6 the old literal used, one source -
+        and `AUTOCORRELATION_EFFECTIVE_N_DECIMALS` is the old literal's own 4.
+        Recomputing both from the unrounded values with those counts has to
+        reproduce the published figures exactly, or a published number moved.
+        """
+        assert AUTOCORRELATION_AR1_DECIMALS == UNCERTAINTY_DECIMALS == 6
+        assert AUTOCORRELATION_EFFECTIVE_N_DECIMALS == 4
+        for n, rho, seed in ((39, 0.107, 2), (173, -0.0908, 2), (400, 0.5, 5),
+                             (311, 0.61, 11), (58, -0.42, 3)):
+            series = _positive_autocorrelated(n=n, rho=rho, seed=seed)
+            unrounded_ar1 = ar1_autocorrelation(series)
+            unrounded_effective = effective_sample_size(n, unrounded_ar1)
+            block = autocorrelation_disclosure(series)
+            assert block["ar1"] == round(unrounded_ar1, 6)
+            assert block["effective_n"] == round(unrounded_effective, 4)
+            # and NOT the value a reader recomputes from the published ar1, on
+            # the windows where the two differ - which is why the bound exists
+            recomputed = effective_sample_size(n, block["ar1"])
+            assert recomputed is not None
+            if abs(recomputed - block["effective_n"]) > 0.0:
+                assert block["effective_n_reproducibility"][
+                    "recomputes_from_published_ar1"
+                ] is False
+
+    def test_a_two_column_frame_reports_the_first_series_and_says_so(self):
+        """`autocorrelation_disclosure` reads column 0 of a 2-D frame.
+
+        Pre-existing behaviour, pinned here because the published `n` is what
+        the formula is evaluated at, and a reader recomputing from a multi-name
+        frame would otherwise use the wrong one.
+        """
+        values = _returns(n=250, k=4, seed=61).to_numpy(dtype=float)
+        block = autocorrelation_disclosure(values)
+        assert block["observations"] == 250
+        _assert_formula_reproduces_figure(block, "two-column frame")
+
+    def test_every_autocorrelation_block_in_a_real_payload_reproduces(self):
+        """The whole-payload form, over three independently built blocks.
+
+        Each producer is a different caller of the shared convention, so this is
+        the form that would catch a caller adding its own rounding rather than
+        reading the declared one.
+        """
+        frame = _returns(seed=61)
+        series = _series(n=220, seed=31)
+        payloads = {
+            "optimization": optimize(frame, "hrp")["estimate_uncertainty"],
+            "engine_risk_statistics": measure_estimate_uncertainty(
+                series.to_numpy(dtype=float),
+                engine_risk_statistics(0.02),
+                {"sharpe_ratio": float(series.mean() / series.std())},
+                scope="unit test",
+            ),
+            "market_model": measure_estimate_uncertainty(
+                frame.to_numpy(dtype=float),
+                market_model_statistics(252),
+                {"beta": 1.0},
+                scope="unit test",
+            ),
+        }
+        checked = 0
+        for name, payload in payloads.items():
+            blocks = _autocorrelation_blocks(payload)
+            assert blocks, f"{name}: no autocorrelation block was found to check"
+            for where, block in blocks.items():
+                _assert_formula_reproduces_figure(block, f"{name}:{where}")
+                checked += 1
+        assert checked >= 3, f"only {checked} blocks were checked"
 
 
 # ---------------------------------------------------------------------------

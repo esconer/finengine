@@ -183,6 +183,84 @@ class TestQuantitativeInvariants:
         assert result["effective_positions"] == pytest.approx(published, abs=0.02)
         assert result["n_holdings"] == 14
 
+    @pytest.mark.asyncio
+    async def test_holdings_basis_states_the_look_through_limitation(self):
+        """One holding is ONE row, and that is a limitation, not a measurement.
+
+        `n_holdings` counts rows. A holding that is itself a fund is never
+        decomposed, so a US mega-cap technology fund on a book of Indian listings
+        is one of the fourteen, and the book reads as fourteen-way diversified
+        while the technology exposure inside that one row is unmeasured. Stating
+        it is the difference between a reader who is misled by the number and a
+        reader who knows what the number does not cover.
+        """
+        engine = AnalyticsEngine()
+        result = await engine.concentration_analysis({f"N{i}": 0.05 for i in range(14)})
+        basis = result["scale"]["holdings_basis"]
+        # the existing count rule is still there, extended rather than replaced
+        assert "n_holdings counts the rows" in basis
+        assert "strictly positive, finite weight" in basis
+        # the limitation, in the payload's own words
+        assert "no look-through" in basis
+        assert "LIMITATION" in basis
+        assert "not measured" in basis
+        # and the consequence that makes it matter on this book
+        assert "fund" in basis
+        assert "currency" in basis
+        # a limitation is prose, not a figure: nothing numeric was added here
+        assert result["n_holdings"] == 14
+        assert result["herfindahl_index"] == pytest.approx(1 / 14, abs=1e-4)
+        # and the same text reaches the empty-book shape, so a consumer reads one
+        empty = engine._empty_concentration()
+        assert empty["scale"]["holdings_basis"] == basis
+
+    @pytest.mark.asyncio
+    async def test_the_ratio_formula_states_which_way_round_it_runs(self):
+        """The orientation, because two scales read as two disagreeing numbers.
+
+        The ratio and the score are the same concentration on different scales,
+        and both run the same way - larger is better diversified. The ratio's
+        MAXIMUM, 1.0, is at equal weight, which is exactly where the score is at
+        its 100; the ratio's MINIMUM, 1 / n_holdings, is at one holding carrying
+        the book, which is exactly where the score is at its 0. Without that a
+        reader parses 0.83 as "83% diversified" beside a score of 98.5 and
+        concludes two numbers disagree.
+
+        The orientation note is asserted against the NUMBERS, not against a
+        phrase, so a reworded sentence still has to be true.
+        """
+        engine = AnalyticsEngine()
+        equal = await engine.concentration_analysis({f"N{i}": 0.2 for i in range(5)})
+        single = await engine.concentration_analysis({"ONLY": 1.0})
+        # a genuinely skewed 14-name book, so the ratio is strictly between its
+        # two ends rather than pinned at equal weight
+        result = await engine.concentration_analysis(
+            {f"N{i}": 0.05 + 0.01 * i for i in range(14)}
+        )
+        formula = result["diversification_ratio_formula"]
+
+        # the claim the note makes, checked against the engine
+        assert equal["diversification_ratio"] == pytest.approx(1.0, abs=1e-9)
+        assert equal["diversification_score"] == pytest.approx(100.0, abs=1e-9)
+        assert single["diversification_ratio"] == pytest.approx(1 / 1, abs=1e-9)
+        assert single["diversification_score"] == pytest.approx(0.0, abs=1e-9)
+        # the minimum of the ratio is 1 / n, NOT 1.0, and lands at one holding
+        assert "1 / n_holdings" in formula
+        assert "1.0" in formula
+        # and the note is present on both ends of the scale, in words
+        assert "ORIENTATION" in formula
+        assert "MAXIMUM is 1.0, at equal weight" in formula
+        assert "MINIMUM is 1 / n_holdings" in formula
+        # a real book sits between the two, and the two scales really do disagree
+        # in magnitude on it - which is the whole reason the note is needed
+        assert 1 / 14 < result["diversification_ratio"] < 1.0
+        assert 0.0 < result["diversification_score"] < 100.0
+        assert result["diversification_score"] != pytest.approx(
+            result["diversification_ratio"] * 100.0, abs=5.0
+        )
+        # the same text reaches the empty-book shape
+        assert engine._empty_concentration()["diversification_ratio_formula"] == formula
+
     def test_inverse_volatility_parity_closed_form(self):
         """
         Inverse-volatility parity weights: w_i proportional to 1 / sigma_i.

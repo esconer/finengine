@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -45,9 +46,11 @@ import pandas as pd
 import pytest
 
 from app.debugging.context_audit import UNCERTAINTY_KEY_TOKENS
+from app.services import analytics_engine
 from app.services.analytics_engine import (
     RISK_CORRELATION_POINTS_PER_UNIT,
     RISK_SCORE_CAP,
+    RISK_SCORE_INPUT_PRECISION_AT,
     RISK_SCORE_LEG_SPECS,
     RISK_SCORE_WEIGHTS,
     UNCERTAINTY_BOOTSTRAP_RESAMPLES,
@@ -471,15 +474,35 @@ class TestDerivedSubScoresInheritPrecision:
             assert derived[leg]["inherits_precision_from"] == statistic
             assert derived[leg]["inherits_precision_at"] is None
             assert derived[leg]["standard_error"] is None
-            assert "no precision disclosure" in derived[leg]["standard_error_reason"]
+            assert "publishes no standard error or interval for it" in (
+                derived[leg]["standard_error_reason"]
+            )
 
     @pytest.mark.asyncio
-    async def test_concentration_inherits_from_the_declared_weights_not_a_measurement(self):
-        """HHI is exact arithmetic on the weights, so its precision is theirs."""
+    async def test_concentration_inherits_from_no_block_rather_than_the_weight_table(self):
+        """HHI is MEASURED, so it cannot inherit a precision from a declared constant.
+
+        It used to point at ``score_audit.precision.declared_constants`` - the
+        ``RISK_SCORE_WEIGHTS`` block, whose own class definition says it "was
+        never estimated" and whose ``standard_error`` and ``conf_int`` are both
+        ``None``.  A measured input was therefore claiming to inherit its
+        precision from a node that declares it has none, and
+        ``estimated_statistics`` held no Herfindahl block to point at instead.
+        The honest answer is a null pointer and a reason.
+        """
         result = await _book_score()
-        derived = _precision(result)["derived_values"]["concentration"]
-        assert derived["inherits_precision_at"] == "score_audit.precision.declared_constants"
+        precision = _precision(result)
+        derived = precision["derived_values"]["concentration"]
+        assert derived["input_statistic_provenance"] == "measured"
+        assert derived["inherits_precision_at"] is None
         assert derived["standard_error"] is None
+        reason = derived["standard_error_reason"]
+        # a null pointer must not still claim an inheritance it cannot have
+        assert "is entirely INHERITED" not in reason
+        assert "measured" in reason
+        assert "score_audit.precision.estimated_statistics" in reason
+        # and there really is no Herfindahl block to have pointed at
+        assert "herfindahl_index" not in precision["estimated_statistics"]
         # still exactly recomputable from its own published input
         herfindahl = derived["input_statistic_value"]
         assert derived["sub_score"] == pytest.approx(
@@ -488,6 +511,310 @@ class TestDerivedSubScoresInheritPrecision:
         assert herfindahl == result["score_audit"]["components"]["concentration"][
             "input_statistic_value"
         ]
+
+
+# ---------------------------------------------------------------------------
+# 2b. THE GENERAL FORM of the pointer defect
+# ---------------------------------------------------------------------------
+
+def _resolve(node: Any, pointer: str) -> Any:
+    """Walk a dotted pointer, or return a marker saying it does not resolve."""
+    missing = object()
+    current = node
+    for part in str(pointer).split("."):
+        if not isinstance(current, dict) or part not in current:
+            return missing
+        current = current[part]
+    return current
+
+
+_MISSING = _resolve(None, "no.such.node.anywhere")
+
+
+def _carries_a_figure(node: Any) -> bool:
+    """A node that publishes a real standard error or a real interval."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("standard_error") is not None:
+        return True
+    interval = node.get("conf_int")
+    return isinstance(interval, (list, tuple)) and len(interval) == 2
+
+
+class TestEveryInheritsPrecisionPointerResolvesToARealFigure:
+    """General form: a pointer is either real, or absent with a stated reason.
+
+    The concrete defect this catches: one leg published
+    ``inherits_precision_at: "score_audit.precision.declared_constants"`` - a
+    pointer to a node whose ``standard_error`` and ``conf_int`` are both null by
+    design.  Written narrowly, the rule "the concentration leg must not point at
+    declared_constants" would have passed the moment somebody invented a third
+    node with no figure in it.  Written this way it cannot.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gappy_leg", [True, False])
+    @pytest.mark.parametrize("names", [5, 9])
+    async def test_every_leg_pointer_resolves_to_a_figure_or_is_null_with_a_reason(
+        self, names: int, gappy_leg: bool
+    ):
+        result = await _book_score(names=names, gappy_leg=gappy_leg)
+        precision = _precision(result)
+        checked = 0
+        for leg in RISK_SCORE_WEIGHTS:
+            entry = precision["derived_values"][leg]
+            pointer = entry["inherits_precision_at"]
+            assert "inherits_precision_at" in entry, leg
+            if pointer is None:
+                reason = entry["standard_error_reason"]
+                assert reason, f"{leg}: a null pointer needs a reason"
+                assert "is entirely INHERITED" not in reason, (
+                    f"{leg}: a null pointer cannot claim an inheritance"
+                )
+                assert "estimated_statistics" in reason, (
+                    f"{leg}: the reason must name where such a figure would go"
+                )
+            else:
+                target = _resolve(precision, str(pointer).removeprefix("score_audit.precision."))
+                assert target is not _MISSING, (
+                    f"{leg}: pointer {pointer!r} does not resolve inside precision"
+                )
+                assert _carries_a_figure(target), (
+                    f"{leg}: pointer {pointer!r} resolves to a node with no "
+                    f"standard error and no interval: {target!r}"
+                )
+            # whatever the pointer says, the leg itself is a derivation and
+            # publishes no band of its own
+            assert entry["classification"] == "deterministic_derivation", leg
+            assert entry["standard_error"] is None, leg
+            assert entry["conf_int"] is None, leg
+            checked += 1
+        assert checked == len(RISK_SCORE_WEIGHTS)
+
+    @pytest.mark.asyncio
+    async def test_the_pointer_map_holds_no_entry_that_resolves_to_nothing(self):
+        """The map itself, checked without building a payload.
+
+        This is the form that fails fastest and covers every leg including the
+        ones a fixture happens not to exercise: an entry in
+        `RISK_SCORE_INPUT_PRECISION_AT` is a promise, and a promise that no node
+        in the block keeps is the defect.
+        """
+        precision_shape = {
+            "estimated_statistics": {
+                "avg_pairwise_correlation": {
+                    "estimates": {"avg_pairwise_correlation": {
+                        "standard_error": 0.01, "conf_int": [0.0, 0.2],
+                    }},
+                },
+                "factor_r_squared": {
+                    "estimates": {"factor_r_squared": {
+                        "standard_error": 0.02, "conf_int": [0.0, 0.4],
+                    }},
+                },
+            },
+            "declared_constants": {
+                # the real shape: a policy table with no band, by design
+                "standard_error": None, "conf_int": None,
+            },
+        }
+        for statistic, pointer in RISK_SCORE_INPUT_PRECISION_AT.items():
+            local = str(pointer).removeprefix("score_audit.precision.")
+            target = _resolve(precision_shape, local)
+            assert target is not _MISSING, (
+                f"{statistic}: RISK_SCORE_INPUT_PRECISION_AT points at "
+                f"{pointer!r}, which resolves to nothing in the published block"
+            )
+            assert _carries_a_figure(target), (
+                f"{statistic}: RISK_SCORE_INPUT_PRECISION_AT points at "
+                f"{pointer!r}, a node with no standard error and no interval"
+            )
+        # the entry this defect removed, asserted by name so the regression is
+        # named rather than merely absent
+        assert "herfindahl_index" not in RISK_SCORE_INPUT_PRECISION_AT
+
+    @pytest.mark.asyncio
+    async def test_a_leg_with_a_null_pointer_and_a_leg_with_a_real_one_read_alike(self):
+        """One shape, two facts.  The reason differs; the grammar does not."""
+        result = await _book_score()
+        resolved = _precision(result)["derived_values"]["correlation"]
+        unresolved = _precision(result)["derived_values"]["volatility"]
+        for entry in (resolved, unresolved):
+            reason = entry["standard_error_reason"]
+            assert reason.startswith("not computed: this sub-score is a "
+                                     "deterministic function of one published input")
+            assert reason.endswith(
+                "not the uncertainty of anything this sub-score measured, and a "
+                "reader could not tell the two apart."
+            ), reason
+            # one reason, used for both absent figures
+            assert entry["conf_int_reason"] == reason
+
+
+# ---------------------------------------------------------------------------
+# 2c. THE GENERAL FORM of the prose defect: no clause spliced into another
+# ---------------------------------------------------------------------------
+
+#: A period glued to the next word with no space.  Legal inside a number
+#: (``0.124123``), a dotted path (``estimates.volatility_forecast``), an
+#: initialism (``U.S.``), an attribute access (``np.linalg.lstsq``) and a file
+#: path (``analytics_engine.py``).  ILLEGAL when the word it opens is prose -
+#: which is what a clause spliced into a pointer produces, and it is how
+#: ``precision.estimated_statistics.portfolio.estimates.the fitted leg's ...``
+#: reached a published reason on fourteen legs.
+_GLUED_PERIOD = re.compile(r"(?<=[A-Za-z0-9_])\.([A-Za-z][A-Za-z0-9_]*)")
+
+#: A dotted path segment is followed by '.', a bracket, a comma, a semicolon or
+#: the end of the string.  Prose is followed by a space and a lower-case word.
+_PROSE_AFTER_GLUED_PERIOD = re.compile(r"^\s+[a-z]")
+
+#: A published field name is a legitimate sentence-opener in lower case.
+_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+
+#: A sentence may legitimately continue in lower case after a label, a list
+#: marker or a parenthetical: "complete case: a row is measured only when ...".
+_CONTINUES_AFTER = (":", "-", "(", "[", "/", "=", ",", ";", "'", '"')
+
+#: Abbreviations whose trailing period is not a sentence end.
+_ABBREVIATIONS = ("i.e.", "e.g.", "vs.", "etc.", "cf.", "resp.", "no.", "fig.")
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_LEADING_TOKEN = re.compile(r"^[^A-Za-z0-9`_]*([A-Za-z0-9`_]+)")
+
+
+def _identifier_chain_start(text: str, index: int) -> int:
+    index -= 1
+    while index >= 0 and re.match(r"[A-Za-z0-9_/\\.-]", text[index]):
+        index -= 1
+    return index + 1
+
+
+def assert_no_clause_is_spliced_into_another(text: str, where: str) -> None:
+    """Raise on a sentence that is a fragment rather than a statement.
+
+    Two rules, both validated against every prose string the v26 artifact
+    publishes (1400 of them) with zero false positives, and both general: a new
+    reason string in this module is checked without being named here.
+
+    1. NO GLUED PROSE.  A period inside a path, a number, an initialism, an
+       attribute access or a file path is not a sentence boundary.  A period
+       immediately followed by an English word, with a space and a lower-case
+       word after it, is a sentence boundary that should not be there.
+
+    2. EVERY SENTENCE IS A SENTENCE.  After splitting on the boundaries rule 1
+       accepts, no sentence may open in lower case unless it is a published
+       field name, a backticked name, or a continuation of a label or an
+       abbreviation.
+    """
+    body = " ".join(str(text).split())
+    assert body, f"{where}: an empty reason states nothing"
+
+    for match in _GLUED_PERIOD.finditer(body):
+        word = match.group(1)
+        if not word[0].islower() or _SNAKE_CASE.match(word):
+            continue
+        if not _PROSE_AFTER_GLUED_PERIOD.match(body[match.end():]):
+            continue
+        chain = body[_identifier_chain_start(body, match.start()):match.start()]
+        if "/" in chain or "\\" in chain:  # a file path
+            continue
+        raise AssertionError(
+            f"{where}: a clause is spliced onto a path - {match.group(0)!r} is "
+            f"followed by prose: ...{body[max(0, match.start() - 80):match.end() + 60]}..."
+        )
+
+    sentences = _SENTENCE_SPLIT.split(body)
+    for previous, sentence in zip(sentences, sentences[1:]):
+        previous, sentence = previous.strip(), sentence.strip()
+        match = _LEADING_TOKEN.match(sentence)
+        if not match:
+            continue
+        opener = match.group(1)
+        if not opener[0].islower():
+            continue
+        if previous.endswith(_CONTINUES_AFTER):
+            continue
+        if any(previous.endswith(a) for a in _ABBREVIATIONS):
+            continue
+        if sentence.startswith("`") or _SNAKE_CASE.match(opener):
+            continue
+        raise AssertionError(
+            f"{where}: {opener!r} opens what is not a sentence - "
+            f"...{previous[-70:]} / {sentence[:90]}..."
+        )
+
+
+class TestNoPublishedProseHasAClauseSplicedIntoAnother:
+    def test_every_reason_this_module_publishes_is_a_sequence_of_sentences(self):
+        """Every module-level prose constant in `analytics_engine`, in one sweep.
+
+        Written over the CONSTANTS rather than over a fixture's output so a
+        string added in a later wave is checked without anybody remembering to
+        add it here, and so the check does not need a book to run.
+        """
+        checked = 0
+        for name in dir(analytics_engine):
+            if not name.isupper():
+                continue
+            value = getattr(analytics_engine, name)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            assert_no_clause_is_spliced_into_another(
+                value, f"analytics_engine.{name}"
+            )
+            checked += 1
+        # a guard on the guard: an empty sweep would pass silently
+        assert checked >= 25, (
+            f"only {checked} prose constants were checked - the sweep is broken"
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_reason_on_the_built_score_block_is_a_sequence_of_sentences(self):
+        result = await _book_score()
+        precision = _precision(result)
+        checked = 0
+
+        def _walk(node: Any, path: str) -> None:
+            nonlocal checked
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    _walk(value, f"{path}.{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    _walk(value, f"{path}[{index}]")
+            elif isinstance(node, str) and path.rsplit(".", 1)[-1].endswith(
+                ("_reason", "_basis", "_note")
+            ):
+                assert_no_clause_is_spliced_into_another(node, path)
+                checked += 1
+
+        _walk(precision, "score_audit.precision")
+        assert checked >= 20, f"only {checked} reason strings were checked"
+
+    @pytest.mark.asyncio
+    async def test_the_absent_interval_reason_never_claims_an_inheritance_it_lacks(self):
+        """The rule that catches the volatility/market_risk splice directly.
+
+        Before this change those two legs published
+        ``inherits_precision_at: null`` alongside a reason reading "Its precision
+        is entirely INHERITED from that input's own disclosure, published at no
+        precision disclosure for this input is published in this section ..." -
+        a whole clause substituted into the noun phrase after "published at",
+        and a claim of inheritance from a disclosure that does not exist.  There
+        is no interior period to find, so it is the CLAIM that has to be checked.
+        """
+        result = await _book_score()
+        derived = _precision(result)["derived_values"]
+        for leg, entry in derived.items():
+            if entry["inherits_precision_at"] is not None:
+                continue
+            reason = entry["standard_error_reason"]
+            assert "is entirely INHERITED" not in reason, leg
+            assert "published at no precision disclosure" not in reason, leg
+            # the absence is named, and the place a figure would go is named
+            assert "publishes no standard error or interval for it" in reason, leg
+            assert "score_audit.precision.estimated_statistics" in reason, leg
+            assert f"score_audit.components.{leg}.input_sample" in reason, leg
 
 
 # ---------------------------------------------------------------------------
