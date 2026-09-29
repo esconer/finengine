@@ -730,6 +730,24 @@ EGARCH_VOL_CLIP_LOW = 0.0
 #: a decay factor written twice is a drift waiting to happen.
 EWMA_LAMBDA = 0.94
 
+#: Draw count for arch's SIMULATION branch, and the seed it is drawn with.
+#: Both are published on `model_params` next to every simulated forecast, and
+#: named here for the reason the clip bounds are: the resampling restatement
+#: re-runs this exact branch, and a simulation count or a seed written twice is
+#: a drift waiting to happen.  `EGARCH_SIMULATION_SEED` is a LITERAL 100 rather
+#: than `UNCERTAINTY_BOOTSTRAP_SEED` on purpose - it was already 100 before any
+#: of it was read, so borrowing the bootstrap seed here would silently move a
+#: published number for no reason.
+#:
+#: WHY THE SEED IS PUBLISHED AT ALL.  arch 8.0.0's simulation branch ignores the
+#: `random_state` this module used to pass it (see the call site in
+#: `volatility_forecast_point`), so the published point was one arbitrary draw
+#: and two forecasts from the same fitted model already differed.  A seed that
+#: is not read is a false provenance claim on the payload, which is worse than
+#: publishing no seed at all.
+FORECAST_SIMULATIONS = 2000
+EGARCH_SIMULATION_SEED = 100
+
 #: Why `confidence_interval` is null.  Published rather than left implicit so
 #: a consumer reading the absence learns the reason instead of assuming a bug.
 FORECAST_NO_INTERVAL_REASON = (
@@ -5373,8 +5391,13 @@ class AnalyticsEngine:
                     "q": 1,
                     "type": "EGARCH",
                     "forecast_method": method,
-                    "simulations": 2000 if simulated else None,
-                    "random_state": 100 if simulated else None,
+                    "simulations": FORECAST_SIMULATIONS if simulated else None,
+                    # The seed is now the one arch actually reads on the
+                    # simulation branch, so this is a true provenance claim
+                    # rather than a number arch ignored. Published from the
+                    # constant the forecast was drawn with, so the payload and
+                    # the draw cannot drift apart.
+                    "random_state": EGARCH_SIMULATION_SEED if simulated else None,
                     "innovation_distribution": "normal",
                     "volatility_units": "annualized",
                     "tail_measure": tail,
@@ -5934,11 +5957,45 @@ def volatility_forecast_point(
                                options={"maxiter": 100})
 
     if name == "EGARCH" and h > 1:
-        # arch 8.x does not provide analytic multi-step EGARCH forecasts.
-        # Simulation is a supported path; fixing the seed makes the returned
-        # path deterministic for tests and clients.
-        forecast = fitted.forecast(horizon=h, method="simulation",
-                                   simulations=2000, random_state=100)
+        # Simulation here is NOT a choice.  arch 8.0.0 refuses an analytic
+        # multi-step EGARCH forecast outright - `ValueError: Analytic forecasts
+        # not available for horizon > 1`, raised by `_check_forecasting_method`
+        # because the EGARCH log-variance recursion does not evolve in squares.
+        # The innovation is `dist="normal"`, so this is not a fat-tail
+        # limitation; no distribution this engine can configure would make the
+        # analytic path exist.  Simulation is the only route.
+        #
+        # WHAT WAS ACTUALLY WRONG is the seed, and the seed the engine passed was
+        # never read.  `forecast(..., random_state=100)` puts an int where arch
+        # documents a `np.random.RandomState`, and `ARCHVolatility.forecast`
+        # forwards `random_state` to `_bootstrap_forecast` ONLY - never to
+        # `_simulation_forecast` (volatility.py:762-797).  The simulation branch
+        # draws from `rng`, which `ConstantMean.forecast` fills from
+        # `self._distribution.simulate(dp)` (mean.py:998), and the model built
+        # above leaves that distribution unseeded.  Passing a real
+        # `RandomState(100)` does not help either; only `rng` is read on this
+        # branch.  So the published point was one arbitrary draw, and two
+        # forecasts from the same fitted model already differed in the 4th
+        # decimal.
+        #
+        # `rng` takes a CALLABLE, not a Generator: a `np.random.Generator` is not
+        # callable and arch rejects it with TypeError, so the bound sampler is
+        # what is passed.  It is taken from a fresh instance of the model's OWN
+        # distribution class rather than written out as a normal draw, so the
+        # innovation law is preserved by construction instead of by a literal
+        # that would silently keep feeding Gaussian shocks if `dist` were ever
+        # changed to a class with estimated shape parameters - StudentsT's
+        # simulator reads `self._parameters`, which a fresh instance does not
+        # have, so that case raises here rather than returning a wrong law.  The
+        # instance is rebuilt on every call, so the stream restarts at the same
+        # point each time instead of advancing.
+        seeded = type(fitted.model.distribution)(seed=EGARCH_SIMULATION_SEED)
+        forecast = fitted.forecast(
+            horizon=h,
+            method="simulation",
+            simulations=FORECAST_SIMULATIONS,
+            rng=seeded.simulate([]),
+        )
         simulated, method = True, "simulation"
     else:
         forecast = fitted.forecast(horizon=1 if name == "EGARCH" else h,

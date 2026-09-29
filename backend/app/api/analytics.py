@@ -4290,22 +4290,44 @@ _DECLARED_CONSTANT_CI_REASON = (
     "estimated, so there is no distribution to take a percentile of"
 )
 
-#: Multi-step EGARCH runs on arch's SIMULATION path, and in arch 8.0.0 that path
-#: does not honour the integer `random_state` the engine passes it: two
-#: back-to-back forecasts on the same fitted model already differ in the 4th
-#: decimal.  A re-fit bootstrap over that path could not reproduce the published
-#: point, so no band is claimed - and the reason is this one, rather than the
-#: estimator's generic "your point did not reproduce" message, which would read
-#: as an accusation against a number that is simply not reproducible.
+#: Multi-step EGARCH runs on arch's SIMULATION path.  That path is now
+#: SEED-REPRODUCIBLE: arch 8.0.0's simulation branch never reads the
+#: `random_state` this engine used to pass it (it is forwarded only to
+#: `_bootstrap_forecast`), and instead draws from an `rng` callable seeded here
+#: from the model's own distribution class.  So two forecasts on the same fitted
+#: model now agree bit-for-bit, and the earlier reason - that they differed in
+#: the 4th decimal - is no longer true.
+#:
+#: A band is still withheld, for a different and now structural reason.
+#: `EGARCH_SIMULATION_SEED` is a LITERAL, not a per-call value, so every
+#: resample of a block bootstrap re-runs the identical seeded simulation and
+#: returns the identical number: the resampled distribution has ZERO dispersion,
+#: and any interval built from it would be `[x, x]` - a constant multiple of the
+#: point, which is the fabrication this disclosure exists to prevent and the
+#: thing NUM-022 exists to catch.  Removing the withhold without changing the
+#: seed's scope would therefore trade an honest absence for a fake band.
+#:
+#: The real uncertainty of a Monte-Carlo mean is the dispersion of its own
+#: draws.  The engine runs `FORECAST_SIMULATIONS` of them and does not publish
+#: their spread; that is the honest fix, and it is a separate change because it
+#: needs the draw distribution rather than a resampling of the input series.
+#: The reason is published rather than the estimator's generic "your point did
+#: not reproduce" message, which would read as an accusation against a number
+#: that is in fact perfectly reproducible.
 _EGARCH_SIMULATED_NO_BAND = (
     "not computed: this forecast's conditional-variance path comes from arch's "
-    "SIMULATION branch, and in arch 8.0.0 that branch does not honour the integer "
-    "random_state the engine passes it - two forecasts from the same fitted model "
-    "already differ. A re-fit resampling estimate therefore cannot reproduce this "
-    "published point, and a band that failed to describe its own point is the "
-    "fabrication this disclosure exists to prevent. The point stands, "
-    "unbanded, and the honest fix is a seed-reproducible multi-step path - which "
-    "would change a published forecast value, so it is not done here"
+    "SIMULATION branch, and that branch is seeded and therefore reproducible - "
+    "two forecasts on the same fitted model now agree exactly. No band is "
+    "claimed anyway, and the reason is structural rather than a defect in the "
+    "point: the seed is a fixed literal rather than a per-call value, so every "
+    "resample of a block bootstrap re-runs the identical seeded simulation and "
+    "returns the identical number. The resampled distribution has zero "
+    "dispersion, so an interval built from it would be a constant multiple of "
+    "this point and would describe no uncertainty that exists. The point is a "
+    "Monte-Carlo mean over FORECAST_SIMULATIONS draws, and the quantity that "
+    "would measure its precision is the spread of those draws, which the engine "
+    "computes but does not publish; publishing that is the honest fix and is a "
+    "separate change"
 )
 
 _TERM_STRUCTURE_BASIS = (

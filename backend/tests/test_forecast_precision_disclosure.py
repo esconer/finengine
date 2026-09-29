@@ -72,6 +72,7 @@ import asyncio
 import json
 import math
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List
@@ -100,7 +101,10 @@ from app.debugging.context_audit import (
     run_rules,
 )
 from app.services.analytics_engine import (
+    EGARCH_SIMULATION_SEED,
     FORECAST_LEG_REFIT_RESAMPLES_WITHHELD,
+    FORECAST_SIMULATIONS,
+    FORECAST_VOL_CLIP_HIGH,
     TAIL_CLIP_HIGH,
     TAIL_CLIP_LOW,
     TAIL_ES_MULTIPLIER,
@@ -804,12 +808,23 @@ class TestTheEstimatedStatisticIsMeasuredNotAsserted:
         )
 
     def test_a_multi_step_egarch_says_why_it_has_no_band(self, monkeypatch):
-        """arch 8.0.0's simulation path ignores its own integer seed.
+        """The multi-step EGARCH point is now seed-reproducible but still unbanded.
 
-        Verified separately: two forecasts from the same fitted model already
-        differ, so a re-fit bootstrap cannot reproduce the published point.  The
-        honest disclosure is the reason, not a band that failed the guard - and
-        not a claim that the point is wrong.
+        WHAT CHANGED.  This test used to assert that the point could not be
+        reproduced.  That was true and it is no longer true: arch 8.0.0's
+        simulation branch ignores the `random_state` the engine passed it, and
+        `volatility_forecast_point` now hands arch the `rng` that branch does
+        read.  `TestTheSeededSimulationBranchIsReproducible` is the test that
+        proves the point is reproducible now; this one still requires the band
+        to be withheld, because a re-fit bootstrap over a Monte-Carlo mean is a
+        band about a different quantity, not about this point.
+
+        The disclosure text itself lives in `app/api/analytics.py`
+        (`_EGARCH_SIMULATED_NO_BAND`), which this wave does not own.  It still
+        contains the token "SIMULATION", which is what is asserted below.  Its
+        SENTENCE that the path is irreproducible is now FALSE and has to be
+        rewritten in the same commit as the engine fix - flagged, not silently
+        left lying.
         """
         monkeypatch.setattr(
             analytics_api, "FORECAST_PORTFOLIO_REFIT_RESAMPLES", TEST_RESAMPLES
@@ -1653,3 +1668,595 @@ class TestTheRefactorMovedNoPublishedValue:
             )
         # and the EWMA decay factor is named once
         assert "lambda_val = 0.94" not in source
+
+
+# ---------------------------------------------------------------------------
+# 3d. the simulation branch is SEEDED, and the one-step path did not move
+# ---------------------------------------------------------------------------
+
+class TestTheSeededSimulationBranchIsReproducible:
+    """The defect this class exists for: a published number that changed when asked twice.
+
+    `volatility_forecast_point` publishes `volatility_forecast` for
+    (EGARCH, horizon > 1) from arch's SIMULATION branch.  That branch used to be
+    handed `random_state=100` and to ignore it, so the published point was one
+    arbitrary draw: two forecasts from the same fitted model already differed in
+    the 4th decimal, and the payload's `model_params.random_state` was a
+    provenance claim about a seed arch never read.
+
+    MECHANISM, verified against the installed arch 8.0.0 rather than assumed.
+    `ARCHVolatility.forecast` forwards `random_state` to `_bootstrap_forecast`
+    ONLY (volatility.py:762-797); the simulation branch draws from `rng`, which
+    `ConstantMean.forecast` fills from `self._distribution.simulate(dp)`
+    (mean.py:998) and this module's model leaves unseeded.  So the fixes that do
+    NOT work are the two obvious ones, and both are asserted below: an integer
+    `random_state`, and a genuine `np.random.RandomState`.  Only `rng` - a
+    CALLABLE, since a `Generator` is not callable and arch rejects it - is read.
+
+    WHY SIMULATION RATHER THAN A WITHHELD FORECAST.  arch 8.0.0 refuses an
+    analytic multi-step EGARCH forecast outright, so simulation is the only
+    route and the alternative is publishing nothing.  The innovation is
+    `dist="normal"`, so this is not a fat-tail limitation: no distribution this
+    engine can configure would make the analytic path exist.  A seeded draw is
+    therefore the correct fix, not a compromise - see
+    `test_there_is_no_analytic_multi_step_egarch_path_to_prefer`.
+    """
+
+    @staticmethod
+    def _point(series: pd.Series, model: str, horizon: int):
+        with warnings.catch_warnings():
+            # The pre-fix path overflows in arch's own exp() on some draws; that
+            # is a separate defect pinned by TestTheSimulationOverflowIsReal.
+            # It must not make THIS class flaky.
+            warnings.simplefilter("ignore")
+            return volatility_forecast_point(series, model, horizon)
+
+    @staticmethod
+    def _same(first: dict, second: dict) -> bool:
+        """Bit-identity over the WHOLE returned dict, arrays included.
+
+        `annualized_volatility_path` is a list for the two fitted models and a
+        numpy array for EWMA (the recursion builds it with `np.array`), so `==`
+        on the dict raises on the array leg.  Comparing key by key, with an
+        exact `==` for the array leg, covers the same fields without depending
+        on which container each branch happens to return.
+        """
+        if set(first) != set(second):
+            return False
+        for key in first:
+            a, b = first[key], second[key]
+            if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                if not np.array_equal(np.asarray(a), np.asarray(b)):
+                    return False
+            elif a != b:
+                return False
+        return True
+
+    def test_every_model_and_horizon_publishes_the_same_number_twice(self):
+        """The headline: forecast the same fitted input twice, assert bit-identity.
+
+        162 combinations - 3 sample sizes x 3 seeds x 3 models x 6 horizons.
+        Comparison is on the whole returned dict, so `forecast_method`,
+        `simulated`, the full `annualized_volatility_path` and the raw /
+        return-space figures are all covered, not just the headline field.
+        """
+        combinations = 0
+        for n in (25, 60, 90):
+            for seed in (1, 2, 3):
+                series = _returns(observations=n, seed=seed, rho=0.0)
+                for model in ("EWMA", "GARCH", "EGARCH"):
+                    for horizon in (1, 2, 3, 5, 10, 21):
+                        first = self._point(series, model, horizon)
+                        second = self._point(series, model, horizon)
+                        assert self._same(first, second), (
+                            f"{model} n={n} seed={seed} h={horizon} is not "
+                            f"reproducible: {first['volatility_forecast']!r} != "
+                            f"{second['volatility_forecast']!r}"
+                        )
+                        combinations += 1
+        assert combinations == 162, combinations
+
+    def test_the_multi_step_path_was_not_reproducible_before_the_fix(self):
+        """Proof the test above can fail: re-derive the PRE-FIX expression here.
+
+        A determinism test that passes both before and after proves nothing, and
+        the pre-change expression cannot be run from a clean checkout any more.
+        So it is reconstructed inline - the same fit, the same `random_state=100`
+        the engine used to pass - and shown to disagree with itself.  Nothing in
+        `app/` is reverted to do this.
+        """
+        from arch import arch_model
+
+        series = _returns()
+        model = arch_model(series * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+
+        def pre_fix() -> np.ndarray:
+            # Exactly what analytics_engine.py used to do on this branch.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return np.asarray(
+                    fitted.forecast(horizon=3, method="simulation",
+                                    simulations=2000,
+                                    random_state=100).variance.values,
+                    dtype=float,
+                )
+
+        first, second = pre_fix(), pre_fix()
+        assert not np.array_equal(first, second), (
+            "the pre-fix expression is now deterministic, so this test no longer "
+            "demonstrates the defect it reconstructs - arch may have changed how "
+            "it consumes random_state, and the reason string in "
+            "app/api/analytics.py must be re-checked against the installed arch"
+        )
+
+    def test_neither_obvious_seed_repairs_arch_and_that_is_why_rng_is_used(self):
+        """An int and a real RandomState both fail; only `rng` is read.
+
+        This is the negative evidence for the fix.  It is what makes passing
+        `rng` a decision rather than a guess, and it is why a future edit that
+        "simplifies" the call back to `random_state=` would be a silent
+        regression: it would look right and restore the defect.
+        """
+        from arch import arch_model
+
+        series = _returns()
+        model = arch_model(series * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+
+        def variance(**kwargs) -> np.ndarray:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return np.asarray(
+                    fitted.forecast(horizon=3, method="simulation",
+                                    simulations=2000, **kwargs).variance.values,
+                    dtype=float,
+                )
+
+        # the integer the engine published as its seed: ignored
+        assert not np.array_equal(
+            variance(random_state=EGARCH_SIMULATION_SEED),
+            variance(random_state=EGARCH_SIMULATION_SEED),
+        )
+        # a real RandomState, i.e. the type arch's own docstring asks for: ALSO
+        # ignored, because the simulation branch never forwards it
+        assert not np.array_equal(
+            variance(random_state=np.random.RandomState(EGARCH_SIMULATION_SEED)),
+            variance(random_state=np.random.RandomState(EGARCH_SIMULATION_SEED)),
+        )
+        # the parameter the branch actually reads: honoured
+        def via_rng() -> np.ndarray:
+            seeded = type(fitted.model.distribution)(
+                seed=EGARCH_SIMULATION_SEED
+            )
+            return variance(rng=seeded.simulate([]))
+
+        assert np.array_equal(via_rng(), via_rng())
+
+    def test_a_generator_itself_is_rejected_so_the_callable_is_not_optional(self):
+        """`rng` takes a callable; a bare Generator raises. Pins the shape of the fix."""
+        from arch import arch_model
+
+        series = _returns()
+        model = arch_model(series * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(TypeError):
+                fitted.forecast(horizon=3, method="simulation", simulations=2000,
+                                rng=np.random.default_rng(EGARCH_SIMULATION_SEED))
+
+    def test_there_is_no_analytic_multi_step_egarch_path_to_prefer(self):
+        """Simulation is the ONLY route here, so seeding it is the fix, not a shortcut.
+
+        If a future arch release adds an analytic multi-step EGARCH forecast,
+        the better move is to use it and delete the simulation - and this test
+        is what will fail to say so.
+        """
+        from arch import arch_model
+
+        series = _returns()
+        model = arch_model(series * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # h == 1 analytic is available and is what the one-step path uses
+            assert fitted.forecast(horizon=1, method="analytic").variance.size == 1
+            for horizon in (2, 5, 21):
+                with pytest.raises(ValueError, match="[Aa]nalytic"):
+                    fitted.forecast(horizon=horizon, method="analytic")
+
+    def test_the_published_seed_is_the_seed_the_draw_used(self):
+        """`model_params.random_state` was a false claim; now it is the seed."""
+        engine = AnalyticsEngine()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            simulated = asyncio.run(engine._egarch_forecast(_returns(), 5))
+            analytic = asyncio.run(engine._egarch_forecast(_returns(), 1))
+        assert simulated["model_params"]["random_state"] == EGARCH_SIMULATION_SEED
+        assert simulated["model_params"]["simulations"] == FORECAST_SIMULATIONS
+        # the analytic path publishes no seed, because it draws no randomness
+        assert analytic["model_params"]["random_state"] is None
+        assert analytic["model_params"]["simulations"] is None
+        assert analytic["model_params"]["forecast_method"] == "analytic"
+        # and the two agree bit for bit, as they must when re-asked
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            again = asyncio.run(engine._egarch_forecast(_returns(), 5))
+        assert again["volatility_forecast"] == simulated["volatility_forecast"]
+        assert again["term_structure"] == simulated["term_structure"]
+
+
+class TestTheSeededDrawDidNotChangeTheLaw:
+    """A seed fixes WHICH draw is used. It must not change the distribution drawn from.
+
+    Without this, "we seeded it" could be hiding a swap to a different or
+    truncated innovation law, which would be a different published number
+    wearing the same provenance.  Measured against 200 000 simulations per leg
+    rather than asserted as a formula, because the quantity of interest is a
+    Monte-Carlo mean and its own noise is the thing being characterised.
+    """
+
+    BIG = 200_000
+
+    @staticmethod
+    def _variance_mean(horizon: int, sims: int, seeded: bool) -> float:
+        from arch import arch_model
+
+        series = _returns().clip(lower=-0.20, upper=0.20) * 100.0
+        model = arch_model(series, vol="EGARCH", p=1, q=1, dist="normal",
+                           rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if seeded:
+                fitted.model.distribution = type(fitted.model.distribution)(
+                    seed=EGARCH_SIMULATION_SEED
+                )
+            values = np.asarray(
+                fitted.forecast(horizon=horizon, method="simulation",
+                                simulations=sims).variance.values,
+                dtype=float,
+            )
+        return float(np.mean(values))
+
+    def test_the_seeded_mean_sits_inside_the_unseeded_monte_carlo_noise(self):
+        for horizon in (3, 21):
+            seeded = self._variance_mean(horizon, self.BIG, True)
+            unseeded = self._variance_mean(horizon, self.BIG, False)
+            relative = abs(seeded - unseeded) / unseeded
+            # The two means are two finite-sample estimates of the SAME
+            # expectation.  A 200 000-draw Monte-Carlo mean of an EGARCH path is
+            # itself noisy - the unseeded leg is exactly that noise - so a
+            # 0.5 % gap is the estimator's standard error, not a changed law.  A
+            # genuine law change (a truncated or rescaled innovation) moves this
+            # by tens of percent, so the bound is nowhere near arbitrary.
+            assert relative < 5e-3, (
+                f"h={horizon}: seeding moved the simulated mean by "
+                f"{relative:.3e} relative ({seeded} vs {unseeded}); that is "
+                f"larger than Monte-Carlo noise and suggests the innovation law "
+                f"changed, not just the draw"
+            )
+
+
+class TestTheOneStepPathDidNotMove:
+    """The live export runs horizon=1. Nothing here may change.
+
+    The artifact's `forecast_risk` is GARCH/analytic at horizon 1, and the
+    one-step EGARCH is analytic too.  The fix is confined to the simulation
+    branch, which only EGARCH at horizon > 1 reaches, so every one-step number -
+    and every multi-step GARCH and EWMA number, which are analytic - must be
+    bit-identical to what it was before.  These are pinned against literal
+    values captured from the pre-change code, not against the current
+    implementation, so a future edit that quietly re-routes a deterministic
+    path through the simulation branch fails here.
+    """
+
+    #: Captured from `volatility_forecast_point` BEFORE the seeding fix, on
+    #: `_returns()` (n=60, seed=3, rho=0.35).  Recompute with
+    #: `git show HEAD:backend/app/services/analytics_engine.py` if these ever
+    #: need to be re-derived; they are the regression baseline.
+    PRE_FIX = {
+        ("GARCH", 1): 0.1520577966,
+        ("GARCH", 5): 0.1517606995,
+        ("GARCH", 21): 0.1508373405,
+        ("EWMA", 1): 0.1588270953,
+        ("EWMA", 5): 0.1588270953,
+        ("EWMA", 21): 0.1588270953,
+        ("EGARCH", 1): 0.1125515650,
+    }
+
+    def test_the_analytic_paths_publish_exactly_the_pre_fix_numbers(self):
+        series = _returns()
+        for (model, horizon), expected in self.PRE_FIX.items():
+            point = volatility_forecast_point(series, model, horizon)
+            # EWMA is not an arch fit at all - it is the RiskMetrics single-pass
+            # recursion, which reports its own method name and is deterministic
+            # by construction.  GARCH and EGARCH h=1 are arch's analytic branch.
+            expected_method = (
+                "riskmetrics_recursion" if model == "EWMA" else "analytic"
+            )
+            assert point["forecast_method"] == expected_method, (model, horizon)
+            assert point["simulated"] is False, (model, horizon)
+            assert repr(round(point["volatility_forecast"], 10)) == repr(expected), (
+                f"{model} h={horizon} moved: {point['volatility_forecast']!r} "
+                f"!= pre-fix {expected!r}"
+            )
+
+    def test_egarch_at_horizon_one_never_reaches_the_simulation_branch(self):
+        """h=1 is the published horizon, and it is analytic in both arch paths.
+
+        This is the test that says the artifact does not move.  The `h > 1`
+        guard on the simulation branch is what makes it true, so the guard is
+        asserted rather than trusted: an `h >= 1` typo, or a change of
+        `horizon=1 if name == "EGARCH" else h`, sends the live export through a
+        Monte-Carlo draw and this fails.
+        """
+        point = volatility_forecast_point(_returns(), "EGARCH", 1)
+        assert point["simulated"] is False
+        assert point["forecast_method"] == "analytic"
+        assert point["horizon"] == 1
+        assert len(point["annualized_volatility_path"]) == 1
+        # and the published route agrees, twice
+        engine = AnalyticsEngine()
+        first = asyncio.run(engine._egarch_forecast(_returns(), 1))
+        second = asyncio.run(engine._egarch_forecast(_returns(), 1))
+        assert first == second
+        assert first["model_params"]["forecast_method"] == "analytic"
+        assert first["model_params"]["simulations"] is None
+
+    def test_the_whole_analytic_surface_is_reported_as_analytic(self):
+        """No model/horizon outside EGARCH h>1 may report a simulation."""
+        for n in (25, 60):
+            series = _returns(observations=n, seed=2, rho=0.0)
+            for model in ("EWMA", "GARCH", "EGARCH"):
+                for horizon in (1, 2, 3, 5, 21):
+                    point = volatility_forecast_point(series, model, horizon)
+                    simulated = model == "EGARCH" and horizon > 1
+                    assert point["simulated"] is simulated, (
+                        f"{model} h={horizon}: simulated={point['simulated']}, "
+                        f"expected {simulated}"
+                    )
+                    if simulated:
+                        expected_method = "simulation"
+                    elif model == "EWMA":
+                        expected_method = "riskmetrics_recursion"
+                    else:
+                        expected_method = "analytic"
+                    assert point["forecast_method"] == expected_method, (
+                        f"{model} h={horizon} reported "
+                        f"{point['forecast_method']!r}, expected "
+                        f"{expected_method!r}"
+                    )
+
+
+class TestTheSimulationOverflowIsReal:
+    """A SECOND defect, found and reproduced but deliberately NOT fixed here.
+
+    THE CHAIN, all inside installed arch, none of it in this repo:
+      volatility.py:2838  np.exp(_lnsigma2[:, m:])  -> `overflow encountered in exp`
+      mean.py:1032/1052   the inf is then `dot`ted   -> `invalid value encountered in dot`
+      analytics_engine.py:5174  cumulative * 252.0   -> `overflow encountered in multiply`
+
+    The EGARCH log-variance recursion is a linear recursion driven by |z| - E|z|,
+    and a Gaussian |z| is unbounded, so a sufficiently extreme simulated shock
+    drives log-variance past the range of a double and `exp` returns inf.
+
+    WHY IT SURVIVES THE ENGINE'S OWN GATE.  `volatility_forecast_point` raises
+    only when the path is NOT FINITE.  The mean over the 2000 simulated paths is
+    a different quantity: a handful of inf paths inside an ensemble mean can
+    leave a FINITE mean that is astronomically large, which passes the gate, and
+    is then silently collapsed onto the clip bound by `np.clip`.  So the
+    published `volatility_forecast` reads exactly `FORECAST_VOL_CLIP_HIGH` - a
+    120 % annualized volatility that is really an overflow artefact wearing the
+    clip bound's clothes - while `raw_volatility_forecast` and
+    `return_space_volatility` are published unclipped at 1e148.
+
+    NOT FIXED HERE, and the reason is a measurement, not a preference.  Over the
+    real 1000-draw moving-block resample set for EGARCH h=3, the raw annualized
+    values are a CONTINUUM: 785 draws under 0.5, 34 in [1.2, 2), 39 in [2, 10),
+    31 in [10, 1000), 16 above 1e3.  There is no gap to put a bound in - a draw
+    at 1.5 is a real 150 % volatility and the clip exists to handle it, while a
+    draw at 1e148 is a divergence, and everything between them is either.  Any
+    threshold that separates the last from the first two moves ~120 published
+    draws by an arbitrary amount, which is a wider change than the defect this
+    wave was given.  It also does not reach the live artifact: the export runs
+    GARCH/analytic, which never enters this branch.  It IS reachable from the
+    public API (`model=EGARCH&horizon>1`) and from the resampling restatement.
+
+    These tests exist to keep the finding measured and to stop it from getting
+    WORSE unnoticed.  They will have to be rewritten when it is fixed.
+    """
+
+    @staticmethod
+    def _resample_draw(index: int, keep: int | None = None) -> pd.Series:
+        """One draw from the PUBLISHED moving-block resample, reproduced by seed.
+
+        Derived from `UNCERTAINTY_BOOTSTRAP_SEED` rather than hand-written, so
+        the reproducer cannot silently stop being the draw that overflows: if
+        the seed or the block rule changes, the test either still overflows or
+        fails loudly instead of quietly testing a different series.  `keep`
+        truncates to a prefix, which is how the overflowing draws were found -
+        a short degenerate sample makes the EGARCH recursion explosive.
+        """
+        series = _returns()
+        indices = moving_block_indices(
+            len(series),
+            moving_block_size(len(series)),
+            UNCERTAINTY_BOOTSTRAP_RESAMPLES,
+            UNCERTAINTY_BOOTSTRAP_SEED,
+        ).T[:, index]
+        values = series.values[indices]
+        if keep is not None:
+            values = values[:keep]
+        return pd.Series(values, index=pd.bdate_range("2025-01-01",
+                                                      periods=len(values)))
+
+    def test_arch_itself_overflows_on_the_egarch_recursion(self):
+        """The overflow is upstream of this repo: arch's own exp() saturates.
+
+        Reproduced on a real resample draw, because a well-behaved synthetic
+        series does NOT overflow - the trigger is a short, near-degenerate
+        sample whose fitted EGARCH recursion is explosive, not a large return.
+        """
+        from arch import arch_model
+
+        draw = self._resample_draw(27, keep=31)
+        model = arch_model(draw * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fitted.forecast(horizon=3, method="simulation", simulations=2000)
+        messages = [str(w.message) for w in caught]
+        assert any("overflow" in m or "invalid value" in m for m in messages), (
+            f"expected arch's EGARCH recursion to overflow on a degenerate "
+            f"resample draw; warnings were {messages!r}. If this no longer "
+            f"holds, arch may have guarded the exponentiation, and the engine's "
+            f"finiteness-only gate may be removable"
+        )
+
+    def test_the_degeneracy_is_a_near_unit_root_fit_not_a_large_return(self):
+        """Why it happens: the fit drives alpha+beta to ~1, so the recursion explodes.
+
+        Recorded because it is what makes the finding a MODEL-FIT problem rather
+        than a data problem, and therefore why no data-size or clip threshold
+        addresses it.
+        """
+        from arch import arch_model
+
+        draw = self._resample_draw(27, keep=31)
+        model = arch_model(draw * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        omega, alpha, gamma, beta = np.asarray(fitted.params)
+        assert abs(beta) > 0.9, (
+            f"expected a near-unit-root beta on the degenerate draw, got {beta}"
+        )
+        assert draw.abs().max() < 0.05, (
+            f"the draw is not large in return terms (max "
+            f"{draw.abs().max()}), so this is the recursion diverging rather "
+            f"than a genuinely volatile sample"
+        )
+        del omega, alpha, gamma
+
+    def test_a_finite_but_astronomical_mean_still_reaches_the_clip_bound(self):
+        """The gate is finiteness-only, so an inf-laden ensemble mean publishes 1.20.
+
+        This is the part that is a real disclosure defect rather than an arch
+        wart: the published number is indistinguishable from a genuine 120 %
+        volatility forecast.  The published `raw_volatility_forecast` and
+        `return_space_volatility` on the same block read 1e34 and 1e33, and are
+        NOT clipped, so the block simultaneously claims 120 % volatility and a
+        return-space sigma of 2.4e33.
+        """
+        from arch import arch_model
+
+        draw = self._resample_draw(4, keep=41)
+        model = arch_model(draw * 100.0, vol="EGARCH", p=1, q=1,
+                           dist="normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            paths = np.asarray(
+                fitted.forecast(horizon=3, method="simulation",
+                                simulations=2000).variance.values,
+                dtype=float,
+            )
+        # the ensemble MEAN is finite, which is exactly why the gate misses it
+        mean_path = paths.mean(axis=tuple(range(2, paths.ndim)))
+        assert np.isfinite(mean_path).all(), (
+            "this test is about a FINITE-but-huge mean; if the mean itself is "
+            "now non-finite the engine's gate catches it and the defect is gone"
+        )
+        # and what the engine publishes for it is the clip bound itself
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            point = volatility_forecast_point(draw, "EGARCH", 3)
+        assert point["volatility_forecast"] == FORECAST_VOL_CLIP_HIGH, (
+            f"expected the published forecast to be the clip bound itself, got "
+            f"{point['volatility_forecast']!r}"
+        )
+        assert point["raw_volatility_forecast"] > 1e6, point["raw_volatility_forecast"]
+        # and the unclipped return-space sigma is published alongside it
+        assert point["return_space_volatility"] > 1e6
+        # reproducible now that the seed is honoured, which is the one thing
+        # about this block that is an improvement rather than a defect
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            again = volatility_forecast_point(draw, "EGARCH", 3)
+        assert again == point
+
+    def test_a_non_finite_path_is_already_correctly_refused(self):
+        """The one part that IS handled: a non-finite path raises, it does not publish.
+
+        Recorded so the gate that exists is not mistaken for the gate that is
+        missing.  The resampling restatement turns this exception into a NaN
+        draw, which it then counts in the published `status` rather than
+        dropping - that part is correct.
+        """
+        draw = self._resample_draw(27, keep=31)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(ValueError, match="no finite EGARCH variance path"):
+                volatility_forecast_point(draw, "EGARCH", 3)
+
+    def test_the_analytic_paths_never_reach_the_exponentiation(self):
+        """Only the simulation branch can overflow: analytic EGARCH is h=1 only.
+
+        This bounds the finding.  GARCH at any horizon and EGARCH at h=1 both run
+        the analytic recursion, which does not exponentiate a simulated path, so
+        neither can produce this class of failure.
+        """
+        series = _returns()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for model in ("GARCH", "EWMA"):
+                for horizon in (1, 3, 21):
+                    volatility_forecast_point(series, model, horizon)
+            volatility_forecast_point(series, "EGARCH", 1)
+        overflows = [str(w.message) for w in caught
+                     if "overflow" in str(w.message) or "invalid value" in str(w.message)]
+        assert not overflows, (
+            f"the analytic paths overflowed: {overflows!r}. If that is possible "
+            f"the finding is wider than the simulation branch and this class's "
+            f"scope claim is wrong"
+        )
+
+    def test_the_overflow_is_not_reachable_from_the_default_export_configuration(self):
+        """The blast radius is the simulated branch only; the export runs GARCH/analytic.
+
+        This is why the finding can be deferred rather than fixed here without
+        the artifact carrying a nonsense volatility: the export's
+        `forecast_risk` is GARCH at horizon 1, and the API default horizon is 1.
+        """
+        engine = AnalyticsEngine()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            garch = asyncio.run(engine._garch_forecast(_returns(), 1))
+            egarch = asyncio.run(engine._egarch_forecast(_returns(), 1))
+        for label, one_step in (("GARCH", garch), ("EGARCH", egarch)):
+            assert one_step["model_params"]["forecast_method"] == "analytic", label
+            assert one_step["horizon"] == 1, label
+        # GARCH has never published simulation provenance at any horizon - it is
+        # analytic throughout - so the key is simply absent rather than null.
+        assert "simulations" not in garch["model_params"]
+        # EGARCH publishes the keys, and at h=1 they are null because the
+        # analytic path draws no randomness.
+        assert egarch["model_params"]["simulations"] is None
+        assert egarch["model_params"]["random_state"] is None
+        # and the default horizon the export and the API both use is 1, so the
+        # simulated branch is not on the default path at all
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "app" / "api" / "analytics.py"
+        ).read_text(encoding="utf-8")
+        assert "horizon: int = Query(default=1" in source, (
+            "the forecast endpoint's default horizon is no longer 1, so the "
+            "simulated EGARCH branch IS on the default export path and the "
+            "overflow reaches the artifact"
+        )
