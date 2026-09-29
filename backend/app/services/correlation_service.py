@@ -82,6 +82,10 @@ def analyze_correlation_stability(
     calls a correlation collapse "normal", which is the failure mode this
     function exists to prevent.
 
+    Because both non-critical tails share the string "ELEVATED", the response
+    also carries ``alert_direction``: which of the four arms fired, in words as
+    well as in token, so the reader is not left inferring sign from a severity.
+
     Args:
         returns_df: Wide DataFrame of daily returns for assets
         window_days: Rolling window size (default 60 days)
@@ -125,20 +129,32 @@ def analyze_correlation_stability(
         f"overlapping {int(window_days)}-day rolling windows"
     )
 
+    # `alert_level` is a severity and says nothing about SIGN: the two ELEVATED
+    # arms below mean opposite things. The upper one is co-movement rising, the
+    # lower one is co-movement collapsed - a reading that removes the very
+    # diversification benefit this section scores, and the one direction a
+    # diversification monitor must never let a consumer mistake for the other.
+    # The direction is set in each arm from the comparison that arm already
+    # used, so level and direction cannot disagree. It is a required assignment
+    # at every arm rather than a computed default: `null` on this schema means
+    # "no comparison ran" (see the single-holding path), not "the service forgot".
     if upper_break:
         alert_level = "CRITICAL"
+        alert_direction = "upper_tail_critical"
         message = (
             f"Average pairwise correlation ({current_avg_corr:.3f}) meets or exceeds 90th percentile "
             f"({threshold_90th:.3f}). Diversification breakdown detected."
         )
     elif current_avg_corr >= threshold_75th:
         alert_level = "ELEVATED"
+        alert_direction = "upper_tail_elevation"
         message = (
             f"Average pairwise correlation ({current_avg_corr:.3f}) exceeds 75th percentile "
             f"({threshold_75th:.3f}). Pairwise correlation is elevated."
         )
     elif lower_break:
         alert_level = "ELEVATED"
+        alert_direction = "lower_tail_collapse"
         message = (
             f"Average pairwise correlation ({current_avg_corr:.3f}) is at or below the 10th "
             f"percentile ({threshold_10th:.3f}) of its own history "
@@ -149,6 +165,7 @@ def analyze_correlation_stability(
         )
     else:
         alert_level = "NORMAL"
+        alert_direction = "within_band"
         # "Normal" is only meaningful as a bounded claim, so the bounds are
         # named: inside the 10th-90th percentile band, and nothing more.
         message = (
@@ -188,6 +205,7 @@ def analyze_correlation_stability(
         historical_median=round(historical_median, 4),
         is_regime_break=is_regime_break,
         alert_level=alert_level,
+        alert_direction=alert_direction,
         message=message,
         series=series_points,
     )

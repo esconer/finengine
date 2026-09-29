@@ -417,7 +417,41 @@ class CorrelationStabilityResponse(BaseModel):
     historical_threshold_10th: Optional[float] = None
     historical_median: Optional[float] = None
     is_regime_break: bool
+    # `alert_level` is a SEVERITY and cannot say which way the book moved:
+    # "ELEVATED" is emitted by the 75th-percentile branch (co-movement RISING)
+    # and by the 10th-percentile branch (co-movement COLLAPSED), and those mean
+    # opposite things about diversification. So the same string is now reachable
+    # from two readings a consumer cannot tell apart, and the one on the live
+    # book is the falling one. `alert_level` keeps its string — it is consumed —
+    # and this field carries the sign, taken from the same comparisons that set
+    # the level. See the `description` for the token -> meaning mapping.
     alert_level: str  # "CRITICAL", "ELEVATED", "NORMAL"
+    alert_direction: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which comparison fired, and what it means for the diversification "
+            "benefit this score credits. Closed set of four: "
+            "'lower_tail_collapse' = current is at or below the 10th percentile; "
+            "co-movement has COLLAPSED, the positions have stopped moving "
+            "together rather than moving together more, so the historical "
+            "diversification benefit may not be available in this regime and "
+            "estimates that assumed the median correlation no longer describe "
+            "this book. A regime change, not a reassurance. "
+            "'upper_tail_elevation' = current is at or above the 75th percentile "
+            "and below the 90th; co-movement is RISING from this book's own "
+            "history, the direction in which diversification erodes. "
+            "'upper_tail_critical' = current is at or above the 90th percentile; "
+            "co-movement is at the top of its own history, a diversification "
+            "breakdown. "
+            "'within_band' = current is between the 10th and 75th percentiles; "
+            "no tail fired, so this section neither supports nor contradicts the "
+            "diversification benefit. "
+            "null means no comparison ran at all (a single holding has undefined "
+            "pairwise correlation and therefore no percentile to rank against); "
+            "it is never a default, and every arm that sets `alert_level` also "
+            "sets a direction."
+        ),
+    )
     message: str
     series: List[CorrelationDataPoint]
     requested_tickers: List[str] = Field(default_factory=list)
