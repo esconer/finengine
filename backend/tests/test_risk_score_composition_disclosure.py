@@ -400,11 +400,18 @@ class TestSaturation:
             RISK_SCORE_CAP * leg["effective_weight"], abs=1e-6
         )
         # The denominator is the PUBLISHED headline, so the share is checkable.
-        assert information["headline_basis_score"] == result["overall_score"]
+        # It used to be asserted == the ROUNDED `overall_score`, which pinned
+        # the defect: the contribution is unrounded, so dividing it by a rounded
+        # total is what made the five shares sum to 1.001419. The unrounded
+        # total is published instead, and this is the same number at 1 dp.
+        assert information["headline_basis_score"] == pytest.approx(
+            result["overall_score"], abs=0.05
+        )
+        assert information["headline_basis_score_rounded"] == result["overall_score"]
         assert information["pinned_share_of_headline"] == pytest.approx(
             information["pinned_weight"] * RISK_SCORE_CAP
             / information["headline_basis_score"],
-            abs=1e-4,
+            abs=1e-6,
         )
         assert "factor_risk" in information["pinned_legs"]
         assert "factor_risk" in result["saturated_components"]
@@ -491,6 +498,81 @@ class TestSaturation:
                     "saturated_at_cap" if leg["saturated"] else "measured"
                 ), name
 
+    @pytest.mark.asyncio
+    async def test_sub_score_and_headroom_are_one_quantity_at_two_roundings(self):
+        """`headroom_to_cap` is not `cap - sub_score`, and the payload says so.
+
+        On the v26 book four of the five legs disagreed: concentration published
+        `sub_score` 8.6 beside `headroom_to_cap` 21.44, which is 30 - 8.56. Both
+        numbers are correct -- `sub_score` is rounded to 1 dp for display and the
+        headroom is taken from the unrounded value -- but the payload published
+        them side by side with no precision basis, so a reader checking
+        `cap - sub_score == headroom_to_cap` read four legs as inconsistent.
+        Nothing moves here: the fix is that the payload now names both
+        roundings and which one answers which question.
+        """
+        engine = AnalyticsEngine()
+        frame = _correlated_frame(n=120)
+        result = await engine.risk_scoring(
+            frame, WEIGHTS, benchmark_data=_noise_benchmark(frame)
+        )
+        audit = _audit(result)
+        disagreeing = 0
+        for name, leg in _legs(audit).items():
+            if leg["sub_score"] is None:
+                continue
+            # The published note has to be present AND has to describe the two
+            # roundings by name, or it does not discharge the disclosure.
+            note = leg["sub_score_precision_note"]
+            assert "1 decimal" in note, (name, note)
+            assert "UNROUNDED" in note, (name, note)
+            assert "headroom_to_cap" in note and "sub_score" in note, (name, note)
+
+            # The reconciliation: cap - headroom is the unrounded sub-score, and
+            # the displayed sub_score is that value at 1 dp.  This is what a
+            # reader does, so it has to hold exactly.
+            unrounded = RISK_SCORE_CAP - leg["headroom_to_cap"]
+            assert leg["sub_score"] == round(unrounded, 1), name
+            assert abs(leg["sub_score"] - unrounded) <= 0.05 + 1e-9, name
+            # And the reconstruction is the value the rest of the leg was built
+            # from, so the share reconciles through it.
+            assert leg["headline_contribution"] == pytest.approx(
+                unrounded * leg["effective_weight"], abs=1e-5
+            ), name
+            if leg["headroom_to_cap"] != pytest.approx(
+                RISK_SCORE_CAP - leg["sub_score"], abs=1e-9
+            ):
+                disagreeing += 1
+        # The fixture must actually exercise the case, or this test proves
+        # nothing: at least one leg has to disagree at 1 dp.
+        assert disagreeing > 0, "no leg disagreed; the rounding never bit"
+
+    @pytest.mark.asyncio
+    async def test_the_note_reconstructs_the_leg_from_its_published_input(self):
+        """`headroom_to_cap` is what reconciles a leg to its input statistic.
+
+        concentration on the v26 book: `sub_score` 8.6, `headroom_to_cap` 21.44,
+        and 30 - 21.44 = 8.56 = `input_statistic_value` 0.0856 x 100. So the
+        published input reproduces the UNROUNDED sub-score, and that is the
+        number `headline_contribution` was multiplied -- which is the point the
+        note makes about which figure to use for what.
+
+        The fixture is the six-name book, where the concentration leg is NOT at
+        its cap: with WEIGHTS = {0.4, 0.3, 0.3} the input is 0.34 and the leg
+        publishes 30.0, which reconciles against the cap rather than the input.
+        """
+        engine = AnalyticsEngine()
+        frame, benchmark, weights = _diversified_book()
+        result = await engine.risk_scoring(frame, weights, benchmark_data=benchmark)
+        leg = _legs(_audit(result))["concentration"]
+        assert not leg["saturated"]
+        unrounded = RISK_SCORE_CAP - leg["headroom_to_cap"]
+        assert unrounded == pytest.approx(leg["input_statistic_value"] * 100, abs=1e-6)
+        assert leg["sub_score"] == round(unrounded, 1)
+        assert leg["headline_contribution"] == pytest.approx(
+            unrounded * leg["effective_weight"], abs=1e-6
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4. effective independent information, as a measurement
@@ -537,20 +619,141 @@ class TestEffectiveInformation:
         assert sum(information["headline_attribution"].values()) == pytest.approx(
             result["overall_score"], abs=0.05
         )
-        assert information["headline_basis_score"] == result["overall_score"]
+        # `headline_basis_score` used to be asserted == the ROUNDED
+        # `overall_score`, and the two bucket shares were reconstructed against
+        # it.  That pinned the defect rather than the property: the shares are
+        # built from UNROUNDED contributions, so dividing them by a rounded
+        # denominator made the five published shares sum to 1.001419 on the v26
+        # book -- 13.118601 of contribution over a 13.1 denominator.  The shares
+        # are now divided by the unrounded total, which is published, so the
+        # property to assert is the sum and the reconciliation against THAT
+        # number -- both of which are wrong under the old code.
+        assert information["headline_basis_score"] == pytest.approx(
+            result["overall_score"], abs=0.05
+        )
+        assert information["headline_basis_score_rounded"] == result["overall_score"]
         assert information["pinned_share_of_headline"] == pytest.approx(
             sum(
                 information["headline_attribution"][leg]
                 for leg in information["pinned_legs"]
             )
             / information["headline_basis_score"],
-            abs=1e-4,
+            abs=1e-6,
+        )
+        # `duplicate_share_of_headline` is the duplicate leg's CONTRIBUTION over
+        # the basis, not its rounded `sub_score` over the basis: the duplicate
+        # leg's sub-score is 7.6 published / 7.615353 measured on the v26 book, a
+        # 1.6e-4 gap in the share. `components.<leg>.headroom_to_cap` recovers
+        # the unrounded value exactly (cap - headroom), so that is the number
+        # the share is checked against.
+        duplicate = information["duplicate_legs"][0]
+        unrounded = (
+            RISK_SCORE_CAP - _legs(audit)["market_risk"]["headroom_to_cap"]
         )
         assert information["duplicate_share_of_headline"] == pytest.approx(
-            information["duplicate_weight"] * result["components"]["market_risk"]
+            information["headline_attribution"][duplicate]
             / information["headline_basis_score"],
-            abs=1e-4,
+            abs=1e-6,
         )
+        assert information["duplicate_share_of_headline"] == pytest.approx(
+            information["duplicate_weight"] * unrounded
+            / information["headline_basis_score"],
+            abs=1e-6,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_published_shares_partition_the_headline(self):
+        """A share column that does not sum to 1 is not a share column.
+
+        The property was violated on every real book, not just the export one:
+        each `headline_share` divided an UNROUNDED contribution by the ROUNDED
+        `overall_score`, so the five shares summed to 1.001419 on the v26 book
+        (13.118601 / 13.1). Rounding a share to 6 dp can move the sum by at most
+        5 x 2.5e-6, so the assertion below is two orders of magnitude tighter
+        than the defect it pins and cannot be satisfied by a rounding artefact.
+        """
+        engine = AnalyticsEngine()
+        frame, benchmark, weights = _diversified_book()
+        result = await engine.risk_scoring(frame, weights, benchmark_data=benchmark)
+        audit = _audit(result)
+        information = audit["effective_information"]
+        shares = {
+            name: leg["headline_share"]
+            for name, leg in _legs(audit).items()
+            if leg["headline_share"] is not None
+        }
+        assert len(shares) == information["measured_leg_count"]
+        assert sum(shares.values()) == pytest.approx(1.0, abs=1e-5)
+        # And each one reconciles against the PUBLISHED unrounded basis, which
+        # is what makes the sum checkable by a reader rather than by this file.
+        for name, share in shares.items():
+            assert share == pytest.approx(
+                _legs(audit)[name]["headline_contribution"]
+                / information["headline_basis_score"],
+                abs=1e-6,
+            ), name
+
+    @pytest.mark.asyncio
+    async def test_the_unrounded_headline_is_published_beside_the_rounded_one(self):
+        """`overall_score_raw` did not exist on risk_score at all -- not null,
+        ABSENT -- while `liquidity` had published exactly that pair since an
+        earlier wave. `headline_basis_score` is the same number under the name
+        the shares are divided by, so a reader can reconcile them against each
+        other instead of against a rounded value.
+        """
+        engine = AnalyticsEngine()
+        frame, benchmark, weights = _diversified_book()
+        result = await engine.risk_scoring(frame, weights, benchmark_data=benchmark)
+        information = _audit(result)["effective_information"]
+        assert information["overall_score_raw"] is not None
+        assert information["headline_basis_score"] == information["overall_score_raw"]
+        # `overall_score` is the same number at the display precision, and is
+        # what `risk_level` was decided on. Neither moved.
+        assert result["overall_score"] == information["headline_basis_score_rounded"]
+        assert information["overall_score_raw"] == pytest.approx(
+            result["overall_score"], abs=0.05
+        )
+        assert sum(information["headline_attribution"].values()) == pytest.approx(
+            information["overall_score_raw"], abs=1e-5
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sum_claim_in_a_published_sentence_is_backed_by_the_numbers(self):
+        """The general form of the defect this wave fixed.
+
+        `headline_weight_basis` used to read "...and the first three sum to 1 --
+        the whole headline" with no noun, in a block whose three preceding keys
+        are `*_share_of_headline`. A reader had one reading available and it was
+        false: the three SHARES summed to 1.001419. The sentence now names both
+        quantities, and this test pins the claim rather than the wording -- if it
+        asserts a sum, the published numbers it names must deliver that sum.
+        """
+        engine = AnalyticsEngine()
+        frame, benchmark, weights = _diversified_book()
+        result = await engine.risk_scoring(frame, weights, benchmark_data=benchmark)
+        audit = _audit(result)
+        information = audit["effective_information"]
+        basis = information["headline_weight_basis"]
+
+        weight_sum = (
+            information["responsive_weight"]
+            + information["pinned_weight"]
+            + information["duplicate_weight"]
+        )
+        share_sum = (
+            information["responsive_share_of_headline"]
+            + information["pinned_share_of_headline"]
+            + information["duplicate_share_of_headline"]
+        )
+        if "sum to 1" in basis:
+            assert "WEIGHTS" in basis, basis
+            assert weight_sum == pytest.approx(1.0, abs=1e-6)
+            assert share_sum == pytest.approx(1.0, abs=1e-5)
+        # Unconditionally, because a reword that simply dropped the claim would
+        # otherwise let the sums rot unnoticed: both sums are properties of the
+        # payload, not of the sentence.
+        assert weight_sum == pytest.approx(1.0, abs=1e-6)
+        assert share_sum == pytest.approx(1.0, abs=1e-5)
 
     @pytest.mark.asyncio
     async def test_an_unmeasured_leg_is_counted_as_unmeasured_not_as_pinned(self):

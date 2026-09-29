@@ -84,6 +84,105 @@ class TestQuantitativeInvariants:
         # (1 - 0.66) / (1 - 1/3) * 100 = 0.34 / (2/3) * 100 = 51.0%
         assert abs(res_skewed["diversification_score"] - 51.0) < 0.5
 
+    @pytest.mark.asyncio
+    async def test_the_diversification_score_satisfies_its_published_formula(self):
+        """RL-7: `diversification_score` shipped as a bare 0-100 number.
+
+        The v26 export published 98.5 with no scale, no formula and no holding
+        count: a reader could not recompute it, and could not tell what 100
+        meant. All three are now published, and this asserts the score is the
+        expression those three keys describe, evaluated on the published inputs
+        rather than on the engine's internal unrounded index.
+
+        The tolerance is derived, not chosen: `herfindahl_index` is published
+        rounded to 4 decimals, so the published index is within 5e-5 of the one
+        the score was computed from, and the formula's divisor is `1 - 1/n` >=
+        0.5 for n >= 2, which puts the induced error in the score at <= 0.01 --
+        and the score itself is published rounded to 1 decimal. Where the
+        published index is exact (a single holding, equal weight) the identity
+        below is exact too, and is asserted as such.
+        """
+        engine = AnalyticsEngine()
+        books = [
+            {"A": 0.8, "B": 0.1, "C": 0.1},
+            {f"N{i}": 0.2 for i in range(5)},
+            {f"N{i}": 1.0 / 7 for i in range(7)},
+            {"A": 0.6, "B": 0.15, "C": 0.15, "D": 0.1},
+            {"A": 0.34, "B": 0.33, "C": 0.33},
+        ]
+        for book in books:
+            result = await engine.concentration_analysis(book)
+            n = result["n_holdings"]
+            assert n == len(book), (n, book)
+            hhi = result["herfindahl_index"]
+            recomputed = ((1 - hhi) / (1 - 1 / n)) * 100
+            assert result["diversification_score"] == pytest.approx(
+                recomputed, abs=0.011
+            ), (book, result["diversification_score"], recomputed)
+            # The ratio is a different statistic, not a second reading of the
+            # score: it is only equal to it (as a fraction) at equal weight.
+            assert result["diversification_ratio"] == pytest.approx(
+                (1 / hhi) / n, abs=0.02
+            ), book
+            assert result["diversification_score_formula"]
+            assert result["diversification_ratio_formula"]
+            assert "1 - 1/n_holdings" in result["diversification_score_formula"]
+            assert "effective_positions / n_holdings" in (
+                result["diversification_ratio_formula"]
+            )
+        # The two anchors, stated as anchors rather than left to be inferred.
+        equal = await engine.concentration_analysis({f"N{i}": 0.2 for i in range(5)})
+        assert equal["diversification_score"] == 100.0
+        assert equal["herfindahl_index"] == 0.2
+        single = await engine.concentration_analysis({"ONLY": 1.0})
+        assert single["diversification_score"] == 0.0
+        assert single["n_holdings"] == 1
+        assert single["herfindahl_index"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_the_diversification_scale_says_what_both_ends_mean(self):
+        """A scale with no anchors is a range, not a scale."""
+        engine = AnalyticsEngine()
+        result = await engine.concentration_analysis({"A": 0.8, "B": 0.1, "C": 0.1})
+        scale = result["scale"]
+        assert scale["min"] == 0.0
+        assert scale["max"] == 100.0
+        assert "0" in scale["unit"] and "100" in scale["unit"]
+        # 100 is a NORMALIZED value: equal weight at any holding count.
+        assert "1 / n_holdings" in scale["at_max"]
+        # 0 is one holding carrying the whole book.
+        assert "herfindahl_index == 1" in scale["at_min"]
+        assert "n_holdings" in scale["holdings_basis"]
+        # And the holding count is the one the formula is evaluated at, not a
+        # second definition: zero and non-finite rows are not holdings.
+        with_zeros = await engine.concentration_analysis(
+            {"A": 0.8, "B": 0.2, "ZERO": 0.0, "NEG": -0.1}
+        )
+        assert with_zeros["n_holdings"] == 2
+        # (1 - 0.68) / (1 - 1/2) * 100 = 64.0
+        assert with_zeros["diversification_score"] == 64.0
+
+    @pytest.mark.asyncio
+    async def test_effective_positions_declares_the_rounding_it_uses(self):
+        """`1 / herfindahl_index` will not reproduce `effective_positions`.
+
+        The index is published at 4 decimals and the effective count is built
+        from the unrounded one, so the two differ by up to ~0.008 on a 14-name
+        book (0.0078 on the v26 one). The payload states the basis rather than
+        leaving a reader to trip over the mismatch.
+        """
+        engine = AnalyticsEngine()
+        book = {f"N{i}": 0.05 + 0.01 * i for i in range(14)}
+        result = await engine.concentration_analysis(book)
+        note = result["effective_positions_note"]
+        assert "UNROUNDED" in note
+        assert "4 decimals" in note
+        # And the statement is true: the two genuinely differ on a skewed book.
+        published = 1 / result["herfindahl_index"]
+        assert published != pytest.approx(result["effective_positions"], abs=1e-4)
+        assert result["effective_positions"] == pytest.approx(published, abs=0.02)
+        assert result["n_holdings"] == 14
+
     def test_inverse_volatility_parity_closed_form(self):
         """
         Inverse-volatility parity weights: w_i proportional to 1 / sigma_i.

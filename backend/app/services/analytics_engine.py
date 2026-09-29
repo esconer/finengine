@@ -389,6 +389,72 @@ STRESS_CO_MOVEMENT_BASIS = (
     "measured_co_movement_with_the_rest_of_the_delivered_book_not_a_market_beta"
 )
 
+# ---------------------------------------------------------------------------
+# concentration / diversification disclosure
+# ---------------------------------------------------------------------------
+#: `diversification_score` was published as a bare 0-100 number with no scale, no
+#: formula and no holding count: 98.5 on the v26 book, and a reader could neither
+#: reproduce it nor tell what the top of the scale means.  The two anchors below
+#: are the repo's own stated intent -- `tests/test_quantitative_invariants.py`
+#: asserts equal weight scores 100.0 and a single holding scores 0.0 -- so the
+#: scale is declared from the behaviour that is already tested, not invented.
+#: `n_holdings` is published because NEITHER formula can be evaluated without it
+#: and it was previously recoverable only by counting `by_weight`.
+CONCENTRATION_DIVERSIFICATION_SCALE = {
+    "min": 0.0,
+    "max": 100.0,
+    "unit": "index_0_to_100_higher_is_better_diversified",
+    "at_max": (
+        "100 is every holding carrying the SAME weight, i.e. "
+        "herfindahl_index == 1 / n_holdings. It is a normalized value, not a "
+        "count: 100 does not mean many holdings, it means evenly held whatever "
+        "the count is"
+    ),
+    "at_min": (
+        "0 is one holding carrying the whole book, i.e. herfindahl_index == 1. "
+        "A single-holding book (n_holdings == 1) is published as 0.0 because "
+        "the formula's denominator 1 - 1/n_holdings is exactly 0 there and the "
+        "limit of the expression is 0"
+    ),
+    "holdings_basis": (
+        "n_holdings counts the rows with a strictly positive, finite weight "
+        "AFTER the weights are normalized to sum to 1. Zero, negative and "
+        "non-finite rows are not holdings and are excluded before the count"
+    ),
+}
+
+CONCENTRATION_DIVERSIFICATION_SCORE_FORMULA = (
+    "diversification_score = ((1 - herfindahl_index) / (1 - 1/n_holdings)) * 100, "
+    "where herfindahl_index = sum(w_i^2) over the normalized weights. It is the "
+    "Herfindahl index placed on a 0-100 scale by normalizing against the "
+    "equal-weight value 1/n_holdings, and it is published as 0.0 when "
+    "n_holdings <= 1"
+)
+
+CONCENTRATION_DIVERSIFICATION_RATIO_FORMULA = (
+    "diversification_ratio = effective_positions / n_holdings, where "
+    "effective_positions = 1 / herfindahl_index. This is a DIFFERENT statistic "
+    "from diversification_score, not a second expression of it: the ratio "
+    "coincides with the score (as a fraction) only at equal weight, and it "
+    "falls as the book concentrates while the score is normalized against "
+    "n_holdings. The two are not expected to agree and are not reconciled here"
+)
+
+#: `effective_positions` is built from the UNROUNDED Herfindahl index while
+#: `herfindahl_index` is published at 4 decimals, so `1 / herfindahl_index` does
+#: not reproduce it exactly on an arbitrary book.  Stated rather than left for a
+#: reader to trip over -- the gap is a rounding one, not an error, and no
+#: published value is changed to hide it.
+CONCENTRATION_EFFECTIVE_POSITIONS_NOTE = (
+    "effective_positions = 1 / herfindahl_index computed on the UNROUNDED index, "
+    "while herfindahl_index is published rounded to 4 decimals, so dividing the "
+    "PUBLISHED index does not reproduce effective_positions exactly. "
+    "diversification_score and diversification_ratio are both built from the "
+    "same unrounded index. herfindahl_index is published at 4 decimals because "
+    "the concentration leg of overall_score is scored from it, and rounding it "
+    "further would move that leg's sub-score"
+)
+
 #: Risk points, on the 0-30 sub-score scale, per unit of measured average
 #: pairwise correlation. The sub-score is `min(30, POINTS * max(0, avg_corr))`.
 #: There is deliberately no "free" correlation baseline: the previous form,
@@ -2320,6 +2386,23 @@ def _leg_series_relation(
     return None
 
 
+#: Why ``sub_score`` and ``headroom_to_cap`` on the same leg do not subtract to
+#: ``cap``.  Published as data on every leg rather than left to be inferred: the
+#: two are one quantity at two roundings, the payload published them side by side
+#: with no precision basis, and a reader checking ``cap - sub_score ==
+#: headroom_to_cap`` concluded four of the five legs were inconsistent.  Nothing
+#: moved; the note says which number answers which question.
+RISK_SCORE_SUB_SCORE_PRECISION_NOTE = (
+    "sub_score is this leg's sub-score rounded to 1 decimal for display, and "
+    "headroom_to_cap is cap minus the UNROUNDED sub-score, so the two differ by "
+    "up to 0.05 and are not meant to subtract to cap. Use sub_score to read the "
+    "leg. Use headroom_to_cap, or reconstruct the unrounded sub-score as cap - "
+    "headroom_to_cap, when reconciling against input_statistic_value: that "
+    "reconstruction is the value every other figure on this leg "
+    "(headline_contribution, headline_share) was built from"
+)
+
+
 def _risk_score_audit(
     *,
     scores: Mapping[str, Optional[float]],
@@ -2362,10 +2445,21 @@ def _risk_score_audit(
         if name not in excluded and scores.get(name) is not None
     ]
     # A numpy scalar would serialise as a different JSON type, and the published
-    # share has to be a plain number a reader can divide with. The denominator is
-    # the PUBLISHED headline, not the unrounded one: a share a reader cannot
-    # reproduce from the number on the payload is a number nobody can check.
-    total = round(float(overall_score), 1)
+    # share has to be a plain number a reader can divide with.
+    #
+    # Every share is divided by the UNROUNDED headline. Dividing the unrounded
+    # contributions by the ROUNDED one -- the old code, on the reasoning that "a
+    # share a reader cannot reproduce from the number on the payload is a number
+    # nobody can check" -- made the five published shares sum to 1.001419 on the
+    # v26 book: 13.118601 of contribution over a 13.1 denominator. Rounding at
+    # 6 dp can move the sum by at most 5 x 2.5e-6, so the 1.4e-3 excess was a
+    # normalisation error and not a display artefact. The old reasoning was
+    # sound and the fix it asked for was the wrong one: the payload now publishes
+    # the unrounded total as `headline_basis_score` / `overall_score_raw` beside
+    # the 1-decimal display value, so a reader reproduces every share exactly
+    # AND still sees the number the score is quoted at.
+    total_unrounded = float(overall_score)
+    total = round(total_unrounded, 1)
 
     # Which leg in a shared statistic family is credited with the independent
     # measurement: the first measured leg of the family, in report order.
@@ -2445,6 +2539,12 @@ def _risk_score_audit(
             "headroom_to_cap": (
                 round(RISK_SCORE_CAP - float(score), 6) if score is not None else None
             ),
+            # The two numbers above are the SAME quantity at two roundings, and
+            # the payload published them with nothing saying so: 4 of the 5 legs
+            # on the v26 book disagreed (concentration published sub_score 8.6
+            # beside headroom 21.44, which is cap - 8.56). Both are right, and
+            # which one to use depends on the question.
+            "sub_score_precision_note": RISK_SCORE_SUB_SCORE_PRECISION_NOTE,
             "saturated": saturated,
             "cap_binding_input": round(float(spec["cap_binding_input"]), 6),
             "cap_binds_when_input_is": spec["cap_binds_when_input_is"],
@@ -2514,21 +2614,28 @@ def _risk_score_audit(
             contribution = float(score) * float(weight)
             contributions[name] = round(contribution, 6)
             entry["headline_contribution"] = round(contribution, 6)
+            # Divided by the UNROUNDED total, so the shares partition the
+            # headline instead of over-claiming it by the rounding of the
+            # denominator (see `total_unrounded` above).
             entry["headline_share"] = (
-                round(contribution / total, 6) if total else None
+                round(contribution / total_unrounded, 6) if total_unrounded else None
             )
             entry["headline_share_reason"] = (
                 None
-                if total
+                if total_unrounded
                 else "overall_score is 0, so a share of it is undefined"
             )
         else:
+            # An unmeasured leg has no share to publish, and the old expression
+            # published 0.0 with a reason when the headline was zero and None
+            # with NO reason when it was not -- the one case that actually
+            # occurs, and an absent value without one. The reason is now always
+            # the one that actually applies, so the two branches agree on the
+            # pairing (value or null, plus why).
             entry["headline_contribution"] = 0.0
-            entry["headline_share"] = 0.0 if not total else None
+            entry["headline_share"] = 0.0 if not total_unrounded else None
             entry["headline_share_reason"] = (
                 "leg was not measured, so it contributes nothing to the headline"
-                if not total
-                else None
             )
         components[name] = entry
 
@@ -2576,11 +2683,16 @@ def _risk_score_audit(
         )
 
     def _share(names: Sequence[str]) -> Optional[float]:
-        """Share of the headline carried by `names`, recomputable from it."""
-        if not total:
+        """Share of the headline carried by `names`, recomputable from it.
+
+        Same denominator as the per-leg `headline_share` and for the same reason:
+        the UNROUNDED total, so the three bucket shares partition the headline
+        rather than exceeding it by the denominator's rounding.
+        """
+        if not total_unrounded:
             return None
         return round(
-            sum(contributions.get(n, 0.0) for n in names) / total, 6
+            sum(contributions.get(n, 0.0) for n in names) / total_unrounded, 6
         )
 
     headline_weight = round(
@@ -2608,12 +2720,37 @@ def _risk_score_audit(
         # are the whole of it and always add up to 1. A leg that was excluded
         # carries none of the headline by construction -- which is not the same
         # statement as being pinned, and is kept apart from it here.
+        #
+        # This sentence is published DATA, so it is held to the same standard as
+        # a number: the old wording ended "the first three sum to 1 -- the whole
+        # headline" with no noun, in a block whose three preceding keys are
+        # `*_share_of_headline`, and the shares summed to 1.001419. A disclosure
+        # that names no quantity cannot be checked by a reader, and the one a
+        # reader would have read was false. So both sums are named, and both are
+        # true.
         "headline_weight_basis": (
             "effective (renormalized) weights; each leg sits in exactly one of "
-            "headline_bucket responsive/pinned/duplicate/excluded, and the "
-            "first three sum to 1 -- the whole headline"
+            "headline_bucket responsive/pinned/duplicate/excluded, and the first "
+            "three buckets' WEIGHTS sum to 1 -- the whole headline. Their shares "
+            "of the headline (responsive_share_of_headline, "
+            "pinned_share_of_headline, duplicate_share_of_headline) also sum to 1, "
+            "divided by headline_basis_score, the UNROUNDED total; overall_score "
+            "is that same total rounded to 1 decimal for display"
         ),
-        "headline_basis_score": total,
+        # The denominator every share on this payload is computed from, at the
+        # precision it is computed at. `headline_basis_score_rounded` is the
+        # display value beside it, and `overall_score_raw` is the same number
+        # under the name `liquidity` already publishes it under.
+        "headline_basis_score": round(total_unrounded, 6),
+        "headline_basis_score_rounded": total,
+        "overall_score_raw": round(total_unrounded, 6),
+        "headline_basis_score_note": (
+            "the unrounded weighted mean of the measured legs' sub-scores, i.e. "
+            "the value that becomes overall_score once rounded to 1 decimal. Every "
+            "headline_share and every *_share_of_headline on this payload is "
+            "divided by it, so those shares sum to 1; dividing by the rounded "
+            "overall_score instead made them sum to 1.001419 on the v26 book"
+        ),
         "headline_weight_total": headline_weight,
         "unmeasured_leg_count": len(excluded),
         "unmeasured_nominal_weight": _nominal_weight_of(list(excluded)),
@@ -2625,11 +2762,13 @@ def _risk_score_audit(
             "contribution = unrounded sub_score x effective_weight; the "
             "contributions sum to the unrounded overall_score, which the "
             "payload publishes rounded to 1 decimal as overall_score, so their "
-            "sum can differ from it by up to 0.05"
+            "sum can differ from it by up to 0.05. The unrounded total they sum "
+            "to is published as headline_basis_score, and it is what each "
+            "contribution is divided by to give headline_share"
         ),
         "share_undefined_reason": (
             None
-            if total
+            if total_unrounded
             else "overall_score is 0, so no share of the headline is defined"
         ),
     }
@@ -3463,6 +3602,19 @@ class AnalyticsEngine:
                 "diversification_score": round(diversification_score, 1),
                 "diversification_ratio": round(diversification_ratio, 2),
                 "gini_coefficient": round(gini, 3),
+                # The score and the ratio above are on different scales built
+                # from the same index, and neither could be evaluated without
+                # the holding count, so all four are published here rather than
+                # left to be reconstructed from `by_weight` by a reader.
+                "n_holdings": n_assets,
+                "scale": dict(CONCENTRATION_DIVERSIFICATION_SCALE),
+                "diversification_score_formula": (
+                    CONCENTRATION_DIVERSIFICATION_SCORE_FORMULA
+                ),
+                "diversification_ratio_formula": (
+                    CONCENTRATION_DIVERSIFICATION_RATIO_FORMULA
+                ),
+                "effective_positions_note": CONCENTRATION_EFFECTIVE_POSITIONS_NOTE,
                 "by_weight": dict(sorted(weights.items(), key=lambda x: x[1], reverse=True))
             }
             
@@ -5743,6 +5895,24 @@ class AnalyticsEngine:
             "diversification_score": 0.0,
             "diversification_ratio": 1.0,
             "gini_coefficient": 0.0,
+            # The disclosure keys are published here too, so a consumer sees one
+            # shape rather than two. `n_holdings` is 0 because no holding was
+            # measured -- that is a true statement about an absent book. The
+            # three numbers above are NOT: diversification_score 0.0 on an empty
+            # book is indistinguishable from a measured single-holding book, the
+            # same class of defect the liquidity `_empty_liquidity` comment
+            # records (V3-09). Left exactly as they were -- changing them is
+            # outside this disclosure, and a consumer that needs the difference
+            # has `error` and `n_holdings` == 0 to read it from.
+            "n_holdings": 0,
+            "scale": dict(CONCENTRATION_DIVERSIFICATION_SCALE),
+            "diversification_score_formula": (
+                CONCENTRATION_DIVERSIFICATION_SCORE_FORMULA
+            ),
+            "diversification_ratio_formula": (
+                CONCENTRATION_DIVERSIFICATION_RATIO_FORMULA
+            ),
+            "effective_positions_note": CONCENTRATION_EFFECTIVE_POSITIONS_NOTE,
             "by_weight": {},
             "error": "No position data available"
         }
@@ -5825,6 +5995,11 @@ class AnalyticsEngine:
     def _empty_risk_score(self) -> Dict[str, Any]:
         return {
             "overall_score": None,
+            # Null, not 0.0: nothing was measured. Published beside the score for
+            # the same reason `liquidity` publishes it -- the pair is what lets a
+            # consumer tell a rounded display value from the value it came from
+            # without re-deriving it.
+            "overall_score_raw": None,
             "risk_level": None,
             "change": None,
             "components": {

@@ -643,9 +643,21 @@ class TestThePublishedScoreIsUnchanged:
         result = await _score(frame, weights, benchmark)
         # recomputed from the payload's own published ingredients
         audit = result["score_audit"]
-        contributions = audit["effective_information"]["headline_attribution"]
+        information = audit["effective_information"]
+        contributions = information["headline_attribution"]
+        # This used to be asserted against the ROUNDED `overall_score` with a
+        # 0.05 window, which passed no matter how wrong the denominator was: it
+        # was measuring the rounding, not the identity. The unrounded total is
+        # now published, so the identity is exact to the 6 dp the contributions
+        # are published at, and the score is unchanged at the display
+        # precision.
         assert sum(contributions.values()) == pytest.approx(
-            result["overall_score"], abs=0.05
+            information["overall_score_raw"], abs=1e-5
+        )
+        assert information["headline_basis_score"] == information["overall_score_raw"]
+        assert information["headline_basis_score_rounded"] == result["overall_score"]
+        assert result["overall_score"] == pytest.approx(
+            information["overall_score_raw"], abs=0.05
         )
         assert result["risk_level"] == (
             "LOW" if result["overall_score"] < 15
@@ -656,6 +668,23 @@ class TestThePublishedScoreIsUnchanged:
             assert weight == RISK_SCORE_WEIGHTS[leg]
         for leg, value in result["components"].items():
             assert value == audit["components"][leg]["sub_score"]
+
+    @pytest.mark.asyncio
+    async def test_the_precision_block_publishes_the_unrounded_headline(self):
+        """`liquidity` has published `overall_score_raw` beside `overall_score`
+        since an earlier wave; `risk_score` did not have the key at all. The
+        precision block's whole subject is what each number is known to, and the
+        headline's first rounding is the one rounding it had no answer for.
+        """
+        frame, benchmark, weights = _book()
+        result = await _score(frame, weights, benchmark)
+        information = result["score_audit"]["effective_information"]
+        assert "overall_score_raw" in information
+        assert information["overall_score_raw"] is not None
+        assert information["overall_score_raw"] == information["headline_basis_score"]
+        # An absent value is null plus a reason; an absent KEY is not a
+        # disclosure at all, which is what this was.
+        assert AnalyticsEngine()._empty_risk_score()["overall_score_raw"] is None
 
     @pytest.mark.asyncio
     async def test_the_alerts_are_unchanged_by_the_disclosure(self):
