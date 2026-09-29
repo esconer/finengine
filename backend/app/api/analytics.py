@@ -40,6 +40,10 @@ from app.services.currency_service import (
     get_currency_service,
 )
 from app.services.analytics_engine import (
+    AUTOCORRELATION_AR1_DECIMALS,
+    AUTOCORRELATION_EFFECTIVE_N_DECIMALS,
+    AUTOCORRELATION_EFFECTIVE_N_REPRODUCIBILITY_BASIS,
+    EGARCH_VOL_CLIP_LOW,
     FORECAST_LEG_REFIT_RESAMPLES_WITHHELD,
     FORECAST_PORTFOLIO_REFIT_RESAMPLES,
     FORECAST_REFIT_COUNT_RULE,
@@ -56,6 +60,7 @@ from app.services.analytics_engine import (
     ar1_autocorrelation,
     effective_sample_size,
     engine_risk_statistics,
+    effective_n_reproducibility_bound,
     market_model_statistics,
     market_model_witness,
     measure_estimate_uncertainty,
@@ -1545,6 +1550,62 @@ CONTRIBUTION_UNIT = "fraction_of_portfolio_risk"
 CONTRIBUTION_DECIMALS = 6
 
 # ---------------------------------------------------------------------------
+# One name per model, in every container of this section
+# ---------------------------------------------------------------------------
+# The section names its two models in FIVE places - `positions`, `excluded_assets`,
+# `contribution_basis.per_model`, `sector_rollup` and
+# `contribution_basis.sector_rollup_per_model` - plus
+# `universe_coverage.model_used_tickers`.  It used to spell the tail model
+# `cvar_tail` in three of them and `cvar` in two, for one model, in one object.  A
+# consumer keying on either spelling silently misses half the block: `cvar_tail`
+# misses `sector_rollup`, `cvar` misses `positions`, and neither failure is
+# visible from the payload.  The arithmetic was never the problem - all fourteen
+# legs roll into their sector with |d| = 0.0 for both models - so nothing here
+# moves a share; the keys are made to agree.
+#
+# WHICH SPELLING IS KEPT, and why.  `cvar_tail`, on four counts rather than on
+# taste: it is the spelling in the majority of containers; it is the spelling
+# `universe_coverage.model_used_tickers` already used, so the coverage block and
+# the share blocks now agree; it is the spelling this module's own header comment
+# above documents; and bare `cvar` collides with the tail MEASURE
+# (`portfolio_cvar_95_daily`, `tail_measure.cvar_forecast`,
+# `cvar_to_var_ratio`) which is a different quantity in a different unit on the
+# same payload.  A name that is already three other things is the wrong one to
+# keep for a fourth.
+CONTRIBUTION_MODEL_NAMES = ("volatility", "cvar_tail")
+
+#: The retired spelling, kept as a POINTER rather than as a second key.  A second
+#: key is exactly the defect: it would put both spellings for one model back into
+#: the payload, which is the thing being fixed.  An alias map says which name to
+#: read and where, so a consumer keying on `cvar` is redirected rather than left
+#: silently empty.
+CONTRIBUTION_MODEL_ALIASES = {"cvar": "cvar_tail"}
+
+CONTRIBUTION_MODEL_NAME_BASIS = (
+    "one model, one name, in every container of this section. "
+    "positions, excluded_assets, contribution_basis.per_model, sector_rollup, "
+    "contribution_basis.sector_rollup_per_model and "
+    "universe_coverage.model_used_tickers are all keyed by the canonical names "
+    "listed here, so a consumer can iterate one vocabulary across all of them. "
+    "aliases maps every retired spelling to the name that replaced it: "
+    + ", ".join(
+        f"{old!r} -> {new!r}" for old, new in CONTRIBUTION_MODEL_ALIASES.items()
+    )
+    + ". No container publishes both spellings for the same model, because a "
+    "reader could not then tell which of two keys was the real one and which was "
+    "the copy. The section previously published 'cvar_tail' in positions, "
+    "excluded_assets and contribution_basis.per_model and 'cvar' in sector_rollup "
+    "and contribution_basis.sector_rollup_per_model, for one model, in one object; "
+    "no published share changed, only which key carries it"
+)
+
+#: The two names `sector_rollup` and `contribution_basis.sector_rollup_per_model`
+#: are built from.  Held as a constant rather than written at the call site so the
+#: rename cannot be applied to one of the two containers and forgotten on the
+#: other, which is how the two spellings diverged in the first place.
+CONTRIBUTION_SECTOR_ROLLUP_NAMES = ("volatility", "cvar_tail")
+
+# ---------------------------------------------------------------------------
 # SI-5 -- precision of this section's two tail estimates
 # ---------------------------------------------------------------------------
 # `portfolio_var_95_daily` and `portfolio_cvar_95_daily` are order statistics of
@@ -1576,6 +1637,63 @@ RISK_CONTRIBUTION_TAIL_EFFECTIVE_N_BASIS = (
     "published beside it at tail_support.window_effective_n and describes the "
     "resampling frame instead"
 )
+
+
+def _tail_support_reproducibility(
+    tail_count: int,
+    tail_ar1: Optional[float],
+    tail_effective_raw: Optional[float],
+) -> Dict[str, Any]:
+    """Does this block's own formula reproduce its own published figure?
+
+    Measured against the UNCAPPED figure, which is the one the formula produces.
+    The cap at the tail count is a separate declared step applied afterwards
+    (`effective_n_cap_applied` says whether it bound), and folding it in here
+    would report a residual the declared rounding bound does not and should not
+    cover - the bound is a statement about ROUNDING, not about the cap.
+
+    `effective_n_reproducibility_bound` is the engine's own function, and it takes
+    only published inputs (`n` and the rounded `ar1`), so this is the same bound
+    the window-side `autocorrelation` block publishes rather than a second
+    derivation of it.
+    """
+    if tail_ar1 is None or tail_effective_raw is None or not tail_count:
+        return {
+            "describes": "effective_n_uncapped",
+            "recomputes_from_published_ar1": None,
+            "recomputation_deviation": None,
+            "recomputation_deviation_bound": None,
+            "within_declared_bound": None,
+            "bound_basis": None,
+            "reason": (
+                "not measured: no AR(1) slope and no effective sample size were "
+                "published for this tail, so there is nothing to recompute. See "
+                "tail_support.effective_n_reason"
+            ),
+        }
+    published_ar1 = round(float(tail_ar1), AUTOCORRELATION_AR1_DECIMALS)
+    published = round(
+        float(tail_effective_raw), AUTOCORRELATION_EFFECTIVE_N_DECIMALS
+    )
+    recomputed = effective_sample_size(int(tail_count), published_ar1)
+    deviation = (
+        abs(float(recomputed) - published) if recomputed is not None else None
+    )
+    bound = effective_n_reproducibility_bound(int(tail_count), published_ar1)
+    return {
+        "describes": "effective_n_uncapped",
+        "recomputes_from_published_ar1": (
+            None if deviation is None else bool(deviation == 0.0)
+        ),
+        "recomputation_deviation": deviation,
+        "recomputation_deviation_bound": bound,
+        "within_declared_bound": (
+            None if (deviation is None or bound is None)
+            else bool(deviation <= bound)
+        ),
+        "bound_basis": AUTOCORRELATION_EFFECTIVE_N_REPRODUCIBILITY_BASIS,
+        "reason": None,
+    }
 
 
 def _contribution_basis_block(
@@ -1617,6 +1735,11 @@ def _contribution_basis_block(
     return {
         "unit": CONTRIBUTION_UNIT,
         "field": "positions.* and sector_rollup.*",
+        "model_names": {
+            "canonical": list(CONTRIBUTION_MODEL_NAMES),
+            "aliases": dict(CONTRIBUTION_MODEL_ALIASES),
+            "basis": CONTRIBUTION_MODEL_NAME_BASIS,
+        },
         "normalization": (
             "Each model's shares are normalized to 1.0 over the legs that model "
             "could support, then rounded to 6 decimals. A model that excluded a "
@@ -1766,14 +1889,19 @@ def _risk_contribution_tail_uncertainty(
     )
     # `effective_n` is replaced per entry, never silently: the block-level
     # `autocorrelation.effective_n` stays the WINDOW figure, and each entry says
-    # which population its own number describes.
+    # which population its own number describes.  Rounded with the engine's own
+    # declared decimal count rather than a literal 4, so this entry and
+    # `tail_support` below cannot drift apart from the window-side block that
+    # publishes the same formula.
     for field, entry in (block.get("estimates") or {}).items():
         entry["effective_n"] = (
-            round(tail_effective, 4) if tail_effective is not None else None
+            round(tail_effective, AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
+            if tail_effective is not None else None
         )
+        entry["effective_n_decimals"] = AUTOCORRELATION_EFFECTIVE_N_DECIMALS
         entry["effective_n_basis"] = RISK_CONTRIBUTION_TAIL_EFFECTIVE_N_BASIS
         entry["effective_n_uncapped"] = (
-            round(tail_effective_raw, 4)
+            round(tail_effective_raw, AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
             if tail_effective_raw is not None
             else None
         )
@@ -1791,17 +1919,69 @@ def _risk_contribution_tail_uncertainty(
         "basis": RISK_CONTRIBUTION_TAIL_SUPPORT_BASIS,
         "tail_observations": tail_count,
         "window_observations": int(series.size),
-        "ar1": round(tail_ar1, 6) if tail_ar1 is not None else None,
+        "ar1": (
+            round(tail_ar1, AUTOCORRELATION_AR1_DECIMALS)
+            if tail_ar1 is not None else None
+        ),
+        "ar1_decimals": AUTOCORRELATION_AR1_DECIMALS,
         "ar1_basis": (
             "OLS slope of r_t on r_(t-1) over the TAIL sample, not the window"
         ),
-        "effective_n": round(tail_effective, 4) if tail_effective is not None else None,
+        "effective_n": (
+            round(tail_effective, AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
+            if tail_effective is not None else None
+        ),
+        "effective_n_decimals": AUTOCORRELATION_EFFECTIVE_N_DECIMALS,
         "effective_n_uncapped": (
-            round(tail_effective_raw, 4)
+            round(tail_effective_raw, AUTOCORRELATION_EFFECTIVE_N_DECIMALS)
             if tail_effective_raw is not None
             else None
         ),
         "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+        # THE SAME CONVENTION `autocorrelation_disclosure` publishes, adopted
+        # rather than re-invented.  This block was rounding `ar1` to 6 decimals
+        # and `effective_n` to 4 - the same two numbers - while publishing
+        # NEITHER count, so one object carried the same formula at a declared
+        # precision on the window side (`autocorrelation`, which does declare it)
+        # and an undeclared one here.  A reader checking the formula against the
+        # published digits had no way to know which rounding they were allowed.
+        #
+        # It also states the scope exclusion the engine's own docstring draws:
+        # `autocorrelation_disclosure` takes the observations and derives `n`
+        # itself, and this block's whole point is a TAIL `n` the caller supplies,
+        # so the function cannot be called here.  What IS reusable without it is
+        # the convention and the bound, and the bound is a function of PUBLISHED
+        # inputs only - which is what makes it the right thing to adopt.
+        #
+        # The bound is measured against `effective_n_uncapped`, NOT against the
+        # published `effective_n`, and that distinction is load-bearing: the cap
+        # below is a separate declared step applied AFTER the formula, so when it
+        # binds, the residual between a recomputation and `effective_n` is the
+        # CAP rather than rounding, and a rounding bound does not cover it.
+        "effective_n_reproducibility": _tail_support_reproducibility(
+            tail_count, tail_ar1, tail_effective_raw
+        ),
+        "effective_n_convention": (
+            "app/services/analytics_engine.py: autocorrelation_disclosure - the "
+            "same declared decimal counts, the same formula, and the same "
+            "recomputation bound. That function derives its own observation count "
+            "and so cannot be called for a TAIL, which is why this block adopts "
+            "its convention and not its implementation; the bound is a function "
+            "of published inputs only and is therefore reusable unchanged"
+        ),
+        "effective_n_cap_applied": (
+            None if tail_effective is None else
+            bool(tail_effective < tail_effective_raw)
+        ),
+        "effective_n_cap_basis": (
+            "the adjustment is applied and then bounded by the tail: an order "
+            "statistic cannot be informed by more days than the tail contains, "
+            "whatever the tail's own AR(1) says. The cap is a step AFTER the "
+            "formula, so effective_n_reproducibility is measured against "
+            "effective_n_uncapped - the figure the formula itself produces - and "
+            "effective_n_cap_applied says whether the published effective_n is "
+            "that figure or the tail count"
+        ),
         "effective_n_bound": (
             "the adjustment is a redundancy correction, so it is applied and then "
             "bounded by the tail: an order statistic cannot be informed by more "
@@ -4553,6 +4733,55 @@ _TERM_STRUCTURE_BASIS = (
     "information the path contains"
 )
 
+# ---------------------------------------------------------------------------
+# The measured cost of the declined measurement, DERIVED rather than written
+# ---------------------------------------------------------------------------
+# The paragraph below once said "3800 refits in total" beside a portfolio leg of
+# "1001 refits" and fourteen legs of "2800" - and 1001 + 2800 is 3801.  The
+# sibling `precision.resample_count_rule` in the SAME block said 1000 for the
+# portfolio leg, so one object carried two totals for one measurement.
+#
+# THE `+1`, now settled from the engine side and mirrored here rather than
+# re-derived: the portfolio leg's 1001 is
+# :data:`FORECAST_PORTFOLIO_REFIT_RESAMPLES` RESAMPLED fits PLUS the one original
+# fit the section measured.  It is not a resample, it is not counted by
+# `bootstrap_resamples`, and it is not a rounding artefact.  Naming it is the
+# whole fix; the arithmetic below is what stops it drifting again.
+#:
+# The 14 is the leg count of the book this was measured on, not a module
+# constant, so it is declared as one HERE rather than left as a literal buried
+# in a sentence.  Every figure in the prose is interpolated from these, so a
+# change to any of them moves the sentence and the structured block together.
+FORECAST_WITHHELD_BOOK_LEGS = 14
+
+#: Resampled fits, plus the one original fit.  See the note above.
+#:
+#: CAPTURED AT IMPORT, and that is load-bearing rather than incidental.  This
+#: whole group is a record of a cost that was MEASURED, so it must not be
+#: re-derived from module globals that a caller - or a test running with a reduced
+#: draw count - can change underneath it.  The first version of the structured
+#: block below mixed the two: it read `FORECAST_PORTFOLIO_REFIT_RESAMPLES` at
+#: call time and the import-time total beside it, and under a reduced draw count
+#: it published `portfolio_resamples: 60` next to `portfolio_fits: 1001`.  Every
+#: figure here is therefore frozen at import, and the block quotes only these.
+FORECAST_WITHHELD_PORTFOLIO_RESAMPLES = FORECAST_PORTFOLIO_REFIT_RESAMPLES
+FORECAST_WITHHELD_PORTFOLIO_FITS = FORECAST_WITHHELD_PORTFOLIO_RESAMPLES + 1
+FORECAST_WITHHELD_LEG_RESAMPLES = FORECAST_LEG_REFIT_RESAMPLES_WITHHELD
+FORECAST_WITHHELD_LEG_FITS = (
+    FORECAST_WITHHELD_LEG_RESAMPLES * FORECAST_WITHHELD_BOOK_LEGS
+)
+FORECAST_WITHHELD_TOTAL_FITS = (
+    FORECAST_WITHHELD_PORTFOLIO_FITS + FORECAST_WITHHELD_LEG_FITS
+)
+
+#: Wall-clock, measured on the real 14-position book.  The seconds DO add up
+#: (17.3 + 51.3 = 68.6) and are left exactly as measured; only the fit COUNTS are
+#: derived above.
+FORECAST_WITHHELD_PORTFOLIO_SECONDS = 17.3
+FORECAST_WITHHELD_LEG_SECONDS = 51.3
+FORECAST_WITHHELD_OPTIMISER_SECONDS = 68.6
+FORECAST_WITHHELD_ROUTE_WALL_SECONDS = 74.2
+
 #: The long form of "this leg's precision was not measured, and here is why",
 #: published ONCE under `precision.measurements_withheld` rather than repeated on
 #: every leg.  A paragraph that says the same thing fourteen times is fourteen
@@ -4568,10 +4797,21 @@ _FORECAST_LEG_MEASUREMENT_WITHHELD = (
     "own conditional-volatility model fit, and the precision of a fitted sigma is "
     "measured by RE-FITTING that model on every resample - a full ARCH optimiser "
     "run per draw, not a vectorised reduction, so a book of N legs costs N of "
-    "them. Measured on the 14-position book this was written against: 3800 refits "
-    "in total, 68.6 s of pure optimiser time and 74.2 s of route wall time, of "
-    "which the portfolio leg's 1001 refits were 17.3 s and the fourteen legs' "
-    "2800 were the remaining 51.3 s. That does not fit the 180 s budget each "
+    "them. Measured on the "
+    f"{FORECAST_WITHHELD_BOOK_LEGS}-position book this was written against: "
+    f"{FORECAST_WITHHELD_TOTAL_FITS} refits in total, "
+    f"{FORECAST_WITHHELD_OPTIMISER_SECONDS} s of pure optimiser time and "
+    f"{FORECAST_WITHHELD_ROUTE_WALL_SECONDS} s of route wall time, of which the "
+    f"portfolio leg's {FORECAST_WITHHELD_PORTFOLIO_FITS} refits were "
+    f"{FORECAST_WITHHELD_PORTFOLIO_SECONDS} s and the "
+    f"{FORECAST_WITHHELD_BOOK_LEGS} legs' {FORECAST_WITHHELD_LEG_FITS} were the "
+    f"remaining {FORECAST_WITHHELD_LEG_SECONDS} s. The portfolio leg's "
+    f"{FORECAST_WITHHELD_PORTFOLIO_FITS} is the module's "
+    f"{FORECAST_WITHHELD_PORTFOLIO_RESAMPLES} RESAMPLED fits plus the one ORIGINAL "
+    "fit the section measured: the original fit is not a resample, is not counted "
+    "by bootstrap_resamples, and is the +1 that an earlier version of this "
+    "sentence dropped while leaving both of its parts in place. That does not fit "
+    "the 180 s budget each "
     "section is assembled under, and overrunning it costs OTHER sections their "
     "output rather than merely making this one slow: the cancelled coroutine "
     "cannot cancel the thread its refits are already running on, so the "
@@ -4593,7 +4833,255 @@ _FORECAST_LEG_MEASUREMENT_WITHHELD = (
 )
 
 
+# ---------------------------------------------------------------------------
+# P1 - the annualized volatility clip bound, counted and measured
+# ---------------------------------------------------------------------------
+# `volatility_forecast_point` publishes a CLIPPED number: the raw terminal
+# annualized volatility the fit produced goes through
+# `np.clip(raw, clip_low, FORECAST_VOL_CLIP_HIGH)`, and the route published only
+# the clipped side of that.  A reader who sees 1.20 therefore cannot tell a
+# data-driven 95th percentile from the bound itself, and cannot tell how far a
+# clipped value moved.
+#
+# WHAT ALREADY EXISTS AND IS NOT REBUILT HERE.  Every leg's `var_forecast` entry
+# in `precision.derived_values` already carries `derivation_precondition`,
+# `derivation_precondition_met` and `derivation_precondition_evidence`, whose
+# evidence string reads "annualized_volatility_at_clip_bound is False: the
+# published leg volatility is ... against bounds [...]".  That is a BOOLEAN about
+# the POINT ESTIMATE.  What is missing is any statement about the BAND, and the
+# MAGNITUDE the clip removed.
+#
+# WHY THERE IS NO THRESHOLD HERE, and this is a measurement rather than a
+# preference (`.scratch/v5-review/13-overflow-discriminator.md` §2, on 5,185 real
+# EGARCH(1,1) fits): thirty candidate discriminators were scored and 30 of 30
+# are non-separable - there is no threshold on any of them at which the divergent
+# set and the genuine-extreme set stop overlapping.  The best principled
+# predicate, the model-implied ln E[sigma^2] exceeding ln DBL_MAX, wrongly
+# refuses 6.0 % of genuine forecasts while missing 21.3 % of divergences, and the
+# four quantities that do separate in-sample hold out at a coin flip
+# (P(zero out-of-sample errors) 0.48-0.52 over 400 repeats).  The reason is
+# structural: for any beta < 1 the EGARCH conditional variance is lognormal with
+# a finite expectation, so no parameter set makes the model assert a
+# nonexistent forecast, and beta approaching 1 asserts an arbitrarily large one
+# continuously.  THE FIX IS TO PUBLISH WHAT WAS CLIPPED, NOT TO DETECT
+# DIVERGENCE.
+#:
+# Gating arch's own ensemble rather than its mean was measured and declined too:
+# it would score 0 false positives and 100 % false negatives for this defect, and
+# it needs a private arch API the library does not expose.  It is not needed
+# here either, because headline and band already run through the same
+# `volatility_forecast_point`, so a bound active on the point is the same bound
+# the restatements are measured against.
+#:
+# REACHABILITY, for the scale of what the count is reporting: on the real
+# 14-position book at EGARCH h=3, 156 of 2,993 usable restatements (5.2 %)
+# published exactly the bound, on 15 of 15 legs, and four legs carried
+# restatements whose true raw value was between 1e6 and 1e54.  No published point
+# estimate was clipped on that book - the headline's maximum raw was 0.4798
+# against a bound of 1.20 - so this is a BAND disclosure and not a headline one.
+CLIP_BOUND_COUNT_DENOMINATOR = (
+    "a USABLE RESTATEMENT is one circular moving-block resample whose refitted "
+    "terminal annualized volatility is finite - the same population the published "
+    "standard error and conf_int are read off, and the same one whose failed draws "
+    "are counted in the block's status rather than dropped. at_clip_bound is the "
+    "number of usable restatements whose PUBLISHED value is exactly "
+    f"{FORECAST_VOL_CLIP_HIGH}, which is the count of draws the clip bound moved. "
+    "share is at_clip_bound divided by usable_restatements, and is null rather "
+    "than 0 whenever the denominator is null: an unmeasured count is an absence, "
+    "not a zero"
+)
+
+_CLIP_BOUND_UNMEASURED_REASON = (
+    "not measured: this leg's re-fit estimator was not evaluated, so there are no "
+    "restatements to count. The measurement that was declined and the cost that "
+    "decided it are published at precision.measurements_withheld. A count of 0 "
+    "here would assert that the clip bound was tested and never bound, which is "
+    "the one claim this payload does not make"
+)
+
+_CLIP_BOUND_NO_CLIP_REASON = (
+    "measured, and zero by construction rather than by result: this leg fell "
+    "below the history gate, so its forecast is its own sample standard deviation "
+    "and the fitted models' annualized clip bounds are not applied to it. The "
+    "restatements were counted; the bound was never in play"
+)
+
+
+def _observed_volatility_statistics(
+    model: str, horizon: int
+) -> Tuple[Any, Dict[str, Any]]:
+    """`volatility_forecast_statistics` wrapped so the clip is OBSERVED, not re-run.
+
+    One ARCH fit already produces both sides of the clip for a draw - the engine's
+    `volatility_forecast_point` returns `volatility_forecast` and
+    `raw_volatility_forecast` from the same computation - and `fields` is an
+    existing parameter of the engine's own factory.  So the raw costs nothing to
+    ask for: this wrapper counts what the bound did and returns the engine's dict
+    UNCHANGED, which is what keeps the band, the standard error and the
+    reproduction guard the engine's own rather than a second implementation that
+    could drift from them.
+
+    `tally` is filled on the resampling pass only.  `measure_estimate_uncertainty`
+    calls the statistic twice - once over the resample block, once over the
+    original sample as the reproduction guard - and only the first of those is a
+    population a count can be read off.
+
+    THE BLOCK IS `(n, draws, k)`, TIME AXIS FIRST, so the draw count is axis 1
+    and not axis 0.  Reading axis 0 here counts observations as if they were
+    draws, which on the real book means a denominator of 175 for a band read off
+    1,000 draws - a number that looks plausible and is simply the wrong
+    population.  The reproduction guard's own call has `draws == 1`, and axis 1
+    is what distinguishes the two passes.
+
+    `return_space_volatility` is still requested, and the reason it is named here
+    rather than left to the engine's default is that the portfolio leg's
+    `var_forecast` and `cvar_forecast` INHERIT their precision from that field's
+    band through `inherits_precision_at_path`.  Narrowing `fields` drops the field
+    from the block, the pointer lands on nothing, and the disclosure silently
+    becomes an unresolvable one - which is precisely the failure
+    `test_the_pointer_resolves_to_a_node_carrying_a_real_figure` exists to catch.
+    """
+    tally: Dict[str, Any] = {"at_clip_bound": None, "usable_restatements": None,
+                             "largest_removed_by_clip": None, "restatements": 0}
+    inner = volatility_forecast_statistics(
+        model, horizon,
+        fields=(
+            "volatility_forecast", "return_space_volatility",
+            "raw_volatility_forecast",
+        ),
+    )
+
+    def observed(block: Any) -> Dict[str, np.ndarray]:
+        out = inner(block)
+        shape = np.asarray(block).shape
+        draws = int(shape[1]) if len(shape) > 1 else 0
+        if draws <= 1:
+            # the reproduction guard's own single-draw call, not a draw set
+            return out
+        published = np.asarray(out.get("volatility_forecast"), dtype=float)
+        raw = np.asarray(out.get("raw_volatility_forecast"), dtype=float)
+        finite = np.isfinite(published)
+        bound = finite & (published >= FORECAST_VOL_CLIP_HIGH)
+        moved = bound & np.isfinite(raw) & (raw > FORECAST_VOL_CLIP_HIGH)
+        tally["restatements"] = draws
+        tally["usable_restatements"] = int(finite.sum())
+        tally["at_clip_bound"] = int(bound.sum())
+        tally["largest_removed_by_clip"] = (
+            float(np.max(raw[moved]) - FORECAST_VOL_CLIP_HIGH) if bool(moved.any())
+            else 0.0
+        )
+        return out
+
+    return observed, tally
+
+
+def _observed_usable_count(
+    statistic: Any, tally: Dict[str, Any]
+) -> Any:
+    """Count a vectorised statistic's finite draws, and return it UNCHANGED.
+
+    The limited-history branch's estimator is a closed-form order statistic and
+    never touches the clip bound, so its `at_clip_bound` is 0 by construction
+    rather than by result.  Its DENOMINATOR still has to mean the same thing it
+    means everywhere else - the finite restatements - so it is counted the same
+    way rather than taken from `bootstrap_resamples`, which is the count
+    REQUESTED and includes the draws that came back non-finite.
+    """
+    def observed(block: Any) -> np.ndarray:
+        out = statistic(block)
+        # `engine_risk_statistics` returns a `(draws,)` array, whose axis 0 IS
+        # the draw count.  The guard's own single-draw call is a length-1 array
+        # and is not recorded.
+        if int(np.asarray(out).shape[0]) > 1:
+            tally["restatements"] = int(np.asarray(out).shape[0])
+            tally["usable_restatements"] = int(
+                np.isfinite(np.asarray(out, dtype=float)).sum()
+            )
+        return out
+
+    return observed
+
+
+def _clip_restatement_record(
+    *,
+    status: str,
+    at_clip_bound: Optional[int] = None,
+    usable_restatements: Optional[int] = None,
+    largest_removed_by_clip: Optional[float] = None,
+    conf_int: Any = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One leg's (or the portfolio's) clip-bound restatement tally.
+
+    Every field is `None` together with a `reason` whenever the estimator did not
+    run.  A count of 0 means the restatements were taken and the bound never bound
+    them; a count of `None` means they were never taken.  Those are different
+    facts and the payload must not be able to express one as the other.
+    """
+    record: Dict[str, Any] = {
+        "status": status,
+        "at_clip_bound": at_clip_bound,
+        "usable_restatements": usable_restatements,
+        "share_of_usable_restatements": (
+            round(at_clip_bound / usable_restatements, 6)
+            if at_clip_bound is not None and usable_restatements
+            else None
+        ),
+        # The MAGNITUDE, not the boolean.  `largest_removed_by_clip` is how far the
+        # furthest restatement was moved by the bound, so a draw that landed on
+        # 1.20 and a draw that was merely 1.20 are different numbers and this is
+        # the one that says which.
+        "largest_removed_by_clip": largest_removed_by_clip,
+        "published_interval": list(conf_int) if conf_int is not None else None,
+        # The band-level statement the point-level `annualized_volatility_at_clip_
+        # bound` evidence string cannot make: whether the PUBLISHED interval's far
+        # end IS the bound.
+        "published_interval_at_clip_bound": (
+            bool(conf_int[-1] >= FORECAST_VOL_CLIP_HIGH)
+            if conf_int is not None else None
+        ),
+        "reason": reason,
+    }
+    return record
+
+
+def _unmeasured_clip_restatement_record(reason: str) -> Dict[str, Any]:
+    """The record for a leg or leg-set whose restatements were never taken."""
+    return _clip_restatement_record(status="not_measured", reason=reason)
+
+
+def _forecast_sentences(*parts: str) -> str:
+    """Join independently-written clauses into complete sentences.
+
+    THE DEFECT THIS EXISTS FOR.  `inherits_precision_reason` for an unmeasured
+    position leg ended with a path terminated by a period and then had a
+    sentence fragment appended with `+`, producing on all fourteen legs:
+
+        "...portfolio.estimates.the fitted leg's return-space sigma is its own
+         published annualized volatility times sqrt(h / 252), which is ..."
+
+    A path glued to a subject-less clause, ungrammatical, and the path it appears
+    to name resolves to nothing.  The fragment was a well-formed sentence on its
+    own; the defect was the missing boundary, not the words.
+
+    Joining HERE rather than at each call site is the structural half of the fix:
+    there is no `+` left to forget a boundary in, and every part is terminated
+    before the next one is attached, so a future clause inherits the guarantee
+    rather than having to remember it.
+    """
+    joined = ""
+    for part in parts:
+        text = " ".join(str(part).split())
+        if not text:
+            continue
+        if not text.endswith((".", "!", "?")):
+            text += "."
+        joined = f"{joined} {text}" if joined else text
+    return joined
+
+
 def _forecast_declared_constant(
+
     name: str,
     value: Any,
     source: str,
@@ -4787,9 +5275,10 @@ def _forecast_portfolio_uncertainty(
     ):
         not_computed = {field: _EGARCH_SIMULATED_NO_BAND for field in published}
         notes["simulated_path"] = _EGARCH_SIMULATED_NO_BAND
-    return measure_estimate_uncertainty(
+    statistics, clip_tally = _observed_volatility_statistics(model, horizon)
+    block = measure_estimate_uncertainty(
         _finite_return_values(portfolio_returns),
-        volatility_forecast_statistics(model, horizon),
+        statistics,
         published,
         scope=scope,
         resamples=FORECAST_PORTFOLIO_REFIT_RESAMPLES,
@@ -4799,6 +5288,39 @@ def _forecast_portfolio_uncertainty(
         not_computed=not_computed or None,
         notes=notes,
     )
+    # The clip bound, counted on the same draws the band was read off.  Read out of
+    # the block's OWN interval rather than restated, so `published_interval` and
+    # `published_interval_at_clip_bound` cannot disagree with the conf_int beside
+    # them.  `not_computed` wins over the tally: on that branch every restatement
+    # is the identical seeded simulation, so a count taken over them would be a
+    # count of one number repeated and would read as a measurement of a spread
+    # that _EGARCH_SIMULATED_NO_BAND says does not exist.
+    if not_computed:
+        clip_record = _unmeasured_clip_restatement_record(
+            "not measured: every restatement of this leg re-runs the identical "
+            "seeded simulation and returns the identical number, so the "
+            "resampled distribution has zero dispersion and there is no "
+            "population of draws to count. See notes.simulated_path on this block"
+        )
+    else:
+        clip_record = _clip_restatement_record(
+            status="measured",
+            at_clip_bound=clip_tally["at_clip_bound"],
+            usable_restatements=clip_tally["usable_restatements"],
+            largest_removed_by_clip=clip_tally["largest_removed_by_clip"],
+            conf_int=(
+                (block.get("estimates") or {}).get("volatility_forecast", {}).get(
+                    "conf_int"
+                )
+            ),
+            reason=(
+                None if clip_tally["usable_restatements"] else
+                "the resampling estimator produced no finite restatement on this "
+                "sample, so the count is an absence rather than a zero"
+            ),
+        )
+    block.setdefault("notes", {})["clip_bound_restatements"] = clip_record
+    return block
 
 
 def _forecast_leg_uncertainty(
@@ -4839,6 +5361,10 @@ def _forecast_leg_uncertainty(
         return None
     limited = bool(leg.get("is_limited_history"))
     withheld: Optional[str] = None
+    #: Filled only on the limited branch, and read only there.  See
+    #: `_observed_usable_count`: the fitted branch never runs its estimator, so it
+    #: has no denominator to count.
+    limited_tally: Dict[str, Any] = {"restatements": 0, "usable_restatements": None}
     if limited:
         # The mapping is keyed by the ESTIMATOR's own name, not by the published
         # one: `measure_estimate_uncertainty` looks the resampled distribution up
@@ -4847,7 +5373,9 @@ def _forecast_leg_uncertainty(
         # reports "no resampling estimator is registered". Keying it the other way
         # round is not a harmless no-op - it is a silently absent band.
         statistics: Any = {
-            "annual_volatility": engine_risk_statistics(0.0)["annual_volatility"]
+            "annual_volatility": _observed_usable_count(
+                engine_risk_statistics(0.0)["annual_volatility"], limited_tally
+            )
         }
         names = {"volatility_forecast": "annual_volatility"}
         estimator = (
@@ -4916,6 +5444,39 @@ def _forecast_leg_uncertainty(
             ),
         },
     )
+    # The clip-bound tally, on the SAME three-way split the rest of this block uses
+    # and for the same reason: a leg whose restatements were taken, a leg whose
+    # restatements were taken over a statistic the clip never touches, and a leg
+    # whose restatements were never taken are three different facts and 0 must not
+    # be able to stand for all three.
+    if withheld is not None:
+        clip_record = _unmeasured_clip_restatement_record(
+            _CLIP_BOUND_UNMEASURED_REASON
+        )
+    elif limited_tally["usable_restatements"] is None:
+        # A leg can be on the limited branch and still be too short for the
+        # resampler - the two gates are not the same gate.  Then no restatement
+        # exists, and a `measured` record carrying a null denominator would be a
+        # count of zero out of an unknown population, which is a fourth thing and
+        # not one of the three.
+        clip_record = _unmeasured_clip_restatement_record(
+            "not measured: this leg's own sample is below the "
+            "UNCERTAINTY_MIN_OBSERVATIONS a percentile interval needs, so the "
+            "resampling estimator was never called and there are no restatements "
+            "to count. The block's own reason for withholding the band is under "
+            "estimates.volatility_forecast.reason"
+        )
+    else:
+        entry = (block.get("estimates") or {}).get("volatility_forecast") or {}
+        clip_record = _clip_restatement_record(
+            status="measured",
+            at_clip_bound=0,
+            usable_restatements=limited_tally["usable_restatements"],
+            largest_removed_by_clip=0.0,
+            conf_int=entry.get("conf_int"),
+            reason=_CLIP_BOUND_NO_CLIP_REASON,
+        )
+    block.setdefault("notes", {})["clip_bound_restatements"] = clip_record
     # An AR(1)-derived effective sample size legitimately EXCEEDS the observation
     # count when the series is negatively autocorrelated: the Quenouille figure
     # is n(1-rho)/(1+rho), and a leg of daily equity returns is often slightly
@@ -4982,6 +5543,201 @@ def _forecast_tail_clip_high(model: str) -> float:
     return 0.0 if str(model).upper() == "EGARCH" else TAIL_CLIP_HIGH
 
 
+def _clip_point_record(
+    published: Any,
+    raw: Any,
+    *,
+    raw_basis: str,
+) -> Dict[str, Any]:
+    """How far the clip moved ONE published point, and by how much.
+
+    `annualized_volatility_at_clip_bound` already exists in the per-leg
+    `derivation_precondition_evidence` prose and answers the boolean.  What a
+    reader cannot do with a boolean is tell how far it moved, so the raw and the
+    distance are published beside it here.  `clip_removed` is exactly 0.0 when the
+    bound was not active, which is the case that makes the non-zero ones legible.
+    """
+    published_value = _forecast_finite(published)
+    raw_value = _forecast_finite(raw)
+    at_bound = (
+        None if published_value is None else
+        bool(published_value <= FORECAST_VOL_CLIP_LOW
+             or published_value >= FORECAST_VOL_CLIP_HIGH)
+    )
+    return {
+        "published": published_value,
+        "raw_volatility_forecast": raw_value,
+        "raw_volatility_forecast_basis": raw_basis,
+        "at_clip_bound": at_bound,
+        "clip_removed": (
+            None if (published_value is None or raw_value is None)
+            else float(raw_value - published_value)
+        ),
+    }
+
+
+def _forecast_volatility_clip_block(
+    *,
+    model: str,
+    forecast_result: Mapping[str, Any],
+    positions: Mapping[str, Any],
+    estimated: Mapping[str, Any],
+    raw_volatility: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """What the annualized volatility clip bound did - to the points and to the band.
+
+    The clip is `np.clip(raw, FORECAST_VOL_CLIP_LOW, FORECAST_VOL_CLIP_HIGH)` in
+    `volatility_forecast_point`, so it is applied to the published headline AND to
+    every restatement the band is read off.  Both run through the same function, so
+    the two cannot drift; what they could do - and did - was say nothing about it.
+
+    `restatements` is read off the blocks' own `notes.clip_bound_restatements`
+    rather than recounted here, so the count published on this node and the count
+    published beside the interval it describes are the same object.  `point` reads
+    the engine's pre-clip `raw_volatility_forecast`, which the route previously
+    dropped entirely: a leg with no fitted model behind it has no raw, and that is
+    published as a null with the reason rather than as a raw equal to its own
+    published value.
+    """
+    raws = dict(raw_volatility or {})
+    fitted_raw = (
+        "the engine's own raw_volatility_forecast for this leg - the same fit, "
+        "before np.clip. clip_removed is raw minus published and is exactly 0.0 "
+        "when the bound was not active"
+    )
+    no_fit_raw = (
+        "no raw: this leg fell below the history gate, so its volatility_forecast "
+        "is its own sample standard deviation, computed without the fitted models' "
+        "clip bounds, and there is no pre-clip value because no clip was applied"
+    )
+    portfolio_point = _clip_point_record(
+        forecast_result.get("volatility_forecast"),
+        forecast_result.get("raw_volatility_forecast"),
+        raw_basis=(
+            "the engine's own raw_volatility_forecast for the PORTFOLIO leg - the "
+            "same fit, before np.clip. clip_removed is raw minus published and is "
+            "exactly 0.0 when the bound was not active"
+        ),
+    )
+    portfolio_record = (
+        ((estimated.get("portfolio") or {}).get("notes") or {}).get(
+            "clip_bound_restatements"
+        )
+    )
+    leg_points: Dict[str, Any] = {}
+    leg_records: Dict[str, Any] = {}
+    for ticker, leg in (positions or {}).items():
+        if not isinstance(leg, Mapping):
+            continue
+        limited = bool(leg.get("is_limited_history"))
+        leg_points[ticker] = _clip_point_record(
+            leg.get("volatility_forecast"),
+            None if limited else raws.get(ticker),
+            raw_basis=no_fit_raw if limited else fitted_raw,
+        )
+        leg_records[ticker] = (
+            ((estimated.get("positions") or {}).get(ticker) or {}).get("notes") or {}
+        ).get("clip_bound_restatements") or _unmeasured_clip_restatement_record(
+            "not measured: this leg published no restatements, so there is no "
+            "population of draws to count. See "
+            "precision.estimated_statistics.positions.<ticker> for what it did "
+            "publish"
+        )
+    measured = sorted(
+        key for key, record in leg_records.items()
+        if record.get("status") == "measured"
+    )
+    unmeasured = sorted(
+        key for key, record in leg_records.items()
+        if record.get("status") != "measured"
+    )
+    return {
+        "bounds": {
+            # The LOW bound is model-dependent and the HIGH bound is not, which is
+            # why publishing one number for both would be wrong on an EGARCH
+            # request.  Read through the same branch `volatility_forecast_point`
+            # takes rather than restated.
+            "low": (
+                EGARCH_VOL_CLIP_LOW if str(model).upper() == "EGARCH"
+                else FORECAST_VOL_CLIP_LOW
+            ),
+            "high": FORECAST_VOL_CLIP_HIGH,
+            "model": model,
+            "low_bound_basis": (
+                "EGARCH's log-variance recursion can collapse, so its low bound is "
+                "EGARCH_VOL_CLIP_LOW (0.0); GARCH and EWMA use "
+                f"FORECAST_VOL_CLIP_LOW ({FORECAST_VOL_CLIP_LOW}). The high bound is "
+                f"FORECAST_VOL_CLIP_HIGH ({FORECAST_VOL_CLIP_HIGH}) for all three. "
+                "All read from app/services/analytics_engine.py, which is also "
+                "where the legacy per-leg evidence string "
+                "`annualized_volatility_at_clip_bound` is worded against the "
+                "FORECAST pair - the two agree whenever the model is not EGARCH"
+            ),
+        },
+        "declared_at": (
+            "app/services/analytics_engine.py: FORECAST_VOL_CLIP_LOW / "
+            "FORECAST_VOL_CLIP_HIGH, applied inside volatility_forecast_point, "
+            "which is the single function the published headline and every "
+            "restatement of it both run through"
+        ),
+        "denominator_rule": CLIP_BOUND_COUNT_DENOMINATOR,
+        "no_divergence_threshold": (
+            "no threshold on the size of a forecast is applied, and none is "
+            "published, because none separates a genuine extreme from a divergent "
+            "one. Measured on 5,185 real EGARCH(1,1) fits (.scratch/v5-review/"
+            "13-overflow-discriminator.md §2): thirty candidate discriminators were "
+            "scored and 30 of 30 are non-separable - no threshold on any of them "
+            "puts the two sets in disjoint ranges. The best principled predicate, "
+            "the model-implied ln E[sigma^2] exceeding ln DBL_MAX, wrongly refuses "
+            "6.0 % of genuine forecasts while missing 21.3 % of divergences, and "
+            "the four quantities that do separate in-sample hold out at a coin "
+            "flip (P(zero out-of-sample errors) 0.48-0.52 over 400 repeats). The "
+            "reason is structural: for any beta < 1 the EGARCH conditional "
+            "variance is lognormal with a finite expectation, so no parameter set "
+            "makes the model assert a nonexistent forecast, and beta approaching 1 "
+            "asserts an arbitrarily large one continuously. THIS BLOCK PUBLISHES "
+            "WHAT WAS CLIPPED RATHER THAN TRYING TO DETECT DIVERGENCE, which is "
+            "the only one of the two that cannot be wrong about a real forecast"
+        ),
+        "point": {
+            "portfolio": portfolio_point,
+            "positions": leg_points,
+            "at_clip_bound_portfolio": portfolio_point["at_clip_bound"],
+            "at_clip_bound_positions": sorted(
+                key for key, value in leg_points.items()
+                if value.get("at_clip_bound")
+            ),
+            "point_basis": (
+                "the BOOLEAN is already published, in prose, on each leg's "
+                "precision.derived_values['positions.<ticker>.var_forecast']."
+                "derivation_precondition_evidence, which reads "
+                "'annualized_volatility_at_clip_bound is <bool>: the published leg "
+                "volatility is <value> against bounds [...]'. What a boolean "
+                "cannot say is HOW FAR the value moved, so raw_volatility_forecast "
+                "and clip_removed are published here beside it"
+            ),
+        },
+        "restatements": {
+            "portfolio": portfolio_record,
+            "positions": leg_records,
+            "denominator_scope": (
+                "usable restatements, per leg and per the portfolio leg, counted "
+                "independently - they are not one pooled population, because each "
+                "leg is re-fitted on its own return series at its own draw count"
+            ),
+            "legs_with_a_measured_count": measured,
+            "legs_whose_count_is_unmeasured": unmeasured,
+            "measured_leg_count": len(measured),
+            "unmeasured_leg_count": len(unmeasured),
+            "measured_leg_count_basis": (
+                "read off each leg's own notes.clip_bound_restatements rather than "
+                "restated, so a leg cannot be claimed as counted without its own "
+                "block saying so"
+            ),
+        },
+    }
+
+
 def _forecast_measured_names(estimated: Mapping[str, Any]) -> List[str]:
     """Which fitted quantities actually carry a MEASURED interval, as dotted paths.
 
@@ -5012,6 +5768,7 @@ def _forecast_precision_block(
     forecast_result: Mapping[str, Any],
     positions: Mapping[str, Any],
     estimated: Mapping[str, Any],
+    raw_volatility: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the three classes into the one `precision` node the route publishes.
 
@@ -5020,6 +5777,11 @@ def _forecast_precision_block(
     threads.  This function only classifies the rest and records the coverage, so
     that the coverage figure cannot drift from what was actually classified: it is
     summed from the classifications themselves rather than asserted alongside them.
+
+    `raw_volatility` is the pre-clip terminal annualized volatility the ENGINE
+    already computed for each leg, keyed by ticker.  The route used to drop it, so
+    a published 1.20 was indistinguishable from a genuine one; it is read here and
+    never written back into `positions`, which stays exactly as it was.
     """
     tail = forecast_result.get("tail_measure") or {}
     h = int(max(1, int(horizon)))
@@ -5294,29 +6056,55 @@ def _forecast_precision_block(
                     "resolved" if leg_measured
                     else "target_is_itself_undisclosed"
                 ),
-                inheritance_reason=(
-                    (
+                # `*` and not a bare tuple: passing the conditional as ONE
+                # argument makes the joiner stringify a tuple, and the payload
+                # then publishes a repr of a tuple of sentences.
+                inheritance_reason=_forecast_sentences(
+                    *((
                         "the entire precision of this value is the precision of this "
                         "leg's own fitted conditional sigma, measured on "
                         f"precision.estimated_statistics.positions.{ticker}."
-                        f"estimates.volatility_forecast. " + clip_note
+                        "estimates.volatility_forecast",
+                        clip_note,
                     ) if leg_measured else (
+                        # NOT "there is no figure at the far end of it", which is
+                        # what this said and which is FALSE: the target publishes
+                        # the leg's own volatility_forecast as `point`, and it is
+                        # the figure the primary fit produced.  What it does not
+                        # publish is that figure's STANDARD ERROR and its INTERVAL,
+                        # because this leg's re-fit estimator was never run.  An
+                        # absent point and an absent interval are different
+                        # absences, and the target's own `reason` says which this
+                        # is - so this sentence had to agree with it.
+                        #
+                        # "ITSELF" is kept deliberately: `inherits_precision_status`
+                        # is `target_is_itself_undisclosed`, and the reason has to
+                        # explain the status word or a reader cannot tell which of
+                        # the two absences the entry is reporting.
                         "the entire precision of this value would be the precision "
                         "of this leg's own fitted conditional sigma, at "
                         f"precision.estimated_statistics.positions.{ticker}."
                         "estimates.volatility_forecast - and that node is ITSELF "
-                        "undisclosed: this leg's estimator was withheld rather than "
-                        "run, for the cost reason published at "
-                        "precision.measurements_withheld. The pointer is kept "
-                        "because the inheritance is real and the node it names is "
-                        "on this payload, but there is no figure at the far end of "
-                        "it and none is claimed; the target does publish the part "
-                        "of its precision that is free, its observation count, "
-                        "AR(1) and effective_n. The portfolio leg's sigma IS "
-                        "measured on this same payload, at "
-                        "precision.estimated_statistics.portfolio.estimates."
-                        + clip_note
-                    )
+                        "without a band, because this leg's estimator was withheld "
+                        "rather than run, for the cost reason published at "
+                        "precision.measurements_withheld",
+                        "the pointer is kept because the inheritance is real and "
+                        "the node it names is on this payload, and the point is "
+                        "there: the target publishes this leg's own "
+                        "volatility_forecast. What it does not publish is that "
+                        "point's standard error and its interval, and an absent "
+                        "interval is a different fact from an absent point - a "
+                        "reader who took this sentence literally would conclude "
+                        "the leg has no forecast at all, which is the opposite of "
+                        "the case",
+                        "the rest of the target's precision costs nothing and is "
+                        "published: its observation count, its AR(1) and its "
+                        "effective_n",
+                        "the PORTFOLIO leg's sigma IS measured on this same "
+                        "payload, at precision.estimated_statistics.portfolio."
+                        "estimates.volatility_forecast",
+                        clip_note,
+                    ))
                 ),
                 precision_inheritance_factor=z_multiplier * h_factor,
                 derivation_residual=published - restated,
@@ -5517,6 +6305,13 @@ def _forecast_precision_block(
         "classes": dict(FORECAST_PRECISION_CLASSES),
         "model": model,
         "horizon_days": h,
+        "volatility_clip": _forecast_volatility_clip_block(
+            model=model,
+            forecast_result=forecast_result,
+            positions=positions,
+            estimated=estimated,
+            raw_volatility=raw_volatility or {},
+        ),
         "estimated_statistics": dict(estimated),
         "estimated_statistics_basis": (
             "one block per fitted quantity, each produced by "
@@ -5573,6 +6368,46 @@ def _forecast_precision_block(
                 "claimed as withheld without its block saying so"
             ),
             "why_not_measured": _FORECAST_LEG_MEASUREMENT_WITHHELD,
+            # The same cost as NUMBERS, so a reader does not have to parse a
+            # paragraph to check it and a test does not have to trust a regex to
+            # do so.  `why_not_measured` above is written from these, so the
+            # sentence and the block cannot state different totals - which is the
+            # defect this exists to make impossible rather than merely absent.
+            "refit_arithmetic": {
+                "scope": "measured_cost_of_the_declined_measurement",
+                "book_leg_count": FORECAST_WITHHELD_BOOK_LEGS,
+                "portfolio_resamples": FORECAST_WITHHELD_PORTFOLIO_RESAMPLES,
+                # The original fit is not a resample.  This is the +1 that an
+                # earlier version of the paragraph dropped.
+                "portfolio_original_fits": 1,
+                "portfolio_fits": FORECAST_WITHHELD_PORTFOLIO_FITS,
+                "resamples_per_leg": FORECAST_WITHHELD_LEG_RESAMPLES,
+                "leg_fits": FORECAST_WITHHELD_LEG_FITS,
+                "total_fits": FORECAST_WITHHELD_TOTAL_FITS,
+                "portfolio_seconds": FORECAST_WITHHELD_PORTFOLIO_SECONDS,
+                "leg_seconds": FORECAST_WITHHELD_LEG_SECONDS,
+                "optimiser_seconds": FORECAST_WITHHELD_OPTIMISER_SECONDS,
+                "route_wall_seconds": FORECAST_WITHHELD_ROUTE_WALL_SECONDS,
+                "basis": (
+                    "measured on the real 14-position book, in "
+                    "app/services/analytics_engine.py's own comment on "
+                    "FORECAST_LEG_REFIT_RESAMPLES_WITHHELD, which derives the same "
+                    "total. Every count here is interpolated into "
+                    "why_not_measured rather than written into it, so the two "
+                    "cannot disagree: portfolio_fits = portfolio_resamples + "
+                    "portfolio_original_fits, leg_fits = resamples_per_leg * "
+                    "book_leg_count, total_fits = portfolio_fits + leg_fits, and "
+                    "optimiser_seconds = portfolio_seconds + leg_seconds. The "
+                    "original fit is counted because it was really run and really "
+                    "cost the time; it is not a resample, which is why "
+                    "bootstrap_resamples on the portfolio block reads "
+                    f"{FORECAST_WITHHELD_PORTFOLIO_RESAMPLES} and not "
+                    f"{FORECAST_WITHHELD_PORTFOLIO_FITS}. These are the figures "
+                    "the measurement was taken at, frozen at import: a caller "
+                    "that reduces the live draw count changes what this section "
+                    "SPENDS and must not change what it COST"
+                ),
+            },
         },
         "resample_count_rule": FORECAST_REFIT_COUNT_RULE,
         "coverage": {
@@ -5735,6 +6570,15 @@ async def get_forecast_risk(
         #: OWN observations.  Not published: it is an input the disclosure
         #: consumes, and the leg already publishes its row counts.
         leg_returns: Dict[str, Any] = {}
+        #: The PRE-CLIP terminal annualized volatility the engine computed for
+        #: each fitted leg, kept for the same reason as `leg_returns` above: the
+        #: precision disclosure has to say how far the clip moved a published
+        #: value, and the route used to drop this number entirely, so a leg
+        #: reading exactly `FORECAST_VOL_CLIP_HIGH` was indistinguishable from a
+        #: leg that genuinely forecast 120 % annualized volatility.  A limited leg
+        #: has no entry because its forecast is computed without the fitted
+        #: models' clip bounds, so there is no pre-clip value to keep.
+        leg_raw_volatility: Dict[str, Any] = {}
         own_return_observations = _own_return_observations(price_data)
         for ticker in price_data.columns:
             try:
@@ -5770,6 +6614,10 @@ async def get_forecast_risk(
                         )
                     })
                 leg_returns[ticker] = ticker_rets
+                if not is_limited:
+                    leg_raw_volatility[ticker] = ticker_forecast.get(
+                        "raw_volatility_forecast"
+                    )
 
                 positions[ticker] = {
                     "volatility_forecast": vol_fc,
@@ -5782,6 +6630,7 @@ async def get_forecast_risk(
             except Exception:
                 logger.error("Volatility forecast leg failed")
                 leg_returns.pop(ticker, None)
+                leg_raw_volatility.pop(ticker, None)
                 positions[ticker] = {
                     "volatility_forecast": None,
                     "var_forecast": None,
@@ -5934,6 +6783,7 @@ async def get_forecast_risk(
                 forecast_result=forecast_result,
                 positions=positions,
                 estimated=estimated_statistics,
+                raw_volatility=leg_raw_volatility,
             ),
         }
         if forecast_result.get("error"):
@@ -9079,11 +9929,19 @@ async def get_risk_contribution(
             # comp values are negative (tail-day losses); normalize to positive loss-shares
             cvar_rc = {a: round(float(-c) / total, 6) for a, c in zip(comp_assets, comp)} if total > 0 else {}
 
-        sector_rollup: Dict[str, Dict[str, float]] = {"volatility": {}, "cvar": {}}
+        # `cvar` -> `cvar_tail`, keyed here from the one constant so the two
+        # sector_rollup containers below cannot be renamed apart again.  The
+        # numbers are untouched: this loop computes each model's roll from its own
+        # per-leg shares and nothing else changes which numbers it sums.
+        sector_rollup: Dict[str, Dict[str, float]] = {
+            name: {} for name in CONTRIBUTION_SECTOR_ROLLUP_NAMES
+        }
         result = await db.execute(select(PortfolioPosition))
         sector_map = {p.ticker: (p.sector or "Unknown") for p in result.scalars().all()}
         if sector_map:
-            for model_name, contribs in (("volatility", vol_rc), ("cvar", cvar_rc)):
+            for model_name, contribs in zip(
+                CONTRIBUTION_SECTOR_ROLLUP_NAMES, (vol_rc, cvar_rc)
+            ):
                 roll: Dict[str, float] = {}
                 for a, c in contribs.items():
                     roll[sector_map.get(a, "Unknown")] = round(
