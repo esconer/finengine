@@ -44,6 +44,11 @@ EFFECTIVE_N_RULE = (
     "count that supports a percentile rank, and n_windows is the raw count"
 )
 
+#: Payloads `_percentile_rank_basis` may be merged into. They do not carry the
+#: same fields, so the withheld-reason clause is subject-specific: see
+#: `_percentile_rank_basis`.
+_PERCENTILE_RANK_SUBJECTS = frozenset({"row", "forecast"})
+
 
 def _effective_window_count(n_windows: int, window_days: int) -> float:
     """Independent-observation count behind `n_windows` overlapping windows."""
@@ -52,7 +57,9 @@ def _effective_window_count(n_windows: int, window_days: int) -> float:
     return float(n_windows) / float(window_days)
 
 
-def _percentile_rank_basis(n_windows: int, window_days: int) -> Dict[str, Any]:
+def _percentile_rank_basis(
+    n_windows: int, window_days: int, subject: str = "row"
+) -> Dict[str, Any]:
     """The counts and precision a percentile rank on this window rests on.
 
     Returns `effective_n` (see :data:`EFFECTIVE_N_RULE`), the worst-case 95%
@@ -60,7 +67,22 @@ def _percentile_rank_basis(n_windows: int, window_days: int) -> Dict[str, Any]:
     :data:`MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE`. The half-width is
     published even when the rank is withheld, so a reader can see how
     uninformative the withheld verdict was rather than only seeing an absence.
+
+    `subject` names the payload the block is being merged into: `"row"` for a
+    vol-cone window row, `"forecast"` for the `current_forecast` overlay. It
+    exists because the two objects do not carry the same fields. A row publishes
+    quantiles and `current_realized`; the forecast publishes neither — only
+    `annualized_vol` and `model` — so a trailing clause borrowed from the row
+    told a reader to trust a field the forecast does not have. The clause names
+    only fields the named subject actually publishes; it does not name the model,
+    which is payload data (`model` is "GARCH(1,1)" or the "EWMA" fallback) and
+    is not knowable here.
     """
+    if subject not in _PERCENTILE_RANK_SUBJECTS:
+        raise ValueError(
+            f"unknown subject {subject!r}; expected one of "
+            f"{sorted(_PERCENTILE_RANK_SUBJECTS)}"
+        )
     effective_n = _effective_window_count(n_windows, window_days)
     sufficient = effective_n >= MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE
     half_width = (
@@ -68,14 +90,34 @@ def _percentile_rank_basis(n_windows: int, window_days: int) -> Dict[str, Any]:
         if effective_n > 0
         else None
     )
+    # Only fields the named subject publishes may be named in its clause.
+    if subject == "forecast":
+        no_windows_clause = (
+            "annualized_vol above is the forecast of the model named in this "
+            "object's model field, not a measurement of realized volatility, and "
+            "there is no observed distribution here to rank it against."
+        )
+        too_thin_clause = (
+            "annualized_vol above is the forecast of the model named in this "
+            "object's model field, not a measurement of realized volatility. It "
+            "is ranked against the same observed overlapping-window distribution "
+            f"the {int(window_days)}d row uses."
+        )
+    else:
+        no_windows_clause = (
+            "The quantiles in this row are null for the same reason; "
+            "current_realized is measured when the window produced a value."
+        )
+        too_thin_clause = (
+            "The quantiles in this row still describe the observed "
+            "overlapping-window sample; current_realized is measured."
+        )
     if sufficient:
         withheld_reason = None
     elif half_width is None:
         withheld_reason = (
             f"withheld: no overlapping windows at all over {int(window_days)}d, "
-            f"so there is no distribution to rank against. The quantiles in "
-            f"this row are null for the same reason; current_realized is "
-            f"measured when the window produced a value."
+            f"so there is no distribution to rank against. {no_windows_clause}"
         )
     else:
         withheld_reason = (
@@ -83,8 +125,7 @@ def _percentile_rank_basis(n_windows: int, window_days: int) -> Dict[str, Any]:
             f"{MIN_EFFECTIVE_OBSERVATIONS_FOR_PERCENTILE:.0f} overlapping-window "
             f"observations over {int(window_days)}d; the worst-case 95% half-width "
             f"on a rank here is {half_width:.1f}pp, so the rank carries no usable "
-            f"information. The quantiles in this row still describe the observed "
-            f"overlapping-window sample; current_realized is measured."
+            f"information. {too_thin_clause}"
         )
 
     return {
@@ -415,7 +456,7 @@ class VolatilityService:
         # against the benchmark window's overlapping realized series, so it
         # inherits that window's effective count and its gate.
         forecast_rank_basis = _percentile_rank_basis(
-            len(benchmark_vol_series), int(target_w)
+            len(benchmark_vol_series), int(target_w), subject="forecast"
         )
         forecast_rank_basis["ranked_against_window_days"] = int(target_w)
         if (
