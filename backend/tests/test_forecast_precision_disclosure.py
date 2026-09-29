@@ -389,24 +389,45 @@ class TestTheClassificationIsExhaustive:
         measured = data["precision"]["estimated_statistics"]
         assert set(measured["positions"]) == set(TICKERS)
         blocks = [measured["portfolio"], *measured["positions"].values()]
+        # A band is only ever published over a point a derivation corroborated,
+        # so those two labels are the only ones that may appear beside a
+        # standard error.  The other four describe a point nothing reproduced -
+        # and they are not interchangeable with one another: `estimator_declined`
+        # is a measurement the caller refused to make, which is a different
+        # event from a witness that could not conclude.
+        corroborated = {
+            "reproduced_by_estimator",
+            "verified_against_independent_witness",
+        }
+        uncorroborated = {
+            "unverified",
+            "estimator_declined",
+            "published_point_reproduced_by_independent_witness",
+            "published_point_not_reproduced_by_independent_witness",
+        }
         for block in blocks:
             assert block["estimates"], "a block with no estimate in it"
             for entry in block["estimates"].values():
                 assert entry["point"] is not None
                 if entry["standard_error"] is None:
-                    assert entry["point_status"] == "unverified", entry
+                    assert entry["point_status"] in uncorroborated, entry
                     assert entry["reason"], entry
                 else:
-                    assert entry["point_status"] in {
-                        "reproduced_by_estimator",
-                        "verified_against_independent_witness",
-                    }, entry["point_status"]
-        # and both branches are actually exercised, so neither is dead code
+                    assert entry["point_status"] in corroborated, entry[
+                        "point_status"
+                    ]
+        # and both branches are actually exercised, so neither is dead code.
+        # This is the payload-level statement of the declined/unverified
+        # distinction: the measured portfolio leg and the fourteen declined
+        # position legs are on ONE payload, and after the fix they no longer
+        # share a word.
         statuses = {
             block["estimates"]["volatility_forecast"]["point_status"]
             for block in blocks
         }
-        assert statuses == {"reproduced_by_estimator", "unverified"}, statuses
+        assert statuses == {
+            "reproduced_by_estimator", "estimator_declined",
+        }, statuses
 
     def test_a_leg_that_published_no_forecast_is_listed_not_classified(
         self, monkeypatch
@@ -903,7 +924,14 @@ class TestTheLegsStateThatTheyWereNotMeasured:
             assert entry["point"] == (
                 data["positions"][ticker]["volatility_forecast"]
             ), ticker
-            assert entry["point_status"] == "unverified", ticker
+            # and the refusal is its own word, not `unverified`.  `unverified`
+            # is what a leg publishes when a check WAS attempted and could not
+            # conclude; nothing was attempted here, the reason is published, and
+            # the portfolio leg on this same payload was measured.  Sharing the
+            # word made a declined leg read as a more doubtful one than a
+            # measured one.
+            assert entry["point_status"] == "estimator_declined", ticker
+            assert entry["point_status"] != "unverified", ticker
 
     def test_the_withheld_block_has_the_same_shape_as_a_measured_one(
         self, fast_resamples

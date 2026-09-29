@@ -888,6 +888,35 @@ UNCERTAINTY_DECIMALS = 6
 #: carries, except POINT_NOT_REPRODUCED_BY_ANY_WITNESS - the only branch in this
 #: module that withholds a POINT rather than a band, and one no live data
 #: currently reaches.
+#:
+#: The enumeration, because the ENUMERATION was the incomplete thing rather
+#: than any one branch.  A point on a live `point_status` reached a
+#: `measure_estimate_uncertainty` block by one of six routes, and five had a
+#: word and the sixth did not:
+#:
+#:   estimator ran, reproduced the point to tolerance -> REPRODUCED_BY_ESTIMATOR
+#:   estimator ran, a second path also reproduced it    -> VERIFIED_BY_WITNESS
+#:   estimator ran, witness reproduced it, ESTIMATOR did not
+#:                                                      -> REPRODUCED_BY_WITNESS_ONLY
+#:   estimator ran, witness also missed it              -> NOT_REPRODUCED_BY_ANY_WITNESS
+#:   estimator ran, witness could not deliver a verdict -> UNVERIFIED
+#:   estimator NEVER INVOKED - declined, reason published -> ESTIMATOR_DECLINED
+#:
+#: The sixth row is why ESTIMATOR_DECLINED exists.  `unverified` means "a check
+#: was attempted and could not conclude", which is the false-positive-safe
+#: default on a point the guard was actually asked about.  A declined estimator
+#: is not that: nobody asked the guard anything, the resampler was never
+#: called, `bootstrap_resamples` reads 0 and the reason is published on the
+#: block.  Publishing it as `unverified` made a deliberate, costed, disclosed
+#: refusal indistinguishable from a check that ran and failed - and it made a
+#: declined leg read as a more-uncertain one than a measured leg on the same
+#: payload, which is the opposite of what happened.  Five of the six values
+#: describe what a DERIVATION did to the point; this one is named for the actor
+#: that did not act, and the reason it did not act stays in `reason` and
+#: `estimator_withheld` rather than in the label, because the label cannot know
+#: the reason - a caller may decline for cost today and for a licence tomorrow,
+#: and baking today's reason into a status word would be a claim about the
+#: future.
 POINT_REPRODUCED_BY_ESTIMATOR = "reproduced_by_estimator"
 POINT_VERIFIED_BY_WITNESS = "verified_against_independent_witness"
 POINT_REPRODUCED_BY_WITNESS_ONLY = (
@@ -897,12 +926,22 @@ POINT_NOT_REPRODUCED_BY_ANY_WITNESS = (
     "published_point_not_reproduced_by_independent_witness"
 )
 POINT_UNVERIFIED = "unverified"
+#: Named for the ACTOR and the fact it did not act, in the same grammar as
+#: `reproduced_by_estimator`, which is also actor-named.  Rejected alternatives:
+#: `estimator_withheld` (already the name of a different key on the block, and
+#: that key is a reason STRING - two vocabularies sharing a word is a hazard a
+#: consumer switches on by accident), `estimator_not_invoked` (mechanism, and it
+#: drops the "deliberate, with a published reason" half that is the entire
+#: point of distinguishing the case), `declined_by_cost` (a fact about today's
+#: caller, not about the state, and a lie the day the reason changes).
+POINT_ESTIMATOR_DECLINED = "estimator_declined"
 POINT_STATUS_VALUES = frozenset({
     POINT_REPRODUCED_BY_ESTIMATOR,
     POINT_VERIFIED_BY_WITNESS,
     POINT_REPRODUCED_BY_WITNESS_ONLY,
     POINT_NOT_REPRODUCED_BY_ANY_WITNESS,
     POINT_UNVERIFIED,
+    POINT_ESTIMATOR_DECLINED,
 })
 
 BOOTSTRAP_METHOD = "circular_moving_block_bootstrap_percentile"
@@ -1303,7 +1342,12 @@ def measure_estimate_uncertainty(
     per-leg re-fit bootstrap costs a book's worth of them.  The reason is
     published on every field and on the block, `bootstrap_resamples` reads 0,
     the resampler is never called, and the point is retained with
-    ``point_status = unverified`` because nothing re-derived it.  It is a
+    ``point_status = estimator_declined`` - the sixth route in the enumeration
+    at POINT_STATUS_VALUES.  It is its own word and not `unverified`, because
+    `unverified` is what a guard that WAS asked and could not conclude
+    publishes; here nobody asked, and conflating the two makes a declined leg
+    read as a less-trusted one than a measured leg carrying the same
+    `unverified` on the same payload.  It is a
     parameter rather than a hand-built second copy of this function's output
     shape precisely so the unmeasured block cannot drift away from the measured
     one: a withheld disclosure with a different set of keys would be the reason
@@ -1437,11 +1481,21 @@ def measure_estimate_uncertainty(
             # was not run at all.  `effective_n` is still real and still
             # published: it is measured from the sample, costs nothing, and is
             # the part of this leg's precision that IS known.
+            #
+            # `estimator_declined`, NOT `unverified`.  `unverified` is the
+            # false-positive-safe default of a guard that WAS asked and could
+            # not conclude; here nobody asked, the resampler was never called,
+            # and the refusal is published.  Labelling a deliberate refusal as
+            # an inconclusive check is the one move this block must not make:
+            # it makes a declined leg read as a less-trusted one than a
+            # measured leg on the same payload.  The point is retained either
+            # way, which is what makes this safe to publish - the new word
+            # costs the reader no number.
             estimates[field] = _uncertainty_entry(
                 field, point=point, status="not_computed",
                 reason=estimator_withheld, observations=count or None,
                 effective_n=effective_n,
-                point_status=POINT_UNVERIFIED,
+                point_status=POINT_ESTIMATOR_DECLINED,
             )
             continue
         if point is None:
@@ -1602,11 +1656,15 @@ def measure_estimate_uncertainty(
             "set when the caller declared the resampling estimator too expensive "
             "to run, so the estimator was never called rather than having run and "
             "produced nothing. bootstrap_resamples reads 0 and the point is "
-            "retained with point_status unverified, because no re-derivation "
-            "checked it. The alternative to withholding - narrowing the draw "
-            "count until the block fits - is only honest while the remaining tail "
-            "of the percentile interval still means something, and below this "
-            "module's floor it does not"
+            "retained with point_status estimator_declined, because no "
+            "re-derivation checked it. That is a different sentence from the "
+            "point_status unverified a field gets when a witness WAS asked and "
+            "could not deliver a verdict: nothing was asked here, so publishing "
+            "an inconclusive check would misreport a deliberate, disclosed "
+            "refusal as a doubtful measurement. The alternative to withholding "
+            "- narrowing the draw count until the block fits - is only honest "
+            "while the remaining tail of the percentile interval still means "
+            "something, and below this module's floor it does not"
             if withheld else None
         ),
         "witness_tolerance": witness_limit,
