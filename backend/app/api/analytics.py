@@ -40,8 +40,18 @@ from app.services.currency_service import (
     get_currency_service,
 )
 from app.services.analytics_engine import (
+    FORECAST_LEG_REFIT_RESAMPLES_WITHHELD,
+    FORECAST_PORTFOLIO_REFIT_RESAMPLES,
+    FORECAST_REFIT_COUNT_RULE,
+    FORECAST_VOL_CLIP_HIGH,
+    FORECAST_VOL_CLIP_LOW,
     GlobalAnalyticsEngine,
     AnalyticsEngine,
+    TAIL_CLIP_HIGH,
+    TAIL_CLIP_LOW,
+    TAIL_ES_MULTIPLIER,
+    TAIL_Z_MULTIPLIER,
+    UNCERTAINTY_BOOTSTRAP_RESAMPLES,
     aggregate_active_returns,
     ar1_autocorrelation,
     effective_sample_size,
@@ -51,6 +61,7 @@ from app.services.analytics_engine import (
     measure_estimate_uncertainty,
     quantstats_ratio_statistics,
     quantstats_returns_look_like_prices,
+    volatility_forecast_statistics,
 )
 from app.models.schemas import (
     StressTestRequest, CorrelationStabilityResponse, CointScannerResponse
@@ -4158,6 +4169,1230 @@ async def get_realized_risk(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# ---------------------------------------------------------------------------
+# forecast_risk precision disclosure (ENV-020)
+# ---------------------------------------------------------------------------
+# This section publishes 26 estimated quantities and, before this block, not
+# one of them carried a standard error, an interval or an effective sample size.
+# Its entire precision content was three keys whose combined message to a reader
+# was "there is no interval, and here is a paragraph explaining why" - which is
+# a true statement about a DIFFERENT thing.  It is not a precision basis, and it
+# was being read as one.
+#
+# The fix is not a better paragraph.  It is that the 26 numbers are three kinds
+# of thing, and each kind admits a different disclosure:
+#
+#   ESTIMATED  - `volatility_forecast` (portfolio and every position leg).  A
+#     conditional sigma fitted to a measured return series.  It has a sampling
+#     distribution.  The PORTFOLIO leg's is MEASURED here, by re-fitting the
+#     model on every moving-block resample; a position leg's is NOT, and each leg
+#     says so with the cost that decided it.  One measured leg and thirteen
+#     declared-unmeasured ones is the disclosure this export can afford; fifteen
+#     measured ones is what broke it.
+#
+#   DERIVED    - `var_forecast`, `cvar_forecast`, `cvar_to_var_ratio`.  Each is
+#     a published function of a published number, so it has no independent
+#     uncertainty to report.  They publish the figure they inherit instead, and
+#     the pointer is resolved by a test that walks it - including the legs whose
+#     target is itself undisclosed, which resolve to a node that says so.
+#
+#   DECLARED   - the z / ES multipliers, the confidence level, the horizon.  The
+#     quantiles of a normal distribution and a stated input.  A design constant
+#     has no sampling distribution, and refusing to invent one is the point.
+#
+# Nothing here changes a published forecast value.  Every number on this section
+# is computed exactly as it was before this block existed; the block only says
+# what is known about how tightly each one was determined.
+#
+# WHAT THIS BLOCK COSTS, AND WHY IT IS SPENT THE WAY IT IS.  Measuring the
+# precision of a fitted conditional sigma means RE-FITTING the model on every
+# resample, and a GARCH(1,1) refit is a full optimiser run, not a vectorised
+# reduction.  Measured on the real 14-position book through the real route: 3800
+# refits, 74.2 s of route wall time, of which 68.6 s was the refits.  That does
+# not survive contact with a whole export.  Each section is assembled under its
+# own 180 s budget (`ai_context_service._SECTION_TIMEOUT_SECONDS`), sections are
+# collected one after another, and a section that overruns is not merely slow:
+# `asyncio.wait_for` cancels the coroutine but cannot cancel the thread the
+# refits are already running on, so the optimiser keeps burning CPU against every
+# section collected afterwards.  Measured on the export that way, three sections
+# (factor_exposure, optimization, regime) were published `unavailable` and seven
+# more degraded to `partial`, and the export stopped completing at all.
+#
+# So the cost was cut where it is largest and least informative.  The portfolio
+# leg - the figure the section is named for - keeps the full re-fit measurement.
+# The position legs stop being re-fitted and state the truth instead: estimated,
+# measured on their own return series, not separately measured, with the
+# observation count, the AR(1) and the effective sample size that ARE known.  A
+# leg's forecast is derived from that leg's own inputs and its precision belongs
+# to those inputs; a withheld figure with a stated reason is the honest outcome
+# and an invented one would be the defect this whole block exists to prevent.
+
+#: The prefix the precision rule builds its paths from.  Published on every
+#: classification so a reader can locate the exact key being described without
+#: reconstructing the artifact path by hand.
+FORECAST_PRECISION_PATH_PREFIX = "sections.forecast_risk.data"
+
+FORECAST_PRECISION_BASIS = (
+    "the numbers this section publishes are three different kinds of thing, and "
+    "a standard error is only a statement about one of them. volatility_forecast "
+    "is a MODEL OUTPUT fitted to a measured return series. The PORTFOLIO leg's is "
+    "MEASURED: the same model is re-fitted on every circular moving-block "
+    "resample and the dispersion of the re-fitted value is the standard error. A "
+    "POSITION leg's is NOT separately measured, and says so - a GARCH refit is a "
+    "full optimiser run, so measuring every leg of the book cost this export "
+    "three other sections their output, and the leg states what is known of its "
+    "precision instead of a figure the export could not afford. "
+    "var_forecast, cvar_forecast and cvar_to_var_ratio are DETERMINISTIC "
+    "FUNCTIONS of numbers this section already publishes, so they carry no "
+    "uncertainty of their own and name the figure they inherit. The z and ES "
+    "multipliers, the confidence level and the horizon are DECLARED CONSTANTS: "
+    "the quantiles of a normal distribution, and a stated input, chosen by "
+    "design. A design constant has no sampling distribution, and inventing one "
+    "to satisfy a disclosure rule would be the defect rather than the fix."
+)
+
+FORECAST_PRECISION_CLASSES = {
+    "estimated": (
+        "a model output computed from data. Carries a measured standard error and "
+        "a 95 % interval where the measurement was affordable, and the effective "
+        "sample size of the return series it was fitted on either way. Where it "
+        "was not measured it says so, names the cost that decided it, and "
+        "publishes a null standard error with a stated reason - never a narrower "
+        "interval chosen to fit a budget, because a percentile interval narrowed "
+        "past the point where its own tail means anything is worse than none"
+    ),
+    "deterministic_derivation": (
+        "a published function of published numbers. Carries no standard error of "
+        "its own - an interval on it would be a rescaled copy of an already "
+        "published number's band - and names the figure it inherits through "
+        "inherits_precision_from / inherits_precision_at, or states that its "
+        "inputs' own precision is undisclosed."
+    ),
+    "declared_constant": (
+        "a lookup constant or a stated input, never estimated from data. Carries "
+        "a null standard error with the source named, because a design constant "
+        "cannot be resampled and a band around it would describe nothing."
+    ),
+}
+
+#: One shared string per class rather than one per key, so the payload does not
+#: repeat a paragraph fourteen times and so there is exactly one place to amend
+#: the wording if the disclosure is ever extended.
+_DECLARED_CONSTANT_SE_REASON = (
+    "not applicable: a declared constant. This value is read from a named table "
+    "in app/services/analytics_engine.py or is a stated request parameter. It was "
+    "never estimated from data, so it has no sampling distribution, no standard "
+    "error and no interval; a figure here would be a fabrication rather than a "
+    "measurement"
+)
+_DECLARED_CONSTANT_CI_REASON = (
+    "not applicable: see standard_error_reason - a declared constant is not "
+    "estimated, so there is no distribution to take a percentile of"
+)
+
+#: Multi-step EGARCH runs on arch's SIMULATION path, and in arch 8.0.0 that path
+#: does not honour the integer `random_state` the engine passes it: two
+#: back-to-back forecasts on the same fitted model already differ in the 4th
+#: decimal.  A re-fit bootstrap over that path could not reproduce the published
+#: point, so no band is claimed - and the reason is this one, rather than the
+#: estimator's generic "your point did not reproduce" message, which would read
+#: as an accusation against a number that is simply not reproducible.
+_EGARCH_SIMULATED_NO_BAND = (
+    "not computed: this forecast's conditional-variance path comes from arch's "
+    "SIMULATION branch, and in arch 8.0.0 that branch does not honour the integer "
+    "random_state the engine passes it - two forecasts from the same fitted model "
+    "already differ. A re-fit resampling estimate therefore cannot reproduce this "
+    "published point, and a band that failed to describe its own point is the "
+    "fabrication this disclosure exists to prevent. The point stands, "
+    "unbanded, and the honest fix is a seed-reproducible multi-step path - which "
+    "would change a published forecast value, so it is not done here"
+)
+
+_TERM_STRUCTURE_BASIS = (
+    "term_structure is the SAME fitted conditional-variance path at each of its "
+    "intermediate horizon steps, and it is not resampled separately: only the "
+    "terminal value carries a band. The intermediate steps are the same estimate "
+    "at a shorter horizon, not a different statistic, and publishing fifteen "
+    "correlated bands for one path would overstate how much independent "
+    "information the path contains"
+)
+
+#: The long form of "this leg's precision was not measured, and here is why",
+#: published ONCE under `precision.measurements_withheld` rather than repeated on
+#: every leg.  A paragraph that says the same thing fourteen times is fourteen
+#: times the bytes and no more information, and the block is already the largest
+#: thing on this section - the earlier fourteen-measured-legs version carried the
+#: same words per leg and the payload grew 28 % while the disclosure shrank.
+#:
+#: The per-leg `estimator_withheld` is deliberately NOT this text and does not
+#: need to be: it states the decision and points here, and the pointer is
+#: resolved by the same test that resolves every other pointer on this block.
+_FORECAST_LEG_MEASUREMENT_WITHHELD = (
+    "not measured, and deliberately. A position leg's volatility_forecast is its "
+    "own conditional-volatility model fit, and the precision of a fitted sigma is "
+    "measured by RE-FITTING that model on every resample - a full ARCH optimiser "
+    "run per draw, not a vectorised reduction, so a book of N legs costs N of "
+    "them. Measured on the 14-position book this was written against: 3800 refits "
+    "in total, 68.6 s of pure optimiser time and 74.2 s of route wall time, of "
+    "which the portfolio leg's 1001 refits were 17.3 s and the fourteen legs' "
+    "2800 were the remaining 51.3 s. That does not fit the 180 s budget each "
+    "section is assembled under, and overrunning it costs OTHER sections their "
+    "output rather than merely making this one slow: the cancelled coroutine "
+    "cannot cancel the thread its refits are already running on, so the "
+    "optimiser keeps competing with every section collected afterwards.\n\n"
+    "So the leg states what is known instead. It IS estimated, it is measured on "
+    "this leg's OWN return observations rather than the portfolio's, and the "
+    "observation count, the AR(1) and the effective sample size that implies are "
+    "published on its block - those cost nothing and they are the part of this "
+    "leg's precision that is genuinely known. What is not published is a standard "
+    "error and an interval, and nothing has been substituted for them. Narrowing "
+    "the draw count until the block fits was rejected for the same reason: a "
+    "percentile interval narrowed past the point where its own 2.5 % tail means "
+    "anything is a figure that describes nothing, which is the defect this whole "
+    "disclosure exists to remove. A withheld figure with a stated reason is an "
+    "honest outcome; an invented one is not.\n\n"
+    "The measurement that was declined is published rather than deleted, so it is "
+    "reproducible by anyone willing to pay for it: see each leg block's "
+    "notes.estimator, which names the statistic that would have been evaluated."
+)
+
+
+def _forecast_declared_constant(
+    name: str,
+    value: Any,
+    source: str,
+    published_at: List[str],
+) -> Dict[str, Any]:
+    """One declared constant: a value with a source and no sampling distribution."""
+    return {
+        "name": name,
+        "classification": "declared_constant",
+        "value": value,
+        "source": source,
+        "published_at": list(published_at),
+        "standard_error": None,
+        "standard_error_reason": _DECLARED_CONSTANT_SE_REASON,
+        "conf_int": None,
+        "conf_int_reason": _DECLARED_CONSTANT_CI_REASON,
+    }
+
+
+def _forecast_derived_value(
+    *,
+    published_at: List[str],
+    formula: str,
+    inputs: Mapping[str, Any],
+    inputs_classification: Mapping[str, Any],
+    inherits_precision_from: Any,
+    inherits_precision_at: Optional[Tuple[str, ...]],
+    inheritance_status: str,
+    inheritance_reason: str,
+    precision_inheritance_factor: Optional[float] = None,
+    derivation_residual: Optional[float] = None,
+    derivation_precondition: Optional[str] = None,
+    derivation_precondition_met: Optional[bool] = None,
+    derivation_precondition_evidence: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One deterministic function of published numbers.
+
+    `inherits_precision_at` is a path into this same payload.  A pointer that
+    lands on a node with no figure is worse than no pointer: it asserts an
+    inheritance that does not exist.  So when the inputs are themselves
+    undisclosed - which is the case for a ratio of two design constants - the
+    pointer is `None`, `inheritance_status` says so, and `inheritance_reason`
+    states the absence rather than pointing at it.
+
+    `inheritance_status` has three values, and the third is why the test that
+    walks these pointers has three branches rather than two:
+
+      resolved                        the target is on the payload and carries a
+                                      measured standard error or interval.
+      inputs_are_declared_constants   there is no target at all - both inputs
+                                      are design constants with no sampling
+                                      distribution - so the pointer is None.
+      target_is_itself_undisclosed    the target IS on the payload and the
+                                      inheritance is real, but the target's own
+                                      precision was not measured, so the pointer
+                                      is KEPT and the status says there is no
+                                      figure at the far end of it.
+
+    The third is the one that could have been written two ways.  Dropping the
+    pointer would have been tidier and less true: a leg's tail really does
+    inherit whatever precision that leg's own sigma has, and the node naming it
+    is right there on the payload saying so.  Claiming `resolved` would have been
+    the defect.  So the pointer stays, the target states its own absence, and
+    the status is the only thing distinguishing the two from a real inheritance.
+
+    THE PATH IS A SEGMENT LIST, NOT A DOTTED STRING, because the keys it has to
+    traverse are ticker symbols: `positions.CIPLA.NS` is one key, and a dotted
+    string would split it into `CIPLA` and `NS` and resolve to nothing.  The
+    readable dotted form is published beside it and is explicitly labelled
+    non-authoritative, so nobody resolves through it by accident.
+    """
+    return {
+        "classification": "deterministic_derivation",
+        "published_at": list(published_at),
+        "formula": formula,
+        "inputs": dict(inputs),
+        "inputs_classification": {
+            name: dict(entry) for name, entry in inputs_classification.items()
+        },
+        "inputs_classification_basis": (
+            "each restated input is classified in its own right. A formula that "
+            "repeats a declared constant next to the number it multiplies "
+            "publishes that constant a second time, and a key that appears "
+            "twice on a payload is still a key - so it is classified, not left "
+            "to be discovered by whichever rule reads it"
+        ),
+        "inherits_precision_from": inherits_precision_from,
+        "inherits_precision_at": (
+            None if inherits_precision_at is None
+            else ".".join(inherits_precision_at)
+        ),
+        "inherits_precision_at_path": (
+            None if inherits_precision_at is None
+            else list(inherits_precision_at)
+        ),
+        "inherits_precision_at_basis": (
+            "inherits_precision_at_path is the AUTHORITATIVE pointer: a list of "
+            "keys walked from the root of this payload. The dotted "
+            "inherits_precision_at beside it is the same pointer written for "
+            "reading and is NOT resolvable by splitting on '.', because the "
+            "position keys it traverses are ticker symbols such as CIPLA.NS and "
+            "contain dots of their own"
+        ),
+        "inherits_precision_status": inheritance_status,
+        "inherits_precision_reason": inheritance_reason,
+        # The exact multiplier that carries the inherited standard error across
+        # the formula.  Published so the propagation is a multiplication the
+        # reader can do, rather than a figure this section declined to compute
+        # and left to be guessed.
+        "precision_inheritance_factor": precision_inheritance_factor,
+        "precision_inheritance_factor_basis": (
+            "the constant this formula multiplies its input by, so a reader can "
+            "apply the inherited standard error to this value without this "
+            "section publishing an interval that describes no new information"
+            if precision_inheritance_factor is not None else None
+        ),
+        "derivation_residual": (
+            None if derivation_residual is None
+            else float(derivation_residual)
+        ),
+        "derivation_residual_basis": (
+            "the published value minus this formula applied to the published "
+            "inputs. It is zero to floating-point noise when the derivation is "
+            "exact, and non-zero means a published clip bound is active on this "
+            "leg - in which case the formula describes the UNCLIPPED relation and "
+            "the residual is the clip, not an error"
+        ),
+        # A formula that only holds while some condition is met must publish the
+        # condition.  An identity that silently stops holding is the kind of
+        # derivation note that is true until the day it is not.
+        "derivation_precondition": derivation_precondition,
+        "derivation_precondition_met": derivation_precondition_met,
+        "derivation_precondition_evidence": derivation_precondition_evidence,
+        "standard_error": None,
+        "standard_error_reason": (
+            "not computed: this value is a deterministic function of numbers this "
+            "section already publishes, so it has no independent uncertainty. A "
+            "standard error here would be the inherited input's standard error "
+            "rescaled by a constant, which describes the input and not this value. "
+            "See inherits_precision_at for the figure this value does inherit"
+        ),
+        "conf_int": None,
+        "conf_int_reason": (
+            "not computed: see standard_error_reason - a deterministic function of "
+            "an already-published number has no distribution of its own, and an "
+            "interval scaled off the input's band would be the input's band again"
+        ),
+    }
+
+
+def _forecast_portfolio_uncertainty(
+    portfolio_returns: Any,
+    model: str,
+    horizon: int,
+    forecast_result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Measured precision for the portfolio leg's two fitted quantities.
+
+    Both published values come out of ONE GARCH fit, so one re-fit per resample
+    produces both; they are handed to `measure_estimate_uncertainty` as a single
+    callable and the guard re-derives each one separately.
+    """
+    tail = forecast_result.get("tail_measure") or {}
+    published = {
+        "volatility_forecast": forecast_result.get("volatility_forecast"),
+        "return_space_volatility": tail.get("return_space_volatility"),
+    }
+    scope = (
+        "forecast_risk.portfolio: the terminal conditional sigma of the fitted "
+        f"{model} model on the aggregated portfolio return series, and the "
+        "return-space sigma the VaR/CVaR multipliers are applied to. Both are "
+        "outputs of the same fit and are re-fitted together on every resample"
+    )
+    notes = {
+        "estimator": (
+            "volatility_forecast_statistics: on each circular moving-block "
+            "resample of the portfolio return series, the engine's own "
+            "volatility_forecast_point re-fits the same model with the same "
+            "options and returns its terminal values. It is the SAME function the "
+            "published forecast is computed by, so the band cannot drift off the "
+            "published number"
+        ),
+        # As on a leg block: the rule covering both legs' counts is published
+        # once at precision.resample_count_rule, not copied here.
+        "resample_count_rule": "published once at precision.resample_count_rule",
+        "term_structure": _TERM_STRUCTURE_BASIS,
+    }
+    not_computed = {}
+    if (
+        str(model).upper() == "EGARCH" and int(max(1, int(horizon))) > 1
+    ):
+        not_computed = {field: _EGARCH_SIMULATED_NO_BAND for field in published}
+        notes["simulated_path"] = _EGARCH_SIMULATED_NO_BAND
+    return measure_estimate_uncertainty(
+        _finite_return_values(portfolio_returns),
+        volatility_forecast_statistics(model, horizon),
+        published,
+        scope=scope,
+        resamples=FORECAST_PORTFOLIO_REFIT_RESAMPLES,
+        # The published values are full float64 - this section does not round the
+        # forecast - so the tolerance is the module's own, not a display step.
+        point_tolerance=1e-6,
+        not_computed=not_computed or None,
+        notes=notes,
+    )
+
+
+def _forecast_leg_uncertainty(
+    leg: Mapping[str, Any],
+    leg_returns: Any,
+    model: str,
+    horizon: int,
+) -> Optional[Dict[str, Any]]:
+    """Precision for one position leg's `volatility_forecast`.
+
+    The two branches of the route's leg loop are DIFFERENT statistics and are
+    disclosed as such:
+
+      limited - the leg fell below the history gate and its forecast is the leg's
+        own sample standard deviation.  That is a closed-form order statistic of
+        the measured series, so it needs no optimiser and IS resampled, through
+        `engine_risk_statistics`' existing vectorised restatement, at the
+        module's full standard draw count.
+
+      fitted  - the leg ran the same model as the portfolio.  Measuring it would
+        mean re-running the ARCH optimiser once per draw, and this export cannot
+        afford that once per leg: see the module header.  So the estimator is
+        NOT RUN, and the leg publishes the truth - estimated, measured on its own
+        return series, not separately measured, with the reason and with the
+        observation count, AR(1) and effective sample size that ARE known.  It
+        returns a block of the same shape as a measured one, built by the same
+        function, so a consumer's reader does not have to know which legs are
+        which in order to read either.
+
+    `None` means the leg published no finite forecast, so there is nothing to
+    classify.  A null is an absence, not an estimate, and ENV-020 does not count
+    it - the route publishes the reason under `coverage.withheld` instead.
+    """
+    published = leg.get("volatility_forecast")
+    if not isinstance(published, (int, float)) or isinstance(published, bool):
+        return None
+    if not np.isfinite(float(published)):
+        return None
+    limited = bool(leg.get("is_limited_history"))
+    withheld: Optional[str] = None
+    if limited:
+        # The mapping is keyed by the ESTIMATOR's own name, not by the published
+        # one: `measure_estimate_uncertainty` looks the resampled distribution up
+        # under the name `statistic_names` maps the published field to, so a
+        # mapping keyed on the published field resolves to nothing and the guard
+        # reports "no resampling estimator is registered". Keying it the other way
+        # round is not a harmless no-op - it is a silently absent band.
+        statistics: Any = {
+            "annual_volatility": engine_risk_statistics(0.0)["annual_volatility"]
+        }
+        names = {"volatility_forecast": "annual_volatility"}
+        estimator = (
+            "engine_risk_statistics' annual_volatility: the vectorised "
+            "restatement of this leg's own expression, ticker_returns.std() * "
+            "sqrt(252), taken because a limited-history leg's forecast is its own "
+            "sample standard deviation and not a fitted model. A closed-form "
+            "order statistic needs no optimiser, so this leg is resampled at the "
+            "module's full standard draw count"
+        )
+    else:
+        statistics = volatility_forecast_statistics(
+            model, horizon, fields=("volatility_forecast",)
+        )
+        names = {}
+        withheld = (
+            "not measured: this leg's re-fit estimator was declared too expensive "
+            "to run, so it was never evaluated rather than having run and failed. "
+            "The measurement that was declined, the draw count it would have used "
+            "and the cost that decided it are published once at "
+            "precision.measurements_withheld. What this leg does publish, because "
+            "it costs nothing and it is true, is on this block: the measured "
+            "observation count, the AR(1) and the effective sample size"
+        )
+        estimator = (
+            "NOT RUN. volatility_forecast_statistics would re-fit the same model "
+            "on each circular moving-block resample of this leg's own return "
+            "series through the engine's own volatility_forecast_point, and it is "
+            "declared here rather than executed: see estimator_withheld on this "
+            "block. The estimator is published rather than deleted so the "
+            "measurement that was declined is reproducible by anyone who wants to "
+            "pay for it"
+        )
+    block = measure_estimate_uncertainty(
+        _finite_return_values(leg_returns),
+        statistics,
+        {"volatility_forecast": published},
+        scope=(
+            "forecast_risk.positions: this leg's own volatility_forecast, "
+            "measured on the leg's own return observations and not the "
+            "portfolio's"
+        ),
+        statistic_names=names,
+        # A limited leg's statistic is a closed-form reduction, so it is cheap
+        # and gets the module's full standard draw count.  A fitted leg's
+        # statistic is an optimiser run, and this export cannot afford one per
+        # leg - so it is not run at a reduced count either, because a percentile
+        # interval narrowed past its own floor is a figure that describes
+        # nothing.  The declined count and the rule that declined it are
+        # published on the block, never silent.
+        resamples=(
+            UNCERTAINTY_BOOTSTRAP_RESAMPLES if limited
+            else FORECAST_PORTFOLIO_REFIT_RESAMPLES
+        ),
+        estimator_withheld=withheld,
+        notes={
+            "estimator": estimator,
+            "limited_history_branch": limited,
+            # The rule is a shared sentence about both legs' counts, so it is
+            # published ONCE at precision.resample_count_rule and named here
+            # rather than copied into every block.  A payload that repeats a
+            # policy fourteen times is not more auditable than one that states it
+            # once and says where to read it.
+            "resample_count_rule": None if limited else (
+                "published once at precision.resample_count_rule"
+            ),
+        },
+    )
+    # An AR(1)-derived effective sample size legitimately EXCEEDS the observation
+    # count when the series is negatively autocorrelated: the Quenouille figure
+    # is n(1-rho)/(1+rho), and a leg of daily equity returns is often slightly
+    # negative, so 71 effective observations out of 59 actual is the formula
+    # behaving correctly - negative correlation genuinely raises the precision of
+    # a mean.  It reads as an impossibility, though, so it is stated rather than
+    # left for a reader to puzzle over.
+    #
+    # Deliberately NOT bounded by n.  Capping it would understate the precision
+    # the formula reports, which is the opposite error.  The tail statistic in
+    # risk_contribution IS bounded, and the two are not inconsistent: there the
+    # population is a bounded SUBSET of the series, so an effective count above
+    # that subset is an artefact of a small sample; here the population is the
+    # whole sample and the excess is a property of a mean.
+    if isinstance(block, dict):
+        _obs = block.get("observations")
+        _ar1 = (block.get("autocorrelation") or {}) if isinstance(
+            block.get("autocorrelation"), dict
+        ) else {}
+        _eff = _ar1.get("effective_n")
+        if (
+            isinstance(_obs, (int, float))
+            and isinstance(_eff, (int, float))
+            and float(_eff) > float(_obs)
+        ):
+            block.setdefault("notes", {})
+            if isinstance(block["notes"], dict):
+                block["notes"]["effective_n_exceeds_observations"] = {
+                    "effective_n": _eff,
+                    "observations": _obs,
+                    "ar1": _ar1.get("ar1"),
+                    "explanation": (
+                        "the AR(1) is negative, so the Quenouille effective "
+                        "sample size n(1-rho)/(1+rho) exceeds n. That is the "
+                        "formula behaving correctly - negatively autocorrelated "
+                        "returns give a more precisely estimated mean - and the "
+                        "figure is deliberately NOT capped at n, because capping "
+                        "would understate the precision it reports."
+                    ),
+                }
+    return block
+
+
+def _forecast_finite(value: Any) -> Optional[float]:
+    """`value` as a finite float, or ``None``.
+
+    An absence, never 0.0.  A null forecast is a forecast that could not be
+    produced, and turning that into a zero loss or a zero volatility is the
+    defect this section's own history is a warning about.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if np.isfinite(float(value)) else None
+
+
+def _forecast_tail_clip_high(model: str) -> float:
+    """The loss-side ceiling the fitted models clip `var_forecast` at.
+
+    EGARCH's log-variance recursion can reach a non-positive loss, so its tail is
+    clipped at 0.0; GARCH and EWMA use the -0.001 floor.  Read from the same
+    branch the engine takes rather than assumed, because publishing a formula
+    with the wrong bound would make `derivation_residual` look like a defect.
+    """
+    return 0.0 if str(model).upper() == "EGARCH" else TAIL_CLIP_HIGH
+
+
+def _forecast_measured_names(estimated: Mapping[str, Any]) -> List[str]:
+    """Which fitted quantities actually carry a MEASURED interval, as dotted paths.
+
+    Read off the blocks themselves rather than restated, so a leg whose forecast
+    could not be produced drops out of the list instead of being claimed, and so a
+    leg whose estimator was withheld is reported as NOT measured rather than
+    counted as if it had been.  The second point is the reason this is not a
+    hand-maintained list: a leg block exists for every leg that published a
+    forecast, and existence is not measurement.
+    """
+    names: List[str] = []
+    portfolio = (estimated.get("portfolio") or {}).get("estimates") or {}
+    names.extend(
+        f"portfolio.estimates.{name}" for name, entry in sorted(portfolio.items())
+        if (entry or {}).get("status") == "computed"
+    )
+    for ticker, block in (estimated.get("positions") or {}).items():
+        entry = ((block or {}).get("estimates") or {}).get("volatility_forecast")
+        if (entry or {}).get("status") == "computed":
+            names.append(f"positions.{ticker}.estimates.volatility_forecast")
+    return sorted(names)
+
+
+def _forecast_precision_block(
+    *,
+    model: str,
+    horizon: int,
+    forecast_result: Mapping[str, Any],
+    positions: Mapping[str, Any],
+    estimated: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Assemble the three classes into the one `precision` node the route publishes.
+
+    `estimated` is the measured half, already computed by
+    `_forecast_portfolio_uncertainty` and `_forecast_leg_uncertainty` on their own
+    threads.  This function only classifies the rest and records the coverage, so
+    that the coverage figure cannot drift from what was actually classified: it is
+    summed from the classifications themselves rather than asserted alongside them.
+    """
+    tail = forecast_result.get("tail_measure") or {}
+    h = int(max(1, int(horizon)))
+    h_factor = float(np.sqrt(h / 252.0))
+    z_multiplier = _forecast_finite(tail.get("var_z_multiplier")) or TAIL_Z_MULTIPLIER
+    es_multiplier = _forecast_finite(tail.get("cvar_es_multiplier")) or TAIL_ES_MULTIPLIER
+    return_space = _forecast_finite(tail.get("return_space_volatility"))
+    clip_high = _forecast_tail_clip_high(model)
+
+    derived: Dict[str, Any] = {}
+    withheld: List[Dict[str, Any]] = []
+
+    def add(key: str, entry: Dict[str, Any]) -> None:
+        derived[key] = entry
+
+    # -- the portfolio's two tail measures ------------------------------------
+    for name, multiplier, source, target in (
+        ("var_forecast", z_multiplier, "var_z_multiplier", return_space),
+        ("cvar_forecast", es_multiplier, "cvar_es_multiplier", return_space),
+    ):
+        path = f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio.{name}"
+        published = _forecast_finite(forecast_result.get(name))
+        if published is None or target is None:
+            withheld.append({
+                "at": path,
+                "reason": (
+                    "not classified: the value is null, so it is an absence rather "
+                    "than a point estimate and carries no precision to disclose"
+                ),
+            })
+            continue
+        restated = float(
+            np.clip(-target * multiplier, TAIL_CLIP_LOW, clip_high)
+        )
+        add(name, _forecast_derived_value(
+            published_at=[path],
+            formula=(
+                f"clip(-return_space_volatility * {source}, "
+                f"{TAIL_CLIP_LOW}, {clip_high})"
+            ),
+            inputs={
+                "return_space_volatility": target,
+                source: multiplier,
+                "clip_bounds": [TAIL_CLIP_LOW, clip_high],
+            },
+            inputs_classification={
+                "return_space_volatility": {
+                    "classification": "estimated",
+                    "published_at": [
+                        f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio.tail_measure"
+                        f".return_space_volatility"
+                    ],
+                    "measured_at": [
+                        "precision", "estimated_statistics", "portfolio",
+                        "estimates", "return_space_volatility",
+                    ],
+                },
+                source: {
+                    "classification": "declared_constant",
+                    "published_at": [
+                        f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio.tail_measure"
+                        f".{source}"
+                    ],
+                    "declared_at": [
+                        "precision", "declared_constants", "constants", source,
+                    ],
+                },
+                "clip_bounds": {
+                    "classification": "declared_constant",
+                    "published_at": [
+                        f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio.tail_measure"
+                        f".{source.replace('_multiplier', '_clip_bounds')}"
+                    ],
+                    "declared_at": [
+                        "precision", "declared_constants", "table",
+                    ],
+                },
+            },
+            inherits_precision_from="return_space_volatility",
+            inherits_precision_at=(
+                "precision", "estimated_statistics", "portfolio",
+                "estimates", "return_space_volatility",
+            ),
+            inheritance_status="resolved",
+            inheritance_reason=(
+                "the entire precision of this value is the precision of the fitted "
+                "conditional sigma it multiplies, which is measured on "
+                "precision.estimated_statistics.portfolio.estimates."
+                "return_space_volatility. Nothing else is estimated here: the "
+                f"multiplier is the declared {source} constant and the clip bounds "
+                "are design limits"
+            ),
+            precision_inheritance_factor=multiplier,
+            derivation_residual=published - restated,
+        ))
+
+    # -- each position leg's tail measure -------------------------------------
+    for ticker, leg in positions.items():
+        path = f"{FORECAST_PRECISION_PATH_PREFIX}.positions.{ticker}.var_forecast"
+        published = _forecast_finite(leg.get("var_forecast"))
+        vol = _forecast_finite(leg.get("volatility_forecast"))
+        if published is None or vol is None:
+            withheld.append({
+                "at": path,
+                "reason": (
+                    "not classified: the leg's forecast is null, so there is no "
+                    "point estimate and therefore no precision to disclose"
+                ),
+            })
+            continue
+        limited = bool(leg.get("is_limited_history"))
+        # Whether the leg's own sigma was MEASURED is read off the leg's block
+        # rather than assumed from the branch.  A pointer has to describe what
+        # is actually at the far end of it, and the two can disagree: a leg whose
+        # estimator was withheld still has a block, and inheriting from it means
+        # inheriting an absence.  That is stated, not papered over.
+        leg_entry = (
+            ((estimated.get("positions") or {}).get(ticker) or {}).get("estimates")
+            or {}
+        ).get("volatility_forecast") or {}
+        leg_measured = leg_entry.get("status") == "computed"
+        if limited:
+            # The limited branch computes its own tail from the sample standard
+            # deviation and applies NO tail clip, so claiming one would put a
+            # residual on the payload that is really a missing bound.
+            restated = float(-vol * z_multiplier * h_factor)
+            formula = (
+                f"-volatility_forecast * {z_multiplier} * sqrt({h} / 252)"
+            )
+            clip_note = (
+                "this leg fell below the history gate, so its forecast is its own "
+                "sample standard deviation and its tail is computed without the "
+                "fitted models' clip bounds"
+            )
+        else:
+            restated = float(
+                np.clip(-vol * z_multiplier * h_factor, TAIL_CLIP_LOW, clip_high)
+            )
+            formula = (
+                f"clip(-volatility_forecast * var_z_multiplier * sqrt({h} / 252), "
+                f"{TAIL_CLIP_LOW}, {clip_high})"
+            )
+            clip_note = (
+                "the fitted leg's return-space sigma is its own published "
+                "annualized volatility times sqrt(h / 252), which is an identity "
+                "of the cumulative-variance path - exact unless the published "
+                "annualized clip bounds are active on this leg, and "
+                "derivation_residual says which case this is"
+            )
+        # The identity above reads the PUBLISHED (clipped) leg volatility.  The
+        # clip only breaks it when the published value sits on a bound, so that is
+        # published too and `derivation_residual` is the proof either way.
+        clip_at_bound = bool(
+            not limited and (
+                vol <= FORECAST_VOL_CLIP_LOW or vol >= FORECAST_VOL_CLIP_HIGH
+            )
+        )
+        add(
+            f"positions.{ticker}.var_forecast",
+            _forecast_derived_value(
+                published_at=[path],
+                formula=formula,
+                inputs={
+                    "volatility_forecast": vol,
+                    "var_z_multiplier": z_multiplier,
+                    "horizon_days": h,
+                    "annualized_volatility_clip_bounds": [
+                        FORECAST_VOL_CLIP_LOW, FORECAST_VOL_CLIP_HIGH,
+                    ],
+                    **({} if limited else {"clip_bounds": [TAIL_CLIP_LOW, clip_high]}),
+                },
+                # Whether the published leg volatility is sitting on a clip bound
+                # is a property OF THE DERIVATION, not an input to it, so it is a
+                # sibling of the formula rather than a restated number in it.
+                derivation_precondition=(
+                    "the identity return_space_volatility = "
+                    "volatility_forecast * sqrt(h / 252) holds only while the "
+                    "published annualized clip bounds are not active on this leg"
+                ),
+                derivation_precondition_met=not clip_at_bound,
+                derivation_precondition_evidence=(
+                    "annualized_volatility_at_clip_bound is "
+                    f"{clip_at_bound}: the published leg volatility is "
+                    f"{vol!r} against bounds [{FORECAST_VOL_CLIP_LOW}, "
+                    f"{FORECAST_VOL_CLIP_HIGH}]. derivation_residual is the proof "
+                    "either way - a zero residual means the identity held exactly"
+                ),
+                inputs_classification={
+                    "volatility_forecast": {
+                        "classification": "estimated",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.positions."
+                            f"{ticker}.volatility_forecast"
+                        ],
+                        "measured_at": [
+                            "precision", "estimated_statistics", "positions",
+                            ticker, "estimates", "volatility_forecast",
+                        ],
+                        # `estimated` says what KIND of number this is, not that
+                        # its precision was measured, and those are different
+                        # claims. Publishing them as one is how a reader ends up
+                        # believing a leg carries a band it does not, so the
+                        # classification carries its own status and the reason it
+                        # reads the leg's block rather than asserting either way.
+                        "measurement_status": (
+                            "measured" if leg_measured
+                            else "estimated_but_not_separately_measured"
+                        ),
+                        "measurement_status_basis": (
+                            "read off this leg's own block at measured_at; see "
+                            "precision.measurements_withheld for the unmeasured "
+                            "case"
+                        ),
+                    },
+                    "var_z_multiplier": {
+                        "classification": "declared_constant",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                            f"tail_measure.var_z_multiplier"
+                        ],
+                        "declared_at": [
+                            "precision", "declared_constants", "constants",
+                            "var_z_multiplier",
+                        ],
+                    },
+                    "horizon_days": {
+                        "classification": "declared_constant",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                            f"tail_measure.var_horizon_days"
+                        ],
+                        "declared_at": [
+                            "precision", "declared_constants", "constants",
+                            "var_horizon_days",
+                        ],
+                    },
+                    "annualized_volatility_clip_bounds": {
+                        "classification": "declared_constant",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                            f"tail_measure.volatility_forecast_units"
+                        ],
+                        "declared_at": [
+                            "precision", "declared_constants", "table",
+                        ],
+                    },
+                    **({
+                        "clip_bounds": {
+                            "classification": "declared_constant",
+                            "published_at": [
+                                f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                                f"tail_measure.var_clip_bounds"
+                            ],
+                            "declared_at": [
+                                "precision", "declared_constants", "table",
+                            ],
+                        }
+                    } if not limited else {}),
+                },
+                inherits_precision_from="volatility_forecast",
+                inherits_precision_at=(
+                    "precision", "estimated_statistics", "positions", ticker,
+                    "estimates", "volatility_forecast",
+                ),
+                # The pointer is KEPT even when the target is itself undisclosed.
+                # Dropping it would be tidier and less true: the leg's tail really
+                # does inherit whatever precision this leg's own sigma has, and the
+                # target node is right there saying what that is.  What changes is
+                # the STATUS, so nothing claims an inheritance that was not
+                # measured.
+                inheritance_status=(
+                    "resolved" if leg_measured
+                    else "target_is_itself_undisclosed"
+                ),
+                inheritance_reason=(
+                    (
+                        "the entire precision of this value is the precision of this "
+                        "leg's own fitted conditional sigma, measured on "
+                        f"precision.estimated_statistics.positions.{ticker}."
+                        f"estimates.volatility_forecast. " + clip_note
+                    ) if leg_measured else (
+                        "the entire precision of this value would be the precision "
+                        "of this leg's own fitted conditional sigma, at "
+                        f"precision.estimated_statistics.positions.{ticker}."
+                        "estimates.volatility_forecast - and that node is ITSELF "
+                        "undisclosed: this leg's estimator was withheld rather than "
+                        "run, for the cost reason published at "
+                        "precision.measurements_withheld. The pointer is kept "
+                        "because the inheritance is real and the node it names is "
+                        "on this payload, but there is no figure at the far end of "
+                        "it and none is claimed; the target does publish the part "
+                        "of its precision that is free, its observation count, "
+                        "AR(1) and effective_n. The portfolio leg's sigma IS "
+                        "measured on this same payload, at "
+                        "precision.estimated_statistics.portfolio.estimates."
+                        + clip_note
+                    )
+                ),
+                precision_inheritance_factor=z_multiplier * h_factor,
+                derivation_residual=published - restated,
+            ),
+        )
+
+    # -- the ratio of the two declared multipliers ----------------------------
+    # Read off the leg blocks rather than restated, so `measurements_withheld`
+    # cannot claim a leg the leg's own block does not agree with.
+    withheld_legs = sorted(
+        ticker
+        for ticker, block in (estimated.get("positions") or {}).items()
+        if (block or {}).get("estimator_withheld")
+    )
+    ratio = _forecast_finite(tail.get("cvar_to_var_ratio"))
+    ratio_paths = [
+        f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio.tail_measure.cvar_to_var_ratio",
+        f"{FORECAST_PRECISION_PATH_PREFIX}.model_params.tail_measure.cvar_to_var_ratio",
+    ]
+    if ratio is None:
+        withheld.extend(
+            {"at": path, "reason": "not classified: the value is null"}
+            for path in ratio_paths
+        )
+    else:
+        add(
+            "tail_measure.cvar_to_var_ratio",
+            _forecast_derived_value(
+                published_at=ratio_paths,
+                formula="cvar_es_multiplier / var_z_multiplier",
+                inputs={
+                    "cvar_es_multiplier": es_multiplier,
+                    "var_z_multiplier": z_multiplier,
+                },
+                inputs_classification={
+                    "cvar_es_multiplier": {
+                        "classification": "declared_constant",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                            f"tail_measure.cvar_es_multiplier"
+                        ],
+                        "declared_at": [
+                            "precision", "declared_constants", "constants",
+                            "cvar_es_multiplier",
+                        ],
+                    },
+                    "var_z_multiplier": {
+                        "classification": "declared_constant",
+                        "published_at": [
+                            f"{FORECAST_PRECISION_PATH_PREFIX}.portfolio."
+                            f"tail_measure.var_z_multiplier"
+                        ],
+                        "declared_at": [
+                            "precision", "declared_constants", "constants",
+                            "var_z_multiplier",
+                        ],
+                    },
+                },
+                inherits_precision_from=[
+                    "cvar_es_multiplier", "var_z_multiplier",
+                ],
+                # Deliberately None, and this is the case the pointer test exists
+                # to catch: both inputs are DECLARED CONSTANTS, so neither has a
+                # sampling distribution and there is no figure anywhere to point
+                # at. A path that resolved here would resolve onto another null.
+                inherits_precision_at=None,
+                inheritance_status="inputs_are_declared_constants",
+                inheritance_reason=(
+                    "not inheritable, and the absence is the answer rather than a "
+                    "gap: this ratio is the ES multiplier divided by the z "
+                    "multiplier, and both are declared constants read from "
+                    "app/services/analytics_engine.py. Neither was estimated from "
+                    "data, so neither has a sampling distribution, so there is no "
+                    "figure to inherit. The ratio is exact rather than imprecise - "
+                    "it is fixed by construction, which is what "
+                    "cvar_to_var_ratio_fixed_by_construction already states - and a "
+                    "null standard error describes that accurately"
+                ),
+                precision_inheritance_factor=None,
+                derivation_residual=(
+                    ratio - (es_multiplier / z_multiplier if z_multiplier else None)
+                    if z_multiplier else None
+                ),
+            ),
+        )
+
+    # -- the declared constants -----------------------------------------------
+    tail_paths = ("portfolio.tail_measure", "model_params.tail_measure")
+    declared = {
+        "classification": "declared_constant",
+        "basis": (
+            "the quantiles of a normal distribution and a stated request "
+            "parameter. They are constants because the normal distribution's "
+            "quantiles are constants, not because the risk was faked, and the "
+            "engine has always published them - what was missing was any "
+            "statement that they were never estimated from data"
+        ),
+        "table": (
+            "app/services/analytics_engine.py: TAIL_CONFIDENCE_LEVEL, "
+            "TAIL_Z_MULTIPLIER, TAIL_ES_MULTIPLIER, TAIL_CLIP_LOW, TAIL_CLIP_HIGH"
+        ),
+        "published_at": [
+            f"{FORECAST_PRECISION_PATH_PREFIX}.{prefix}.{name}"
+            for prefix in tail_paths
+            for name in (
+                "var_confidence_level", "var_horizon_days",
+                "var_z_multiplier", "cvar_es_multiplier",
+            )
+        ],
+        "constants": {
+            "var_confidence_level": _forecast_declared_constant(
+                "var_confidence_level",
+                _forecast_finite(tail.get("var_confidence_level")),
+                "app/services/analytics_engine.py: TAIL_CONFIDENCE_LEVEL - the "
+                "normal quantile level the fitted models' tail is read at",
+                [f"{FORECAST_PRECISION_PATH_PREFIX}.{p}.var_confidence_level"
+                 for p in tail_paths],
+            ),
+            "var_horizon_days": _forecast_declared_constant(
+                "var_horizon_days",
+                tail.get("var_horizon_days"),
+                "the `horizon` query parameter of GET /api/v1/analytics/"
+                "forecast-risk, echoed as the number of days the tail covers. It "
+                "is an input the caller chose, not a quantity this service "
+                "estimated",
+                [f"{FORECAST_PRECISION_PATH_PREFIX}.{p}.var_horizon_days"
+                 for p in tail_paths],
+            ),
+            "var_z_multiplier": _forecast_declared_constant(
+                "var_z_multiplier",
+                z_multiplier,
+                "app/services/analytics_engine.py: TAIL_Z_MULTIPLIER - the 95 % "
+                "standard-normal quantile Phi^-1(0.05), applied to the fitted "
+                "conditional sigma",
+                [f"{FORECAST_PRECISION_PATH_PREFIX}.{p}.var_z_multiplier"
+                 for p in tail_paths],
+            ),
+            "cvar_es_multiplier": _forecast_declared_constant(
+                "cvar_es_multiplier",
+                es_multiplier,
+                "app/services/analytics_engine.py: TAIL_ES_MULTIPLIER - the normal "
+                "expected-shortfall multiple of the same sigma, so it is the ES "
+                "of the same N(0, sigma^2) the z multiplier reads",
+                [f"{FORECAST_PRECISION_PATH_PREFIX}.{p}.cvar_es_multiplier"
+                 for p in tail_paths],
+            ),
+        },
+        "standard_error": None,
+        "standard_error_reason": _DECLARED_CONSTANT_SE_REASON,
+        "conf_int": None,
+        "conf_int_reason": _DECLARED_CONSTANT_CI_REASON,
+    }
+
+    # -- coverage, summed from the classifications themselves -----------------
+    # Restated inputs count.  `derived_values.var_forecast.inputs.var_z_multiplier`
+    # is a second copy of a declared constant, and a key that appears twice on a
+    # payload is still a key a rule will read, so it is classified rather than
+    # left to be discovered by whichever rule happens to look.
+    classified: List[str] = []
+    restated: List[Dict[str, Any]] = []
+    for name, entry in derived.items():
+        classified.extend(entry["published_at"])
+        for input_name, input_entry in (entry.get("inputs_classification")
+                                        or {}).items():
+            for at in input_entry.get("published_at") or ():
+                classified.append(at)
+            mirror = (
+                f"{FORECAST_PRECISION_PATH_PREFIX}.precision.derived_values"
+                f".{name}.inputs.{input_name}"
+            )
+            # The MIRROR path is what a rule reading this payload will flag, so
+            # it is the mirror path that has to be classified - not only the
+            # original it restates.
+            classified.append(mirror)
+            # NO per-entry `reason`.  The explanation is the same for every one of
+            # these entries - there are ninety-odd of them on a 14-leg book - and
+            # ninety-odd copies of a paragraph is ninety-odd times the bytes, the
+            # drift risk, and none of the information.  It is published once as
+            # `coverage.input_restatements_basis` and each entry carries the
+            # FACTS that are actually specific to it: where the copy is, what it
+            # restates, what kind of number it is and where that kind is
+            # classified.
+            restated.append({
+                "at": mirror,
+                "classification": input_entry.get("classification"),
+                "restates": input_entry.get("published_at") or [],
+                "declared_or_measured_at": input_entry.get(
+                    "declared_at"
+                ) or input_entry.get("measured_at"),
+            })
+    for entry in declared["constants"].values():
+        classified.extend(entry["published_at"])
+    classified.extend(declared["published_at"])
+    classified = sorted(set(classified))
+
+    return {
+        "basis": FORECAST_PRECISION_BASIS,
+        "classes": dict(FORECAST_PRECISION_CLASSES),
+        "model": model,
+        "horizon_days": h,
+        "estimated_statistics": dict(estimated),
+        "estimated_statistics_basis": (
+            "one block per fitted quantity, each produced by "
+            "measure_estimate_uncertainty over that quantity's OWN measured "
+            "return series, and every block carries the same keys whether its "
+            "estimator ran or was withheld - so a reader does not have to know "
+            "which legs are which in order to read either. No band is published "
+            "unless the re-fit estimator reproduces the published point first, so "
+            "an interval on this section always describes the number printed "
+            "beside it. A block whose estimator was declared too expensive to run "
+            "says so on estimator_withheld, publishes bootstrap_resamples 0, and "
+            "carries a null standard error with a stated reason; the declined "
+            "measurement is named, not deleted"
+        ),
+        "derived_values": derived,
+        "declared_constants": declared,
+        # The one place a leg's withheld measurement is explained.  Every leg
+        # block's `estimator_withheld` and every leg-derived value's
+        # `inherits_precision_reason` point here rather than repeating the
+        # paragraph, so the reason is stated once and the pointers to it are
+        # themselves checked by the pointer test.
+        "measurements_withheld": {
+            "applies_to": sorted(withheld_legs),
+            "applies_to_basis": (
+                "the position legs whose volatility_forecast is classified "
+                "estimated but was not measured. A leg that published no forecast "
+                "is absent from this list because there was nothing to measure, and "
+                "a leg whose estimator DID run - a limited-history leg, whose "
+                "statistic is a closed-form order statistic rather than a model fit "
+                "- is absent because its measurement is on "
+                "precision.estimated_statistics.positions"
+            ),
+            "count": len(withheld_legs),
+            "declined_draws_per_leg": FORECAST_LEG_REFIT_RESAMPLES_WITHHELD,
+            "declared_at": [
+                f"{FORECAST_PRECISION_PATH_PREFIX}.precision."
+                "estimated_statistics.positions.<ticker>.estimates."
+                "volatility_forecast"
+            ],
+            "estimator": (
+                "the measurement that was declined: "
+                "volatility_forecast_statistics(model, horizon) re-fitting the same "
+                "model on every circular moving-block resample of that leg's own "
+                "return series through the engine's own volatility_forecast_point. "
+                "It is named on every leg block under notes.estimator, so the "
+                "declined measurement is reproducible by anyone who wants to pay "
+                "for it"
+            ),
+            "published_at_basis": (
+                "each of these legs' own volatility_forecast, at "
+                f"{FORECAST_PRECISION_PATH_PREFIX}.positions.<ticker>."
+                "volatility_forecast. The list is read off the leg blocks' "
+                "estimator_withheld rather than restated, so a leg cannot be "
+                "claimed as withheld without its block saying so"
+            ),
+            "why_not_measured": _FORECAST_LEG_MEASUREMENT_WITHHELD,
+        },
+        "resample_count_rule": FORECAST_REFIT_COUNT_RULE,
+        "coverage": {
+            "basis": (
+                "every key this section publishes that a precision-disclosure "
+                "rule would read as an estimated quantity, classified. The list is "
+                "summed from the classification entries themselves rather than "
+                "asserted beside them, so a key cannot be classified in one place "
+                "and forgotten in another"
+            ),
+            "classified_keys": classified,
+            "classified_key_count": len(classified),
+            "classes_used": {
+                "estimated": _forecast_measured_names(estimated),
+                "deterministic_derivation": sorted(derived),
+                "declared_constant": sorted(
+                    list(declared["constants"]) + ["tail_measure"]
+                ),
+            },
+            "not_classified": withheld,
+            "not_classified_basis": (
+                "a null is an absence, not a point estimate, so it has no "
+                "precision to disclose. Each is listed with its path so the "
+                "absence is visible rather than inferred from a missing key. The "
+                "key is named not_classified rather than withheld because a "
+                "withheld FIELD is a different thing - a field the payload "
+                "declined to publish at all - and a null is published"
+            ),
+            "input_restatements": restated,
+            "input_restatements_basis": (
+                "the numbers a formula repeats beside the value it produces. They "
+                "are classified here so that the classified-key count covers every "
+                "key on this section rather than only the ones a reader happened "
+                "to look at. A formula restates its inputs so the derivation can "
+                "be recomputed from the payload, and each restated copy is "
+                "classified as the same kind of number as the original and points "
+                "at where that classification is published. That explanation is "
+                "stated HERE, once, rather than on every entry: this list has one "
+                "entry per restated input - ninety on a 14-leg book - and the "
+                "sentence is identical for all of them, so repeating it would buy "
+                "bytes and drift risk and no information. Each entry carries what "
+                "is actually specific to it: `at`, `restates`, `classification` "
+                "and `declared_or_measured_at`"
+            ),
+        },
+        "rule_limitation": (
+            "a precision-disclosure rule keyed on key names alone cannot tell a "
+            "declared constant from a derived value from a measured estimate: all "
+            "three look like a number next to a name. This block separates them by "
+            "classification, but it is still a disclosure and not a truth gate - it "
+            "says how each number was determined and how tightly, not whether any "
+            "of them is correct"
+        ),
+    }
+
+
 @router.get("/forecast-risk")
 async def get_forecast_risk(
     model: str = Query(default="GARCH", description="Risk model: EWMA, GARCH, or EGARCH"),
@@ -4259,6 +5494,11 @@ async def get_forecast_risk(
         # sample the annualization gate exists to refuse.
         positions = {}
         warnings_list = []
+        #: The series each leg's forecast was actually computed from, kept beside
+        #: the published leg so the precision disclosure measures each leg on its
+        #: OWN observations.  Not published: it is an input the disclosure
+        #: consumes, and the leg already publishes its row counts.
+        leg_returns: Dict[str, Any] = {}
         own_return_observations = _own_return_observations(price_data)
         for ticker in price_data.columns:
             try:
@@ -4293,7 +5533,8 @@ async def get_forecast_risk(
                             "volatility uses sample volatility."
                         )
                     })
-                
+                leg_returns[ticker] = ticker_rets
+
                 positions[ticker] = {
                     "volatility_forecast": vol_fc,
                     "var_forecast": var_fc,
@@ -4304,6 +5545,7 @@ async def get_forecast_risk(
                 }
             except Exception:
                 logger.error("Volatility forecast leg failed")
+                leg_returns.pop(ticker, None)
                 positions[ticker] = {
                     "volatility_forecast": None,
                     "var_forecast": None,
@@ -4337,6 +5579,77 @@ async def get_forecast_risk(
         # series, so its sample is that series' length - never a position count
         # and never the number of tickers that happened to clear a per-leg gate.
         portfolio_observations = int(portfolio_returns.notna().sum())
+        # The precision disclosure (ENV-020).  Every estimated quantity this
+        # section publishes is one of three kinds of thing and admits a different
+        # disclosure; see FORECAST_PRECISION_BASIS.  Built AFTER the response
+        # skeleton so it can only read published values, never influence them,
+        # and each measured block runs on its own thread because a re-fit
+        # bootstrap is CPU-bound and would otherwise hold the event loop for the
+        # better part of a minute.
+        estimated_statistics: Dict[str, Any] = {}
+        estimated_statistics["portfolio"] = await asyncio.to_thread(
+            _forecast_portfolio_uncertainty,
+            portfolio_returns, model, horizon, forecast_result,
+        )
+        estimated_statistics["positions"] = {}
+        for ticker, leg in positions.items():
+            leg_block = await asyncio.to_thread(
+                _forecast_leg_uncertainty,
+                leg, leg_returns.get(ticker), model, horizon,
+            )
+            if leg_block is not None:
+                estimated_statistics["positions"][ticker] = leg_block
+        # ENV-016: a section that withholds something must name it, whatever its
+        # own status says.  The per-leg refit is declined deliberately and
+        # declared inside the precision block, but a reader who looks only at
+        # `status` and `warnings` - which is what a consumer deciding whether to
+        # trust a number does - would see `available` beside an empty list and
+        # conclude every leg was measured.  On this book 14 of 15 were not.  The
+        # declaration was reachable only by knowing to go looking for
+        # `estimator_withheld` under a ticker key, which is not a disclosure a
+        # consumer can rely on finding.  Name it where the rest of this section's
+        # degradations are named.
+        leg_blocks = estimated_statistics["positions"]
+        withheld_legs = sorted(
+            ticker
+            for ticker, block in leg_blocks.items()
+            if isinstance(block, dict) and block.get("estimator_withheld")
+        )
+        if withheld_legs:
+            warnings_list.append(
+                {
+                    "code": "forecast_precision_leg_refit_declined",
+                    "legs_published": len(leg_blocks),
+                    # Deliberately NOT named `..._interval` or anything else
+                    # carrying an uncertainty token.  ENV-020 accepts a finite
+                    # value on a token-matching key as a precision figure, and
+                    # this is a COUNT of legs that declined one - so a name like
+                    # `legs_without_a_measured_interval` satisfied the precision
+                    # rule with a count, which is precisely the hollow pass that
+                    # rule was just tightened to stop.  Caught by this section's
+                    # own control test, which could no longer turn red.
+                    "legs_with_declined_measurement": len(withheld_legs),
+                    "tickers": withheld_legs,
+                    "message": (
+                        f"{len(withheld_legs)} of {len(leg_blocks)} leg "
+                        "volatility forecasts publish no standard error and no "
+                        "interval. Measuring one means re-fitting that leg's ARCH "
+                        "model on every resample - a full optimiser run per draw - "
+                        "and this export cannot afford one per leg: at the module's "
+                        "own floor for a percentile interval to mean anything, the "
+                        "14-position book spent ~51 s of extra refit time and the "
+                        "section overran the 180 s budget it is assembled under, "
+                        "which left three later sections published unavailable. "
+                        "Each such leg publishes its own observation count, AR(1) "
+                        "and effective sample size, and the declined measurement is "
+                        "declared once at data.precision.measurements_withheld and "
+                        "per leg at data.precision.estimated_statistics.positions."
+                        "<ticker>.estimator_withheld. The PORTFOLIO leg is measured, "
+                        "with a standard error, a 95% interval and an effective "
+                        "sample size."
+                    ),
+                }
+            )
         response = {
             "model": model,
             "horizon": horizon,
@@ -4378,7 +5691,14 @@ async def get_forecast_risk(
             "model_params": forecast_result.get("model_params", {"p": 1, "q": 1, "type": model}),
             "data_range": {"start": start, "end": end},
             "latest_observation_date": _latest_observation_date(price_data),
-            "methodology": f"Volatility forecasting using {model} model with {horizon}-day horizon"
+            "methodology": f"Volatility forecasting using {model} model with {horizon}-day horizon",
+            "precision": _forecast_precision_block(
+                model=model,
+                horizon=horizon,
+                forecast_result=forecast_result,
+                positions=positions,
+                estimated=estimated_statistics,
+            ),
         }
         if forecast_result.get("error"):
             response["error"] = forecast_result["error"]

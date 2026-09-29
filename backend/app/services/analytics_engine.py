@@ -714,6 +714,22 @@ TAIL_ES_MULTIPLIER = 2.06
 TAIL_CLIP_LOW = -0.99
 TAIL_CLIP_HIGH = -0.001
 
+#: Annualized-volatility clip bounds on the published `volatility_forecast`.
+#: GARCH and EWMA floor at 0.05; EGARCH floors at 0.0 because its log-variance
+#: recursion can drive the conditional variance below any positive floor without
+#: that being an error.  These were inline literals inside each forecast method.
+#: They are named now because the precision disclosure RE-FITS the same model on
+#: every resample and has to clip identically: a restatement that clipped
+#: differently would fail `measure_estimate_uncertainty`'s reproduction guard and
+#: the band would be withheld for a reason that has nothing to do with precision.
+FORECAST_VOL_CLIP_LOW = 0.05
+FORECAST_VOL_CLIP_HIGH = 1.20
+EGARCH_VOL_CLIP_LOW = 0.0
+#: RiskMetrics (1996) single-pass decay factor.  Named for the same reason as
+#: the clip bounds: the resampling restatement re-runs this exact recursion, and
+#: a decay factor written twice is a drift waiting to happen.
+EWMA_LAMBDA = 0.94
+
 #: Why `confidence_interval` is null.  Published rather than left implicit so
 #: a consumer reading the absence learns the reason instead of assuming a bug.
 FORECAST_NO_INTERVAL_REASON = (
@@ -1146,6 +1162,7 @@ def measure_estimate_uncertainty(
     witness_basis: Optional[str] = None,
     row_filter: Optional[Any] = None,
     row_filter_basis: Optional[str] = None,
+    estimator_withheld: Optional[str] = None,
     notes: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Precision disclosure for one block of published estimates.
@@ -1197,6 +1214,20 @@ def measure_estimate_uncertainty(
     (one evaluation, never resampled) - it re-derives a point, it does not
     produce a distribution.
 
+    `estimator_withheld` is for the case where the ESTIMATOR ITSELF is too
+    expensive to run - a GARCH(1,1) refit is a full optimiser run, so a
+    per-leg re-fit bootstrap costs a book's worth of them.  The reason is
+    published on every field and on the block, `bootstrap_resamples` reads 0,
+    the resampler is never called, and the point is retained with
+    ``point_status = unverified`` because nothing re-derived it.  It is a
+    parameter rather than a hand-built second copy of this function's output
+    shape precisely so the unmeasured block cannot drift away from the measured
+    one: a withheld disclosure with a different set of keys would be the reason
+    a consumer's reader broke on the fields that were kept.  The alternative to
+    withholding - narrowing the draw count until the block fits - is only
+    correct while the remaining tail still means something, and below this
+    module's floor it does not.
+
     THE ASYMMETRY IS DELIBERATE.  On a witness that cannot be run - it raises,
     it returns a non-finite value, it is absent, it is handed no finite
     observation - the point is RETAINED and flagged `unverified`.  It is never
@@ -1237,7 +1268,13 @@ def measure_estimate_uncertainty(
     draws: Dict[str, np.ndarray] = {}
     own_point: Dict[str, Optional[float]] = {}
     blocked_reason: Optional[str] = None
-    if count >= UNCERTAINTY_MIN_OBSERVATIONS:
+    if estimator_withheld is not None:
+        # Declared before any work is done, not after a timeout or a failure.
+        # The caller is not reporting that the estimator broke; it is reporting
+        # that running it was a decision it could not afford, and the estimator
+        # never runs at all.
+        blocked_reason = estimator_withheld
+    elif count >= UNCERTAINTY_MIN_OBSERVATIONS:
         try:
             indices = moving_block_indices(count, block_length, resamples, seed)
             # (draws, n, k) -> (n, draws, k): time axis first, one draw per column.
@@ -1306,6 +1343,19 @@ def measure_estimate_uncertainty(
             estimates[field] = _uncertainty_entry(
                 field, point=point, status="not_computed",
                 reason=declared_not_computed[field], observations=count or None,
+                effective_n=effective_n,
+                point_status=POINT_UNVERIFIED,
+            )
+            continue
+        if estimator_withheld is not None:
+            # A field-specific `not_computed` above is the caller naming a
+            # reason about THIS field; this is the caller saying the estimator
+            # was not run at all.  `effective_n` is still real and still
+            # published: it is measured from the sample, costs nothing, and is
+            # the part of this leg's precision that IS known.
+            estimates[field] = _uncertainty_entry(
+                field, point=point, status="not_computed",
+                reason=estimator_withheld, observations=count or None,
                 effective_n=effective_n,
                 point_status=POINT_UNVERIFIED,
             )
@@ -1403,6 +1453,11 @@ def measure_estimate_uncertainty(
     with_interval = sorted(
         field for field, entry in estimates.items() if entry["status"] == "computed"
     )
+    #: True when the caller declined to run the estimator at all, as opposed to
+    #: the estimator running and declining to produce a band.  The two are
+    #: published differently because they are different facts, and a reader who
+    #: cannot tell them apart has to assume the worse one.
+    withheld = estimator_withheld is not None
     block: Dict[str, Any] = {
         "scope": scope,
         "status": "computed" if with_interval else "not_computed",
@@ -1410,9 +1465,9 @@ def measure_estimate_uncertainty(
             "no field in this block carries a resampling interval; each field "
             "states its own reason under estimates.<field>.reason"
         ),
-        "method": BOOTSTRAP_METHOD if with_interval else None,
-        "method_basis": BOOTSTRAP_METHOD_BASIS,
-        "confidence_level": level,
+        "method": (None if (withheld or not with_interval) else BOOTSTRAP_METHOD),
+        "method_basis": (None if withheld else BOOTSTRAP_METHOD_BASIS),
+        "confidence_level": (None if withheld else level),
         "observations": count,
         "observation_columns": width,
         "observation_filter": (
@@ -1432,20 +1487,43 @@ def measure_estimate_uncertainty(
         "block_size": block_length,
         "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) "
         "trading days",
-        "bootstrap_resamples": int(resamples),
+        "bootstrap_resamples": 0 if withheld else int(resamples),
         "resample_seed": int(seed),
-        "resampling_basis": BOOTSTRAP_RESAMPLING_BASIS,
-        "point_tolerance": float(point_tolerance),
+        "resampling_basis": (None if withheld else BOOTSTRAP_RESAMPLING_BASIS),
+        # Only meaningful when the estimator ran.  Publishing the tolerance on a
+        # block where no reproduction test happened would imply a check that was
+        # never made, and `estimator_withheld` is the key that says so instead.
+        "point_tolerance": (
+            None if withheld else float(point_tolerance)
+        ),
+        # These two explain what a RUNNING estimator does.  A withheld block ran
+        # none, so publishing their prose would describe a check that never
+        # happened; the keys stay (the shape is identical either way) and the
+        # values go, which is the same rule as method / point_tolerance above.
         "band_provenance_tolerance_basis": (
-            "a BAND-PROVENANCE test, not a truth test. An interval is published "
-            "only after the resampling estimator's own point value reproduces "
-            "the published value to within this tolerance, which is what makes "
-            "the band belong to the statistic the reader can see. It says "
-            "nothing about whether either number is CORRECT: on its own the "
-            "test cannot tell which of the two is wrong. A disagreement is "
-            "adjudicated against an independent witness - see "
-            "estimates.<field>.point_status, which states which side failed, "
-            "and witness_status / witness_tolerance on this block."
+            None if withheld else (
+                "a BAND-PROVENANCE test, not a truth test. An interval is published "
+                "only after the resampling estimator's own point value reproduces "
+                "the published value to within this tolerance, which is what makes "
+                "the band belong to the statistic the reader can see. It says "
+                "nothing about whether either number is CORRECT: on its own the "
+                "test cannot tell which of the two is wrong. A disagreement is "
+                "adjudicated against an independent witness - see "
+                "estimates.<field>.point_status, which states which side failed, "
+                "and witness_status / witness_tolerance on this block."
+            )
+        ),
+        "estimator_withheld": estimator_withheld,
+        "estimator_withheld_basis": (
+            "set when the caller declared the resampling estimator too expensive "
+            "to run, so the estimator was never called rather than having run and "
+            "produced nothing. bootstrap_resamples reads 0 and the point is "
+            "retained with point_status unverified, because no re-derivation "
+            "checked it. The alternative to withholding - narrowing the draw "
+            "count until the block fits - is only honest while the remaining tail "
+            "of the percentile interval still means something, and below this "
+            "module's floor it does not"
+            if withheld else None
         ),
         "witness_tolerance": witness_limit,
         "witness_status": (
@@ -1453,27 +1531,29 @@ def measure_estimate_uncertainty(
             "not_supplied" if witness is None else "witness_failed"
         ),
         "witness_status_basis": (
-            "an independent second derivation of the published point value, by "
-            "a different code path over the sample the point was published "
-            "from, used ONLY to decide which side of a failed reproduction test "
-            "is wrong. It never produces an interval: the band still comes from "
-            "the resampling estimator, and it is withheld whenever the "
-            "estimator's own point value misses the published one."
-            + (
-                f" The witness was evaluated over {witness_shape[0]} finite "
-                f"observation(s) and {witness_shape[1]} column(s) - the sample "
-                "the PUBLISHED value was measured on, which is not necessarily "
-                "the frame the resampling estimator was handed "
-                f"({count} observation(s), {width} column(s), published above as "
-                "observation_columns). A witness run over a mis-aligned frame "
-                "would agree with a mis-aligned ESTIMATOR rather than with the "
-                "published value and would withhold a correct point, which is "
-                "why the two frame sizes are published side by side."
-                if witness_shape is not None
-                else ""
+            None if withheld else (
+                "an independent second derivation of the published point value, by "
+                "a different code path over the sample the point was published "
+                "from, used ONLY to decide which side of a failed reproduction test "
+                "is wrong. It never produces an interval: the band still comes from "
+                "the resampling estimator, and it is withheld whenever the "
+                "estimator's own point value misses the published one."
+                + (
+                    f" The witness was evaluated over {witness_shape[0]} finite "
+                    f"observation(s) and {witness_shape[1]} column(s) - the sample "
+                    "the PUBLISHED value was measured on, which is not necessarily "
+                    "the frame the resampling estimator was handed "
+                    f"({count} observation(s), {width} column(s), published above as "
+                    "observation_columns). A witness run over a mis-aligned frame "
+                    "would agree with a mis-aligned ESTIMATOR rather than with the "
+                    "published value and would withhold a correct point, which is "
+                    "why the two frame sizes are published side by side."
+                    if witness_shape is not None
+                    else ""
+                )
+                + (f" Caller's basis: {witness_basis}." if witness_basis else "")
+                + (f" Not available: {witness_failure}." if witness_failure else "")
             )
-            + (f" Caller's basis: {witness_basis}." if witness_basis else "")
-            + (f" Not available: {witness_failure}." if witness_failure else "")
         ),
         "autocorrelation": autocorrelation,
         "estimates": estimates,
@@ -5163,37 +5243,25 @@ class AnalyticsEngine:
         ``arch`` returns one conditional variance per future period.  The
         adapter sums that path before converting to return-space VaR/CVaR;
         applying a second ``sqrt(horizon / 252)`` would double-count time.
+
+        The numeric core lives in :func:`volatility_forecast_point` so the
+        precision disclosure's resampling restatement and this method are the
+        SAME code and cannot drift apart.  See that function for why.
         """
         h = int(max(1, horizon))
         try:
-            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
-            if len(clean_returns) < 20:
-                return self._empty_forecast(h, "GARCH")
-
-            # Scale returns by 100 for arch optimizer numerical convergence stability.
-            scaled_returns = clean_returns * 100.0
-            model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
-            fitted_model = await asyncio.to_thread(
-                lambda: model.fit(disp='off', show_warning=False, options={'maxiter': 100})
+            point = await asyncio.to_thread(
+                volatility_forecast_point, returns, "GARCH", h
             )
-
-            forecast = await asyncio.to_thread(
-                lambda: fitted_model.forecast(horizon=h, method='analytic')
-            )
-            variance_path = self._forecast_variance_path(forecast, h)
-            if variance_path.size == 0 or not np.isfinite(variance_path).all():
-                raise ValueError("arch returned no finite GARCH variance path")
-            variance_path = np.maximum(variance_path, 0.0)
-
-            # arch supplies per-period conditional variances.  Aggregate
-            # them before converting to the h-day return-space tail units.
-            volatility_path, return_space_path = self._cumulative_forecast_volatility(
-                variance_path
-            )
-            raw_vol_final = float(volatility_path[-1])
-            vol_final = float(np.clip(raw_vol_final, 0.05, 1.20))
-            return_space_vol = float(return_space_path[-1])
+        except _InsufficientForecast:
+            return self._empty_forecast(h, "GARCH")
+        except Exception as e:
+            logger.error(f"GARCH forecast error: {e}")
+            return self._empty_forecast(h, "GARCH", error="GARCH forecast failed")
+        try:
+            vol_final = point["volatility_forecast"]
+            raw_vol_final = point["raw_volatility_forecast"]
+            return_space_vol = point["return_space_volatility"]
             var_forecast = float(
                 np.clip(-return_space_vol * TAIL_Z_MULTIPLIER, TAIL_CLIP_LOW, TAIL_CLIP_HIGH)
             )
@@ -5215,12 +5283,17 @@ class AnalyticsEngine:
                 # a fixed +/-20 % haircut, exact to the last bit, carrying no
                 # level and no sampling error.  A null plus a reason is the
                 # only honest value; inventing a band is what created the
-                # defect.
+                # defect.  The point estimate's own precision is published
+                # separately, as a measured resampling band, on
+                # `precision.estimated_statistics` - see the route.
                 "confidence_interval": None,
                 "confidence_interval_status": "not_computed",
                 "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
                 "tail_measure": tail,
-                "term_structure": [float(np.clip(v, 0.05, 1.20)) for v in volatility_path],
+                "term_structure": [
+                    float(np.clip(v, FORECAST_VOL_CLIP_LOW, FORECAST_VOL_CLIP_HIGH))
+                    for v in point["annualized_volatility_path"]
+                ],
                 "model_params": {
                     "p": 1,
                     "q": 1,
@@ -5242,51 +5315,21 @@ class AnalyticsEngine:
             )
 
     async def _egarch_forecast(self, returns: pd.Series, horizon: int) -> Dict[str, Any]:
-        """EGARCH forecast using analytic h=1 and seeded simulation for h>1."""
+        """EGARCH forecast using analytic h=1 and seeded simulation for h>1.
+
+        The numeric core lives in :func:`volatility_forecast_point`, shared with
+        the precision disclosure's resampling restatement.  See that function.
+        """
         h = int(max(1, horizon))
         try:
-            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
-            if len(clean_returns) < 20:
-                return self._empty_forecast(h, "EGARCH")
-
-            scaled_returns = clean_returns * 100.0
-            model = arch_model(scaled_returns, vol='EGARCH', p=1, q=1, dist='normal', rescale=False)
-            fitted_model = await asyncio.to_thread(
-                lambda: model.fit(disp='off', show_warning=False)
+            point = await asyncio.to_thread(
+                volatility_forecast_point, returns, "EGARCH", h
             )
-
-            if h == 1:
-                forecast = await asyncio.to_thread(
-                    lambda: fitted_model.forecast(horizon=1, method='analytic')
-                )
-                simulated = False
-                method = "analytic"
-            else:
-                # arch 8.x does not provide analytic multi-step EGARCH
-                # forecasts.  Simulation is a supported path; fixing the seed
-                # makes the returned path deterministic for tests and clients.
-                forecast = await asyncio.to_thread(
-                    lambda: fitted_model.forecast(
-                        horizon=h,
-                        method="simulation",
-                        simulations=2000,
-                        random_state=100,
-                    )
-                )
-                simulated = True
-                method = "simulation"
-
-            variance_path = self._forecast_variance_path(forecast, h, simulated=simulated)
-            if variance_path.size == 0 or not np.isfinite(variance_path).all():
-                raise ValueError("arch returned no finite EGARCH variance path")
-            variance_path = np.maximum(variance_path, 0.0)
-            volatility_path, return_space_path = self._cumulative_forecast_volatility(
-                variance_path
-            )
-            raw_vol_final = float(volatility_path[-1])
-            vol_final = float(np.clip(raw_vol_final, 0.0, 1.20))
-            return_space_vol = float(return_space_path[-1])
+            method = point["forecast_method"]
+            simulated = point["simulated"]
+            vol_final = point["volatility_forecast"]
+            raw_vol_final = point["raw_volatility_forecast"]
+            return_space_vol = point["return_space_volatility"]
             # EGARCH's tail is clipped at 0.0 on the loss side, not at the
             # -0.001 floor GARCH/EWMA use; the bound travels with the number.
             egarch_clip_high = 0.0
@@ -5321,7 +5364,10 @@ class AnalyticsEngine:
                 "confidence_interval_status": "not_computed",
                 "confidence_interval_reason": FORECAST_NO_INTERVAL_REASON,
                 "tail_measure": tail,
-                "term_structure": [float(np.clip(v, 0.0, 1.20)) for v in volatility_path],
+                "term_structure": [
+                    float(np.clip(v, EGARCH_VOL_CLIP_LOW, FORECAST_VOL_CLIP_HIGH))
+                    for v in point["annualized_volatility_path"]
+                ],
                 "model_params": {
                     "p": 1,
                     "q": 1,
@@ -5335,6 +5381,8 @@ class AnalyticsEngine:
                     "confidence_interval_status": "not_computed",
                 },
             }
+        except _InsufficientForecast:
+            return self._empty_forecast(h, "EGARCH")
         except Exception as e:
             logger.error(f"EGARCH forecast error: {e}")
             return self._empty_forecast(
@@ -5345,18 +5393,12 @@ class AnalyticsEngine:
         """EWMA volatility forecast (RiskMetrics 1996 single-pass recursion)."""
         try:
             h = max(1, horizon)
-            clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-            clean_returns = clean_returns.clip(lower=-0.20, upper=0.20)
-            lambda_val = 0.94  # Standard RiskMetrics decay factor
-
-            # Single-pass recursion: sigma^2_t = lambda*sigma^2_{t-1} + (1-lambda)*r^2_{t-1}
-            r = clean_returns.to_numpy(dtype=float)
-            var = float(np.var(r)) if len(r) else 0.0
-            for x in r[-min(len(r), 60):]:
-                var = lambda_val * var + (1.0 - lambda_val) * x * x
-
-            raw_forecast_volatility = float(np.sqrt(max(0.0, var) * 252))
-            forecast_volatility = float(np.clip(raw_forecast_volatility, 0.05, 1.20))
+            # The numeric core is shared with the precision disclosure's
+            # resampling restatement; see `volatility_forecast_point`.
+            point = volatility_forecast_point(returns, "EWMA", h)
+            lambda_val = EWMA_LAMBDA
+            forecast_volatility = point["volatility_forecast"]
+            raw_forecast_volatility = point["raw_volatility_forecast"]
             # RiskMetrics has no mean reversion: flat h-step term structure
             term_structure = [forecast_volatility] * h
             h_factor = np.sqrt(h / 252.0)
@@ -5781,6 +5823,246 @@ class AnalyticsEngine:
             "alerts": ["Insufficient data for comprehensive risk analysis"],
             "error": "Insufficient data for risk scoring"
         }
+
+
+# ---------------------------------------------------------------------------
+# Volatility forecast: the point, and the precision of the point (ENV-020)
+# ---------------------------------------------------------------------------
+# `volatility_forecast` is the one genuinely ESTIMATED quantity this section
+# publishes: the terminal conditional sigma of a model fitted to a measured
+# return series.  `var_forecast` and `cvar_forecast` are a DECLARED normal
+# quantile times that sigma, so they are deterministic functions of a published
+# number plus a published constant and carry no independent uncertainty.  The
+# z / ES multipliers, the confidence level and the horizon are declared
+# parameters with no sampling distribution at all.
+#
+# The precision of the estimated quantity is measured the only way it can be:
+# the model is RE-FITTED on every moving-block resample and the dispersion of the
+# re-fitted terminal sigma is the standard error.  Nothing about a conditional
+# volatility forecast has a usable closed-form standard error, and the
+# alternative - publishing an interval around a function of an already-published
+# sigma - would describe a number the reader can already see.
+
+
+class _InsufficientForecast(Exception):
+    """Too few finite returns for a volatility forecast at all.
+
+    Distinct from every other failure on purpose.  The three forecast methods
+    report "Insufficient data for forecast" for this case and
+    "<MODEL> forecast failed" for everything else, and that distinction is a
+    published string, so it cannot be collapsed into one handler.
+    """
+
+
+def volatility_forecast_point(
+    returns: Any, model: str = "GARCH", horizon: int = 1
+) -> Dict[str, Any]:
+    """The engine's OWN conditional-volatility point, as a pure synchronous core.
+
+    This is the single source of truth for what the section publishes as
+    `volatility_forecast`, `raw_volatility_forecast` and
+    `return_space_volatility`, for all three models.  It exists because
+    :func:`volatility_forecast_statistics` has to re-run exactly this
+    computation once per resample, and a restatement written as a second copy
+    of a GARCH fit is a restatement that will drift: the day the clip bound or
+    the arch call options change here and not there, the band silently stops
+    describing the published number and `measure_estimate_uncertainty`'s
+    reproduction guard will withhold it for a reason that has nothing to do
+    with precision.
+
+    `AnalyticsEngine._garch_forecast` / `_egarch_forecast` / `_ewma_forecast`
+    call this too, so the published value and the resampled value are the same
+    code by construction rather than by review.
+
+    Raises `_InsufficientForecast` below the model's minimum sample and
+    propagates any other failure (a failed fit, a non-finite variance path).
+    """
+    h = int(max(1, int(horizon)))
+    name = str(model or "GARCH").upper()
+    # Anything that is not EWMA or EGARCH is fitted as GARCH, which is the same
+    # fallback `forecast_volatility`'s own dispatch applies. `returns` is held to
+    # the pandas interface the three forecast methods have always been handed:
+    # a non-pandas input raises here exactly as it raised there, rather than
+    # being quietly accepted and producing a number where there used to be none.
+    clean = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    clean = clean.clip(lower=-0.20, upper=0.20)
+
+    if name == "EWMA":
+        # Single-pass recursion:
+        # sigma^2_t = lambda*sigma^2_{t-1} + (1-lambda)*r^2_{t-1}
+        # NOTE the absent minimum-sample gate.  EWMA has never had one - the
+        # recursion is a closed form over whatever it is handed - and adding one
+        # here would have turned a published number into a null.  The 30-day
+        # floor that does apply to this section lives on
+        # `AnalyticsEngine.forecast_volatility`, above the model dispatch.
+        r = clean.to_numpy(dtype=float)
+        var = float(np.var(r)) if len(r) else 0.0
+        for x in r[-min(len(r), 60):]:
+            var = EWMA_LAMBDA * var + (1.0 - EWMA_LAMBDA) * x * x
+        raw = float(np.sqrt(max(0.0, var) * 252))
+        annualized = np.array([float(np.clip(raw, FORECAST_VOL_CLIP_LOW,
+                                            FORECAST_VOL_CLIP_HIGH))] * h)
+        return {
+            "model": "EWMA",
+            "horizon": h,
+            "volatility_forecast": float(annualized[-1]),
+            "raw_volatility_forecast": raw,
+            "return_space_volatility": float(annualized[-1] * np.sqrt(h / 252.0)),
+            "annualized_volatility_path": annualized,
+            "forecast_method": "riskmetrics_recursion",
+            "simulated": False,
+        }
+
+    if len(clean) < 20:
+        raise _InsufficientForecast(
+            f"{len(clean)} finite return(s) is below the 20 a volatility model "
+            "needs to be fitted at all"
+        )
+
+    name = "EGARCH" if name == "EGARCH" else "GARCH"
+    clip_low = EGARCH_VOL_CLIP_LOW if name == "EGARCH" else FORECAST_VOL_CLIP_LOW
+    # Scale returns by 100 for arch optimizer numerical convergence stability.
+    scaled = clean * 100.0
+    if name == "EGARCH":
+        model_obj = arch_model(scaled, vol="EGARCH", p=1, q=1, dist="normal",
+                               rescale=False)
+        fitted = model_obj.fit(disp="off", show_warning=False)
+    else:
+        model_obj = arch_model(scaled, vol="Garch", p=1, q=1, dist="normal",
+                               rescale=False)
+        fitted = model_obj.fit(disp="off", show_warning=False,
+                               options={"maxiter": 100})
+
+    if name == "EGARCH" and h > 1:
+        # arch 8.x does not provide analytic multi-step EGARCH forecasts.
+        # Simulation is a supported path; fixing the seed makes the returned
+        # path deterministic for tests and clients.
+        forecast = fitted.forecast(horizon=h, method="simulation",
+                                   simulations=2000, random_state=100)
+        simulated, method = True, "simulation"
+    else:
+        forecast = fitted.forecast(horizon=1 if name == "EGARCH" else h,
+                                   method="analytic")
+        simulated, method = False, "analytic"
+
+    variance_path = AnalyticsEngine._forecast_variance_path(forecast, h,
+                                                            simulated=simulated)
+    if variance_path.size == 0 or not np.isfinite(variance_path).all():
+        raise ValueError(f"arch returned no finite {name} variance path")
+    variance_path = np.maximum(variance_path, 0.0)
+    annualized_path, return_space_path = (
+        AnalyticsEngine._cumulative_forecast_volatility(variance_path)
+    )
+    raw = float(annualized_path[-1])
+    clipped = np.clip(annualized_path, clip_low, FORECAST_VOL_CLIP_HIGH)
+    return {
+        "model": name,
+        "horizon": h,
+        "volatility_forecast": float(clipped[-1]),
+        "raw_volatility_forecast": raw,
+        "return_space_volatility": float(return_space_path[-1]),
+        "annualized_volatility_path": [float(v) for v in clipped],
+        "forecast_method": method,
+        "simulated": simulated,
+    }
+
+
+#: Resamples spent on the PORTFOLIO leg's refit.  The full
+#: :data:`UNCERTAINTY_BOOTSTRAP_RESAMPLES`, because this is the number the
+#: section is named for and it is the one re-fit set the export can afford.
+FORECAST_PORTFOLIO_REFIT_RESAMPLES = UNCERTAINTY_BOOTSTRAP_RESAMPLES
+
+#: The draw count a POSITION leg's re-fit bootstrap WOULD need, published because
+#: it is not spent.  This is a record of a declined cost, not a knob: no leg is
+#: re-fitted, so nothing reads this except the reason text a leg publishes.
+#:
+#: WHY NO LEG IS RE-FITTED.  Measuring a fitted leg's conditional sigma means
+#: re-running the ARCH optimiser once per draw - a full fit, not a vectorised
+#: reduction - so a book of N legs costs N times what one costs.  Measured on the
+#: real 14-position book: 1001 refits for the portfolio leg cost 17.3 s, and 200
+#: per leg across the fourteen legs cost a further 51.3 s, 3800 fits in total.  On
+#: a host a few times slower that is more than this section's 180 s assembly
+#: budget (`ai_context_service._SECTION_TIMEOUT_SECONDS`), and a section that
+#: overruns its budget is not merely slow: `asyncio.wait_for` cancels the
+#: coroutine but cannot cancel the thread the refits are already running on, so
+#: the optimiser keeps burning CPU against every section collected after it.
+#: Three sections (factor_exposure, optimization, regime) were published
+#: `unavailable` for exactly that reason and seven more degraded to `partial`.
+#:
+#: A per-leg forecast is DERIVED from that leg's own inputs, and its precision
+#: belongs to those inputs rather than to a fresh bootstrap per leg.  So the leg
+#: states the truth instead: estimated, not separately measured, and here is
+#: what it does publish and why the band is missing.  A withheld figure is an
+#: honest outcome; an invented one is the defect this disclosure exists to fix,
+#: and so is a figure that costs three other sections their output.
+#:
+#: 200 is this module's own published floor for a percentile interval to mean
+#: anything (:data:`PAIRWISE_STATISTIC_MIN_RESAMPLES`).  It is the floor the
+#: declined measurement would have used, and it is named here so a reader can
+#: see that what was dropped was a real interval rather than a token one.
+FORECAST_LEG_REFIT_RESAMPLES_WITHHELD = PAIRWISE_STATISTIC_MIN_RESAMPLES
+
+#: Published on every block in this section's precision disclosure, so the
+#: count a reader is looking at - or not looking at - is on the payload rather
+#: than in a diff.
+FORECAST_REFIT_COUNT_RULE = (
+    "the portfolio leg is resampled at the module's standard "
+    f"{FORECAST_PORTFOLIO_REFIT_RESAMPLES} circular moving-block draws, and its "
+    "conditional sigma is the only figure on this section measured by re-fitting "
+    "the model. No position leg is re-fitted. A leg's volatility_forecast comes "
+    "out of the same kind of ARCH fit, so measuring it would mean one optimiser "
+    f"run per draw, {FORECAST_LEG_REFIT_RESAMPLES_WITHHELD} of them at this "
+    "module's own floor for a percentile interval, and once per leg of the book. "
+    "On the measured 14-position book that was 2800 additional optimiser runs "
+    "and roughly 51 s of pure refit time, which does not fit the 180 s budget this "
+    "section is assembled under - and overrunning that budget costs OTHER "
+    "sections their output, because the cancelled refit thread keeps running. So "
+    "each leg publishes a null standard error with the reason, and the "
+    f"declined count is published here as {FORECAST_LEG_REFIT_RESAMPLES_WITHHELD}"
+    ". The count actually spent is published as bootstrap_resamples on each "
+    "block, where a leg that was not measured reads 0"
+)
+
+
+def volatility_forecast_statistics(
+    model: str = "GARCH",
+    horizon: int = 1,
+    fields: tuple[str, ...] = ("volatility_forecast", "return_space_volatility"),
+) -> Any:
+    """A resampling statistic that RE-FITS the volatility model on every draw.
+
+    Returned as a single callable rather than the `{field: callable}` mapping
+    the other providers here use, and deliberately so: one fit produces every
+    field, and the mapping form would re-run the optimiser once per field.  On
+    a two-field block that doubles a ~15 s leg for no additional information.
+    `measure_estimate_uncertainty` accepts either shape
+    (`_statistic_matrix_from`), so this costs the caller nothing.
+
+    A draw that cannot produce a finite value - a fit that does not converge, a
+    variance path that goes non-finite - is reported as NaN and counted in the
+    published `status`, never quietly dropped.  Dropping it would shrink the
+    sample the percentile interval is read off without saying so.
+    """
+    names = tuple(fields)
+
+    def volatility_forecast(block: Any) -> Dict[str, np.ndarray]:
+        column = _statistic_column(block)
+        draws = int(column.shape[1]) if column.ndim == 2 else 0
+        out = {name: np.full(draws, np.nan, dtype=float) for name in names}
+        for index in range(draws):
+            try:
+                point = volatility_forecast_point(
+                    pd.Series(column[:, index]), model, horizon
+                )
+            except Exception:  # noqa: BLE001 - a failed draw is NaN, not a band
+                continue
+            for name in names:
+                value = point.get(name)
+                if value is not None and np.isfinite(float(value)):
+                    out[name][index] = float(value)
+        return out
+
+    return volatility_forecast
 
 
 # Global analytics engine instance
