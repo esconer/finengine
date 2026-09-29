@@ -460,7 +460,14 @@ class TestEnv019TradeStatusRespectsGate:
         assert reconciled["CCC.NS"]["execution_eligible"] is False
         assert "leg_status" not in reconciled["CCC.NS"]
         assert disclosure["restated_trade_tickers"] == ["AAA.NS", "BBB.NS"]
-        assert disclosure["rule"] == TRADE_GATE_RECONCILIATION_RULE
+        # The rule travels as a TEMPLATE and the counts in the published sentence
+        # are this payload's own. A literal count written from one book would
+        # state a number the section's own records contradict on any other book.
+        assert "{restated_count}" in TRADE_GATE_RECONCILIATION_RULE
+        assert "cannot collect 2 order instructions out of 3 legs" in disclosure["rule"]
+        assert disclosure["rule"] == TRADE_GATE_RECONCILIATION_RULE.format(
+            restated_count=disclosure["restated_trade_count"], total_count=3
+        )
 
     def test_open_gate_leaves_every_status_untouched(self) -> None:
         trades = {"AAA.NS": {"shares_delta": 2, "status": "executable"}}

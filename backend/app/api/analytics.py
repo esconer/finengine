@@ -1362,6 +1362,47 @@ FULL_HISTORY_RELATION = (
     "annualizes this model window."
 )
 
+# --- Which sample `model_observation_count` counts ---------------------------
+# `history_coverage.model_observation_count` used to be a copy of
+# `full_history.observation_count` - the ROWS OF THE INPUT FRAME - published
+# under the name of the model's own sample. On the live book that published 175
+# where the regression used 101, so a reader checking the count against the
+# `r_squared` beside it (`adjusted_r_squared` is 1-(1-R^2)(n-1)/(n-2) and pins
+# n=101) found a contradiction the export could not explain. A frame row is not
+# a regression observation: the fit runs on the dates the PUBLISHED portfolio
+# series contains, intersected with the benchmark, which is a subset of the
+# frame whenever any leg is late-listed or the book is refused for partial
+# coverage.
+#
+# So the count is now handed IN by the caller that knows it, with the population
+# it describes. The two scopes below are populations, not labels: the fit's own
+# sample, and the input frame that bounds it from above when the fit's own
+# sample cannot be measured.
+MODEL_SAMPLE_FITTED_SCOPE = "active_benchmark_overlap_return_rows"
+MODEL_SAMPLE_FRAME_SCOPE = "input_return_rows_regression_subset_unmeasured"
+MODEL_SAMPLE_COVARIANCE_FRAME_SCOPE = "full_exchange_history_return_frame_rows"
+MODEL_SAMPLE_FITTED_NOTE = (
+    "The regression's OWN sample: the dates the published portfolio return "
+    "series contains, intersected with the benchmark. It is a subset of "
+    "full_history.observation_count - the input frame the fit was handed - and "
+    "is the same fit that produced r_squared/adjusted_r_squared and "
+    "portfolio.observations on this section."
+)
+MODEL_SAMPLE_FRAME_NOTE = (
+    "The input return frame the regression was handed, NOT a measured "
+    "regression sample. The fit published no usable count of its own, so this "
+    "number is an UPPER BOUND on the sample used and will read high whenever a "
+    "leg is late-listed or the book is refused for partial coverage. Treat the "
+    "count as a frame size, not as a sample size."
+)
+MODEL_SAMPLE_COVARIANCE_FRAME_NOTE = (
+    "Rows of the wide per-leg return frame this section's covariance model was "
+    "computed over. cov(min_periods=2) estimates each PAIR over the rows where "
+    "both legs are priced, so the effective per-pair sample is at most this "
+    "count; the complete-book portfolio series this section also publishes is "
+    "counted separately as calculation_observations."
+)
+
 
 def _full_history_evidence(
     returns_frame: Any,
@@ -1784,6 +1825,8 @@ def _risk_contribution_tail_uncertainty(
 def _model_history_coverage(
     holding_context: Mapping[str, Any],
     full_history: Mapping[str, Any],
+    *,
+    model_sample: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """`history_coverage` for a full-history model: model evidence + ancillary holdings.
 
@@ -1791,6 +1834,16 @@ def _model_history_coverage(
     because neither describes this model; the holding window is reachable only
     under `holding_context`, where its own `covered_days`/`annualized` describe
     the holding tenure rather than the model sample.
+
+    `model_sample` is REQUIRED and is the caller's own count of the rows its
+    model consumed, with the population that count describes. It is required
+    because this builder is called BEFORE any fit exists at its old call sites,
+    which is exactly how it came to publish the input frame's row count under
+    the name of the regression's sample: a builder handed no sample filled the
+    gap from the one number it did have, and that number was the frame. A
+    caller that cannot measure its own sample must say so - pass the frame with
+    `MODEL_SAMPLE_FRAME_SCOPE` - rather than let the block imply a measurement
+    nobody took.
     """
     return {
         "scope": HOLDING_CONTEXT_SCOPE,
@@ -1807,7 +1860,13 @@ def _model_history_coverage(
         "truncated": False,
         "covered_days": full_history.get("observation_count"),
         "covered_days_scope": "model_return_observations",
-        "model_observation_count": full_history.get("observation_count"),
+        # NOT `full_history.observation_count`. `covered_days` above is the
+        # input frame and stays that; the model's own sample is handed in.
+        "model_observation_count": model_sample.get("count"),
+        "model_observation_count_scope": model_sample.get("scope"),
+        "model_observation_count_status": model_sample.get("status"),
+        "model_observation_count_status_reason": model_sample.get("status_reason"),
+        "model_observation_count_note": model_sample.get("note"),
         "model_window": full_history.get("window"),
         "effective_start": None,
         "intersection_start": holding_context.get("intersection_start"),
@@ -1815,6 +1874,54 @@ def _model_history_coverage(
         "requested_start": holding_context.get("requested_start"),
         "requested_end": holding_context.get("requested_end"),
         "tickers": holding_context.get("tickers", {}),
+    }
+
+
+def _factor_fit_sample(
+    factor_result: Mapping[str, Any],
+    full_history: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """The portfolio regression's own sample, or a stated upper bound.
+
+    `portfolio.observations` is `len(port_active)` from the fit itself - the
+    published portfolio return series intersected with the benchmark - so it is
+    the same sample that produced `r_squared`, `adjusted_r_squared` and the
+    portfolio block's own coefficients. Reading it back here is what lets the
+    count be the FIT's rather than the frame's.
+
+    The engine publishes `observations: 0` on every not-fitted path (no
+    benchmark window, fewer than ten active dates, or a failed regression), so
+    zero and absent are both "no sample was measured". In that case the block
+    degrades to the input frame's row count under a scope that says it is an
+    upper bound - a stated ceiling, never a wrong sample.
+    """
+    portfolio = factor_result.get("portfolio")
+    observations = portfolio.get("observations") if isinstance(portfolio, Mapping) else None
+    fitted = (
+        isinstance(observations, (int, float))
+        and not isinstance(observations, bool)
+        and float(observations) > 0.0
+    )
+    if fitted:
+        return {
+            "count": int(observations),
+            "scope": MODEL_SAMPLE_FITTED_SCOPE,
+            "status": "fitted",
+            "status_reason": None,
+            "note": MODEL_SAMPLE_FITTED_NOTE,
+        }
+    return {
+        "count": full_history.get("observation_count"),
+        "scope": MODEL_SAMPLE_FRAME_SCOPE,
+        "status": "regression_sample_unavailable",
+        "status_reason": (
+            "The portfolio regression published no usable sample of its own "
+            f"(portfolio.observations = {observations!r}), so the count below is "
+            "the input return frame it was handed, which is an upper bound on the "
+            "sample used and reads high whenever a leg is late-listed or the book "
+            "is refused for partial coverage. See `data_status` and `error`."
+        ),
+        "note": MODEL_SAMPLE_FRAME_NOTE,
     }
 
 
@@ -2688,6 +2795,56 @@ LIQUIDITY_SCORING_CURRENCY = "INR"
 LIQUIDITY_SCORE_PRECISION = 1
 LIQUIDITY_SCORE_SCALE = {"min": 2.5, "max": 10.0, "unit": "index_0_to_10"}
 
+# --- Liquidity: what the section-level band and the volume means aggregate ----
+# `liquidation_time_days` is `_liquidity_band(overall_score)` and `overall_score`
+# is the MEAN of the per-position published scores. So the section value is the
+# band of a mean, while the per-leg `liquidation_days` values beside it are a
+# distribution - on the live book the section reads "1-2" over legs distributed
+# {1-2: 10, 2-5: 3, 5-10: 1}. Nothing in the export said which, so the two could
+# not be reconciled by a reader. The rule is stated instead of the value being
+# changed: the value is the engine's, and the aggregation is what it always was.
+LIQUIDATION_TIME_AGGREGATION = (
+    "band_of_the_mean_published_overall_score. The section's liquidation window "
+    "is the band that the MEAN of the per-position published scores falls into "
+    "(mean -> round to 1 decimal -> scoring.bands, the same mapping published "
+    "under scoring.thresholds). It is NOT a worst case over the legs, NOT a "
+    "median, and NOT the most common leg band: by_position.*.liquidation_days is "
+    "the full per-leg distribution and is EXPECTED to disagree with this value, "
+    "because band-of-a-mean is not a band of the legs."
+)
+LIQUIDITY_BANDS_ALIAS_OF = "bands"
+LIQUIDITY_BANDS_ALIAS_NOTE = (
+    "scoring.thresholds is the SAME mapping as scoring.bands, republished under "
+    "its older name because a consumer reads it. It is one band table with one "
+    "meaning, not a second rule: the two keys are the same object and the rule "
+    "that banded any published score is `bands`."
+)
+
+# `avg_volume` is `np.mean` over the per-leg mean volumes, and the legs are means
+# over UNEQUAL row counts - 20, 21 or 22 rows on the live book - so the section
+# figure weights a 20-row leg exactly as heavily as a 22-row leg. It is not a
+# weighted mean, not a median, and not a portfolio volume. The numbers stay as
+# they are: `total_portfolio_volume` on the same block is the SUM of those same
+# per-leg means, so changing one without the other would leave the block
+# internally inconsistent. Both bases are stated here instead.
+LIQUIDITY_AVG_VOLUME_BASIS = (
+    "unweighted_mean_of_the_per_leg_mean_volumes: every measured position "
+    "contributes its own mean daily volume with equal weight, REGARDLESS of how "
+    "many rows that leg's mean was taken over. It is not a row-weighted mean, "
+    "not a median, and not a portfolio volume. The per-leg row counts are "
+    "published in avg_volume_leg_observations and each leg's own mean in "
+    "by_position.*.avg_volume, so the inequality between the legs is visible "
+    "rather than asserted."
+)
+LIQUIDITY_TOTAL_VOLUME_BASIS = (
+    "sum_of_the_same_per_leg_mean_volumes. It is the cross-sectional SUM of the "
+    "per-position mean daily volumes, so it is neither the book's own average "
+    "daily volume over a common window nor a market-value-weighted quantity: it "
+    "is not weighted by position size, and each term is itself a mean over that "
+    "leg's own (unequal) row count. It carries the same weighting limitation as "
+    "avg_volume, in the opposite direction."
+)
+
 
 # --- Liquidity: what `spread` and a capped `score_raw` actually are ---------
 # `spread` sat in the payload as a bare number next to `score`/`score_raw`, and
@@ -2957,6 +3114,43 @@ def _liquidity_volume_band_residual(
     }
 
 
+def _liquidity_volume_mean_basis(
+    observation_window: Mapping[str, Any],
+    *,
+    positions: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Say what `avg_volume` averages, and publish the inequality it averages over.
+
+    The section figure is an unweighted mean of the per-leg means, and the legs
+    are means over unequal row counts, so the claim "unweighted mean of the
+    per-leg means" is a claim a reader cannot check from the block alone. The
+    per-leg row counts are therefore published with it, read from the delivered
+    observation window this same response already carries - not recomputed from
+    the frames - so the disclosure cannot drift from the window it describes.
+    Nothing is reweighted and no mean is recomputed here.
+    """
+    per_ticker = (observation_window or {}).get("per_ticker")
+    per_ticker = per_ticker if isinstance(per_ticker, Mapping) else {}
+    leg_observations: Dict[str, int] = {}
+    for ticker in (positions or {}):
+        entry = per_ticker.get(ticker)
+        entry = entry if isinstance(entry, Mapping) else {}
+        try:
+            count = int(entry.get("observations"))
+        except (TypeError, ValueError):
+            continue
+        leg_observations[str(ticker)] = count
+    counts = sorted(leg_observations.values())
+    return {
+        "avg_volume_basis": LIQUIDITY_AVG_VOLUME_BASIS,
+        "avg_volume_leg_observations": leg_observations,
+        "avg_volume_leg_observation_total": sum(counts) if counts else None,
+        "avg_volume_leg_observation_min": counts[0] if counts else None,
+        "avg_volume_leg_observation_max": counts[-1] if counts else None,
+        "total_portfolio_volume_basis": LIQUIDITY_TOTAL_VOLUME_BASIS,
+    }
+
+
 def _liquidity_observation_window(frames: Mapping[str, Any]) -> Dict[str, Any]:
     """Delivered liquidity range measured from the fetched frames themselves.
 
@@ -3006,7 +3200,12 @@ def _liquidity_scoring_block(
         "published_score_field": "score",
         "band_source": (rule or {}).get("band_source") if isinstance(rule, Mapping) else None,
         "bands": (rule or {}).get("bands") if isinstance(rule, Mapping) else None,
+        # The same object under its older name, kept because a consumer reads
+        # it. One band table, not two: the alias says which key is canonical so
+        # publishing it twice cannot read as publishing two rules.
         "thresholds": (rule or {}).get("bands") if isinstance(rule, Mapping) else None,
+        "thresholds_alias_of": LIQUIDITY_BANDS_ALIAS_OF,
+        "thresholds_alias_note": LIQUIDITY_BANDS_ALIAS_NOTE,
         "currency": LIQUIDITY_SCORING_CURRENCY,
         "currency_provenance": "derived",
         "monetary_unit": "rupees",
@@ -3396,6 +3595,13 @@ EXECUTABLE_TRADE_STATUSES = frozenset(
 #: permission, and the engine's own per-leg verdict is preserved beside it.
 BLOCKED_BY_SECTION_GATE_STATUS = "blocked_by_section_execution_gate"
 
+#: The rule is a TEMPLATE and its counts are formatted from the records that
+#: were actually restated. It used to carry a literal "13", written from one
+#: book, inside a sentence published into every export: on any other book the
+#: section's own rule text stated a count its own payload contradicted, which is
+#: the one thing a rule sentence must never do. `restated_count` can legitimately
+#: be below the leg count, so the template also says why - the legs that were not
+#: restated are the ones that never claimed executability in the first place.
 TRADE_GATE_RECONCILIATION_RULE = (
     "A per-trade status is the ENGINE's verdict on that leg alone: whether the "
     "notional buys a whole share at the sizing price. It is not permission to "
@@ -3403,8 +3609,12 @@ TRADE_GATE_RECONCILIATION_RULE = (
     "Where that gate is false, every leg's executable status is restated as "
     f"{BLOCKED_BY_SECTION_GATE_STATUS!r} with the engine's own reading kept in "
     "leg_status, and the record carries the gate itself, so a consumer iterating "
-    "trades[] cannot collect 13 order instructions from a target the section says "
-    "is not a normal rebalance."
+    "trades[] cannot collect {restated_count} order instructions out of "
+    "{total_count} legs from a target the section says is not a normal rebalance. "
+    "The legs that were not restated are the ones that never claimed "
+    "executability: below_minimum_notional, immaterial_no_op, no_trade_required "
+    "and unavailable keep their own status, which is why the restated count can "
+    "be below the leg count."
 )
 
 
@@ -3458,7 +3668,11 @@ def _reconcile_trade_status_with_gate(
             "restated_trade_count": len(restated),
             "gate_source": "execution.execution_eligible",
             "block_reason": reason,
-            "rule": TRADE_GATE_RECONCILIATION_RULE,
+            # Formatted from the counts this very disclosure carries, so the rule
+            # sentence cannot state a leg count the payload contradicts.
+            "rule": TRADE_GATE_RECONCILIATION_RULE.format(
+                restated_count=len(restated), total_count=len(reconciled)
+            ),
         }
     return reconciled, disclosure
 
@@ -5873,8 +6087,13 @@ async def get_factor_exposure(
         # Model evidence lives in its own object: a full-history regression is
         # not truncated to the holding window, so it publishes its own window,
         # observation count, latest observation and annualization flag. The
-        # return frame the regression consumes is the thing described, so the
-        # counts are the observations the model used.
+        # FRAME the regression was handed is described by `full_history`; the
+        # SAMPLE it actually fitted on is a subset of that frame and is only
+        # knowable once the fit has run, so `history_coverage` is built below
+        # the fit rather than above it. Building it above the fit is what made
+        # `model_observation_count` a copy of the frame's 175 rows while the
+        # regression used 101 - the comment here used to assert that the counts
+        # "are the observations the model used", and they were not.
         model_returns = price_data.pct_change(fill_method=None).iloc[1:]
         full_history = _full_history_evidence(
             model_returns,
@@ -5889,7 +6108,6 @@ async def get_factor_exposure(
                 for ticker, series in price_data_dict.items()
             },
         )
-        history_coverage = _model_history_coverage(holding_context, full_history)
 
         # Fetch benchmark returns via BenchmarkService (^NSEI)
         benchmark_returns = None
@@ -5897,6 +6115,21 @@ async def get_factor_exposure(
             benchmark_returns = await benchmark_service.get_returns(start=start, end=end)
         except Exception:
             logger.warning("Benchmark data unavailable")
+
+        # Perform factor exposure analysis using analytics engine
+        factor_result = await analytics_engine.factor_exposure_analysis(
+            price_data, 
+            benchmark_data=benchmark_returns,
+            weights=factor_weights
+        )
+
+        # AFTER the fit, so the count is the fit's own sample rather than the
+        # frame handed to it.
+        history_coverage = _model_history_coverage(
+            holding_context,
+            full_history,
+            model_sample=_factor_fit_sample(factor_result, full_history),
+        )
         history_coverage["calculation_basis"] = FULL_HISTORY_BASIS
         if benchmark_returns is not None:
             benchmark_series = benchmark_returns
@@ -5908,13 +6141,6 @@ async def get_factor_exposure(
                 history_coverage["benchmark_overlap_observations"] = int(
                     len(model_returns.index.intersection(benchmark_series.index))
                 )
-
-        # Perform factor exposure analysis using analytics engine
-        factor_result = await analytics_engine.factor_exposure_analysis(
-            price_data, 
-            benchmark_data=benchmark_returns,
-            weights=factor_weights
-        )
 
         # Collect warnings for assets with limited history. `data_points` is the
         # benchmark-overlap sample the regression actually used; the full
@@ -6014,6 +6240,57 @@ CONCENTRATION_NO_VALUATION_DATE_WARNING = (
     "that series rather than treat this snapshot's clock as one."
 )
 
+# --- The scale `diversification_score` is read on ---------------------------
+# `diversification_score` is a 0-100 index that the route used to publish with
+# no scale, no `n` and no formula, so nothing said what 98.5 meant or what would
+# make it 100. The ENGINE measures the index and now declares it
+# (`analytics_engine.CONCENTRATION_DIVERSIFICATION_SCALE` and the two formula
+# strings, published on both its measured and its empty result), so there is
+# exactly ONE declaration of the scale and this route owns only the MAPPING of
+# it into the payload.
+#
+# A second copy of that text here was shadowed dead weight: every measured and
+# every engine-empty path forwarded the engine's object, so the only reader of
+# the local copy was this route's own no-book early return, which never calls the
+# engine. It has been deleted rather than kept "in case", because two texts for
+# one scale is the same defect as one object published under two names. What the
+# deleted copy said that the engine's does not is handed to the engine's owner
+# in the wave report, not reimplemented here.
+CONCENTRATION_DIVERSIFICATION_FORWARDED_KEYS = (
+    "scale",
+    "diversification_score_formula",
+    "diversification_ratio_formula",
+    "effective_positions_note",
+)
+
+
+def _concentration_diversification_disclosure(
+    concentration_result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """The engine's scale, formulas and holding count, forwarded unchanged.
+
+    The values are the engine's, and the objects are the engine's own objects:
+    the `scale` dict is forwarded by reference, so the payload's scale and the
+    scale the index was measured under cannot be two equal-but-separate objects
+    that drift apart on a later edit. `n_holdings` is reconciled against
+    `by_weight` - the same population this section already publishes - only when
+    the engine published no count, so the denominator of the published formula
+    and the keys of `by_weight` cannot disagree. Nothing here recomputes the
+    index, and nothing here declares a scale: an absent declaration is the
+    engine's to publish, not the route's to invent.
+    """
+    disclosure: Dict[str, Any] = {}
+    for key in CONCENTRATION_DIVERSIFICATION_FORWARDED_KEYS:
+        if concentration_result.get(key) is not None:
+            disclosure[key] = concentration_result[key]
+    by_weight = concentration_result.get("by_weight")
+    by_weight = by_weight if isinstance(by_weight, Mapping) else {}
+    holdings = concentration_result.get("n_holdings")
+    if isinstance(holdings, bool) or not isinstance(holdings, int) or holdings < 0:
+        holdings = len(by_weight)
+    disclosure["n_holdings"] = holdings
+    return disclosure
+
 
 @router.get("/concentration")
 async def get_concentration_metrics(
@@ -6037,6 +6314,13 @@ async def get_concentration_metrics(
                 "herfindahl_index": 0.0,
                 "effective_positions": 0.0,
                 "diversification_score": 0.0,
+                # `n_holdings: 0` beside the 0.0 is what disambiguates this state:
+                # the index is undefined with no holdings, so the 0.0 marks an
+                # ABSENT book rather than a measured single-holding one. The scale
+                # itself is the engine's declaration and is deliberately NOT
+                # restated here - this branch never calls the engine, and a second
+                # copy of that text is the defect a single implementation avoids.
+                **_concentration_diversification_disclosure({"by_weight": {}}),
                 "diversification_ratio": 1.0,
                 "gini_coefficient": 0.0,
                 "by_weight": {},
@@ -6084,9 +6368,14 @@ async def get_concentration_metrics(
         sector_weight_total = float(sum(sector_totals.values()))
         sector_published_total = float(sum(by_sector.values()))
         sector_rounding_residual = round(1.0 - sector_published_total, 12)
+        # Read once: the coverage universe, the published `by_weight` and the
+        # `n_holdings` the scale declares are the same population, and reading it
+        # from three places is how they would come to disagree.
+        by_weight = concentration_result.get("by_weight", {})
+        by_weight = by_weight if isinstance(by_weight, Mapping) else {}
         coverage = _universe_coverage(
             requested_tickers,
-            concentration_result.get("by_weight", {}).keys(),
+            by_weight.keys(),
             active=_active_weight_tickers(weights),
         )
         return {
@@ -6097,9 +6386,13 @@ async def get_concentration_metrics(
             "herfindahl_index": concentration_result.get("herfindahl_index", 0.0),
             "effective_positions": concentration_result.get("effective_positions", 0.0),
             "diversification_score": concentration_result.get("diversification_score", 0.0),
+            # The score's scale, the two formulas and the `n` it was measured
+            # over, so a reader can recompute the published index from the
+            # published HHI instead of taking 98.5 on trust.
+            **_concentration_diversification_disclosure(concentration_result),
             "diversification_ratio": concentration_result.get("diversification_ratio", 1.0),
             "gini_coefficient": concentration_result.get("gini_coefficient", 0.0),
-            "by_weight": concentration_result.get("by_weight", {}),
+            "by_weight": by_weight,
             "by_sector": by_sector,
             "by_sector_total": round(sector_weight_total, 12),
             "by_sector_published_total": round(sector_published_total, 12),
@@ -6308,6 +6601,9 @@ async def get_liquidity_metrics(
         volume_stats.update(
             _liquidity_volume_band_residual(volume_stats, positions=by_position)
         )
+        volume_stats.update(
+            _liquidity_volume_mean_basis(delivered, positions=by_position)
+        )
         scoring_block = _liquidity_scoring_block(
             liquidity_result,
             data_range={"start": start, "end": end},
@@ -6327,6 +6623,10 @@ async def get_liquidity_metrics(
             "overall_score_raw": liquidity_result.get("overall_score_raw"),
             "overall_band": liquidity_result.get("overall_band"),
             "liquidation_time_days": liquidity_result.get("liquidation_time_days"),
+            # The value is the engine's band of the mean score and is NOT
+            # changed; what was missing was the rule that produced it, without
+            # which the per-leg distribution beside it could not be reconciled.
+            "liquidation_time_days_aggregation": LIQUIDATION_TIME_AGGREGATION,
             "risk_level": liquidity_result.get("risk_level"),
             "by_position": by_position,
             "volume_stats": volume_stats,
@@ -8661,7 +8961,23 @@ async def get_risk_contribution(
         # `covered_days` used to be the model's own 252 observations published
         # under holding names, so a 39-day holding window read as a 252-day
         # holding coverage. The two windows are now separate objects.
-        history_coverage = _model_history_coverage(holding_context, full_history)
+        #
+        # This section's model is the whole-book covariance, not a benchmark
+        # regression, so its sample IS the frame it was computed over - there is
+        # no smaller fitted subset to report. The count is unchanged and the
+        # population is now named, because the same key on `factor_exposure`
+        # means something narrower there and one reader cannot tell which.
+        history_coverage = _model_history_coverage(
+            holding_context,
+            full_history,
+            model_sample={
+                "count": full_history.get("observation_count"),
+                "scope": MODEL_SAMPLE_COVARIANCE_FRAME_SCOPE,
+                "status": "covariance_frame",
+                "status_reason": None,
+                "note": MODEL_SAMPLE_COVARIANCE_FRAME_NOTE,
+            },
+        )
         history_coverage["calculation_observations"] = int(len(port_ret))
         assets = list(returns_df.columns)
         missing_assets = [ticker for ticker in ticker_list if ticker not in set(assets)]
