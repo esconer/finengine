@@ -427,6 +427,77 @@ def benjamini_hochberg_threshold(
     return best[1]
 
 
+def benjamini_hochberg_threshold_basis(
+    p_values: List[Optional[float]],
+    q: float,
+) -> str:
+    """Why the published BH threshold is the number it is, or why there is none.
+
+    `corrected_threshold: null` is a real answer, not an absent one: the step-up
+    takes the largest `k` with `p_(k) <= k*q/m` over the delivered p-values, and
+    when no rank qualifies there is no critical value to publish. Publishing
+    `0.0` in its place would be a different claim - a threshold that rejects
+    every p-value including the ones that cleared nothing - and the reader
+    cannot tell the two apart from the number alone.
+
+    So the reason travels with the number, in the shape this module uses
+    everywhere else: the family size and `q` it is computed over, the rank that
+    came closest to qualifying with its p-value and its own cutoff, the margin
+    it missed by, and the family's smallest p-value. A reader can sort the
+    published `declared_positive_pairs` and re-derive every number in it. When a
+    threshold does exist the same string states the `k` that qualified and the
+    cutoff it published, so the two cases are the same shape and the key does
+    not appear and disappear with the value.
+    """
+    usable = [p for p in p_values if p is not None]
+    m = len(usable)
+    if m == 0 or not _is_real(q):
+        return (
+            "No Benjamini-Hochberg threshold exists because the step-up ran over "
+            "no p-values: there is no rank to compare against a cutoff, so there "
+            "is no threshold to publish. 0.0 is not published in its place, "
+            "because 0.0 would be a cutoff that rejects every test including the "
+            "tests that were never run."
+        )
+    ordered = sorted(usable)
+    q = float(q)
+    best: Optional[Tuple[int, float]] = None
+    for index, p_value in enumerate(ordered, start=1):
+        if p_value <= index * q / m:
+            best = (index, index * q / m)
+    smallest = ordered[0]
+    if best is not None:
+        rank, cutoff = best
+        return (
+            f"The Benjamini-Hochberg step-up takes the largest rank k with "
+            f"p_(k) <= k*q/m over the {m} delivered p-values at q={q:g}. Rank "
+            f"k={rank} qualified at p_(k)={ordered[rank - 1]:.6g} <= "
+            f"{rank}*{q:g}/{m} = {cutoff:.12g}, so the published threshold is "
+            f"{cutoff:.12g} and the first {rank} sorted p-values are the "
+            f"discoveries. The family's smallest p-value is {smallest:.6g}."
+        )
+    # No rank qualified. The rank that came CLOSEST is the one a reader has to
+    # check, and it is not always the first: the cutoff grows with the rank, so
+    # the binding comparison is per-rank, not "is the minimum below q/m".
+    gaps = [
+        (p_value - index * q / m, index, p_value, index * q / m)
+        for index, p_value in enumerate(ordered, start=1)
+    ]
+    gap, rank, p_value, cutoff = min(gaps)
+    return (
+        f"No Benjamini-Hochberg threshold exists, and none is published: over the "
+        f"{m} delivered p-values at q={q:g} the step-up takes the largest rank k "
+        f"with p_(k) <= k*q/m, and no rank qualifies. The rank that came closest "
+        f"was k={rank}, at p={p_value:.6g} against its own cutoff "
+        f"{rank}*{q:g}/{m} = {cutoff:.12g}, short by {gap:.6g}. The family's "
+        f"smallest p-value is {smallest:.6g}, so the rejection set is empty and "
+        f"nothing survives the correction. The null is published rather than 0.0 "
+        f"because 0.0 would state a threshold that rejects every p-value in the "
+        f"family, which is a different claim from there being no threshold to "
+        f"test them against."
+    )
+
+
 def multiplicity_report(
     pairs: List[CointPairResult],
     *,
@@ -507,6 +578,15 @@ def multiplicity_report(
             "comparisons_used": len(delivered),
             "scope": "delivered_rows_only",
             "corrected_threshold": round(bh_threshold, 12) if bh_threshold is not None else None,
+            # An absent value is null PLUS a reason. The Bonferroni side above
+            # carries its explanation in `note` and `gate_basis`; the BH side
+            # carried a bare null, so a reader met a silence that read like an
+            # oversight. Same convention, same place: the reason is a key beside
+            # the figure and is present in BOTH shapes, so it does not appear and
+            # disappear with the value.
+            "corrected_threshold_basis": benjamini_hochberg_threshold_basis(
+                [p for _, p in delivered], alpha
+            ),
             "survivor_count": len(bh_surviving),
         },
         "note": (

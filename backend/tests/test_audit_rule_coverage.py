@@ -1465,6 +1465,79 @@ def _two_tone_writes(
     return tuple(writes)
 
 
+#: 200 of 2000 paths end at 10.0 and 1800 at 90.0, with the target at 95.0, so
+#: EVERY published level falls short of it.  This is the one table shape on
+#: which the loose and tight ceilings differ: ``below`` is all five levels, so
+#: ``min`` gives the weak ceiling 0.95 and ``max`` gives the tight one 0.05.  It
+#: is what makes a ceiling-side assertion mean anything -- on the two-tone table
+#: ``below`` is the single level 5, the two agree, and a ceiling test there
+#: would pass whether or not the ceiling had ever been tightened.
+_FIVE_SHORT_TERMINALS = np.array([10.0] * 200 + [90.0] * 1800)
+_FIVE_SHORT_TARGET = 95.0
+_FIVE_SHORT_LEVELS = {"p5": 10.0, "p25": 90.0, "p50": 90.0, "p75": 90.0,
+                      "p95": 90.0}
+
+
+def _five_short_writes(
+    prob_success: Any,
+    *,
+    num_paths: Any = None,
+) -> tuple[tuple[tuple[Any, ...], Any], ...]:
+    """The all-levels-short table as writes; ``num_paths`` may be :data:`DELETE`."""
+    writes: list[tuple[tuple[Any, ...], Any]] = [
+        (("terminal_percentiles",), dict(_FIVE_SHORT_LEVELS)),
+        (("target_value",), _FIVE_SHORT_TARGET),
+        (("prob_success",), prob_success),
+    ]
+    if num_paths is not None:
+        writes.append((("num_paths",), num_paths))
+    return tuple(writes)
+
+
+def test_num026_the_all_short_table_is_the_case_the_ceiling_tightening_acts_on():
+    """The table the loose ceiling got wrong, pinned in both directions.
+
+    ``_FIVE_SHORT_TERMINALS`` is 200 paths at 10.0 and 1800 at 90.0 against a
+    target of 95.0, so every published level -- p5 at 10.0 and p25 through p95
+    at 90.0 -- falls short of it.  That is the one shape on which the loose and
+    tight ceilings disagree: ``1 - min(below)`` banks only the 200 paths below
+    p5 and caps the share at 0.95, while ``1 - max(below)`` banks all 1800
+    below p95 and caps it at 0.05.
+
+    The tight cap is the one the table actually requires, and it is what the
+    loose one failed to enforce: no path in this array ends at or above 95.0, so
+    the array's own share is 0.0 and a claim that 90% of the paths clear the
+    target contradicts p95 by a factor of eighteen.  Under the loose ceiling
+    that claim passed silently, because 0.9 sits inside ``[0, 0.95]``.  Under
+    the tight one it is rejected.  Both verdicts are asserted, and the FALSE one
+    is asserted as FIREING, because a tightening only ever shown accepting
+    figures has not been shown to bite.
+    """
+    published = np.percentile(_FIVE_SHORT_TERMINALS, [5, 25, 50, 75, 95])
+    levels = {key: float(value) for key, value in
+              zip(("p5", "p25", "p50", "p75", "p95"), published)}
+    assert levels == _FIVE_SHORT_LEVELS, (
+        "numpy no longer publishes these levels for this array, so the case "
+        f"below is not the case this test claims it is: {published}"
+    )
+    truth = round(float(np.mean(_FIVE_SHORT_TERMINALS >= _FIVE_SHORT_TARGET)), 4)
+    assert truth == 0.0, "the array's own mean indicator is not 0.0"
+
+    # The array's own figure is inside the tight bracket.
+    assert _monte_carlo_firing(
+        _five_short_writes(truth, num_paths=2000)
+    ) == {}, "the array's own share was rejected"
+
+    # And the figure the loose ceiling accepted is now caught.
+    rejected = _monte_carlo_firing(_five_short_writes(0.9, num_paths=2000))
+    assert "NUM-026" in rejected, (
+        "a success probability the array's own p95 contradicts was accepted: "
+        f"{rejected}"
+    )
+    assert "lies outside [0, 0.05]" in rejected["NUM-026"][0], rejected
+    assert "the published p95 is below" in rejected["NUM-026"][0], rejected
+
+
 def test_num026_accepts_a_success_probability_its_own_table_supports():
     """THE COUNTEREXAMPLE.  Red before the floor was re-derived, green after.
 
@@ -1548,20 +1621,50 @@ def test_num026_the_degenerate_tables_bracket_what_they_can_and_decline_what_the
 
     None of these four may raise, and the two that carry no information may
     produce no finding rather than a guess.  A target above every published
-    level leaves the table no floor but still a ceiling (nothing above p95 can
-    clear it); a target below every level leaves it a floor but no ceiling.
+    level leaves the table no floor but still a ceiling; a target below every
+    level leaves it a floor but no ceiling.
+
+    RE-FROZEN, DELIBERATELY, on the ABOVE case.  This test used to assert that
+    ``0.95`` is accepted when the target sits above every published level, and
+    that ``0.96`` is the first rejected value -- i.e. it pinned the bracket at
+    ``[0, 0.95]``.  That was the LOOSE ceiling: it banked the mass below p5 only
+    and ignored the mass below p50, p75 and p95, all of which is likewise below
+    the target.  The tightest sound ceiling is ``1 - max(below)/100``, and with
+    every level short the max is p95, so the bracket is ``[0, 0.05]``: if the
+    target is above p95 then at most 5% of the mass can clear it, which is what
+    p95 means, and accepting 0.95 accepts a share the published table
+    contradicts by a factor of nineteen.
+
+    The accepted/rejected pair is therefore re-pinned to 0.05 and 0.06, and the
+    values between 0.06 and 0.95 that the loose ceiling let through are now
+    asserted CAUGHT.  The re-freeze is a strengthening, not a loosened
+    tolerance: nothing the tight bracket accepts was rejected.  It is recorded
+    here because this is the case the loose ceiling was hiding, and it was
+    hiding it precisely because a table where every level falls short is the one
+    shape in which the two ceilings cannot coincide.
     """
     levels = {"p5": 0.5, "p25": 10.0, "p50": 10.0, "p75": 10.0, "p95": 10.0}
     common = (("terminal_percentiles",), levels)
 
     above = _monte_carlo_firing((common, (("target_value",), 20.0),
-                                 (("prob_success",), 0.95)))
-    assert above == {}, f"0.95 clears a target above every published level: {above}"
-    below_edge = _monte_carlo_firing((common, (("target_value",), 20.0),
-                                      (("prob_success",), 0.96)))
-    assert "lies outside [0, 0.95]" in below_edge["NUM-026"][0], below_edge
-    assert "the table puts no floor under prob_success" in \
-        below_edge["NUM-026"][0], below_edge
+                                 (("prob_success",), 0.05)))
+    assert above == {}, f"0.05 is inside the bracket p95 requires: {above}"
+    for caught in (0.06, 0.5, 0.9, 0.95):
+        below_edge = _monte_carlo_firing((common, (("target_value",), 20.0),
+                                          (("prob_success",), caught)))
+        assert "lies outside [0, 0.05]" in below_edge["NUM-026"][0], (
+            caught, below_edge
+        )
+        assert "the table puts no floor under prob_success" in \
+            below_edge["NUM-026"][0], (caught, below_edge)
+        # The ceiling clause must name the level it came from, so a reader can
+        # see it is p95 and not p5: the whole difference is that one level.
+        assert "the published p95 is below" in below_edge["NUM-026"][0], (
+            caught, below_edge
+        )
+        assert "so at most 5% of the paths clear it" in below_edge["NUM-026"][0], (
+            caught, below_edge
+        )
 
     under = _monte_carlo_firing((common, (("target_value",), 0.0),
                                  (("prob_success",), 0.95)))
@@ -1586,16 +1689,23 @@ def test_num026_the_degenerate_tables_bracket_what_they_can_and_decline_what_the
 
 
 def test_num026_the_bracket_is_one_path_of_the_mass_wide_and_no_wider():
-    """The interpolation tolerance, derived rather than fitted.
+    """The interpolation tolerance on the FLOOR edge, derived not fitted.
 
     A published level is a blend of the two order statistics numpy puts either
     side of it, so the mass under it can sit up to one path away from the
     ``a/100`` its nominal level names, and the derived bound moves with it: one
     path of the mass, ``1/num_paths``.  At this table's 2000 paths that is
-    0.0005 against a 0.20-wide bracket.  The tolerance is asserted from BOTH
-    sides, and with ``num_paths`` removed it is asserted to vanish, which is
-    what makes it a derived width rather than a number tuned until a hard case
-    passed.
+    0.0005 against a 0.20-wide bracket.  With ``num_paths`` removed the
+    tolerance is asserted to vanish, which is what makes it a derived width
+    rather than a number tuned until a hard case passed.
+
+    The docstring says "asserted from BOTH sides", and the two edges used to be
+    one table's two ends -- which is true of the two-tone table, whose bracket
+    is 0.20 wide and whose ceiling is fixed at 0.95 by its single short level.
+    The CEILING is now walked in the two tests below, on a table where every
+    level falls short, because that is the only shape on which the tightened
+    ceiling is visible at all.  A tolerance the ceiling never gets to test is a
+    tolerance asserted on one side of a symmetric derivation.
 
     Zero width is the wrong default for a block that does declare a path count
     and unsound to invent one for a block that does not, so the fallback is
@@ -1617,4 +1727,150 @@ def test_num026_the_bracket_is_one_path_of_the_mass_wide_and_no_wider():
         "a block that publishes no path count must be checked with NO width, "
         f"not with an assumed one: {undeclared}"
     )
+
+
+def test_num026_the_one_path_tolerance_holds_on_the_ceiling_side_too():
+    """The tolerance, walked on the edge the tightened ceiling moved.
+
+    A tolerance that was derived symmetrically and MEASURED on the floor alone
+    is a half-checked tolerance, and the edge that moved in this change is the
+    ceiling.  So the same walk is asserted on the ceiling, and on a table whose
+    ceiling comes from the LARGEST short level -- which is the only shape where
+    the loose and tight ceilings differ, and therefore the only shape on which
+    a ceiling-side tolerance bug could hide.
+
+    The two-tone table cannot carry this case: its ``below`` is the single level
+    5, so ``min`` and ``max`` coincide and the test would pass whether or not
+    the ceiling had ever been tightened.  ``_FIVE_SHORT_TERMINALS`` puts every
+    level below the target, so its ceiling is ``1 - 95/100 = 0.05`` on the TIGHT
+    derivation and ``1 - 5/100 = 0.95`` on the loose one -- two different
+    numbers, so a tolerance measured here is the tightened ceiling's tolerance
+    and there is nowhere for it to hide.
+    """
+    one_path = 1.0 / 2000
+    # Inside by less than a path, then inside by more than a path: both silent.
+    for inside in (0.05, 0.05 - one_path, 0.0499):
+        assert _monte_carlo_firing(
+            _five_short_writes(inside, num_paths=2000)
+        ) == {}, f"the rule rejected {inside}, which a p95 ceiling permits: {inside}"
+
+    # One path of slack on the tight side, then two: the tolerance bites, and
+    # only at one path.
+    at_edge = _monte_carlo_firing(
+        _five_short_writes(0.05 + one_path, num_paths=2000)
+    )
+    assert at_edge == {}, (
+        "one path outside the ceiling is inside the one path of interpolation "
+        f"the derivation allows: {at_edge}"
+    )
+    beyond = _monte_carlo_firing(
+        _five_short_writes(0.05 + 2 * one_path, num_paths=2000)
+    )
+    assert "NUM-026" in beyond, (
+        f"two paths outside the ceiling was accepted: {beyond}"
+    )
+    assert "lies outside [0, 0.05]" in beyond["NUM-026"][0], beyond
+
+    # And the ceiling clause names the level it came from, so a reader can
+    # re-derive 0.05 from the published table without reading the source.
+    assert "the published p95 is below" in beyond["NUM-026"][0], beyond
+    assert "so at most 5% of the paths clear it" in beyond["NUM-026"][0], beyond
+
+    # No declared path count means no width on this edge either.
+    undeclared = _monte_carlo_firing(
+        _five_short_writes(0.05 + one_path, num_paths=DELETE)
+    )
+    assert "NUM-026" in undeclared, (
+        "the ceiling kept its tolerance on a block that publishes no path "
+        f"count: {undeclared}"
+    )
+
+
+def test_num026_the_tolerance_is_one_path_of_mass_wide_in_measurement_not_just_in_proof():
+    """The tolerance's NUMERIC bound, over both edges, not only the floor.
+
+    The derivation in the relation's docstring is symmetric on paper.  This is
+    the measurement that says it is symmetric in fact: over many (sample,
+    target) pairs, every value that lands outside the exact bracket -- the
+    bracket computed from the empirical mass, with no tolerance at all -- must
+    be inside one path of it, and the assertion is made SEPARATELY for the two
+    edges so a ceiling regression cannot hide behind a floor that still holds.
+
+    The sample sizes are deliberately non-commensurate with the published
+    levels.  When ``N * c / 100`` lands on an integer the interpolated level
+    sits exactly on the order statistic the derivation assumes, the gap is
+    identically zero, and a tolerance sized for a gap that never appears looks
+    unnecessary -- which is how the floor-only measurement came to be
+    reassuring without ever having been stressed.
+    """
+    levels = (5, 25, 50, 75, 95)
+    rng = np.random.default_rng(20260930)
+    outside = {"floor": 0, "ceiling": 0}
+    worst = {"floor": 0.0, "ceiling": 0.0}
+    beyond = {"floor": 0, "ceiling": 0}
+    pairs = 0
+
+    for n in (97, 199, 501, 777, 999, 1501, 2003):
+        for draw in range(6):
+            if draw == 0:
+                sample = np.sort(rng.normal(1.0, 0.3, n))
+            elif draw == 1:
+                sample = np.sort(np.round(rng.normal(100.0, 20.0, n)))
+            elif draw == 2:
+                sample = np.sort(np.concatenate([
+                    np.full(n // 10, 10.0), rng.normal(200.0, 40.0, n - n // 10)]))
+            elif draw == 3:
+                sample = np.sort(np.concatenate([
+                    np.full(n // 2, 50.0), rng.normal(150.0, 30.0, n - n // 2)]))
+            elif draw == 4:
+                sample = np.sort(rng.standard_t(3, n) * 0.4 + 1.0)
+            else:
+                sample = np.sort(np.exp(rng.normal(0.0, 0.4, n)))
+            published = np.percentile(sample, list(levels))
+            targets = np.concatenate([
+                published,
+                np.nextafter(published, np.inf),   # one ULP above each level
+                sample,                            # on every order statistic
+                (sample[:-1] + sample[1:]) / 2.0,  # between every pair
+            ])
+            for target in np.unique(targets):
+                below = [c for c, v in zip(levels, published) if v < target]
+                at_or_above = [c for c, v in zip(levels, published) if v >= target]
+                if not below and not at_or_above:
+                    continue
+                low = 1.0 - min(at_or_above) / 100.0 if at_or_above else 0.0
+                high = 1.0 - max(below) / 100.0 if below else 1.0
+                # prob_success is mean(T >= t): the order statistics strictly
+                # below t are the first `index` of the sorted sample.
+                exact = (n - int(np.searchsorted(sample, target, side="left"))) / n
+                pairs += 1
+                if exact < low:
+                    outside["floor"] += 1
+                    excess = (low - exact) * n
+                    worst["floor"] = max(worst["floor"], excess)
+                    beyond["floor"] += int(excess > 1.0)
+                if exact > high:
+                    outside["ceiling"] += 1
+                    excess = (exact - high) * n
+                    worst["ceiling"] = max(worst["ceiling"], excess)
+                    beyond["ceiling"] += int(excess > 1.0)
+
+    assert pairs > 10_000, f"the measurement is too small to mean anything: {pairs}"
+    # Both edges must be genuinely EXERCISED. An edge with no cases is an edge
+    # this test has not checked, and asserting a bound over an empty set is the
+    # way a half-checked tolerance stays half-checked.
+    assert outside["floor"] > 0, "the floor edge was never exercised by this sample"
+    assert outside["ceiling"] > 0, (
+        "the ceiling edge was never exercised by this sample, so the bound "
+        "below is a statement about nothing"
+    )
+    for edge in ("floor", "ceiling"):
+        assert beyond[edge] == 0, (
+            f"{outside[edge]} {edge} case(s) sat more than one path outside the "
+            f"exact bracket; the worst was {worst[edge]:.6f} of a path, so "
+            f"1/num_paths is too narrow on this edge"
+        )
+        assert worst[edge] <= 1.0, (
+            f"{edge} worst excess {worst[edge]:.6f} paths exceeds one path of mass"
+        )
 

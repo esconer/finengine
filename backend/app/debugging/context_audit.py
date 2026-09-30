@@ -4024,30 +4024,41 @@ def _rel_probability_bounded_by_its_own_percentiles(
     property of a quantile is the pair ``P(T < p_c) <= c/100 <= P(T <= p_c)``,
     and the whole relation is the two inclusions that follow from it.  Both are
     written out rather than summarised, because this derivation has been got
-    wrong twice and a reader has to be able to check it rather than trust it.
+    wrong three times -- twice on the floor, in mirror images, and once on the
+    ceiling, in the one direction that is sound but weak -- and a reader has to
+    be able to check it rather than trust it.
 
-    * ``p_a >= t``.  At least ``a`` percent of the mass is at or BELOW ``p_a``,
-      so the mass at or above it -- ``100 - a`` percent -- is at or above
-      ``p_a`` and therefore at or above ``t``.  That gives the FLOOR
-      ``P(T >= t) >= 1 - a/100``.  Every clearing level yields such a floor and
-      the SMALLEST clearing level yields the TIGHTEST one, so the floor is
+    * ``p_a >= t``.  Read the property from its other half: at most ``a`` percent
+      of the mass is STRICTLY below ``p_a``, so at least ``100 - a`` percent is
+      at or above it; and because ``p_a >= t`` every value at or above ``p_a``
+      is also at or above ``t``, so that mass is mass which clears the target.
+      That gives the FLOOR ``P(T >= t) >= 1 - a/100``.  Every clearing level
+      yields such a floor, and a smaller level gives a LARGER one, so the
+      TIGHTEST floor comes from the SMALLEST clearing level and the floor is
       ``1 - min(at_or_above)/100``.  The direction is the whole content of the
       clause: the share that clears the target is the share ABOVE the clearing
       percentile, so the level enters complemented.  A target below ``p_a``
       says nothing about the share above ``t`` except that it is at least the
       share above ``p_a``.
-    * ``p_c < t``.  Symmetrically, at least ``c`` percent of the mass is at or
-      below ``p_c`` and all of it falls short of ``t``, so at most ``100 - c``
-      percent of the mass clears it: ``P(T >= t) <= 1 - c/100``.  The SMALLEST
-      falling-short level gives the WEAKEST ceiling, which is the one taken
-      here.  The strongest available ceiling is ``1 - max(below)/100``, and the
-      block's own ``terminal_percentiles_basis_detail`` publishes the weaker
-      bracket, so the rule checks the bracket the export declares for itself
-      rather than a tighter one it never claimed.
+    * ``p_c < t``.  The same property read the other way: at least ``c`` percent
+      of the mass is at or below ``p_c``, and because ``p_c < t`` every one of
+      those values also falls short of ``t``.  So at least ``c/100`` of the mass
+      fails the target and at most ``100 - c`` percent clears it:
+      ``P(T >= t) <= 1 - c/100``.  Every falling-short level yields such a
+      ceiling, and a larger level gives a SMALLER one -- more mass provably
+      short of the target is a tighter cap on the share that clears it -- so
+      the TIGHTEST ceiling comes from the LARGEST falling-short level and the
+      ceiling is ``1 - max(below)/100``.
 
-    So the bracket is ``[1 - min(at_or_above)/100, 1 - min(below)/100]``, and on
+    So the bracket is ``[1 - min(at_or_above)/100, 1 - max(below)/100]``, and on
     this export's table -- target 85249.0, p5 79001.08 below it, p25 117447.13
     above it -- that is ``[0.75, 0.95]``, which the published 0.922 sits inside.
+    ``below`` is the single level 5 there, so ``min`` and ``max`` coincide and
+    the tighter ceiling changes nothing on this table; it changes the tables
+    where MORE THAN ONE level falls short, which is the case a weak ceiling
+    hides -- a target above p95 leaves all five levels short, and the weak
+    bracket lets a ``prob_success`` of 0.96 through where the tight one caps it
+    at 0.05.
 
     The floor has been wrong twice, in mirror images, and both errors were
     invisible because each coincided with the ceiling on a symmetric table.
@@ -4060,6 +4071,19 @@ def _rel_probability_bounded_by_its_own_percentiles(
     complement is both a lower bound and the strongest one available, which is
     what makes it the only one of the three that is worth publishing.
 
+    The ceiling's mirror-image error is the third: ``1 - min(below)/100`` is a
+    sound ceiling and the WEAKEST one available, and it was taken because the
+    block's ``terminal_percentiles_basis_detail`` published that weaker
+    bracket.  Checking only the bracket an export declares for itself is a real
+    principle, but it is a reason to publish the TIGHTEST bracket and a bad
+    reason to check a weaker one: the export is not the authority on its own
+    tolerance, the quantile property is, and a deliberately loose bound published
+    as the declared basis tells a reader they can bracket the figure less
+    tightly than they actually can.  So the rule checks the strongest sound
+    bracket and the service now declares that bracket.  The error is recorded
+    because it was invisible by construction: on a table with one short level
+    the weak and tight ceilings are the same number.
+
     One path of the mass is the width of the band, and nothing else is.  The
     levels are numpy percentiles under linear interpolation -- the block says so
     in ``terminal_percentiles_basis_detail`` -- so each sits BETWEEN the two
@@ -4068,19 +4092,47 @@ def _rel_probability_bounded_by_its_own_percentiles(
     ``(floor(h) + 1)``-th order statistics of the sorted sample, so the mass
     strictly below it is at most ``(floor(h) + 1)/N`` -- within ``1/N`` of
     ``a/100`` -- and the mass at or below it is at least ``(floor(h) + 1)/N``,
-    again within ``1/N``.  Repeated values do not break this: a blend of two
+    again within ``1/N``.  Those two halves are the CEILING and the FLOOR
+    respectively, and the derivation is symmetric: ``floor(h) + 1`` is above
+    ``h`` by less than one, so the mass below a level never sits more than one
+    path under its nominal ``c/100`` and the mass at or below it never sits more
+    than one path over it -- the ceiling can be tight by under a path and the
+    floor can be loose by under a path, which is the SAME ``1/N`` on both edges.
+    Repeated values do not break this: a blend of two
     equal order statistics IS that shared value, whose mass below is smaller
     still, and a blend of two distinct ones has no sample point strictly
     between them, so its mass below is exactly the earlier count.  Each edge is
     therefore widened OUTWARD by ``1/num_paths``, and by nothing else: at this
     export's 2000 paths that is 0.0005 against a bracket 0.20 wide, one
-    four-hundredth of it.  It is derived from the interpolation rather than
-    fitted to a case, and it was checked rather than assumed -- over 30,991
-    (sample, target) pairs drawn from continuous, integer-tied, two-tone-gap
-    and half-tied samples, 1056 pairs sat outside the exact bracket, every one
-    of them inside one path of it and none outside.  A block that published the
-    table without a path count is checked with no width at all, which is the
-    stricter reading of the same derivation.
+    four-hundredth of it.
+
+    It is derived from the interpolation rather than fitted to a case, and it
+    was MEASURED on both edges rather than assumed, because a tolerance that is
+    symmetric on paper and checked on one side is a half-checked tolerance.
+    Over 88,502 (sample, target) pairs -- continuous, integer-tied, two-tone-gap,
+    half-tied and student-t samples at N from 97 to 2003, and deliberately
+    NON-commensurate with the published levels, because when ``N * c / 100``
+    lands on an integer the interpolated level sits exactly on the order
+    statistic the derivation assumes and the gap is invisible -- 80 pairs sat
+    below the exact floor and 130 above the exact ceiling.  Every one of the 210
+    was inside one path of its own edge, the worst of them 0.85 of a path, and
+    NONE was outside, on either side: zero is the only number that makes
+    ``1/N`` a bound rather than a hope.  The previous measurement of this
+    argument walked the floor alone; the ceiling column is the one that had
+    never been run, and it is the edge whose bound moved in this change.
+
+    One further width is measured here and deliberately NOT taken, on either
+    edge: the service publishes ``prob_success`` at 4dp, so the figure a reader
+    can check sits up to 5e-5 further out than the exact share again.  That is
+    0.1 of a path at this export's 2000, and it is added to no edge, so on a
+    table whose true share lands within 5e-5 of a bracket edge the rule can
+    reject a correctly rounded figure.  It is symmetric, it is under 1/20 of a
+    path on every N this service uses, and widening by it would loosen both
+    edges of the one relation whose job is to miss nothing -- so it is recorded
+    here rather than folded in silently.
+
+    A block that published the table without a path count is checked with no
+    width at all, which is the stricter reading of the same derivation.
 
     The block states in ``success_definition_detail`` that ``prob_success``
     counts the very paths whose terminal percentiles are published beside it,
@@ -4110,10 +4162,13 @@ def _rel_probability_bounded_by_its_own_percentiles(
     if not below and not at_or_above:
         return False, None
     # See the docstring: the share that clears the target is the share AT OR
-    # ABOVE the clearing percentile, so the floor is the level COMPLEMENTED,
-    # and the tightest one is the SMALLEST clearing level.
+    # ABOVE the clearing percentile, so the floor is the level COMPLEMENTED and
+    # the tightest floor is the SMALLEST clearing level.  Symmetrically, the
+    # share BELOW a falling-short level provably fails the target, so the
+    # tightest ceiling is the one that banks the most such mass: the LARGEST
+    # falling-short level.
     clearing = min(at_or_above) if at_or_above else None
-    short = min(below) if below else None
+    short = max(below) if below else None
     low = 1.0 - clearing / 100.0 if clearing is not None else 0.0
     high = 1.0 - short / 100.0 if short is not None else 1.0
     paths = node.get("num_paths")
