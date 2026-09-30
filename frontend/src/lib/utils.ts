@@ -47,13 +47,29 @@ export function formatCurrency(
 
 /**
  * Format percentage values
- * @param value - Numeric value to format as percentage
+ * @param value - Numeric value to format as percentage (null/undefined/NaN = unmeasured)
  * @param decimals - Number of decimal places (default: 2)
- * @returns Formatted percentage string
+ * @param unavailableReason - Optional explanation of WHY the value is unmeasured.
+ *   Rendered after the dash, e.g. "N/A — no persisted prior score". Omit it at
+ *   call sites that have no reason to give; the bare "N/A" is the house default.
+ * @returns Formatted percentage string, or 'N/A' when unmeasured
  * Input contract: FRACTION — 0.12 renders as "12.00%". Do not pass
  * already-percent fields (e.g. backend `*_pct` values like 6.67).
+ *
+ * Absent-value rule (N/A-never-0, pinned by format-invariants.test.tsx): a null
+ * or undefined measurement renders as 'N/A', never as "0.00%" — a fabricated
+ * zero is indistinguishable from a real one. A *measured* 0 still renders as
+ * "0.00%". Guard mirrors formatCurrency exactly so the two formatters cannot
+ * drift apart.
  */
-export function formatPercentage(value: number, decimals: number = 2): string {
+export function formatPercentage(
+  value: number | null | undefined,
+  decimals: number = 2,
+  unavailableReason?: string | null
+): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return unavailableReason ? `N/A — ${unavailableReason}` : 'N/A';
+  }
   return `${(value * 100).toFixed(decimals)}%`;
 }
 
@@ -86,10 +102,15 @@ export const formatPercent = formatPercentage;
 
 /**
  * Format Indian Rupees in Cr / L notation or standard INR
- * @param value - Numeric value in rupees
- * @returns Formatted Indian Rupee string
+ * @param value - Numeric value in rupees (null/undefined/NaN = unmeasured)
+ * @returns Formatted Indian Rupee string, or 'N/A' when unmeasured
+ * An absent value falls through both scale branches (null >= 1e7 is false) and
+ * is delegated to formatCurrency, which owns the N/A guard.
  */
-export function formatIndianRupees(value: number): string {
+export function formatIndianRupees(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'N/A';
+  }
   if (value >= 1e7) {
     return `₹${(value / 1e7).toFixed(2)} Cr`;
   }
@@ -101,10 +122,15 @@ export function formatIndianRupees(value: number): string {
 
 /**
  * Format large numbers with K, M, B suffixes
- * @param value - Numeric value to format
- * @returns Formatted number string
+ * @param value - Numeric value to format (null/undefined/NaN = unmeasured)
+ * @returns Formatted number string, or 'N/A' when unmeasured
+ * The sub-1e3 fallback calls value.toFixed(2), which throws on null — so the
+ * absent-value guard is load-bearing here, not cosmetic.
  */
-export function formatLargeNumber(value: number): string {
+export function formatLargeNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'N/A';
+  }
   if (value >= 1e9) {
     return `${(value / 1e9).toFixed(1)}B`;
   }

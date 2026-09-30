@@ -759,7 +759,12 @@ export default function FactorExposurePage() {
                 <span className="font-mono font-semibold text-teal-600 dark:text-teal-400">{benchmarkCorr != null ? `${benchmarkCorr}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-teal-500 h-2 rounded-full" style={{ width: `${benchmarkCorr ?? 0}%` }} />
+                {/* An unmeasured share draws NO bar. `?? 0` would render an empty
+                    bar that reads identically to "measured 0% systematic". The
+                    N/A label above already carries the absent state. */}
+                {benchmarkCorr != null && (
+                  <div data-testid="variance-bar-corr" className="bg-teal-500 h-2 rounded-full" style={{ width: `${benchmarkCorr}%` }} />
+                )}
               </div>
             </div>
             <div>
@@ -768,7 +773,9 @@ export default function FactorExposurePage() {
                 <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">{systematicShare != null ? `${systematicShare}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${systematicShare ?? 0}%` }} />
+                {systematicShare != null && (
+                  <div data-testid="variance-bar-systematic" className="bg-blue-500 h-2 rounded-full" style={{ width: `${systematicShare}%` }} />
+                )}
               </div>
             </div>
             <div>
@@ -777,7 +784,9 @@ export default function FactorExposurePage() {
                 <span className="font-mono font-semibold text-purple-600 dark:text-purple-400">{idiosyncraticShare != null ? `${idiosyncraticShare}%` : 'N/A'}</span>
               </div>
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div className="bg-purple-500 h-2 rounded-full" style={{ width: `${idiosyncraticShare ?? 0}%` }} />
+                {idiosyncraticShare != null && (
+                  <div data-testid="variance-bar-idiosyncratic" className="bg-purple-500 h-2 rounded-full" style={{ width: `${idiosyncraticShare}%` }} />
+                )}
               </div>
             </div>
           </div>

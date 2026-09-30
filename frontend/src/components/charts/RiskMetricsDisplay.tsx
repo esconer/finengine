@@ -4,6 +4,7 @@
 
 import React from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import { formatPercentage } from '@/lib/utils';
 import {
   TrendingDown,
   Activity,
@@ -78,12 +79,10 @@ const RiskMetricsDisplayImpl: React.FC<RiskMetricsDisplayProps> = ({
     return 'negative'; // High volatility is bad
   };
 
-  const formatPercentage = (value: number | null | undefined): string => {
-    if (value === null || value === undefined || isNaN(value)) {
-      return 'N/A';
-    }
-    return `${(value * 100).toFixed(2)}%`;
-  };
+  // NOTE: this file previously carried its own hand-rolled `formatPercentage`
+  // with a local null guard. A second implementation of the same rule is how a
+  // guard silently stops covering this component — it now imports the shared
+  // formatter, which format-invariants.test.tsx sweeps automatically.
 
   const getVaRInterpretation = (var95: number | null): { level: string; color: string } => {
     if (var95 == null || isNaN(var95)) {
@@ -136,14 +135,14 @@ const RiskMetricsDisplayImpl: React.FC<RiskMetricsDisplayProps> = ({
 
         <MetricCard
           title="Volatility Forecast"
-          value={metrics.forecast_volatility ? formatPercentage(metrics.forecast_volatility) : 'N/A'}
+          value={formatPercentage(metrics.forecast_volatility)}
           icon={Activity}
           loading={loading}
         />
 
         <MetricCard
           title="VaR Forecast"
-          value={metrics.forecast_var ? formatPercentage(metrics.forecast_var) : 'N/A'}
+          value={formatPercentage(metrics.forecast_var)}
           icon={TrendingDown}
           loading={loading}
         />

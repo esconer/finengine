@@ -258,13 +258,18 @@ export default function RiskStudioPage() {
   // Unknown fat-tail conclusion stays unknown — never coerced to "No"
   const fatTailed: boolean | null = tailRisk?.is_fat_tailed ?? tailRisk?.gpd_parameters?.is_fat_tailed ?? null;
 
-  // Prepare Euler Chart Data — CVaR share stays null when tail attribution is absent
+  // Prepare Euler Chart Data — BOTH shares stay null when that model's
+  // attribution is absent. `volShare || 0` claimed a holding with no measured
+  // volatility share contributed exactly 0% of portfolio risk, which is a
+  // fabricated position in the bar chart and in the CSV.
   const eulerPositions = useMemo(() =>
     riskContribution?.positions?.volatility
       ? Object.entries(riskContribution.positions.volatility).map(([ticker, volShare]: [string, any]) => ({
           ticker: ticker.replace('.NS', '').replace('.BO', ''),
           fullTicker: ticker,
-          vol_contrib: +((volShare || 0) * 100).toFixed(1),
+          vol_contrib: volShare != null
+            ? +(volShare * 100).toFixed(1)
+            : null,
           cvar_contrib: riskContribution.positions.cvar_tail?.[ticker] != null
             ? +((riskContribution.positions.cvar_tail[ticker]) * 100).toFixed(1)
             : null
@@ -320,7 +325,7 @@ export default function RiskStudioPage() {
     rows.push('Euler Volatility & Tail CVaR Position Decomposition');
     rows.push('Ticker,Volatility Risk Share (%),Tail CVaR Loss Share (%)');
     for (const p of eulerPositions) {
-      rows.push(`${escapeCsvCell(p.fullTicker)},${p.vol_contrib}%,${p.cvar_contrib != null ? `${p.cvar_contrib}%` : 'N/A'}`);
+      rows.push(`${escapeCsvCell(p.fullTicker)},${p.vol_contrib != null ? `${p.vol_contrib}%` : 'N/A'},${p.cvar_contrib != null ? `${p.cvar_contrib}%` : 'N/A'}`);
     }
     rows.push('');
     rows.push('Bivariate Student-t Copula Lower-Tail Dependence Matrix');
@@ -486,7 +491,7 @@ export default function RiskStudioPage() {
                         return (
                           <div className="bg-slate-950 border border-slate-700 p-2.5 rounded-lg text-xs text-slate-200 shadow-xl">
                             <p className="font-semibold text-white mb-1">{d.fullTicker}</p>
-                            <p className="text-blue-400">Vol Share: {d.vol_contrib}%</p>
+                            <p className="text-blue-400">Vol Share: {d.vol_contrib != null ? `${d.vol_contrib}%` : 'N/A'}</p>
                             <p className="text-rose-400">CVaR Share: {d.cvar_contrib != null ? `${d.cvar_contrib}%` : 'N/A'}</p>
                           </div>
                         );

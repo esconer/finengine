@@ -430,9 +430,30 @@ export default function LiquidityPage() {
   };
 
   const overallScore: number | null = liquidityData?.overall_score ?? null;
+  const isScored = (p: PositionLiquidity) =>
+    typeof p.score === 'number' && Number.isFinite(p.score);
   const highVolumeCount = positionData.filter(p => p.score != null && p.score >= 8).length;
   const mediumVolumeCount = positionData.filter(p => p.score != null && p.score >= 6 && p.score < 8).length;
   const lowVolumeCount = positionData.filter(p => p.score != null && p.score < 6).length;
+  // The buckets above only ever count SCORED positions, so dividing by
+  // positionData.length reported a share of a denominator that includes holdings
+  // the page never classified. The share is over the scored set; the unscored
+  // remainder is stated rather than silently folded in or silently dropped.
+  const scoredCount = positionData.filter(isScored).length;
+  const unscoredCount = positionData.length - scoredCount;
+  const highLiquidityShare = scoredCount > 0 ? highVolumeCount / scoredCount : null;
+  const unscoredDisclosure =
+    unscoredCount > 0
+      ? ` — ${unscoredCount} of ${positionData.length} unscored`
+      : '';
+  // Share of the SCORED set, or null when nothing is scored. A bar and a
+  // percentage both need a measurement, so both read N/A rather than 0.
+  const shareOfScored = (count: number): number | null =>
+    scoredCount > 0 ? (count / scoredCount) * 100 : null;
+  const shareLabel = (count: number): string => {
+    const share = shareOfScored(count);
+    return share === null ? 'N/A' : `${share.toFixed(1)}%`;
+  };
 
   // Position liquidity table columns with ? explainers
   const positionColumns: DataTableColumn<PositionLiquidity>[] = [
@@ -685,9 +706,9 @@ export default function LiquidityPage() {
           <div className="relative group">
             <MetricCard
               title="High Liquidity Positions"
-              value={liquidityData == null
+              value={liquidityData == null || highLiquidityShare === null
                 ? 'N/A'
-                : `${highVolumeCount} (${positionData.length > 0 ? formatPercentage(highVolumeCount / positionData.length, 1) : '0.0%'})`}
+                : `${highVolumeCount} (${formatPercentage(highLiquidityShare, 1)})${unscoredDisclosure}`}
               icon={TrendingDown}
               loading={loading}
             />
@@ -769,14 +790,16 @@ export default function LiquidityPage() {
                       High Liquidity (8.0 - 10.0)
                     </span>
                     <span className="text-emerald-400 font-semibold font-mono">
-                      {highVolumeCount} positions ({positionData.length > 0 ? ((highVolumeCount / positionData.length) * 100).toFixed(1) : 0}%)
+                      {highVolumeCount} positions ({shareLabel(highVolumeCount)}{unscoredDisclosure})
                     </span>
                   </div>
                   <div className="w-full bg-slate-800 rounded-full h-3 overflow-hidden">
-                    <div
-                      className="h-full bg-emerald-500 rounded-full transition-all duration-500"
-                      style={{ width: `${positionData.length > 0 ? (highVolumeCount / positionData.length) * 100 : 0}%` }}
-                    />
+                    {shareOfScored(highVolumeCount) !== null && (
+                      <div
+                        className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                        style={{ width: `${shareOfScored(highVolumeCount)}%` }}
+                      />
+                    )}
                   </div>
                 </div>
 
@@ -787,14 +810,16 @@ export default function LiquidityPage() {
                       Medium Liquidity (6.0 - 7.9)
                     </span>
                     <span className="text-amber-400 font-semibold font-mono">
-                      {mediumVolumeCount} positions ({positionData.length > 0 ? ((mediumVolumeCount / positionData.length) * 100).toFixed(1) : 0}%)
+                      {mediumVolumeCount} positions ({shareLabel(mediumVolumeCount)})
                     </span>
                   </div>
                   <div className="w-full bg-slate-800 rounded-full h-3 overflow-hidden">
-                    <div
-                      className="h-full bg-amber-500 rounded-full transition-all duration-500"
-                      style={{ width: `${positionData.length > 0 ? (mediumVolumeCount / positionData.length) * 100 : 0}%` }}
-                    />
+                    {shareOfScored(mediumVolumeCount) !== null && (
+                      <div
+                        className="h-full bg-amber-500 rounded-full transition-all duration-500"
+                        style={{ width: `${shareOfScored(mediumVolumeCount)}%` }}
+                      />
+                    )}
                   </div>
                 </div>
 
@@ -805,14 +830,16 @@ export default function LiquidityPage() {
                       Low Liquidity (0.0 - 5.9)
                     </span>
                     <span className="text-rose-400 font-semibold font-mono">
-                      {lowVolumeCount} positions ({positionData.length > 0 ? ((lowVolumeCount / positionData.length) * 100).toFixed(1) : 0}%)
+                      {lowVolumeCount} positions ({shareLabel(lowVolumeCount)})
                     </span>
                   </div>
                   <div className="w-full bg-slate-800 rounded-full h-3 overflow-hidden">
-                    <div
-                      className="h-full bg-rose-500 rounded-full transition-all duration-500"
-                      style={{ width: `${positionData.length > 0 ? (lowVolumeCount / positionData.length) * 100 : 0}%` }}
-                    />
+                    {shareOfScored(lowVolumeCount) !== null && (
+                      <div
+                        className="h-full bg-rose-500 rounded-full transition-all duration-500"
+                        style={{ width: `${shareOfScored(lowVolumeCount)}%` }}
+                      />
+                    )}
                   </div>
                 </div>
               </div>
@@ -866,7 +893,7 @@ export default function LiquidityPage() {
                   </span>
                 </div>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  {highVolumeCount} of {positionData.length} holdings are high-liquidity large-caps/ETFs capable of rapid cash conversion with minimal price impact.
+                  {highVolumeCount} of {scoredCount} scored holdings{unscoredDisclosure} are high-liquidity large-caps/ETFs capable of rapid cash conversion with minimal price impact.
                 </p>
               </div>
 

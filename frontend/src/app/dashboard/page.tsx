@@ -155,14 +155,39 @@ export default function DashboardSummary() {
 
   // Calculate enhanced portfolio metrics
   const portfolioMetrics = useMemo(() => {
-    const totalGainLoss = (totalValue || 0) - totalCost;
-    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
+    // The store types totalValue as `number` and seeds it to 0, so a zero here is
+    // a MEASURED zero (an empty book really is worth ₹0) and is kept as one. What
+    // must not happen is a non-finite total being laundered into 0 by `|| 0`:
+    // NaN || 0 is 0, which turns a broken payload into a confident ₹0.00.
+    const measuredTotalValue = typeof totalValue === 'number' && Number.isFinite(totalValue)
+      ? totalValue
+      : null;
+    // totalCost sums only well-formed base-currency legs, so it can legitimately
+    // be 0 for a book that exists (a position with no usable price/qty). A 0 cost
+    // basis makes the return ratio undefined, not 0% — `totalCost > 0 ? … : 0`
+    // published a confident "0.00%" beside a real +₹1,000 gain.
+    const hasCostBasis = totalCost > 0;
+    const totalGainLoss = measuredTotalValue === null ? null : measuredTotalValue - totalCost;
+    const totalGainLossPct = measuredTotalValue === null || !hasCostBasis
+      ? null
+      : ((totalGainLoss as number) / totalCost) * 100;
+    // A position with an absent weight must not be absorbed as 0: `sum + pos.weight`
+    // silently shrank the total, and `totalWeight - 1` then reported a confident
+    // drift for a book the page never actually weighed. Any absent leg ⇒ unknown.
+    let totalWeight: number | null = 0;
+    for (const pos of positions) {
+      if (typeof pos.weight !== 'number' || !Number.isFinite(pos.weight)) {
+        totalWeight = null;
+        break;
+      }
+      totalWeight += pos.weight;
+    }
     return {
-      totalValue: totalValue || 0,
+      totalValue: measuredTotalValue,
       totalGainLoss,
       totalGainLossPct,
       positionsCount: positions.length,
-      totalWeight: positions.reduce((sum, pos) => sum + pos.weight, 0),
+      totalWeight,
       averageWeight: positions.length > 0 ? (100 / positions.length) : 0,
       topSector: sectorData.length > 0 ? sectorData[0]?.name || 'N/A' : 'N/A',
       riskScore: analyticsData.riskScore?.overall_score ?? null,
@@ -397,7 +422,7 @@ export default function DashboardSummary() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Total Portfolio Value"
-          value={portfolioMetrics.totalValue}
+          value={portfolioMetrics.totalValue ?? 'N/A'}
           prefix="₹"
           icon={TrendingUp}
           loading={isOverallLoading}
@@ -405,10 +430,12 @@ export default function DashboardSummary() {
         <div>
           <MetricCard
             title="Unrealized P&L"
-            value={`${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-            change={totalCost > 0 ? portfolioMetrics.totalGainLossPct : undefined}
-            changeType={portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
-            icon={portfolioMetrics.totalGainLoss >= 0 ? TrendingUp : TrendingDown}
+            value={portfolioMetrics.totalGainLoss == null
+              ? 'N/A'
+              : `${portfolioMetrics.totalGainLoss >= 0 ? '+' : '-'}₹${Math.abs(portfolioMetrics.totalGainLoss).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+            change={portfolioMetrics.totalGainLossPct ?? undefined}
+            changeType={portfolioMetrics.totalGainLoss == null || portfolioMetrics.totalGainLoss >= 0 ? 'positive' : 'negative'}
+            icon={portfolioMetrics.totalGainLoss != null && portfolioMetrics.totalGainLoss < 0 ? TrendingDown : TrendingUp}
             loading={isOverallLoading}
           />
           {!isOverallLoading && positions.length > 0 && (
@@ -528,9 +555,12 @@ export default function DashboardSummary() {
           var_95: analyticsData.realizedRisk?.portfolio?.var_95 ?? null,
           cvar_95: analyticsData.realizedRisk?.portfolio?.cvar_95 ?? null,
           // Add FORECAST RISK DATA - This fixes the N/A issue
-          forecast_volatility: analyticsData.forecastRisk?.portfolio?.volatility_forecast || null,
-          forecast_var: analyticsData.forecastRisk?.portfolio?.var_forecast || null,
-          realized_volatility: analyticsData.summary?.realized_volatility || portfolioMetrics.volatility,
+          // `??` not `||`: a measured 0.0 forecast volatility/vol is a real
+          // measurement and must reach the formatter as 0, not be collapsed to
+          // null and rendered N/A.
+          forecast_volatility: analyticsData.forecastRisk?.portfolio?.volatility_forecast ?? null,
+          forecast_var: analyticsData.forecastRisk?.portfolio?.var_forecast ?? null,
+          realized_volatility: analyticsData.summary?.realized_volatility ?? portfolioMetrics.volatility,
         }}
         loading={analyticsLoading}
       />
@@ -693,12 +723,19 @@ export default function DashboardSummary() {
               </div>
             </div>
             <div className="text-center">
+              {/* Weight drift needs every leg's weight. When any is absent the
+                  sum is unknown, so drift reads N/A rather than a confident
+                  figure for a book the page never actually weighed. */}
               <div className={`text-2xl font-bold ${
-                ((portfolioMetrics.totalWeight - 1) * 100) >= 0
-                  ? 'text-blue-600 dark:text-blue-400'
-                  : 'text-amber-500 dark:text-amber-400'
+                portfolioMetrics.totalWeight === null
+                  ? 'text-gray-500 dark:text-gray-400'
+                  : ((portfolioMetrics.totalWeight - 1) * 100) >= 0
+                    ? 'text-blue-600 dark:text-blue-400'
+                    : 'text-amber-500 dark:text-amber-400'
               }`}>
-                {((portfolioMetrics.totalWeight - 1) * 100).toFixed(1)}%
+                {portfolioMetrics.totalWeight === null
+                  ? 'N/A'
+                  : `${((portfolioMetrics.totalWeight - 1) * 100).toFixed(1)}%`}
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 Weight Drift

@@ -548,10 +548,23 @@ export default function RiskContributionPage() {
                 <HelpBtn onClick={() => setActiveExplainer('divergence_insight')} />
               </div>
               {(() => {
-                const tailHeavier = [...volEntries]
+                // Only compare legs that have BOTH models measured. `?? 0`
+                // claimed an absent tail contribution was 0% tail risk, which
+                // reads as "this holding is safe in a crash" — the one
+                // conclusion a missing CVaR share must never support.
+                const comparable = volEntries.filter(
+                  ([t]) => typeof data.positions.cvar_tail[t] === 'number'
+                );
+                if (comparable.length === 0) {
+                  // Nothing comparable: no divergence claim is measurable, so
+                  // no insight is rendered. Previously this fell through to
+                  // the "Symmetric" copy below — a confident false all-clear.
+                  return null;
+                }
+                const tailHeavier = comparable
                   .map(([t, v]) => ({
                     ticker: t,
-                    diff: (data.positions.cvar_tail[t] ?? 0) - v,
+                    diff: (data.positions.cvar_tail[t] as number) - v,
                   }))
                   .sort((a, b) => b.diff - a.diff)[0];
                 if (!tailHeavier || tailHeavier.diff <= 0.05) {

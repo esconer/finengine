@@ -101,6 +101,17 @@ export default function RealizedRiskPage() {
     if (!performanceData || performanceData.length < 2) {
       return { drawdownSeries: [], rollingVolSeries: [] };
     }
+    // A drawdown series is only measurable over a window where EVERY observation
+    // has a portfolio value. `p.portfolio_value || 0` substituted a fabricated
+    // 0 — which also became `peak`, flattening every later real value to a 0.00%
+    // drawdown. An incomplete window is a gap, not a flat line: fall through to
+    // the empty state the chart already knows how to render.
+    const hasCompleteWindow = performanceData.every(
+      (p) => typeof p.portfolio_value === 'number' && Number.isFinite(p.portfolio_value) && p.portfolio_value > 0
+    );
+    if (!hasCompleteWindow) {
+      return { drawdownSeries: [], rollingVolSeries: [] };
+    }
     let peak = -Infinity;
     const dd: { date: string; drawdown: number }[] = [];
     const returns: number[] = [];
@@ -108,7 +119,7 @@ export default function RealizedRiskPage() {
 
     for (let i = 0; i < performanceData.length; i++) {
       const p = performanceData[i];
-      const val = p.portfolio_value || 0;
+      const val = p.portfolio_value as number;
       if (val > peak) peak = val;
       const drawdown = peak > 0 ? (val - peak) / peak : 0;
       dd.push({
@@ -553,7 +564,7 @@ export default function RealizedRiskPage() {
                 </LineChart>
               </ResponsiveContainer>
             ) : (
-              <div className="h-full flex items-center justify-center text-gray-400 text-sm">
+              <div data-testid="rolling-vol-empty" className="h-full flex items-center justify-center text-gray-400 text-sm">
                 {perfLoading ? 'Loading...' : 'No performance history yet'}
               </div>
             )}
@@ -582,7 +593,7 @@ export default function RealizedRiskPage() {
                 </AreaChart>
               </ResponsiveContainer>
             ) : (
-              <div className="h-full flex items-center justify-center text-gray-400 text-sm">
+              <div data-testid="drawdown-empty" className="h-full flex items-center justify-center text-gray-400 text-sm">
                 {perfLoading ? 'Loading...' : 'No performance history yet'}
               </div>
             )}
