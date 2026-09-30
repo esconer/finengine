@@ -278,6 +278,156 @@ export interface RealizedRiskEnvelope {
   methodology?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Marginal trade impact wire shapes.
+//
+// Declared locally for the same reason as the performance-history and
+// realized-risk shapes above: the endpoint returns an ENVELOPE of blocks, and
+// the load-bearing contract here is per-figure, not per-block. Mirrors
+// `backend/app/models/schemas.py:940-997` (`MarginalTradeImpactRequest`,
+// `MarginalTradeImpactResponse`) and the block builders in
+// `backend/app/api/analytics.py:12476-13320`.
+//
+// The one rule these types exist to keep type-safe: a figure is never a bare
+// number. Every entry carries `before`, `after`, `delta` AND a `state` from a
+// closed vocabulary, so `delta` can be null only alongside a refusal that says
+// why. A type that allowed `number` here would let a caller render a refused
+// change as a measured one.
+// ---------------------------------------------------------------------------
+
+/** How a proposal is funded. Named in the request, never inferred by the server. */
+export type MarginalFundingRule = 'sell_and_rebalance' | 'cash_residual';
+
+/**
+ * The three states a published figure can carry.
+ *
+ * `unmeasurable` means a measurement was attempted and came back too small
+ * (`observations` names what was seen, `reason` names the floor). `not_attempted`
+ * means no measurement was ever made and `reason` says why not. Neither may be
+ * rendered as a number.
+ */
+export type MarginalMeasurementState = 'measured' | 'unmeasurable' | 'not_attempted';
+
+/**
+ * A proposed weight is user-SUPPLIED, which is neither `measured` nor
+ * "unmeasured" — it was not observed on any feed. Every figure derived from it
+ * inherits this, so the panel may not present it as a measurement.
+ */
+export type MarginalWeightProvenance = 'measured' | 'proposed';
+
+/** One proposed position: a ticker and the fraction-of-1 weight it should carry after. */
+export interface MarginalLegRequest {
+  ticker: string;
+  target_weight: number;
+}
+
+export interface MarginalTradeImpactRequest {
+  /** 1..50 legs; a ticker may appear at most once. */
+  legs: MarginalLegRequest[];
+  funding?: MarginalFundingRule;
+  /** Days of history the risk half measures over (30..3650, default 365). */
+  history_days?: number;
+}
+
+/**
+ * One before/after/delta figure with its state and its sample.
+ *
+ * `delta` is `after - before` and is null whenever either side is null, so a
+ * refused side cannot produce a number that reads as a measured change.
+ * `units` is the endpoint's own label and drives how the figure is rendered.
+ */
+export interface MarginalStatistic {
+  before: number | null;
+  after: number | null;
+  delta: number | null;
+  state: MarginalMeasurementState;
+  reason: string | null;
+  observations: number | null;
+  units?: string;
+  /** Present on fraction-of-1 risk figures: the delta in percentage points. */
+  delta_percentage_points?: number | null;
+  /** Present on per-leg contributions only. */
+  contribution_units?: string;
+  /** Present on per-leg contributions only. */
+  weight_provenance?: MarginalWeightProvenance;
+}
+
+/** Fields both the concentration and the risk half publish. */
+export interface MarginalBlock {
+  state: MarginalMeasurementState;
+  reason: string | null;
+  metrics: Record<string, MarginalStatistic>;
+  weight_provenance_vocabulary?: Record<string, string>;
+  proposed_tickers?: string[];
+  basis?: string;
+  thresholds?: Record<string, unknown>;
+}
+
+export interface MarginalConcentrationBlock extends MarginalBlock {
+  /** Per-leg share of the book, before AND after. */
+  by_leg: Record<string, MarginalStatistic>;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+}
+
+export interface MarginalRiskBlock extends MarginalBlock {
+  shared_sessions: number | null;
+  minimum_shared_sessions_required: number;
+  per_ticker_return_observations?: Record<string, number>;
+  tickers_below_minimum_sample?: string[];
+  history_window?: Record<string, unknown> | null;
+  unmeasurable_correlation_reason?: string | null;
+}
+
+/** The published derivation of the proposed book, so the arithmetic is checkable. */
+export interface MarginalWeightDerivation {
+  funding?: string;
+  funding_rule?: string;
+  current_weights?: Record<string, number>;
+  proposed_weights?: Record<string, number>;
+  current_total?: number;
+  proposed_total?: number;
+  funding_residual?: number | null;
+  cash_weight?: number | null;
+  proposed_tickers?: string[];
+  weight_provenance_vocabulary?: Record<string, string>;
+  unnamed_book_weight_before?: number;
+  unnamed_book_weight_after?: number;
+  unnamed_book_scale_factor?: number | null;
+}
+
+export interface MarginalDisclosure {
+  proposal_provenance: string;
+  /** Always false: the route writes no PortfolioPosition row and no `added_on`. */
+  persisted: boolean;
+  persistence_note?: string;
+  funding_rule?: string;
+  weight_derivation?: MarginalWeightDerivation;
+  weight_provenance_vocabulary?: Record<string, string>;
+  thresholds?: Record<string, unknown>;
+  states?: MarginalMeasurementState[];
+  minimum_shared_sessions_required?: number;
+  history_window?: Record<string, unknown> | null;
+  resolved_from?: string;
+  resolved_via_resolve_allocation?: boolean;
+}
+
+export interface MarginalTradeImpactResponse {
+  proposal_provenance: string;
+  funding_rule: string;
+  current_weights: Record<string, number>;
+  proposed_weights: Record<string, number>;
+  cash_weight: number | null;
+  funding_residual: number | null;
+  concentration: MarginalConcentrationBlock;
+  risk: MarginalRiskBlock;
+  disclosure: MarginalDisclosure;
+  universe_coverage: Record<string, unknown>;
+  data_status: 'available' | 'partial' | 'unavailable';
+  /** Non-null means the route refused outright: no book, or no fundable proposal. */
+  error: string | null;
+}
+
 // Portfolio API
 export const portfolioApi = {
   // Get portfolio summary (defaults to INR currency for Indian market)
@@ -640,6 +790,21 @@ export const analyticsApi = {
     seed?: number;
   }): Promise<MonteCarloResponse> {
     const response = await apiClient.post('/analytics/monte-carlo', data);
+    return response.data;
+  },
+
+  // Marginal trade impact: what a PROPOSED change does to the persisted book.
+  // Before / after / DELTA for the concentration indices and for annualised
+  // volatility, VaR, CVaR and Sharpe. Every figure carries an explicit state;
+  // an unmeasurable one is `null` plus a reason and is never a zero.
+  //
+  // The proposal is arithmetic on the caller's own persisted weights and is NOT
+  // persisted: `funding` is required to be explicit because "buy X at 5%" does
+  // not say where the 5% comes from.
+  async getMarginalTradeImpact(
+    data: MarginalTradeImpactRequest
+  ): Promise<MarginalTradeImpactResponse> {
+    const response = await apiClient.post('/analytics/marginal-trade-impact', data);
     return response.data;
   },
 };

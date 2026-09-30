@@ -18,6 +18,7 @@ import {
   BarChart3,
   ArrowUpDown,
   BookOpen,
+  Scale,
 } from 'lucide-react';
 import {
   flexRender,
@@ -27,6 +28,7 @@ import {
 import { dataTableFeatures, type DataTableColumn } from '@/components/ui/DataTable';
 
 import { screenerApi, portfolioApi } from '@/lib/api';
+import { MarginalImpactPanel } from '@/components/portfolio/MarginalImpactPanel';
 import { ScreenerStock, ScreenerStrategyMeta, ScreenerStrategyResponse } from '@/types';
 
 const STRATEGY_ICONS: Record<string, React.ReactNode> = {
@@ -66,6 +68,14 @@ export default function ScreenerStudioPage() {
   const [globalFilter, setGlobalFilter] = useState('');
   const [addedStocks, setAddedStocks] = useState<Record<string, boolean>>({});
   const [addingStock, setAddingStock] = useState<string | null>(null);
+  // The screened ticker whose marginal impact is on screen, held by the EXCHANGE
+  // SUFFIXED `ticker` the screener already published. `screener_service
+  // ._screen_ticker` (backend/app/services/screener_service.py:45-52) stamps
+  // `.NS` / `.BO` on that field, which is the same field `handleAddToPortfolio`
+  // has always sent — so a screened row is already resolvable by the analytics
+  // layer and needs no new plumbing. Holding `symbol` here instead would ask
+  // analytics about a ticker that does not exist.
+  const [impactTicker, setImpactTicker] = useState<string | null>(null);
 
   const fetchStrategies = async () => {
     try {
@@ -379,6 +389,19 @@ export default function ScreenerStudioPage() {
               >
                 <BookOpen className="w-3.5 h-3.5" />
               </Link>
+              {/* The bridge: a screen found this candidate, and the question after
+                  "interesting" is "what does it do to the book I already hold".
+                  Opens the panel pre-filled with the suffixed ticker. It ADDS
+                  nothing — the Portfolio button below is still the only action
+                  that writes a position. */}
+              <button
+                onClick={() => setImpactTicker(data.ticker)}
+                aria-label={`What would ${data.ticker} do to your portfolio?`}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 rounded text-xs transition-colors border border-cyan-900/50"
+                title="What would this do to your portfolio?"
+              >
+                <Scale className="w-3.5 h-3.5" />
+              </button>
               <button
                 onClick={() => handleAddToPortfolio(data)}
                 disabled={isAdding || isAdded}
@@ -733,6 +756,19 @@ export default function ScreenerStudioPage() {
           </>
         )}
       </div>
+
+      {/* The bridge's panel. Mounted below the table so the screen stays the
+          screen; it answers the question the screen raised. The pre-filled
+          weight is the panel's own default and is labelled user-supplied there
+          — nothing here implies the reader chose it. */}
+      {impactTicker ? (
+        <MarginalImpactPanel
+          ticker={impactTicker}
+          defaultTargetWeight={0.05}
+          subject="Screened candidate"
+          onClose={() => setImpactTicker(null)}
+        />
+      ) : null}
     </div>
   );
 }
