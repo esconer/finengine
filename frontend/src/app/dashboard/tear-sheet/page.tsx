@@ -7,6 +7,10 @@
 
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
 import {
@@ -293,6 +297,17 @@ interface TearSheetData {
   underwater: { date: string; drawdown: number }[];
   methodology: string;
   history_coverage?: HistoryCoverage | null;
+  /**
+   * The newest delivered observation the holding-window returns were measured
+   * on. Distinct from `window.end`, which is the REQUESTED window end and may
+   * be later than anything actually delivered — so the provenance line reads
+   * this field, never `window.end`.
+   */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -504,6 +519,15 @@ export default function TearSheetPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: the DELIVERED observation date, not the requested window
+          end above, plus the coverage the route measured over. */}
+      <SectionProvenance
+        section="Tear-sheet"
+        asOf={data?.latest_observation_date ?? null}
+        coverage={sectionCoverage(data?.universe_coverage)}
+        warnings={data?.warnings ?? null}
+      />
 
       {/* Error State */}
       {error && (

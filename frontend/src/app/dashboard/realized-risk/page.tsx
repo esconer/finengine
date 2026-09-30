@@ -7,6 +7,10 @@
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import type {
   InstrumentRiskPositionRow,
   RealizedRiskPositionRow,
@@ -405,6 +409,24 @@ export default function RealizedRiskPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: what these risk numbers were measured on, and when. The
+          envelope already publishes it — `latest_observation_date` and
+          `universe_coverage.missing_tickers` — so this renders the endpoint's
+          own claims and adds no measurement of its own.
+
+          `warnings` is deliberately NOT passed here. This page already renders
+          them, behind the coverage banner's expanded-details toggle, and
+          `RealizedRiskBanner.test.tsx` holds that collapsed by design: the
+          per-position history notes are a bullet wall the reader opts into.
+          Duplicating them into an always-open line would undo that decision and
+          put the same sentences on screen twice. The warnings are not lost —
+          they are one click away, which is where this page already keeps them. */}
+      <SectionProvenance
+        section="Realized risk"
+        asOf={realizedRisk?.latest_observation_date ?? null}
+        coverage={sectionCoverage(realizedRisk?.universe_coverage)}
+      />
 
       {/* Holding-intersection coverage banner (Phase 2 disclosure) */}
       {coverageWarnings.length > 0 && (

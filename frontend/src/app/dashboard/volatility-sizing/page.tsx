@@ -7,6 +7,10 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell, formatCurrency as formatAmount } from '@/lib/utils';
@@ -272,8 +276,30 @@ function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
   );
 }
 
+/**
+ * Freshness fields the route publishes that `@/types` does not model — it is
+ * owned by another workstream. `price_freshness` is the one that matters here:
+ * the route states plainly that `sizing_price_as_of` (not the section date) is
+ * the freshness of the executable trade list, so the provenance line is bound to
+ * it rather than to a date that does not describe the share counts.
+ */
+interface VolSizingPriceFreshness {
+  sizing_price_as_of: string | null;
+  latest_delivered_observation: string | null;
+  sizing_price_calendar_days_behind: number | null;
+  sizing_price_as_of_status: 'measured' | 'unavailable';
+  rule: string;
+}
+
 interface VolatilitySizingData extends VolatilitySizingResponse {
   model_params?: Record<string, any>;
+  /** Newest delivered observation the sizing window was measured on. */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  sizing_basis?: VolatilitySizingResponse['sizing_basis'] & {
+    missing_tickers?: string[] | null;
+    price_freshness?: VolSizingPriceFreshness | null;
+  };
 }
 
 const MODELS = [
@@ -1478,6 +1504,32 @@ export default function VolatilitySizingPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance bound to `sizing_price_as_of`, NOT the section date. The
+          route's own rule is explicit that the price date is what the share
+          counts were struck from, so dating the trade list by the section
+          `as_of` would misdescribe every executable number on this page. */}
+      <SectionProvenance
+        section="Volatility sizing"
+        asOf={
+          sizingData?.sizing_basis?.price_freshness?.sizing_price_as_of
+          ?? sizingPriceAsOf
+        }
+        asOfSemantics={
+          sizingData?.sizing_basis?.price_freshness
+            ? 'sizing_price_as_of: the last close delivered inside the sizing window, and the only price every share_delta was divided by'
+            : null
+        }
+        coverage={sectionCoverage(sizingData?.universe_coverage)}
+        warnings={[
+          ...(sizingData?.warnings ?? []),
+          ...(sizingData?.sizing_basis?.price_freshness?.sizing_price_calendar_days_behind != null
+            ? [
+                `Sizing prices are ${sizingData.sizing_basis.price_freshness.sizing_price_calendar_days_behind} calendar day(s) behind the newest delivered observation (${sizingData.sizing_basis.price_freshness.latest_delivered_observation}).`,
+              ]
+            : []),
+        ]}
+      />
 
       {/* Volatility Sizing Metric Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

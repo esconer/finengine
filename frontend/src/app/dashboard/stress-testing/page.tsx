@@ -7,6 +7,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -41,6 +45,17 @@ interface StressTestResult {
   confidence_level?: number;
   methodology?: string;
   error?: string;
+  /**
+   * The newest delivered daily observation this scenario's returns were built
+   * from. Per scenario, not per page: each run re-measures on its own window,
+   * so the provenance line below is bound to the ACTIVE scenario's result.
+   */
+  latest_observation_date?: string | null;
+  data_status?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 interface Scenario {
@@ -720,6 +735,16 @@ export default function StressTestingPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance for the ACTIVE scenario. Each run re-measures on its own
+          window, so a page-level date would describe whichever scenario ran
+          last, not the one on screen. */}
+      <SectionProvenance
+        section={`Stress testing — ${activeScenarioName}`}
+        asOf={activeResult?.latest_observation_date ?? null}
+        coverage={sectionCoverage(activeResult?.universe_coverage)}
+        warnings={activeResult?.warnings ?? null}
+      />
 
       {/* Custom Scenario Builder */}
       {showCustomForm && (

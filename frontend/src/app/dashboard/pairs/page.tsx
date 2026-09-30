@@ -3,21 +3,50 @@
 import React, { useState, useEffect } from 'react';
 import { RefreshCw, Radar, AlertCircle } from 'lucide-react';
 import api from '@/lib/api';
+import {
+    SectionProvenance,
+    sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 
 const LOOKBACK_DAYS = 252;
 const P_VALUE_THRESHOLD = 0.05;
+
+/**
+ * The scan envelope, not just its rows.
+ *
+ * `/analytics/coint` publishes `as_of` AND `as_of_semantics` (default
+ * `latest_available_observation`; `request_end_no_usable_price_data` when the
+ * scan had no usable price), plus `missing_tickers` and `warnings`. Reading only
+ * `res.data.pairs` threw all of that away, which is how a scan dated by its
+ * REQUEST end became indistinguishable from one dated by its newest delivered
+ * observation.
+ */
+interface CointScanEnvelope {
+    pairs?: unknown[];
+    as_of?: string | null;
+    as_of_semantics?: string | null;
+    latest_observation_date?: string | null;
+    warnings?: string[] | null;
+    missing_tickers?: string[] | null;
+    universe_coverage?: {
+        missing_tickers?: string[] | null;
+    } | null;
+}
 
 export default function PairsScannerPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [pairs, setPairs] = useState<any[]>([]);
+    const [scan, setScan] = useState<CointScanEnvelope | null>(null);
 
     const fetchPairs = async () => {
         setLoading(true);
         setError(null);
         try {
             const res = await api.get(`/analytics/coint?lookback_days=${LOOKBACK_DAYS}&p_value_threshold=${P_VALUE_THRESHOLD}`);
-            setPairs(res.data.pairs || []);
+            const envelope = (res.data ?? {}) as CointScanEnvelope;
+            setScan(envelope);
+            setPairs(envelope.pairs ?? []);
         } catch (err: any) {
             setError(err?.message || 'Failed to scan cointegrated pairs');
         } finally {
@@ -51,6 +80,21 @@ export default function PairsScannerPage() {
                     Scan Universe
                 </button>
             </div>
+
+            {/* Provenance: this is one of the few sections whose route publishes
+                `as_of_semantics`, and the two values it takes
+                (`latest_available_observation` vs
+                `request_end_no_usable_price_data`) mean very different things,
+                so the semantics are rendered with the date, never dropped. */}
+            <SectionProvenance
+                section="Cointegration & pairs"
+                asOf={scan?.as_of ?? scan?.latest_observation_date ?? null}
+                asOfSemantics={scan?.as_of_semantics ?? null}
+                coverage={sectionCoverage(
+                    scan?.universe_coverage ?? { missing_tickers: scan?.missing_tickers },
+                )}
+                warnings={scan?.warnings ?? null}
+            />
 
             {error && (
                 <div className="p-4 rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-300 flex items-center gap-2">

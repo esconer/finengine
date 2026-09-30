@@ -3,6 +3,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import apiClient from '@/lib/api';
 import { escapeCsvCell } from '@/lib/utils';
 import {
@@ -207,6 +211,24 @@ export default function RiskStudioPage() {
   const [volCone, setVolCone] = useState<any>(null);
   const [correlation, setCorrelation] = useState<any>(null);
 
+  // Risk Studio is a COMPOSITE of four endpoints, and it is only as fresh as
+  // its STALEST leg — the rule the backend's exporter applies to every
+  // composite (`COMPOSITE_AS_OF_SEMANTICS = "oldest_component_observation"`).
+  // Taking the newest date here would date the whole studio off whichever leg
+  // happened to be freshest, which is exactly the claim the composite rule
+  // forbids. The legs publish their freshness under different field names, so
+  // each contributes the field its own route declares.
+  const componentDates = [
+    riskContribution?.latest_observation_date,
+    tailRisk?.as_of,
+    volCone?.latest_observation_date ?? volCone?.as_of,
+    correlation?.as_of,
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  const oldestComponentDate = componentDates.length
+    ? componentDates.reduce((oldest, current) => (current < oldest ? current : oldest))
+    : null;
+  const legsReportingFreshness = componentDates.length;
+
   const fetchData = async () => {
     try {
       setError(null);
@@ -400,6 +422,26 @@ export default function RiskStudioPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance for the composite: the STALEST of its four component legs,
+          labelled with the backend's own composite policy rather than a
+          page-local paraphrase of it. */}
+      <SectionProvenance
+        section="Risk Studio"
+        asOf={oldestComponentDate}
+        asOfSemantics={
+          legsReportingFreshness === 4
+            ? 'oldest_component_observation'
+            : null
+        }
+        coverage={sectionCoverage(
+          riskContribution?.universe_coverage ?? tailRisk?.universe_coverage,
+        )}
+        warnings={[
+          ...(Array.isArray(riskContribution?.warnings) ? riskContribution.warnings : []),
+          ...(Array.isArray(tailRisk?.warnings) ? tailRisk.warnings : []),
+        ]}
+      />
 
       {error && (
         <div className="p-4 bg-rose-950/40 border border-rose-800/60 rounded-xl flex items-center space-x-3 text-rose-300 text-sm">

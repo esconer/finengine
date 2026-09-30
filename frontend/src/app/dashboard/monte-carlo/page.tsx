@@ -7,6 +7,10 @@
 
 import React, { useMemo, useState } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
 import {
   Target,
@@ -33,6 +37,16 @@ interface MonteCarloResult {
   historical_sigma_annual: number;
   student_t_df: number | null;
   disclaimer: string;
+  /**
+   * The newest delivered observation behind the fitted `mu`/`sigma`. The
+   * simulation is conditioned on this return history, so it is the date the
+   * whole fan chart rests on.
+   */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 const METHODS = [
@@ -125,6 +139,15 @@ export default function MonteCarloPage() {
           <Target className="hidden md:block w-16 h-16 text-lime-200" />
         </div>
       </div>
+
+      {/* Provenance: the return history the simulation was fitted to, and which
+          holdings were excluded from it. */}
+      <SectionProvenance
+        section="Goal probability"
+        asOf={result?.latest_observation_date ?? null}
+        coverage={sectionCoverage(result?.universe_coverage)}
+        warnings={result?.warnings ?? null}
+      />
 
       {/* Inputs */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">

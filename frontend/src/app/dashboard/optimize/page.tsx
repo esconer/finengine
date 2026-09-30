@@ -7,6 +7,10 @@
 
 import React, { useState, useMemo } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import {
   SlidersHorizontal,
@@ -75,6 +79,16 @@ interface OptimizeResult {
   trades_required_basis?: TradesRequiredBasis | null;
   data_status?: string | null;
   error?: string | null;
+  /**
+   * The newest delivered observation the common return frame was built from.
+   * The target weights are solved over the DELIVERED universe only, so this is
+   * also the freshness of the covariance matrix behind them.
+   */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 const NOT_AVAILABLE = 'N/A';
@@ -469,6 +483,15 @@ export default function OptimizePage() {
           <SlidersHorizontal className="hidden md:block w-16 h-16 text-zinc-300" />
         </div>
       </div>
+
+      {/* Provenance: the observation the target weights were solved on, and
+          which holdings were excluded from the solved universe. */}
+      <SectionProvenance
+        section="Optimizer"
+        asOf={result?.latest_observation_date ?? null}
+        coverage={sectionCoverage(result?.universe_coverage)}
+        warnings={result?.warnings ?? null}
+      />
 
       {/* Strategy Selector + Run */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700">

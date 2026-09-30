@@ -8,6 +8,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { MetricCardLoading, DataTableLoading } from '@/components/ui/LoadingState';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -253,6 +257,12 @@ interface LiquidityData {
     low_volume_pct: number;
   };
   methodology?: string;
+  /** The newest delivered daily observation the scoring was measured on. */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 type PositionLiquidity = {
@@ -638,6 +648,15 @@ export default function LiquidityPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: the observation date, coverage and warnings the route
+          already publishes for these liquidity scores. */}
+      <SectionProvenance
+        section="Liquidity"
+        asOf={liquidityData?.latest_observation_date ?? null}
+        coverage={sectionCoverage(liquidityData?.universe_coverage)}
+        warnings={liquidityData?.warnings ?? null}
+      />
 
       {/* Error State */}
       {(error || liquidityData?.error) && (

@@ -7,6 +7,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import { DataTable } from '@/components/ui/DataTable';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 
 import {
   ResponsiveContainer,
@@ -56,6 +60,19 @@ interface ConcentrationData {
   by_weight: Record<string, number>;
   by_sector: Record<string, number>;
   methodology?: string;
+  /**
+   * The route publishes `as_of: None` and `as_of_semantics: None` on this
+   * envelope, deliberately: concentration is a cross-section of live-quoted
+   * market-value weights and a quote carries a refresh instant, not an
+   * observation date. Both are declared so a reader is told there is no
+   * measurement date rather than shown a bare "N/A" with no reason.
+   */
+  as_of?: string | null;
+  as_of_semantics?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
 }
 
 interface ConcentrationMetric {
@@ -675,6 +692,16 @@ export default function ConcentrationPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: this section declares no measurement date and says why, so
+          the line states the absence rather than leaving it to be inferred. */}
+      <SectionProvenance
+        section="Concentration"
+        asOf={concentrationData?.as_of ?? null}
+        asOfSemantics={concentrationData?.as_of_semantics ?? null}
+        coverage={sectionCoverage(concentrationData?.universe_coverage)}
+        warnings={concentrationData?.warnings ?? null}
+      />
 
       {/* Error State */}
       {error && (

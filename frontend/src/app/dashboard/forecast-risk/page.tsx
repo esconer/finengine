@@ -8,6 +8,10 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
 import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
+import {
   ResponsiveContainer,
   LineChart,
   Line,
@@ -341,7 +345,17 @@ interface ForecastData {
       data_points?: number;
     }
   >;
+  // Declared exactly as the warning banner above consumes it — this task must not
+  // change what that banner renders. The route also emits `code`-keyed records
+  // (e.g. `forecast_precision_leg_refit_declined`) carrying no `ticker`/`message`;
+  // the provenance line renders those too, because its warning type accepts the
+  // record shape the banner does not model.
   warnings?: Array<{ ticker: string; data_points: number; message: string }>;
+  /** Freshness anchor published by the route: its newest delivered observation. */
+  latest_observation_date?: string | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
   model_params?: Record<string, any>;
   methodology?: string;
   error?: string;
@@ -671,6 +685,15 @@ export default function ForecastRiskPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: the freshness anchor, coverage and warnings the route
+          already publishes for these forecasts. */}
+      <SectionProvenance
+        section="Forecast risk"
+        asOf={forecastData?.latest_observation_date ?? null}
+        coverage={sectionCoverage(forecastData?.universe_coverage)}
+        warnings={forecastData?.warnings ?? null}
+      />
 
       {/* Insufficient History Warning Banner */}
       {forecastData?.warnings && forecastData.warnings.length > 0 && (

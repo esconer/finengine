@@ -7,6 +7,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import {
@@ -259,6 +263,11 @@ interface FactorData {
   };
   positions: Record<string, any>;
   warnings?: Array<{ ticker: string; data_points: number; message: string }>;
+  /** Freshness anchor published by the route: its newest delivered observation. */
+  latest_observation_date?: string | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
   r_squared?: number | null;
   adjusted_r_squared?: number | null;
   data_range?: {
@@ -577,6 +586,15 @@ export default function FactorExposurePage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: the freshness anchor, coverage and warnings the route
+          already publishes for these exposures. */}
+      <SectionProvenance
+        section="Factor exposure"
+        asOf={factorData?.latest_observation_date ?? null}
+        coverage={sectionCoverage(factorData?.universe_coverage)}
+        warnings={factorData?.warnings ?? null}
+      />
 
       {/* Factor regression error banner */}
       {hasError && (

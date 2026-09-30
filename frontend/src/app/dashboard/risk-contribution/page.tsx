@@ -8,6 +8,10 @@
 
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  SectionProvenance,
+  sectionCoverage,
+} from '@/components/provenance/SectionProvenance';
 import type { RiskContributionModelName, RiskContributionResponse } from '@/types';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
@@ -230,8 +234,24 @@ function ContributionBars({
   );
 }
 
+/**
+ * What the route publishes beyond {@link RiskContributionResponse}.
+ *
+ * The shared type in `@/types` is owned by another workstream, so the freshness
+ * fields the route actually sends are declared here rather than there. Only the
+ * provenance line reads them; nothing below reinterprets a metric.
+ */
+type RiskContributionProvenance = RiskContributionResponse & {
+  /** Newest delivered observation the decomposition was measured on. */
+  latest_observation_date?: string | null;
+  warnings?: string[] | null;
+  universe_coverage?: {
+    missing_tickers?: string[] | null;
+  } | null;
+};
+
 export default function RiskContributionPage() {
-  const [data, setData] = useState<RiskContributionResponse | null>(null);
+  const [data, setData] = useState<RiskContributionProvenance | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
@@ -383,6 +403,15 @@ export default function RiskContributionPage() {
           </div>
         </div>
       </div>
+
+      {/* Provenance: the newest delivered observation the decomposition was
+          measured on, distinct from the requested `window` above. */}
+      <SectionProvenance
+        section="Risk contribution"
+        asOf={data?.latest_observation_date ?? null}
+        coverage={sectionCoverage(data?.universe_coverage)}
+        warnings={data?.warnings ?? null}
+      />
 
       {/* Error State */}
       {error && (
