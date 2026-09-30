@@ -84,6 +84,16 @@ jobs:
       working-directory: frontend
       run: bun x tsc --noEmit
 
+    # Errors only, deliberately. `frontend/package.json`'s `lint` script is a
+    # bare `eslint` with no --max-warnings, so this command exits non-zero on
+    # errors alone. The tree currently stands at 0 errors / ~271 warnings, and
+    # that warning backlog is not clearable in one commit -- gating on warnings
+    # here would block every push for a count nobody signed up to fix, so
+    # warnings stay a report and only errors fail the build.
+    - name: Run frontend linting
+      working-directory: frontend
+      run: bun x eslint src/
+
     - name: Run frontend unit & component tests
       working-directory: frontend
       run: bun run test:run

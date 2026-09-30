@@ -15,7 +15,9 @@ import {
   FileDown
 } from 'lucide-react';
 import { useUIStore, usePortfolioStore } from '@/lib/store';
-import { ExportService, type RiskMetricsSnapshot } from '@/lib/export';
+// Type-only, so it is erased at compile time and costs no runtime edge.
+// `ExportService` is reached through `await import()` in the handler below.
+import type { RiskMetricsSnapshot } from '@/lib/export';
 import api from '@/lib/api';
 import { useNotifications } from '@/hooks/useRealTime';
 import { formatRelativeTime } from '@/components/ui/LoadingState';
@@ -99,6 +101,11 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
       // carries holdings only. A route that fails leaves its block absent and
       // the document drops that section's sentences.
       const riskMetrics = await loadRiskMetrics();
+      // Dynamic import keeps jspdf/xlsx/file-saver/recharts out of the initial
+      // chunk: the dashboard layout renders this button on every section page,
+      // so a static import made all of them download the export stack before
+      // first paint.
+      const { ExportService } = await import('@/lib/export');
       await ExportService.exportInstitutionalReviewPDF({
         positions,
         totalValue: totalVal,
