@@ -51,10 +51,12 @@ from app.services.analytics_engine import (
     FORECAST_VOL_CLIP_LOW,
     GlobalAnalyticsEngine,
     AnalyticsEngine,
+    MIN_SHARED_ROWS_FOR_CORRELATION,
     TAIL_CLIP_HIGH,
     TAIL_CLIP_LOW,
     TAIL_ES_MULTIPLIER,
     TAIL_Z_MULTIPLIER,
+    UNMEASURABLE_CORRELATION_REASON,
     UNCERTAINTY_BOOTSTRAP_RESAMPLES,
     aggregate_active_returns,
     ar1_autocorrelation,
@@ -69,6 +71,11 @@ from app.services.analytics_engine import (
     volatility_forecast_statistics,
 )
 from app.models.schemas import (
+    MarginalTradeImpactRequest,
+    MarginalTradeImpactResponse,
+    MARGINAL_FUNDING_CASH_RESIDUAL,
+    MARGINAL_FUNDING_RULE,
+    MARGINAL_FUNDING_SELL_AND_REBALANCE,
     StressTestRequest, CorrelationStabilityResponse, CointScannerResponse
 )
 from app.services.correlation_service import analyze_correlation_stability
@@ -80,6 +87,7 @@ from app.services.cointegration_service import (
     usable_observations_by_ticker,
 )
 from app.utils.allocations import (
+    MIN_SIZING_OBSERVATIONS,
     WEIGHT_NORMALIZATION_RULE,
     gross_exposure,
     normalization_block,
@@ -12446,4 +12454,851 @@ async def get_tail_risk_and_copula(
     except Exception:
         logger.error("Tail dependence request failed")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ---------------------------------------------------------------------------
+# marginal trade impact: what a PROPOSED change does to the book
+# ---------------------------------------------------------------------------
+# Every other analytics route describes the portfolio as it IS. This one takes
+# the user's real persisted weights and a hypothetical change, and publishes
+# the DELTA that change would make. The book is read through
+# `_load_portfolio_allocation` (market-value weights off the positions table)
+# and NOT through `resolve_allocation`, for a reason that is load-bearing:
+#
+#   `resolve_allocation` hard-codes `eq = 1.0 / len(ticker_list)` for any
+#   ticker absent from the positions table. A proposal to "buy X at 5%" would
+#   therefore be silently reinterpreted as "N tickers at 1/N each" -- a
+#   DIFFERENT portfolio, not a perturbation of this one, and the deltas would
+#   describe a book the user does not hold. The proposed weight is an
+#   instruction from the user; it is applied to their own numbers or not at all.
+#
+# Nothing is persisted. A proposed position is not a holding: writing one would
+# give it an `added_on`, and `effective_start` in `app/utils/holdings.py` takes
+# the INTERSECTION start across the book, so one hypothetical row would move the
+# whole book's window to a period the real holdings never occupied. Nothing is
+# written; the proposal exists for the duration of one response.
+
+#: The three states every published figure carries. Same vocabulary the
+#: risk-score correlation leg already uses (`analytics_engine.risk_scoring`:
+#: `scores[leg] = None` plus `excluded` plus a reason) and the two-row wording
+#: the engine already declares for an unmeasurable correlation.
+MARGINAL_STATE_MEASURED = "measured"
+MARGINAL_STATE_UNMEASURABLE = "unmeasurable"
+MARGINAL_STATE_NOT_ATTEMPTED = "not_attempted"
+
+#: Weight provenance. A proposed weight is user-SUPPLIED, which is neither
+#: `measured` nor `unmeasured`: it was not observed on any feed, and calling it
+#: unmeasured would hide the fact that the user asserted it. The third state
+#: exists because the existing vocabulary is load-bearing and a proposal has to
+#: be distinguishable from a missing number. This extends the pattern already
+#: established at `app/utils/allocations.py:570` (`sizing_price_provenance:
+#: str = "measured"`) rather than inventing a parallel mechanism.
+MARGINAL_WEIGHT_PROVENANCE_MEASURED = "measured"
+MARGINAL_WEIGHT_PROVENANCE_PROPOSED = "proposed"
+
+MARGINAL_WEIGHT_PROVENANCE_VOCABULARY = {
+    MARGINAL_WEIGHT_PROVENANCE_MEASURED: (
+        "derived from the persisted book: a market-value weight read off "
+        "PortfolioPosition, normalized across the book"
+    ),
+    MARGINAL_WEIGHT_PROVENANCE_PROPOSED: (
+        "supplied by the caller in this request as an intended target weight. "
+        "It was not observed on any price feed and is not a measurement of "
+        "anything; every figure derived from it inherits this provenance"
+    ),
+}
+
+MARGINAL_PROPOSAL_PROVENANCE = (
+    "user_supplied: the proposed legs and their target weights are an "
+    "instruction from the caller, not an observation. No leg here was written "
+    "to the positions table, and none was given an `added_on`."
+)
+
+#: Below this many shared sessions the book cannot produce a trustworthy delta.
+#: Declared from the constant rather than restated as a literal, so this gate
+#: cannot drift from the annualization gate every sibling route applies.
+MARGINAL_MIN_SHARED_SESSIONS = MIN_ANNUALIZE_DAYS
+
+MARGINAL_THRESHOLDS = {
+    "MIN_ANNUALIZE_DAYS": {
+        "value": MIN_ANNUALIZE_DAYS,
+        "declared_in": "app/utils/holdings.py",
+        "gates": (
+            "the number of shared return sessions the risk half needs before it "
+            "will publish a volatility / VaR / CVaR / Sharpe delta. Below it "
+            "every risk figure is refused with the count, never a number."
+        ),
+    },
+    "MIN_SIZING_OBSERVATIONS": {
+        "value": MIN_SIZING_OBSERVATIONS,
+        "declared_in": "app/utils/allocations.py",
+        "gates": (
+            "per-ticker return observations a leg needs before its own risk "
+            "characteristics may be annualized. Reported per candidate so a "
+            "short-history instrument is visible rather than silently averaged "
+            "into a book-level number."
+        ),
+    },
+    "MIN_SHARED_ROWS_FOR_CORRELATION": {
+        "value": MIN_SHARED_ROWS_FOR_CORRELATION,
+        "declared_in": "app/services/analytics_engine.py",
+        "gates": (
+            "shared finite return rows below which a pairwise Pearson "
+            "correlation is not measurable. pandas' `.corr()` is pairwise "
+            "complete and answers NaN below this floor; NaN means UNKNOWN and "
+            "is never published as 0.0, which would assert no relationship "
+            "whatsoever."
+        ),
+    },
+    "PORTFOLIO_RETURN_MIN_COVERAGE": {
+        "value": 1.0,
+        "declared_in": "app/services/analytics_engine.py",
+        "gates": (
+            "fraction of gross positive weight a date must cover before it "
+            "becomes a portfolio return. Below 1.0 the date is dropped, never "
+            "renormalised: a partial basket published under the whole book's "
+            "name is a different portfolio."
+        ),
+    },
+}
+
+#: `_build_wide_returns` raises this when the frame was built but no date on it
+#: covers the whole declared book. See the `except` in `_marginal_risk_block`.
+_MARGINAL_NO_SHARED_SESSIONS = "No active return observations"
+
+#: The units each risk figure is published in, so a delta is readable next to
+#: the levels it came from.
+MARGINAL_RISK_UNITS = {
+    "annual_volatility": "annualized_fraction_of_1",
+    "var_95": "daily_loss_fraction_of_1",
+    "cvar_95": "daily_loss_fraction_of_1",
+    "sharpe_ratio": "ratio",
+}
+
+
+def _marginal_statistic(
+    before: Any,
+    after: Any,
+    *,
+    state: str,
+    reason: Optional[str],
+    observations: Optional[int],
+) -> Dict[str, Any]:
+    """One before/after/delta figure with its state and sample, never a bare number.
+
+    `delta` is `after - before` and is null whenever either side is null, so a
+    refused side can never produce a number that reads as a measured change.
+    """
+    delta: Optional[float] = None
+    if before is not None and after is not None:
+        try:
+            delta = round(float(after) - float(before), 6)
+        except (TypeError, ValueError):
+            delta = None
+    return {
+        "before": before,
+        "after": after,
+        "delta": delta,
+        "state": state,
+        "reason": reason,
+        "observations": observations,
+    }
+
+
+def _marginal_apply_funding(
+    current: Dict[str, float],
+    legs: Mapping[str, float],
+    funding: str,
+) -> Tuple[Dict[str, float], Optional[float], Optional[str]]:
+    """Turn target weights into a full book under the named funding rule.
+
+    `sell_and_rebalance`: a named leg takes its target weight exactly, and the
+    unnamed book is scaled by `(1 - sum(targets)) / (1 - sum(current of named
+    legs))`. For a single new ticker at weight w that reduces to the book
+    scaled by `(1 - w)` -- "buy X at 5% leaves every existing position at 95%
+    of its current weight" -- because the named leg currently holds nothing.
+
+    `cash_residual`: unnamed legs keep their current weight exactly and the
+    unspent weight becomes cash. The legs then sum to less than 1, which is
+    the point: nothing was quietly reinvested.
+
+    Returns `(weights, cash_weight, refusal_reason)`. A refusal reason is
+    non-None only when the arithmetic cannot produce a book at all -- a
+    proposal that must sell more than the unnamed book holds, or that names
+    every holding so there is no unnamed remainder left to fund it.
+    """
+    named = {str(t).upper(): float(w) for t, w in legs.items()}
+    if funding == MARGINAL_FUNDING_CASH_RESIDUAL:
+        weights = {
+            str(t).upper(): float(w)
+            for t, w in current.items()
+            if float(w) > 0.0
+        }
+        # A named leg takes its target weight EXACTLY, including a target of
+        # zero. Only merging positive targets would leave a full exit sitting at
+        # its old weight: the sale would publish as if nothing had been sold.
+        for ticker, target in named.items():
+            if target > 0.0:
+                weights[ticker] = target
+            else:
+                weights.pop(ticker, None)
+        invested = float(sum(weights.values()))
+        cash = 1.0 - invested
+        if cash < -1e-9:
+            return {}, None, (
+                "the proposal asks for more weight than the book holds "
+                f"({round(invested, 6)} requested against "
+                "1.0 available), so no book can be built from it"
+            )
+        return weights, max(0.0, cash), None
+
+    # sell_and_rebalance
+    named_current = float(sum(current.get(t, 0.0) for t in named))
+    unnamed_current = 1.0 - named_current
+    target_sum = float(sum(named.values()))
+    if target_sum > 1.0 + 1e-9:
+        return {}, None, (
+            f"the proposed target weights sum to {round(target_sum, 6)}, "
+            "which is more than the whole book"
+        )
+    if unnamed_current <= 1e-9:
+        # Every holding is named, so the unnamed book is empty and cannot fund
+        # anything. The only coherent proposal is one that re-allocates the
+        # whole book and sums to 1.0 exactly.
+        if abs(target_sum - 1.0) > 1e-9:
+            return {}, None, (
+                "the proposal names every holding, so the remaining weight has "
+                f"nothing to sell ({round(target_sum, 6)} of 1.0 allocated); "
+                "name one leg less, or set `funding=cash_residual` and accept "
+                "the cash"
+            )
+        return {t: w for t, w in named.items() if w > 0.0}, None, None
+
+    scale = (1.0 - target_sum) / unnamed_current
+    weights = {
+        str(t).upper(): float(w) * scale
+        for t, w in current.items()
+        if t not in named and float(w) > 0.0
+    }
+    weights.update({t: w for t, w in named.items() if w > 0.0})
+    return weights, None, None
+
+
+def _marginal_weights_block(
+    current: Dict[str, float],
+    proposed: Dict[str, float],
+    *,
+    funding: str,
+    cash_weight: Optional[float],
+    proposed_tickers: List[str],
+) -> Dict[str, Any]:
+    """Publish the derivation so a reader can redo the arithmetic by hand.
+
+    The funding rule is the only place the proposed book can differ from
+    "current weights with some replaced", so the released weight, the scale
+    factor applied to the unnamed book, and the resulting vector are all
+    published rather than left to be inferred from `proposed_weights`.
+    """
+    total = float(sum(proposed.values()))
+    closed = total + (float(cash_weight) if cash_weight is not None else 0.0)
+    block: Dict[str, Any] = {
+        "funding": funding,
+        "funding_rule": MARGINAL_FUNDING_RULE[funding],
+        "current_weights": dict(sorted(current.items())),
+        "proposed_weights": dict(sorted(proposed.items())),
+        "current_total": round(float(sum(current.values())), 12),
+        "proposed_total": round(total, 12),
+        # Whether the rule is `sell_and_rebalance` or `cash_residual`, the whole
+        # proposed book -- legs plus cash -- must close on 1.0. Published so a
+        # reader can see that rather than assume it, and so a rule that failed
+        # to close is visible instead of looking like a smaller book.
+        "funding_residual": round(closed - 1.0, 12),
+        "cash_weight": (
+            round(float(cash_weight), 12) if cash_weight is not None else None
+        ),
+        "proposed_tickers": sorted(proposed_tickers),
+        "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+    }
+    if funding == MARGINAL_FUNDING_SELL_AND_REBALANCE:
+        # The arithmetic as numbers rather than prose, so the scaling is
+        # checkable without re-deriving it from the rule string.
+        unnamed_before = float(
+            sum(w for t, w in current.items() if t not in proposed_tickers)
+        )
+        unnamed_after = 1.0 - float(
+            sum(proposed.get(t, 0.0) for t in proposed_tickers)
+        )
+        block["unnamed_book_weight_before"] = round(unnamed_before, 12)
+        block["unnamed_book_weight_after"] = round(unnamed_after, 12)
+        block["unnamed_book_scale_factor"] = (
+            round(unnamed_after / unnamed_before, 12)
+            if unnamed_before > 0 else None
+        )
+    return block
+
+
+def _marginal_concentration_block(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    proposed_tickers: List[str],
+) -> Dict[str, Any]:
+    """Before / after / delta for the four concentration figures and per leg.
+
+    Pure arithmetic on a weights dict, so this half needs no price history and
+    no adapter. The delta is the answer: "new HHI 0.34" is a level, "0.29 ->
+    0.34, +0.05" is a decision.
+
+    `by_weight` contribution share is published per leg before AND after,
+    because "which position absorbed the change" is the second question a buyer
+    asks right after "did I get more concentrated".
+    """
+    def _measured(mapping: Any) -> bool:
+        """Did the engine actually measure this book, or did it publish an empty?
+
+        `concentration_analysis` answers `{}`-for-an-empty book with
+        `_empty_concentration`, which carries `error` and `n_holdings: 0`. Its
+        zeroed indices are an ABSENCE wearing a measurement's clothes, so the
+        block below reports `unmeasurable` rather than forwarding them as a
+        change in concentration.
+        """
+        if not isinstance(mapping, Mapping):
+            return False
+        if mapping.get("error"):
+            return False
+        count = mapping.get("n_holdings")
+        return isinstance(count, int) and not isinstance(count, bool) and count > 0
+
+    def _share(mapping: Any, ticker: str, measured: bool) -> Optional[float]:
+        """A leg's share of the book: 0.0 when it is absent, null when unmeasured.
+
+        A ticker the book does not hold has a share of exactly 0.0 -- that is a
+        measurement, not a gap, and publishing it as null would say the share is
+        unknown when the engine has just told us the book is 60% one name.
+        Null is reserved for a book that was not measured at all.
+        """
+        weights = mapping.get("by_weight") if isinstance(mapping, Mapping) else None
+        if not isinstance(weights, Mapping) or ticker not in weights:
+            return 0.0 if measured else None
+        try:
+            return round(float(weights[ticker]), 6)
+        except (TypeError, ValueError):
+            return None
+
+    before_measured = _measured(before)
+    after_measured = _measured(after)
+    if not (before_measured and after_measured):
+        failed = [
+            side for side, ok in (("before", before_measured), ("after", after_measured))
+            if not ok
+        ]
+        reason = (
+            "concentration_analysis measured no book for the "
+            f"{' and '.join(failed)} side(s) of the proposal "
+            f"({(before if not before_measured else after).get('error') or 'empty weights'}), "
+            "so no concentration delta exists; the zeroes in that result are an "
+            "absent book, not a measured index"
+        )
+        return {
+            "state": MARGINAL_STATE_UNMEASURABLE,
+            "reason": reason,
+            "metrics": {},
+            "by_leg": {},
+            "before": dict(before) if isinstance(before, Mapping) else {},
+            "after": dict(after) if isinstance(after, Mapping) else {},
+            "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+            "proposed_tickers": sorted(proposed_tickers),
+            "basis": (
+                "concentration_analysis(weights) needs only a weights dict, so "
+                "this half needs no price history and no adapter. It is "
+                "refused here only because one of the two books was empty."
+            ),
+        }
+
+    holdings = after.get("n_holdings")
+    observations = (
+        int(holdings)
+        if isinstance(holdings, int) and not isinstance(holdings, bool)
+        else None
+    )
+    metrics: Dict[str, Any] = {}
+    for key, units in (
+        ("herfindahl_index", "sum_of_squared_weights"),
+        ("effective_positions", "count_of_effective_positions"),
+        ("top_3", "fraction_of_weight"),
+        ("diversification_score", "index_0_to_100"),
+    ):
+        entry = _marginal_statistic(
+            before.get(key), after.get(key),
+            state=MARGINAL_STATE_MEASURED,
+            reason=None,
+            observations=observations,
+        )
+        entry["units"] = units
+        metrics[key] = entry
+
+    by_leg: Dict[str, Any] = {}
+    tickers = sorted(
+        set(before.get("by_weight") or {}) | set(after.get("by_weight") or {})
+    )
+    for ticker in tickers:
+        entry = _marginal_statistic(
+            _share(before, ticker, before_measured),
+            _share(after, ticker, after_measured),
+            state=MARGINAL_STATE_MEASURED,
+            reason=None,
+            observations=None,
+        )
+        entry["contribution_units"] = "fraction_of_total_weight"
+        # A leg whose target weight the caller asserted is not a measured
+        # weight, and the indices above are computed FROM these, so the
+        # assumption has to reach the per-leg line and not stop at the input.
+        entry["weight_provenance"] = (
+            MARGINAL_WEIGHT_PROVENANCE_PROPOSED
+            if ticker in proposed_tickers
+            else MARGINAL_WEIGHT_PROVENANCE_MEASURED
+        )
+        by_leg[ticker] = entry
+
+    return {
+        "state": MARGINAL_STATE_MEASURED,
+        "reason": None,
+        "metrics": metrics,
+        "by_leg": by_leg,
+        "before": dict(before),
+        "after": dict(after),
+        "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+        "proposed_tickers": sorted(proposed_tickers),
+        "basis": (
+            "concentration_analysis(weights) over the current book and over the "
+            "book with the proposal applied. It is arithmetic on the weights "
+            "dict alone: no price history is read and no adapter is involved, "
+            "so this half is always measurable for a non-empty book. Legs "
+            "marked `proposed` carry a user-supplied weight, and every index "
+            "above is computed from a vector that contains them."
+        ),
+    }
+
+
+def _returns_frame_to_prices(returns_df: pd.DataFrame) -> pd.DataFrame:
+    """Rebase a complete-case RETURN frame into the PRICE frame the engine takes.
+
+    `calculate_portfolio_metrics` differentiates its input, so a strictly
+    positive index of the same shape returns exactly the same rows back. This is
+    a rebasing of an already-measured return series, not a reconstruction of
+    prices: nothing here invents a price, a level, or a return.
+    """
+    return (1.0 + returns_df).cumprod() * 100.0
+
+
+async def _marginal_risk_block(
+    current: Dict[str, float],
+    proposed: Dict[str, float],
+    tickers: List[str],
+    *,
+    start: str,
+    end: str,
+    data_service: DataService,
+    analytics_engine: AnalyticsEngine,
+) -> Dict[str, Any]:
+    """Before / after / delta for volatility, VaR, CVaR and Sharpe -- or a refusal.
+
+    Both books are measured on the SAME wide return frame, so the delta is a
+    difference of two readings over one sample rather than two samples. The
+    frame is the union of the current book and the proposal, and `holdings` is
+    deliberately NOT passed: a proposal is a hypothetical, and
+    `app/utils/holdings.py` documents the hypothetical tools as the case where
+    the holding window is not applied. That choice is also what makes trap two
+    structural rather than a promise -- a proposed leg has no `added_on` because
+    nothing was written, so it cannot enter `effective_start`'s intersection and
+    move the real holdings' window. The before-state here is therefore the book
+    measured on exchange history, not the book measured over its holding
+    tenure, and `history_window` publishes the frame that was actually used.
+
+    Refusal is the honest answer and this half is allowed to give it. A
+    candidate with three weeks of history, or with no overlapping period
+    against the holdings, cannot produce a trustworthy delta, and publishing
+    0.0 for an unmeasured change would be indistinguishable from a measured one.
+    """
+    def _refuse(state: str, reason: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "reason": reason,
+            "shared_sessions": None,
+            "minimum_shared_sessions_required": MARGINAL_MIN_SHARED_SESSIONS,
+            "metrics": {
+                key: {
+                    **_marginal_statistic(
+                        None, None, state=state, reason=reason, observations=None,
+                    ),
+                    "units": units,
+                }
+                for key, units in MARGINAL_RISK_UNITS.items()
+            },
+            "per_ticker_return_observations": {},
+            "thresholds": MARGINAL_THRESHOLDS,
+            "basis": (
+                "calculate_portfolio_metrics over one shared wide return frame. "
+                "No delta is published here: a number that cannot be measured "
+                "is absent plus a reason, never zero."
+            ),
+        }
+
+    if not current:
+        return _refuse(
+            MARGINAL_STATE_NOT_ATTEMPTED,
+            "the current book has no active weights, so there is no before-state "
+            "to compare a proposal against",
+        )
+
+    try:
+        returns_df, _port_ret, _coverage = await _build_wide_returns(
+            tickers, proposed, start, end, data_service,
+        )
+    except ValueError as exc:
+        # `_build_wide_returns` raises once the frame EXISTS but no date on it
+        # covers the whole declared book -- that is a MEASUREMENT that came
+        # back too small, not one that was never attempted, and a reader is
+        # owed the count. The distinction is made on the helper's own message
+        # because it is the only place that knows which of its gates fired; if
+        # the message ever changes this degrades to `not_attempted`, which is
+        # the safe direction (a refusal, never a fabricated number).
+        if _MARGINAL_NO_SHARED_SESSIONS in str(exc):
+            return {
+                **_refuse(
+                    MARGINAL_STATE_UNMEASURABLE,
+                    f"0 shared return sessions on the complete-case frame, below "
+                    f"the {MARGINAL_MIN_SHARED_SESSIONS} required to annualize "
+                    f"(MIN_ANNUALIZE_DAYS): {_build_wide_returns.__name__} "
+                    f"published no date on which the whole declared book traded "
+                    f"({exc})",
+                ),
+                "shared_sessions": 0,
+                "per_ticker_return_observations": {},
+                "tickers_below_minimum_sample": [],
+            }
+        return _refuse(
+            MARGINAL_STATE_NOT_ATTEMPTED,
+            "no usable return frame for this universe over the requested "
+            f"window: {exc}",
+        )
+
+    if returns_df is None or returns_df.empty:
+        return _refuse(
+            MARGINAL_STATE_NOT_ATTEMPTED,
+            "the delivered return frame is empty, so no before or after reading "
+            "exists",
+        )
+
+    # Per-ticker counts are read off the frame the risk figures are measured
+    # on. A short-history candidate is named here rather than averaged into a
+    # book-level number that hides it.
+    per_ticker = {
+        str(ticker): int(returns_df[ticker].notna().sum())
+        for ticker in returns_df.columns
+    }
+    short = sorted(
+        ticker for ticker, count in per_ticker.items()
+        if count < MIN_SIZING_OBSERVATIONS
+    )
+
+    # Both books over the SAME rows. Restricting the frame to the complete-case
+    # intersection is what makes the delta a delta; measuring each book over its
+    # own longest window would compare a 90-session before against a
+    # 250-session after and call the difference a change in risk.
+    complete = returns_df.dropna(how="any")
+    shared = int(len(complete))
+    shortest = ", ".join(f"{t}={per_ticker[t]}" for t in short) or "none"
+    if shared < MARGINAL_MIN_SHARED_SESSIONS:
+        return {
+            **_refuse(
+                MARGINAL_STATE_UNMEASURABLE,
+                f"{shared} shared return sessions on the complete-case frame, "
+                f"below the {MARGINAL_MIN_SHARED_SESSIONS} required to "
+                f"annualize (MIN_ANNUALIZE_DAYS). Legs below the "
+                f"{MIN_SIZING_OBSERVATIONS}-session per-leg minimum: {shortest}",
+            ),
+            "shared_sessions": shared,
+            "per_ticker_return_observations": per_ticker,
+            "tickers_below_minimum_sample": short,
+        }
+
+    frame = _returns_frame_to_prices(complete)
+    before_metrics = await analytics_engine.calculate_portfolio_metrics(
+        frame, current,
+    )
+    after_metrics = await analytics_engine.calculate_portfolio_metrics(
+        frame, proposed,
+    )
+
+    engine_error = None
+    for measured in (before_metrics, after_metrics):
+        if isinstance(measured, Mapping) and measured.get("error"):
+            engine_error = str(measured.get("error"))
+    if engine_error:
+        return {
+            **_refuse(
+                MARGINAL_STATE_UNMEASURABLE,
+                "calculate_portfolio_metrics published no measurement on this "
+                f"frame: {engine_error}",
+            ),
+            "shared_sessions": shared,
+            "per_ticker_return_observations": per_ticker,
+            "tickers_below_minimum_sample": short,
+        }
+
+    def _value(measured: Any, key: str) -> Optional[float]:
+        if not isinstance(measured, Mapping):
+            return None
+        value = measured.get(key)
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(number, 6) if math.isfinite(number) else None
+
+    metrics_out: Dict[str, Any] = {}
+    for key, units in MARGINAL_RISK_UNITS.items():
+        before_value = _value(before_metrics, key)
+        after_value = _value(after_metrics, key)
+        # A figure with a null side cannot claim `measured`. Publishing
+        # `state: measured` beside a null is precisely the ambiguity this
+        # payload exists to remove: the reader cannot tell an absent value from
+        # a measured one, and a null delta cannot be acted on.
+        if before_value is None or after_value is None:
+            entry = _marginal_statistic(
+                before_value, after_value,
+                state=MARGINAL_STATE_UNMEASURABLE,
+                reason=(
+                    f"calculate_portfolio_metrics published no {key} for the "
+                    + (
+                        "before" if before_value is None else "after"
+                    )
+                    + " book on this frame, so no delta exists; it is unknown, "
+                    "not zero"
+                ),
+                observations=shared,
+            )
+        else:
+            entry = _marginal_statistic(
+                before_value, after_value,
+                state=MARGINAL_STATE_MEASURED, reason=None, observations=shared,
+            )
+        entry["units"] = units
+        if key in ("var_95", "cvar_95", "annual_volatility"):
+            # A delta in fractions is unreadable next to a delta in points.
+            entry["delta_percentage_points"] = (
+                None if entry["delta"] is None
+                else round(entry["delta"] * 100.0, 4)
+            )
+        metrics_out[key] = entry
+
+    return {
+        "state": MARGINAL_STATE_MEASURED,
+        "reason": None,
+        "shared_sessions": shared,
+        "minimum_shared_sessions_required": MARGINAL_MIN_SHARED_SESSIONS,
+        "metrics": metrics_out,
+        "per_ticker_return_observations": per_ticker,
+        "tickers_below_minimum_sample": short,
+        "thresholds": MARGINAL_THRESHOLDS,
+        "history_window": _history_window(start, end, complete),
+        "basis": (
+            "calculate_portfolio_metrics(price_frame, weights) is called twice "
+            "on ONE price frame derived from the complete-case intersection of "
+            "the union return frame, so before and after are two readings over "
+            "identical sessions. The frame is union(current book, proposal); "
+            "proposed tickers carry no holding date, so they cannot mask the "
+            "book to a window it never occupied."
+        ),
+        "unmeasurable_correlation_reason": UNMEASURABLE_CORRELATION_REASON,
+    }
+
+
+@router.post(
+    "/marginal-trade-impact",
+    response_model=MarginalTradeImpactResponse,
+)
+async def post_marginal_trade_impact(
+    request: MarginalTradeImpactRequest,
+    db: AsyncSession = Depends(get_db_session),
+    data_service: DataService = Depends(get_data_service),
+    analytics_engine: AnalyticsEngine = Depends(get_analytics_engine),
+) -> Dict[str, Any]:
+    """What a PROPOSED change does to the portfolio's concentration and risk.
+
+    Publishes before, after and DELTA for the concentration indices and for
+    annualised volatility, VaR, CVaR and Sharpe. Every figure carries an
+    explicit state; an unmeasurable one is `null` plus a reason and is never a
+    zero, and the risk half refuses outright when the shared sample is too
+    short to support a delta.
+
+    The proposed book is arithmetic on the caller's own persisted weights. It
+    is not persisted: a hypothetical position is not a holding, and an
+    `added_on` written for one would move the effective start of every real
+    holding through `effective_start`'s intersection semantics.
+    """
+    legs = {leg.ticker: float(leg.target_weight) for leg in request.legs}
+    proposed_tickers = sorted(legs)
+    funding = request.funding
+
+    def _refusal(reason: str, current: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        # `current_weights` is a MEASUREMENT of the persisted book, not part of
+        # the proposal, so it is published even on a refusal: a reader told
+        # "your proposal names every holding" needs to see which holdings.
+        return {
+            "proposal_provenance": MARGINAL_PROPOSAL_PROVENANCE,
+            "funding_rule": MARGINAL_FUNDING_RULE[funding],
+            "current_weights": dict(sorted((current or {}).items())),
+            "proposed_weights": {},
+            "cash_weight": None,
+            "funding_residual": None,
+            "concentration": {
+                "state": MARGINAL_STATE_NOT_ATTEMPTED,
+                "reason": reason,
+                "metrics": {},
+                "by_leg": {},
+                "before": {},
+                "after": {},
+                "proposed_tickers": proposed_tickers,
+                "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+                "basis": (
+                    "concentration_analysis(weights) needs only a weights dict, "
+                    "but with no current book there is no before-state and no "
+                    "delta could be stated."
+                ),
+            },
+            "risk": {
+                "state": MARGINAL_STATE_NOT_ATTEMPTED,
+                "reason": reason,
+                "shared_sessions": None,
+                "minimum_shared_sessions_required": MARGINAL_MIN_SHARED_SESSIONS,
+                "metrics": {},
+                "per_ticker_return_observations": {},
+                "thresholds": MARGINAL_THRESHOLDS,
+            },
+            "disclosure": {
+                "proposal_provenance": MARGINAL_PROPOSAL_PROVENANCE,
+                "persisted": False,
+                "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+                "thresholds": MARGINAL_THRESHOLDS,
+                "states": (
+                    MARGINAL_STATE_MEASURED,
+                    MARGINAL_STATE_UNMEASURABLE,
+                    MARGINAL_STATE_NOT_ATTEMPTED,
+                ),
+                "minimum_shared_sessions_required": MARGINAL_MIN_SHARED_SESSIONS,
+                "resolved_from": (
+                    "the persisted book via _load_portfolio_allocation"
+                ),
+                "resolved_via_resolve_allocation": False,
+            },
+            "universe_coverage": _universe_coverage([], []),
+            "data_status": DATA_STATUS_UNAVAILABLE,
+            "error": reason,
+        }
+
+    # The user's OWN weights. `resolve_allocation` is deliberately not used: it
+    # assigns 1/N to any ticker absent from the positions table, which would
+    # turn "buy X at 5%" into a different portfolio rather than a perturbation
+    # of this one.
+    raw_weights = await _load_portfolio_allocation(db)
+    current = {
+        str(ticker).upper(): float(weight)
+        for ticker, weight in (raw_weights or {}).items()
+        if math.isfinite(float(weight)) and float(weight) > 0.0
+    }
+    if not current:
+        return _refusal(
+            "No portfolio positions found: a marginal impact is a difference "
+            "between the book as it is and the book as proposed, and there is "
+            "no book to differ from"
+        )
+
+    proposed, cash_weight, funding_refusal = _marginal_apply_funding(
+        current, legs, funding,
+    )
+    if funding_refusal:
+        return _refusal(funding_refusal, current)
+
+    proposed_tickers_all = sorted(set(current) | set(proposed))
+    coverage = _universe_coverage(
+        proposed_tickers_all, proposed_tickers_all,
+        active=_active_weight_tickers(proposed),
+    )
+
+    concentration_before = await analytics_engine.concentration_analysis(current)
+    concentration_after = await analytics_engine.concentration_analysis(proposed)
+    concentration = _marginal_concentration_block(
+        concentration_before, concentration_after,
+        proposed_tickers=proposed_tickers,
+    )
+
+    # Anchored to the clock, never to a fixture date: the window is a request
+    # and the delivered frame is the evidence that answers it.
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (
+        datetime.now() - timedelta(days=int(request.history_days))
+    ).strftime("%Y-%m-%d")
+    risk = await _marginal_risk_block(
+        current, proposed, proposed_tickers_all,
+        start=start, end=end,
+        data_service=data_service, analytics_engine=analytics_engine,
+    )
+
+    weights_block = _marginal_weights_block(
+        current, proposed,
+        funding=funding,
+        cash_weight=cash_weight,
+        proposed_tickers=proposed_tickers,
+    )
+
+    status = (
+        _data_status(coverage)
+        if risk["state"] == MARGINAL_STATE_MEASURED
+        else DATA_STATUS_PARTIAL
+    )
+
+    return {
+        "proposal_provenance": MARGINAL_PROPOSAL_PROVENANCE,
+        "funding_rule": MARGINAL_FUNDING_RULE[funding],
+        "current_weights": weights_block["current_weights"],
+        "proposed_weights": weights_block["proposed_weights"],
+        "cash_weight": weights_block["cash_weight"],
+        "funding_residual": weights_block["funding_residual"],
+        "concentration": concentration,
+        "risk": risk,
+        "disclosure": {
+            "proposal_provenance": MARGINAL_PROPOSAL_PROVENANCE,
+            "persisted": False,
+            "persistence_note": (
+                "no PortfolioPosition row is created, updated or deleted by this "
+                "route, and no `added_on` is written for a proposed leg. A "
+                "hypothetical is not a holding: an `added_on` would enter "
+                "`effective_start`'s intersection and mask every real holding "
+                "to a window that never existed."
+            ),
+            "funding_rule": MARGINAL_FUNDING_RULE[funding],
+            "weight_derivation": weights_block,
+            "weight_provenance_vocabulary": MARGINAL_WEIGHT_PROVENANCE_VOCABULARY,
+            "thresholds": MARGINAL_THRESHOLDS,
+            "states": (
+                MARGINAL_STATE_MEASURED,
+                MARGINAL_STATE_UNMEASURABLE,
+                MARGINAL_STATE_NOT_ATTEMPTED,
+            ),
+            "minimum_shared_sessions_required": MARGINAL_MIN_SHARED_SESSIONS,
+            "history_window": risk.get("history_window"),
+            "resolved_from": (
+                "the persisted book via _load_portfolio_allocation (market-value "
+                "weights off PortfolioPosition)"
+            ),
+            "resolved_via_resolve_allocation": False,
+        },
+        "universe_coverage": coverage,
+        "data_status": status,
+        "error": None,
+    }
 

@@ -877,3 +877,123 @@ class CustomScreenRequest(BaseModel):
     max_stocks: Optional[int] = Field(default=50, ge=5, le=100)
 
 
+# ---------------------------------------------------------------------------
+# Marginal trade impact: what a PROPOSED change does to the book
+# ---------------------------------------------------------------------------
+# Everything published so far describes the portfolio as it IS. This request
+# describes a change the user is contemplating, so every weight it carries is
+# an instruction rather than a measurement, and the response has to say so.
+#
+# `target_weight` is a TARGET, not a trade size: 0.05 means "this position
+# should be 5% of the book after the change". That is the only form in which
+# "buy X at 5%" is unambiguous - a trade size in currency needs a portfolio
+# value this endpoint does not have and does not ask for. The funding rule is
+# named, never inferred (see `funding`).
+MARGINAL_FUNDING_SELL_AND_REBALANCE = "sell_and_rebalance"
+MARGINAL_FUNDING_CASH_RESIDUAL = "cash_residual"
+MARGINAL_FUNDING_RULES = (
+    MARGINAL_FUNDING_SELL_AND_REBALANCE,
+    MARGINAL_FUNDING_CASH_RESIDUAL,
+)
+
+#: The one funding rule, stated as the arithmetic a reader can redo by hand.
+MARGINAL_FUNDING_RULE = {
+    MARGINAL_FUNDING_SELL_AND_REBALANCE: (
+        "A named leg's `target_weight` is its weight in the book AFTER the "
+        "change, funded by selling down the legs you did not name in "
+        "proportion to their current weights. A named leg that is not currently "
+        "held has no weight to sell, so the whole book is scaled by "
+        "(1 - target_weight) and the named leg takes exactly `target_weight`: "
+        "'buy X at 5%' leaves every existing position at 95% of its current "
+        "weight. Named legs are applied first, so their sum may not exceed "
+        "what the unnamed book can release."
+    ),
+    MARGINAL_FUNDING_CASH_RESIDUAL: (
+        "A named leg's `target_weight` is its weight in the book AFTER the "
+        "change, funded by holding the difference as cash rather than "
+        "reallocating it. A leg you did not name keeps its current weight "
+        "exactly, and any weight the book no longer spends is published as "
+        "`cash_weight`; the sum of every leg plus `cash_weight` is 1.0. Use "
+        "this when the money is genuinely leaving the book - otherwise "
+        "`sell_and_rebalance` is the rule you want, because cash is not a "
+        "diversifying asset."
+    ),
+}
+
+
+class ProposedLegRequest(BaseModel):
+    """One proposed position: a ticker and the weight it should carry after.
+
+    `target_weight` is user-SUPPLIED. It is a target, so the response tags
+    every figure derived from it `proposed` provenance rather than letting it
+    read as a measurement of the book.
+    """
+
+    ticker: str = Field(..., min_length=1, max_length=20)
+    target_weight: float = Field(..., ge=0.0, le=1.0, allow_inf_nan=False)
+
+    @validator("ticker", pre=True)
+    def normalize_ticker(cls, value):
+        return str(value or "").strip().upper()
+
+
+class MarginalTradeImpactRequest(BaseModel):
+    """A hypothetical change to the book, scored for what it does to risk.
+
+    Nothing here is persisted: a proposed position is not a holding, and a
+    holding written for a hypothetical would be given an `added_on` that moves
+    the whole book's effective start.
+    """
+
+    legs: List[ProposedLegRequest] = Field(..., min_length=1, max_length=50)
+    # Named rather than defaulted. "Buy X at 5%" does not say where the 5%
+    # comes from, and silently picking a funding rule is exactly the rescaling
+    # the caller did not ask for. `cash_residual` for money leaving the book.
+    funding: str = Field(default=MARGINAL_FUNDING_SELL_AND_REBALANCE)
+    history_days: int = Field(default=365, ge=30, le=3650)
+
+    @validator("funding", pre=True)
+    def normalize_funding(cls, value):
+        normalized = str(value or "").strip().lower()
+        if normalized not in MARGINAL_FUNDING_RULES:
+            raise ValueError(
+                f"funding must be one of {', '.join(MARGINAL_FUNDING_RULES)}"
+            )
+        return normalized
+
+    @validator("legs")
+    def unique_leg_tickers(cls, legs):
+        tickers = [leg.ticker for leg in legs]
+        duplicates = sorted({t for t in tickers if tickers.count(t) > 1})
+        if duplicates:
+            raise ValueError(
+                f"a ticker may appear at most once in a proposal: "
+                f"{', '.join(duplicates)}"
+            )
+        return legs
+
+
+class MarginalTradeImpactResponse(BaseModel):
+    """Before / after / delta for a PROPOSED change, with refusals named.
+
+    A level is never the answer: every figure carries `before`, `after` and
+    `delta`. Every figure also carries a `state` from the closed vocabulary
+    `measured` / `unmeasurable` / `not_attempted` and, when it is not
+    `measured`, a `reason`. An absent value is `null` plus a reason; it is
+    never a zero and never a stand-in number.
+    """
+
+    proposal_provenance: str
+    funding_rule: str
+    current_weights: Dict[str, float]
+    proposed_weights: Dict[str, float]
+    cash_weight: Optional[float] = None
+    funding_residual: Optional[float] = None
+    concentration: Dict[str, Any]
+    risk: Dict[str, Any]
+    disclosure: Dict[str, Any]
+    universe_coverage: Dict[str, Any]
+    data_status: str = "available"
+    error: Optional[str] = None
+
+
