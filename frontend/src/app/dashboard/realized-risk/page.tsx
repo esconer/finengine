@@ -6,7 +6,11 @@
 
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
+import type {
+  InstrumentRiskPositionRow,
+  RealizedRiskPositionRow,
+} from '@/lib/api';
 import { usePortfolioAnalytics, usePerformanceData } from '@/hooks/useAnalytics';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
 import { CSVExporter } from '@/lib/export';
@@ -21,6 +25,7 @@ import {
   resolveTickerStart,
   resolveWindowStart,
   startQualifier,
+  type AnalyticsStartSource,
   type HistoryCoverage,
 } from '@/lib/historyFormat';
 import {
@@ -45,6 +50,24 @@ import {
   Shield,
   Target,
 } from 'lucide-react';
+
+/**
+ * One rendered position row: an instrument-risk (full exchange history) row or
+ * a holding-period row, plus the provenance the route derives. Both source
+ * shapes are unions of nullable metrics — a withheld ratio is ABSENT, never 0 —
+ * so every numeric field here is nullable and each cell must guard before use.
+ */
+type PositionRiskRow = Partial<
+  Omit<RealizedRiskPositionRow, 'ticker'> & Omit<InstrumentRiskPositionRow, 'ticker'>
+> & {
+  ticker: string;
+  weight?: number;
+  analytics_start: string | null;
+  analytics_start_source: AnalyticsStartSource;
+  stored_added_on: string | null;
+  is_limited_history: boolean;
+  history_warning: string | null;
+};
 
 export default function RealizedRiskPage() {
   const [loading, setLoading] = useState(false);
@@ -117,7 +140,7 @@ export default function RealizedRiskPage() {
 
   // Generate position risk data for table. Derived, never stored in state: a
   // state round-trip here would re-run on every store snapshot change.
-  const positionData = React.useMemo(() => {
+  const positionData = React.useMemo<PositionRiskRow[]>(() => {
     if (!realizedRisk?.positions) return [];
     // DSP-10: per-position risk rows come from the FULL-history
     // instrument_risk block; holding-period data stays in realizedRisk.positions.
@@ -126,7 +149,7 @@ export default function RealizedRiskPage() {
     // Limited-history status is that position's OWN measured sample: a
     // portfolio-sized count must never make a 20-observation leg look like
     // full history, and the route's honest warning (when present) is kept.
-    return Object.entries(source).map(([ticker, data]: [string, any]) => {
+    return Object.entries(source).map(([ticker, data]) => {
       const start = resolveTickerStart(
         realizedRisk.history_coverage?.tickers?.[ticker],
         storedAddedOnByTicker[ticker],
@@ -139,7 +162,10 @@ export default function RealizedRiskPage() {
         analytics_start_source: start.source,
         stored_added_on: start.storedAddedOn,
         is_limited_history: isOwnHistoryLimited(data),
-        history_warning: data?.history_warning ?? describeOwnHistory(data),
+        // Only the holding-period row carries a route-published warning; the
+        // full-history row publishes none, so it falls back to the derived text.
+        history_warning:
+          ('history_warning' in data ? data.history_warning : null) ?? describeOwnHistory(data),
       };
     });
   }, [realizedRisk, storedAddedOnByTicker]);
@@ -169,12 +195,12 @@ export default function RealizedRiskPage() {
   };
 
   // DataTable columns
-  const positionColumns = [
+  const positionColumns: DataTableColumn<PositionRiskRow>[] = [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="flex items-center space-x-2">
             <span className="font-semibold text-gray-900 dark:text-white">
@@ -200,8 +226,8 @@ export default function RealizedRiskPage() {
     {
       header: 'Weight',
       accessorKey: 'weight',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-mono text-gray-900 dark:text-white">
             {formatPercentage(data.weight)}
@@ -212,8 +238,8 @@ export default function RealizedRiskPage() {
     {
       header: 'Total Return (Full History)',
       accessorKey: 'total_return',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const ret = data.total_return ?? data.annual_return;
         if (ret == null) {
           return <div className="font-mono text-gray-400">N/A</div>;
@@ -229,8 +255,8 @@ export default function RealizedRiskPage() {
     {
       header: 'Volatility',
       accessorKey: 'annual_volatility',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-mono text-gray-900 dark:text-white">
             {formatPercentage(data.annual_volatility)}
@@ -241,8 +267,8 @@ export default function RealizedRiskPage() {
     {
       header: 'Sharpe Ratio',
       accessorKey: 'sharpe_ratio',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         if (data.is_limited_history || data.annualized === false) {
           return (
             <div className="font-mono text-xs text-amber-600 dark:text-amber-400" title="Insufficient data (<30d) for annualized Sharpe ratio">
@@ -250,12 +276,33 @@ export default function RealizedRiskPage() {
             </div>
           );
         }
+        // A withheld ratio is ABSENT, not zero, so it may not be banded.
+        // `null >= 1` is false and `null >= 0` is TRUE, so an unguarded null
+        // falls into the yellow 0-1 band below and reads exactly like a
+        // measured sub-1.0 Sharpe — while `undefined` falls to red, so the
+        // two spellings of "absent" render as different verdicts. Gate on
+        // nullish before the band and render neutral, like the other
+        // absent-value cells on this page. The engine withholds this field
+        // below 10 return observations with a stated reason, so a null here is
+        // a measurement that was refused, never a zero.
+        const sharpe = data.sharpe_ratio;
+        const measured = typeof sharpe === 'number' && !Number.isNaN(sharpe);
+        if (!measured) {
+          return (
+            <div
+              className="font-mono text-gray-400"
+              title="Not measured — insufficient return observations to annualize"
+            >
+              {formatRatio(null)}
+            </div>
+          );
+        }
         return (
           <div className={`font-mono font-medium ${
-            data.sharpe_ratio >= 1 ? 'text-green-600 dark:text-green-400' :
-            data.sharpe_ratio >= 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400'
+            sharpe >= 1 ? 'text-green-600 dark:text-green-400' :
+            sharpe >= 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400'
           }`}>
-            {formatRatio(data.sharpe_ratio)}
+            {formatRatio(sharpe)}
           </div>
         );
       },
@@ -263,8 +310,8 @@ export default function RealizedRiskPage() {
     {
       header: 'Max Drawdown',
       accessorKey: 'max_drawdown',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-mono text-red-600 dark:text-red-400">
             {formatPercentage(data.max_drawdown)}
@@ -275,8 +322,8 @@ export default function RealizedRiskPage() {
     {
       header: 'VaR (95%)',
       accessorKey: 'var_95',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-mono text-red-600 dark:text-red-400">
             {formatPercentage(data.var_95)}
@@ -291,7 +338,9 @@ export default function RealizedRiskPage() {
   const fullHistory = realizedRisk?.instrument_risk?.portfolio;
 
   // Phase 2 disclosure: one summary banner for the holding-intersection window.
-  const coverage = realizedRisk?.history_coverage as HistoryCoverage | undefined;
+  // The envelope types this block, so the cast to the shared vocabulary is no
+  // longer load-bearing — `HistoryCoverage` is a subset of what the route sends.
+  const coverage: HistoryCoverage | undefined = realizedRisk?.history_coverage;
   const coverageWarnings = realizedRisk?.warnings || [];
   const intersection = coverage?.intersection_start || coverage?.effective_start;
   const coveredDays = coverage?.covered_days ?? coverageWarnings[0]?.data_points;
@@ -382,7 +431,7 @@ export default function RealizedRiskPage() {
             </button>
             {showCoverageDetail && (
               <div data-testid="coverage-details" className="text-amber-800 dark:text-amber-300 mt-2 space-y-1">
-                {coverageWarnings.map((w: any, idx: number) => {
+                {coverageWarnings.map((w, idx: number) => {
                   // Both the route's message and the derived detail lead with
                   // the ticker, so the bullet is not prefixed a second time.
                   const own = w.message ?? perTickerDetail(
@@ -455,25 +504,25 @@ export default function RealizedRiskPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard
           title="Max Drawdown"
-          value={hasData && realizedRisk?.portfolio?.max_drawdown !== undefined ? formatPercentage(realizedRisk.portfolio.max_drawdown) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.max_drawdown != null ? formatPercentage(realizedRisk.portfolio.max_drawdown) : 'N/A'}
           icon={TrendingDown}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Value at Risk (95% Daily)"
-          value={hasData && realizedRisk?.portfolio?.var_95 !== undefined ? formatPercentage(realizedRisk.portfolio.var_95) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.var_95 != null ? formatPercentage(realizedRisk.portfolio.var_95) : 'N/A'}
           icon={AlertTriangle}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Conditional VaR (95% Daily)"
-          value={hasData && realizedRisk?.portfolio?.cvar_95 !== undefined ? formatPercentage(realizedRisk.portfolio.cvar_95) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.cvar_95 != null ? formatPercentage(realizedRisk.portfolio.cvar_95) : 'N/A'}
           icon={Shield}
           loading={analyticsLoading}
         />
         <MetricCard
           title="Hit Ratio (% Positive Days)"
-          value={hasData && realizedRisk?.portfolio?.hit_ratio !== undefined ? formatPercentage(realizedRisk.portfolio.hit_ratio) : 'N/A'}
+          value={hasData && realizedRisk?.portfolio?.hit_ratio != null ? formatPercentage(realizedRisk.portfolio.hit_ratio) : 'N/A'}
           icon={Activity}
           loading={analyticsLoading}
         />

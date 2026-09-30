@@ -4,12 +4,16 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { analyticsApi } from '@/lib/api';
-import type { PerformanceHistoryEnvelope, PerformanceHistoryRow } from '@/lib/api';
+import type {
+  PerformanceHistoryEnvelope,
+  PerformanceHistoryRow,
+  RealizedRiskEnvelope,
+} from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 
 interface AnalyticsData {
   summary: any;
-  realizedRisk: any;
+  realizedRisk: RealizedRiskEnvelope | null;
   forecastRisk: any;
   factorExposure: any;
   concentration: any;

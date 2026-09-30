@@ -9,11 +9,18 @@ import type {
   AIDataStatus,
   AIContextCoverage,
   AIContextCoverageStatus,
+  AIContextDashboardComponent,
+  AIContextInlineComponent,
+  AIContextReferencedComponent,
   AIContextResponse,
   AIContextSection,
   AIContextStatus,
   AIContextWeightBasis,
   IndiaFlowsResponse,
+  RiskContributionModelAliases,
+  RiskContributionModelName,
+  RiskContributionModelNames,
+  RiskContributionResponse,
 } from '@/types';
 
 const COVERAGE_STATUSES: readonly AIContextCoverageStatus[] = [
@@ -284,6 +291,14 @@ describe('AI context export contract', () => {
     expect(concentration.generated_at).toBe('2026-09-25T12:00:05Z');
     expect(envelope.generated_at).toBe('2026-09-25T12:00:00Z');
     expect(envelope.sections.liquidity.as_of).toBe('2026-09-25T11:58:00Z');
+
+    // The envelope names WHICH field produced `as_of`, so a reader can tell what
+    // the date measures rather than guessing. The backend's response model
+    // declares the key (`as_of_semantics: Optional[str] = None`), so it is on
+    // the wire for every section even where the label is null. Reading it
+    // without a cast is the assertion: the type used to omit the key entirely.
+    const semantics: string | null | undefined = envelope.sections.liquidity.as_of_semantics;
+    expect(semantics).toBeUndefined();
   });
 
   it('never folds an unmeasured institutional leg into a measured zero', () => {
@@ -325,5 +340,131 @@ describe('AI context export contract — compile-time guards', () => {
     // @ts-expect-error success omits `error`; publishing null is not the contract.
     const nullError: AIContextSection['error'] = null;
     void nullError;
+  });
+
+  it('keeps a top-level section payload required', () => {
+    // A section envelope always publishes `data` (null when the section
+    // failed), so this key is NOT optional. Making it optional would be the same
+    // silent-empty defect in the other direction: a compile-clean read of
+    // `sections.x.data` that renders nothing for a section that does have one.
+    const sectionData: AIContextSection['data'] = null;
+    void sectionData;
+  });
+
+  it('refuses to read a payload off a referenced dashboard component', () => {
+    const referenced: AIContextReferencedComponent = {
+      data_inline: false,
+      data_ref: 'sections.portfolio',
+      data_ref_status: 'referenced',
+      status: 'available',
+    };
+
+    // @ts-expect-error a referenced component publishes NO `data` key at all.
+    const pointedAt: unknown = referenced.data;
+    // @ts-expect-error the payload is at `<data_ref>.data`, not on the component.
+    const badRef: AIContextReferencedComponent = { data_inline: false, data_ref: 'cvar' };
+
+    void pointedAt;
+    void badRef;
+  });
+
+  it('refuses an inline component without a payload, or a referenced one with one', () => {
+    // @ts-expect-error `data_inline: true` is the only publication; `data` is required.
+    const missingPayload: AIContextInlineComponent = { data_inline: true, status: 'available' };
+    const wrongFlag: AIContextReferencedComponent = {
+      // @ts-expect-error a referenced component is never `data_inline: true`.
+      data_inline: true,
+      data_ref: 'sections.portfolio',
+      data_ref_status: 'referenced',
+      status: 'available',
+    };
+    const wrongStatusWord: AIContextReferencedComponent = {
+      data_inline: false,
+      data_ref: 'sections.portfolio',
+      // @ts-expect-error `data_status` is a normalized contract vocabulary, not a pointer.
+      data_status: 'referenced',
+      status: 'available',
+    };
+
+    void missingPayload;
+    void wrongFlag;
+    void wrongStatusWord;
+  });
+
+  it('reads a component payload only after narrowing on data_inline', () => {
+    const components: Record<string, AIContextDashboardComponent> = {
+      portfolio: {
+        data_inline: false,
+        data_ref: 'sections.portfolio',
+        data_ref_status: 'referenced',
+        status: 'available',
+      },
+      summary: { data_inline: true, data: { portfolio_value: 1000 }, status: 'available' },
+    };
+
+    const component = components.summary;
+    if (component.data_inline) {
+      // Narrowed: the payload is here, and it is `unknown` because the exporter
+      // publishes arbitrary per-component payloads.
+      const payload: unknown = component.data;
+      void payload;
+    } else {
+      // @ts-expect-error still a pointer once the other arm is excluded.
+      const stillAPointer: unknown = component.data;
+      void stillAPointer;
+    }
+  });
+
+  it('publishes the risk-contribution model names under the canonical spelling', () => {
+    // `cvar` is the RETIRED name. It is a pointer in
+    // `contribution_basis.model_names.aliases`, not a key in any container, so
+    // declaring it beside `cvar_tail` compiled clean and read `undefined`.
+    const names: RiskContributionModelNames = {
+      canonical: ['volatility', 'cvar_tail'],
+      aliases: { cvar: 'cvar_tail' },
+      basis: 'one model, one name, in every container of this section',
+    };
+    const aliases: RiskContributionModelAliases = { cvar: 'cvar_tail' };
+    const model: RiskContributionModelName = 'cvar_tail';
+
+    // @ts-expect-error the retired spelling is not a model name any more.
+    const retired: RiskContributionModelName = 'cvar';
+    // @ts-expect-error the alias map points AT a canonical name, not at itself.
+    const selfAlias: RiskContributionModelAliases = { cvar: 'cvar' };
+
+    expect(names.canonical).toEqual(['volatility', 'cvar_tail']);
+    expect(aliases.cvar).toBe('cvar_tail');
+    expect(model).toBe('cvar_tail');
+    void retired;
+    void selfAlias;
+  });
+
+  it('publishes no `cvar` key in the risk-contribution share containers', () => {
+    // Both containers are keyed by the canonical names, which is the whole
+    // point of the alias map: a reader can iterate one vocabulary across them.
+    // Annotated off the DECLARED type, not off its own literal, so this guard
+    // reads the type rather than restating it.
+    const sectorRollup: RiskContributionResponse['sector_rollup'] = {
+      volatility: { Tech: 1 },
+      cvar_tail: { Tech: 1 },
+    };
+
+    expect(Object.keys(sectorRollup)).toEqual(['volatility', 'cvar_tail']);
+    expect(sectorRollup.cvar_tail.Tech).toBe(1);
+
+    // @ts-expect-error `sector_rollup.cvar` is not on the wire; reading it is
+    // the silent empty this type used to invite.
+    const retiredKey: unknown = sectorRollup.cvar;
+    void retiredKey;
+  });
+
+  it('carries a nullable annualized volatility, never a measured zero', () => {
+    // The annualization gate sets the key to `null` below the minimum measured
+    // return sample. A `number` here would let `fmtPct(0)` print `0.00%` for a
+    // history too short to annualize.
+    const gated: Pick<RiskContributionResponse, 'portfolio_volatility_annualized'> = {
+      portfolio_volatility_annualized: null,
+    };
+    expect(gated.portfolio_volatility_annualized).toBeNull();
   });
 });

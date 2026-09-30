@@ -15,10 +15,46 @@ import {
   FileDown
 } from 'lucide-react';
 import { useUIStore, usePortfolioStore } from '@/lib/store';
-import { ExportService } from '@/lib/export';
+import { ExportService, type RiskMetricsSnapshot } from '@/lib/export';
+import api from '@/lib/api';
 import { useNotifications } from '@/hooks/useRealTime';
 import { formatRelativeTime } from '@/components/ui/LoadingState';
 import { cn } from '@/lib/utils';
+
+/**
+ * Collect the risk figures the review PDF is allowed to quote.
+ *
+ * `allSettled` on purpose: these three routes fail independently, and a route
+ * that fails leaves its own block `undefined` so the document omits that
+ * section's sentences. Nothing is substituted from a neighbouring route and no
+ * failure is converted into a number — a PDF that silently drops its risk
+ * section is recoverable, one that invents it is not.
+ */
+async function loadRiskMetrics(): Promise<RiskMetricsSnapshot> {
+  const [contribution, limits, liquidity] = await Promise.allSettled([
+    api.get<RiskMetricsSnapshot['riskContribution']>('/analytics/risk-contribution'),
+    api.get<RiskMetricsSnapshot['liquidityLimits']>('/analytics/liquidity-limits'),
+    api.get<RiskMetricsSnapshot['liquidity']>('/analytics/liquidity'),
+  ]);
+
+  const snapshot: RiskMetricsSnapshot = {};
+  if (contribution.status === 'fulfilled') {
+    snapshot.riskContribution = contribution.value?.data ?? null;
+  } else {
+    console.error('Risk contribution unavailable for PDF export:', contribution.reason);
+  }
+  if (limits.status === 'fulfilled') {
+    snapshot.liquidityLimits = limits.value?.data ?? null;
+  } else {
+    console.error('Liquidity limits unavailable for PDF export:', limits.reason);
+  }
+  if (liquidity.status === 'fulfilled') {
+    snapshot.liquidity = liquidity.value?.data ?? null;
+  } else {
+    console.error('Liquidity score unavailable for PDF export:', liquidity.reason);
+  }
+  return snapshot;
+}
 
 interface HeaderProps {
   title?: string;
@@ -58,10 +94,16 @@ export function Header({ title, subtitle, onMenuClick, className }: HeaderProps)
         (sum, p) => sum + (p.market_value_base ?? p.market_value ?? 0),
         0
       );
+      // Fetched here, not read from the store: the three analytics routes are
+      // the only source for the figures the review quotes, and the store
+      // carries holdings only. A route that fails leaves its block absent and
+      // the document drops that section's sentences.
+      const riskMetrics = await loadRiskMetrics();
       await ExportService.exportInstitutionalReviewPDF({
         positions,
         totalValue: totalVal,
-        currency: 'INR'
+        currency: 'INR',
+        riskMetrics
       });
       addNotification('success', 'PDF Exported', 'Institutional review downloaded.');
     } catch (error) {

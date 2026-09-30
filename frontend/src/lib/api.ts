@@ -11,7 +11,6 @@ import {
   PortfolioUpdateRequest,
   PortfolioBulkAddRequest,
   StockData,
-  RealizedRiskMetrics,
   ForecastRiskResponse,
   FactorExposureResponse,
   ConcentrationMetrics,
@@ -162,6 +161,121 @@ export interface PerformanceHistoryEnvelope {
   as_of_semantics?: string | null;
   history_coverage?: PerformanceHistoryCoverage | null;
   warnings?: string[] | null;
+}
+
+// Realized-risk wire shape. Declared locally, mirroring the performance-history
+// shapes above: the endpoint returns an ENVELOPE of blocks, and the per-block
+// `number | null` contract (a withheld ratio is absent, never 0) only holds at
+// the block level. Mirrors `backend/app/api/analytics.py:4526-4660`.
+//
+// The envelope was previously typed as a flat metrics block that carried only
+// the *portfolio* field list — every `portfolio` / `positions` /
+// `instrument_risk` access on the envelope then failed to compile, so the hook
+// erased the whole response to `any` and the null contract was never checked.
+// A duplicate of that flat block in `src/types` was removed rather than kept
+// beside this one: two declarations of one payload drift, and this is the one
+// the hook and the pages actually consume.
+
+/** Holding-window position row (analytics.py:4588-4603 + provenance). */
+export interface RealizedRiskPositionRow {
+  annual_return: number | null;
+  annual_volatility: number | null;
+  sharpe_ratio: number | null;
+  max_drawdown: number | null;
+  var_95: number | null;
+  sortino_ratio?: number | null;
+  weight: number;
+  data_points: number;
+  return_observations: number | null;
+  is_limited_history: boolean;
+  history_warning: string | null;
+  /** Set by the route's own annualization gate, independent of the engine's. */
+  annualized: boolean;
+  analytics_start: string | null;
+  analytics_start_source: string | null;
+  stored_added_on: string | null;
+  buy_price_inferred: string | null;
+}
+
+/** Full-exchange-history position row (analytics.py:4490-4496). */
+export interface InstrumentRiskPositionRow {
+  annual_volatility: number | null;
+  sharpe_ratio: number | null;
+  max_drawdown: number | null;
+  total_return: number | null;
+  data_points: number;
+  annualized: boolean;
+}
+
+/** Portfolio block: the metrics the route publishes under `portfolio` and
+ *  under `instrument_risk.portfolio` (analytics.py:4467-4475, 4526-4542). */
+export interface RealizedRiskPortfolioBlock {
+  annual_return: number | null;
+  annual_volatility: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  skewness?: number | null;
+  kurtosis?: number | null;
+  max_drawdown: number | null;
+  var_95: number | null;
+  cvar_95: number | null;
+  hit_ratio: number | null;
+  annualized?: boolean;
+  /** Only present on `instrument_risk.portfolio` (analytics.py:4474). */
+  days?: number;
+}
+
+/** Per-ticker coverage row, as published under `history_coverage.tickers`. */
+export interface RealizedRiskTickerCoverage {
+  effective_start?: string | null;
+  analytics_start?: string | null;
+  analytics_start_source?: string | null;
+  stored_added_on?: string | null;
+  buy_price_inferred?: string | null;
+  return_observations?: number | null;
+  data_points?: number | null;
+  is_limited_history?: boolean;
+  limited_history?: boolean;
+}
+
+export interface RealizedRiskCoverage {
+  requested_start?: string | null;
+  effective_start?: string | null;
+  intersection_start?: string | null;
+  oldest_holding?: string | null;
+  covered_days?: number | null;
+  truncated?: boolean;
+  annualized?: boolean;
+  full_history_days?: number | null;
+  full_history_start?: string | null;
+  effective_start_source?: string | null;
+  intersection_start_source?: string | null;
+  inferred_start_tickers?: string[];
+  tickers?: Record<string, RealizedRiskTickerCoverage>;
+}
+
+/** One withheld-measurement warning (analytics.py:4582-4587). */
+export interface RealizedRiskWarning {
+  ticker: string;
+  data_points?: number | null;
+  return_observations?: number | null;
+  message?: string | null;
+}
+
+export interface RealizedRiskEnvelope {
+  portfolio: RealizedRiskPortfolioBlock;
+  positions: Record<string, RealizedRiskPositionRow>;
+  instrument_risk: {
+    portfolio?: RealizedRiskPortfolioBlock;
+    positions?: Record<string, InstrumentRiskPositionRow>;
+  };
+  universe_coverage?: Record<string, unknown>;
+  data_status?: 'available' | 'partial' | 'unavailable';
+  warnings: RealizedRiskWarning[];
+  data_range?: { start: string | null; end: string | null };
+  latest_observation_date?: string | null;
+  history_coverage?: RealizedRiskCoverage;
+  methodology?: string;
 }
 
 // Portfolio API
@@ -398,7 +512,7 @@ export const analyticsApi = {
     tickers?: string;
     start?: string;
     end?: string;
-  }): Promise<RealizedRiskMetrics & { by_position?: Record<string, RealizedRiskMetrics> }> {
+  }): Promise<RealizedRiskEnvelope> {
     const response = await apiClient.get('/analytics/realized-risk', { params });
     return response.data;
   },

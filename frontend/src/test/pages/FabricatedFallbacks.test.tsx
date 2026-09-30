@@ -636,7 +636,11 @@ describe('fabricated fallbacks — risk contribution all-negative divergence', (
         volatility: { A: 0.6, B: 0.4 },
         cvar_tail: { A: 0.4, B: 0.3 },
       },
-      sector_rollup: { volatility: { Tech: 1.0 }, cvar: { Tech: 1.0 } },
+      // `cvar_tail`, not `cvar`: the route keys every container by the canonical
+      // model name. A fixture carrying the retired `cvar` keeps a key alive that
+      // the wire never publishes, which is how the sector rollup went on
+      // reading `undefined` while its test stayed green.
+      sector_rollup: { volatility: { Tech: 1.0 }, cvar_tail: { Tech: 1.0 } },
       portfolio_volatility_annualized: 0.18,
       portfolio_var_95_daily: -0.02,
       portfolio_cvar_95_daily: -0.03,
@@ -649,5 +653,54 @@ describe('fabricated fallbacks — risk contribution all-negative divergence', (
       expect(screen.getByText(/Symmetric Risk Distribution/)).toBeDefined();
     });
     expect(screen.queryByText(/more to your tail losses/)).toBeNull();
+  });
+});
+
+// The sector panel keys the same two models as every other container on the
+// route. It read `sector_rollup.cvar`, which the wire never published, so
+// `data.sector_rollup.cvar || {}` collapsed to `{}` and the "Tail Loss Share"
+// toggle showed "No sector risk contribution data available." — an empty
+// panel, with no error anywhere, for a model the route had measured.
+describe('risk contribution sector rollup reads the canonical model name', () => {
+  const payload = {
+    window: { start: '2025-01-01', end: '2026-01-01' },
+    positions: {
+      volatility: { 'A.NS': 0.6, 'B.NS': 0.4 },
+      cvar_tail: { 'A.NS': 0.4, 'B.NS': 0.3 },
+    },
+    sector_rollup: {
+      volatility: { Technology: 0.6, Energy: 0.4 },
+      cvar_tail: { Technology: 0.7, Energy: 0.3 },
+    },
+    portfolio_volatility_annualized: 0.18,
+    portfolio_var_95_daily: -0.02,
+    portfolio_cvar_95_daily: -0.03,
+    methodology: 'Euler decomposition',
+  };
+
+  beforeEach(() => {
+    mocks.getRiskContribution.mockResolvedValue(payload);
+  });
+
+  it('renders the CVaR sector shares, not an empty panel', async () => {
+    const { default: RiskContributionPage } = await import('@/app/dashboard/risk-contribution/page');
+    render(<RiskContributionPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Risk Contribution by Sector')).toBeDefined();
+    });
+    // The empty-state copy is the exact shape of the silent miss: a measured
+    // model rendered as though nothing had been produced.
+    expect(screen.queryByText('No sector risk contribution data available.')).toBeNull();
+
+    // Volatility model shows first.
+    expect(screen.getAllByText('Technology').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByText('Tail Loss Share'));
+    // The empty-state copy is the exact shape of the silent miss: a measured
+    // model rendered as though nothing had been produced.
+    expect(screen.queryByText('No sector risk contribution data available.')).toBeNull();
+    // The tail model's own share, 70% of the CVaR model total, is now drawn.
+    expect(screen.getAllByText('70.0%').length).toBeGreaterThan(0);
   });
 });

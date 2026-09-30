@@ -198,9 +198,14 @@ interface RiskContributionData {
   };
   sector_rollup: {
     volatility: Record<string, number>;
-    cvar: Record<string, number>;
+    // `cvar_tail`, not `cvar`: the route keys every container by the canonical
+    // model name and publishes the retired bare `cvar` as a pointer in
+    // `contribution_basis.model_names.aliases`. The old `cvar` key here was
+    // never on the wire, so the sector rollup read `undefined` and this panel
+    // rendered empty.
+    cvar_tail: Record<string, number>;
   };
-  portfolio_volatility_annualized: number;
+  portfolio_volatility_annualized: number | null;
   portfolio_var_95_daily: number;
   portfolio_cvar_95_daily: number | null;
   methodology: string;
@@ -250,7 +255,7 @@ export default function RiskContributionPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
-  const [selectedSectorModel, setSelectedSectorModel] = useState<'volatility' | 'cvar'>('volatility');
+  const [selectedSectorModel, setSelectedSectorModel] = useState<'volatility' | 'cvar_tail'>('volatility');
 
   const fetchRiskContribution = async () => {
     setLoading(true);
@@ -319,11 +324,11 @@ export default function RiskContributionPage() {
     rows.push('Sector,Volatility Risk Share (%),CVaR Tail Loss Share (%)');
     const allSectors = Array.from(new Set([
       ...Object.keys(data.sector_rollup.volatility || {}),
-      ...Object.keys(data.sector_rollup.cvar || {})
+      ...Object.keys(data.sector_rollup.cvar_tail || {})
     ]));
     for (const sec of allSectors) {
       const vShare = data.sector_rollup.volatility[sec];
-      const cShare = data.sector_rollup.cvar[sec];
+      const cShare = data.sector_rollup.cvar_tail[sec];
       rows.push(
         `${escapeCsvCell(sec)},${vShare != null ? `${(vShare * 100).toFixed(2)}%` : 'N/A'},${cShare != null ? `${(cShare * 100).toFixed(2)}%` : 'N/A'}`
       );
@@ -537,9 +542,9 @@ export default function RiskContributionPage() {
                     Volatility Share
                   </button>
                   <button
-                    onClick={() => setSelectedSectorModel('cvar')}
+                    onClick={() => setSelectedSectorModel('cvar_tail')}
                     className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${
-                      selectedSectorModel === 'cvar'
+                      selectedSectorModel === 'cvar_tail'
                         ? 'bg-rose-500 text-white font-bold shadow-sm'
                         : 'text-slate-400 hover:text-white'
                     }`}

@@ -65,30 +65,16 @@ export interface PortfolioSummary {
   position_currencies?: Record<string, string>;
 }
 
-// Realized Risk Metrics Type
-// Fabricable metrics are `number | null` — never invent numbers; pages render N/A.
-// Optional flags mirror the backend null+flag contract (model_fitted /
+// Forecast Risk Metrics Type
+// Fabricable metrics are `number | null` — never invent numbers; pages render
+// N/A. Optional flags mirror the backend null+flag contract (model_fitted /
 // is_limited_history / error) on endpoints without a response_model.
-export interface RealizedRiskMetrics {
-  annual_return: number | null;
-  annual_volatility: number | null;
-  sharpe_ratio: number | null;
-  sortino_ratio: number | null;
-  skewness: number | null;
-  kurtosis: number | null;
-  max_drawdown: number | null;
-  var_95: number | null;
-  cvar_95: number | null;
-  hit_ratio: number | null;
-  beta_vs_benchmark?: number | null;
-  up_capture?: number | null;
-  down_capture?: number | null;
-  model_fitted?: boolean;
-  is_limited_history?: boolean;
-  error?: string;
-}
-
-// Forecast Risk Metrics Type (null+flag contract, see RealizedRiskMetrics)
+// The realized-risk wire shape has NO declaration here: that endpoint returns an
+// ENVELOPE of blocks, not a flat metrics object, so it is declared once in
+// `@/lib/api` as `RealizedRiskEnvelope` + `RealizedRiskPortfolioBlock`. A second
+// copy of the same payload in two files is the drift hazard this project exists
+// to prevent, and it already bit once (a `types` copy typed the envelope as a
+// flat block, so every `portfolio` access failed and the hook erased it to `any`).
 export interface ForecastRiskMetrics {
   model: "EWMA" | "GARCH" | "EGARCH";
   horizon: number;
@@ -414,6 +400,16 @@ export interface AIContextSection {
    */
   as_of: string | null;
   /**
+   * Which declared field produced `as_of` (e.g. `latest_observation_date`,
+   * `liquidity_component_only`, `oldest_component_observation`), or `null`
+   * when the section measured no freshness at all. Published on the envelope by
+   * every section, so a reader can tell WHAT the date measures instead of
+   * guessing — and the backend's response model declares it
+   * (`as_of_semantics: Optional[str] = None`), so the key is always on the wire
+   * even where the label is null.
+   */
+  as_of_semantics?: string | null;
+  /**
    * Explicitly declared monetary unit, uppercased, or `null` when nothing
    * declared one. Precedence: the section payload's own declaration, then a
    * nested `data` declaration, then component payloads ONLY when every measured
@@ -438,6 +434,77 @@ export interface AIContextSection {
    */
   error?: string;
 }
+
+/**
+ * The section envelope keys a referenced dashboard component carries beside its
+ * pointer. They are COPIES of the referenced section's own values, not
+ * independent measurements, so the two paths cannot disagree.
+ */
+export interface AIContextReferencedComponentMetadata {
+  as_of?: string | null;
+  as_of_semantics?: string | null;
+  currency?: string | null;
+  detail?: AIContextDetail;
+  inputs?: Record<string, unknown>;
+  omitted_fields?: string[];
+  warnings?: string[];
+  /** Absent on a successful twin, never a null sentinel. */
+  error?: string;
+}
+
+/**
+ * A dashboard component that POINTS at the section holding its payload.
+ *
+ * The document publishes eight of the dashboard's eleven components as their
+ * own top-level sections too, so the exporter does not republish those payloads
+ * a second time: a referenced component publishes no `data` key at all and the
+ * payload lives at `<data_ref>.data` in the same document. `data_ref_status` is
+ * deliberately not named `data_status` — that is a normalized contract
+ * vocabulary (`available` / `partial` / `unavailable`) and reusing the name for
+ * "this is a pointer" would put a word outside it.
+ *
+ * There is no `data` on this arm. That is the point: reading `.data` here is a
+ * compile error, not an `undefined` that renders as an empty block. Dereference
+ * `data_ref` against the response object to reach the payload.
+ */
+export interface AIContextReferencedComponent extends AIContextReferencedComponentMetadata {
+  data_inline: false;
+  /** Dot-separated path into this same document, e.g. `sections.portfolio`. */
+  data_ref: string;
+  data_ref_status: 'referenced';
+  status: AIContextStatus;
+}
+
+/**
+ * A component with no standalone section — `summary`, `risk_score`,
+ * `performance_history`. It is the only publication of that payload in the
+ * document, so it keeps its own `data` and points at nothing. `data` may still
+ * be `null` when the component failed; a null payload is not the same thing as
+ * a pointer, and the two are told apart by `data_inline`, not by the presence of
+ * `data`.
+ */
+export interface AIContextInlineComponent extends AIContextReferencedComponentMetadata {
+  data_inline: true;
+  data: unknown;
+  status: AIContextStatus;
+}
+
+/**
+ * One entry of `sections.dashboard.data.components`.
+ *
+ * NOT an {@link AIContextSection}, and the two must not be unified: a top-level
+ * section always publishes `data`, while a referenced component never does.
+ * Typing the component map as the section envelope is what let eight of eleven
+ * components be read as though they carried a payload they do not.
+ *
+ * Component-specific extras beside these keys (`performance_history`'s
+ * `history_coverage` and breadth block, for one) are NOT modelled here, so
+ * reading them is a compile error rather than a silent `undefined`. Reach them
+ * through a narrowed local type, not through this one.
+ */
+export type AIContextDashboardComponent =
+  | AIContextReferencedComponent
+  | AIContextInlineComponent;
 
 export interface AIContextResponse {
   schema_version: string;
@@ -571,6 +638,43 @@ export interface RegimeResponse {
   };
 }
 
+/**
+ * How the risk-contribution section names its two models.
+ *
+ * ONE NAME PER MODEL, IN EVERY CONTAINER. The backend keys `positions`,
+ * `sector_rollup`, `excluded_assets`, `contribution_basis.per_model` and
+ * `universe_coverage.model_used_tickers` by these two names, and publishes the
+ * retired bare `cvar` as a POINTER in `contribution_basis.model_names.aliases`
+ * rather than as a second key in each container.
+ *
+ * `cvar_tail` is the canonical spelling and the only one on the wire. `cvar` is
+ * NOT a field here on purpose: declaring it as a sibling of `cvar_tail` compiles
+ * clean and reads `undefined`, which is the silent-empty the alias map exists to
+ * prevent. A consumer holding a retired name resolves it through
+ * {@link RISK_CONTRIBUTION_MODEL_ALIASES} and reads the canonical key.
+ */
+export type RiskContributionModelName = 'volatility' | 'cvar_tail';
+
+/** A spelling this section used to publish and no longer does. */
+export type RiskContributionRetiredModelName = 'cvar';
+
+/**
+ * Retired spelling -> the canonical name that replaced it, mirroring
+ * `contribution_basis.model_names.aliases` on the wire. Declared as a type
+ * rather than a second field so the two names cannot both be read off one
+ * container and a reader cannot mistake the copy for the measurement.
+ */
+export type RiskContributionModelAliases = Readonly<
+  Record<RiskContributionRetiredModelName, RiskContributionModelName>
+>;
+
+/** `contribution_basis.model_names`, as the section publishes it. */
+export interface RiskContributionModelNames {
+  canonical: readonly RiskContributionModelName[];
+  aliases: RiskContributionModelAliases;
+  basis: string;
+}
+
 export interface RiskContributionResponse {
   window: { start: string; end: string };
   positions: {
@@ -579,10 +683,16 @@ export interface RiskContributionResponse {
   };
   sector_rollup: {
     volatility: Record<string, number>;
-    cvar: Record<string, number>;
+    cvar_tail: Record<string, number>;
   };
-  portfolio_volatility_annualized: number;
+  /**
+   * `null` when the annualization gate declined to publish it — the endpoint
+   * sets the key to `null` below the minimum measured return sample rather than
+   * annualizing a short history. Not `0`: a zero would be a measured flat book.
+   */
+  portfolio_volatility_annualized: number | null;
   portfolio_var_95_daily: number;
+  /** `null` when the window produced no tail days at all. */
   portfolio_cvar_95_daily: number | null;
   methodology: string;
 }
