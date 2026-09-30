@@ -9,7 +9,11 @@ Pure tests: no DB, no network, seeded RNG only.
 import numpy as np
 import pandas as pd
 
-from app.services.optimization_service import _hrp_weights, optimize
+from app.services.optimization_service import (
+    _hrp_weights,
+    measurable_clustering_universe,
+    optimize,
+)
 
 
 def _seeded_returns(n_obs=500, vols=(0.01, 0.01, 0.04, 0.04), seed=0):
@@ -48,13 +52,41 @@ def test_hrp_favors_low_variance_cluster():
     assert low > high
 
 
-def test_hrp_flat_series_no_crash():
+def test_hrp_flat_series_is_declined_not_treated_as_uncorrelated():
+    """A leg that never moves has no correlation to anything, and must be said so.
+
+    The old assertion was:
+
+        rets["A3"] = 0.0  # zero-variance leg: NaN corr guard must hold
+        w = _hrp_weights(rets)
+        assert np.isfinite(w.values).all()
+        assert abs(w.sum() - 1.0) < 1e-4
+        assert (w.values >= 0).all()
+
+    which passed only because `corr().fillna(0.0)` turned A3's three NaN pairs
+    into "no relationship whatsoever" and clustered it at the maximum distance
+    in the matrix. That encoded the defect: a leg with no measurable
+    correlation was allocated as though it were a diversifier. The assertions
+    that matter are kept; the leg is now declined from the clustering instead,
+    and the refusal is visible.
+    """
     rets = _seeded_returns()
-    rets["A3"] = 0.0  # zero-variance leg: NaN corr guard must hold
+    rets["A3"] = 0.0  # zero-variance leg: no correlation is measurable to anyone
     w = _hrp_weights(rets)
     assert np.isfinite(w.values).all()
     assert abs(w.sum() - 1.0) < 1e-4
     assert (w.values >= 0).all()
+    # Declined, not silently kept at a fabricated distance.
+    assert set(w.index) == {"A0", "A1", "A2"}
+    kept, dropped = measurable_clustering_universe(rets)
+    assert dropped == ["A3"]
+    assert kept == ["A0", "A1", "A2"]
+    # And `optimize` says so in the payload rather than dropping it in silence.
+    res = optimize(rets, "hrp")
+    assert res["excluded"] == ["A3"]
+    assert "fewer than two shared return rows" in res["excluded_reasons"]["A3"]
+    assert res["weights"]["A3"] == 0.0
+    assert abs(sum(res["weights"].values()) - 1.0) < 1e-4
 
 
 def test_hrp_deterministic():

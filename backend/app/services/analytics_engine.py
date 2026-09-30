@@ -489,6 +489,30 @@ CONCENTRATION_EFFECTIVE_POSITIONS_NOTE = (
 #: indistinguishable hard zero and dragged `overall_score` down (D-04).
 RISK_CORRELATION_POINTS_PER_UNIT = 50.0
 
+#: Shared finite return rows below which a Pearson correlation is not a
+#: measurement. pandas' `.corr()` is PAIRWISE COMPLETE -- each pair is measured
+#: on the rows where THAT pair is finite -- and its own answer for a pair under
+#: this floor is NaN. NaN means "not measurable"; it is never the number 0.0.
+#: This is the same floor `pairwise_average_correlation_statistics` applies
+#: when it reproduces the risk-score leg's own statistic.
+MIN_SHARED_ROWS_FOR_CORRELATION = 2
+
+#: Why a correlation is refused rather than substituted, wherever one is
+#: consumed. Three paths carried `.fillna(0.0)` on a pairwise-complete
+#: correlation matrix -- the risk score's own leg was already fixed, and the
+#: volatility-sizing current book, the volatility-sizing scale, and HRP's
+#: distance matrix were not. In a correlation matrix 0.0 is not a neutral
+#: placeholder, it is the strongest available claim ("no relationship
+#: whatsoever"), so filling a hole with it told the reader a late-listed,
+#: barely-overlapping leg was a free diversifier, and in HRP it placed the pair
+#: at `sqrt(0.5 * (1 - 0))` -- the largest distance the matrix contains.
+#: Vocabulary matches the risk-score leg, which publishes `None` plus an
+#: `excluded` entry rather than a stand-in number.
+UNMEASURABLE_CORRELATION_REASON = (
+    "fewer than two shared return rows, so the pairwise correlation is not "
+    "measurable; it is unknown, not zero"
+)
+
 #: Lower bound of the 0-30 sub-score scale, and the reason a leg can publish
 #: exactly 0.0 for a MEASURED input.  The scale has no negative risk points: a
 #: negatively-correlated book is a real measurement, but "correlated" is not a
@@ -4639,16 +4663,48 @@ class AnalyticsEngine:
                     current_weight_values.append(weight)
                     current_vol_values.append(vol / np.sqrt(252))
             current_volatility = None
+            current_volatility_reason: Optional[str] = None
+            current_unmeasurable: list[str] = []
             if current_tickers:
                 current_corr = returns[current_tickers].corr()
-                current_corr = current_corr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-                current_corr_values = current_corr.to_numpy(dtype=float).copy()
-                np.fill_diagonal(current_corr_values, 1.0)
-                current_cov = current_corr_values * np.outer(current_vol_values, current_vol_values)
-                current_vec = np.asarray(current_weight_values, dtype=float)
-                variance = float(current_vec @ current_cov @ current_vec)
-                if np.isfinite(variance):
-                    current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
+                current_corr = current_corr.replace([np.inf, -np.inf], np.nan)
+                # A pair with fewer than two shared return rows -- or with no
+                # variation in either leg -- is NaN here, and NaN means NOT
+                # MEASURABLE. The old `.fillna(0.0)` asserted the strongest
+                # claim a correlation matrix can make, that the two legs have
+                # no relationship whatsoever, and then published a portfolio
+                # volatility computed from it: a leg that was merely unobserved
+                # read as a free diversifier, understating the book's risk.
+                # The risk-score correlation leg already refuses this
+                # measurement the same way (`finite_pairs` only, `None` plus
+                # `excluded`); so does this one. The quadratic form needs a
+                # full matrix to be a measurement at all, so the figure is
+                # absent rather than approximated.
+                columns = list(current_corr.columns)
+                current_unmeasurable = [
+                    f"{columns[i]}/{columns[j]}"
+                    for i in range(len(columns))
+                    for j in range(i + 1, len(columns))
+                    if not np.isfinite(current_corr.iat[i, j])
+                ]
+                if current_unmeasurable:
+                    current_volatility_reason = (
+                        f"{UNMEASURABLE_CORRELATION_REASON}: "
+                        f"{', '.join(current_unmeasurable)}"
+                    )
+                else:
+                    current_corr_values = current_corr.to_numpy(dtype=float).copy()
+                    np.fill_diagonal(current_corr_values, 1.0)
+                    current_cov = current_corr_values * np.outer(current_vol_values, current_vol_values)
+                    current_vec = np.asarray(current_weight_values, dtype=float)
+                    variance = float(current_vec @ current_cov @ current_vec)
+                    if np.isfinite(variance):
+                        current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
+                    else:
+                        current_volatility_reason = (
+                            "the correlation quadratic form did not evaluate to a "
+                            "finite variance on the measured legs"
+                        )
             # The same book measured on the sample covariance.  Published
             # because `current_volatility` above is a MODEL quantity
             # (correlation x EWMA marginals) and the artifact used to carry it
@@ -4693,11 +4749,43 @@ class AnalyticsEngine:
             rec_tickers = list(recommended_weights)
             rec_vec = np.asarray([recommended_weights[ticker] for ticker in rec_tickers], dtype=float)
             rec_vol_vec = np.asarray([annualized_vols[ticker] / np.sqrt(252) for ticker in rec_tickers], dtype=float)
+            rec_unmeasurable: list[str] = []
             if len(rec_tickers) == 1:
                 rec_vol_ann = float(rec_vol_vec[0] * np.sqrt(252))
             else:
                 rec_corr = returns[rec_tickers].corr()
-                rec_corr = rec_corr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                rec_corr = rec_corr.replace([np.inf, -np.inf], np.nan)
+                # Same refusal as the current book above, and here it is
+                # load-bearing: `rec_vol_ann` is the divisor of
+                # `scale = target / rec_vol_ann`, so an unmeasurable pair here
+                # scales every published weight. Filling it with 0.0 published
+                # a target that leaned on a leg for having no measurable
+                # relationship to the rest of the book.
+                rec_columns = list(rec_corr.columns)
+                rec_unmeasurable = [
+                    f"{rec_columns[i]}/{rec_columns[j]}"
+                    for i in range(len(rec_columns))
+                    for j in range(i + 1, len(rec_columns))
+                    if not np.isfinite(rec_corr.iat[i, j])
+                ]
+                if rec_unmeasurable:
+                    # Refuse rather than drop the leg. Dropping it from the
+                    # matrix alone would leave it in `recommended_weights` and
+                    # poison the very form it was meant to protect; dropping it
+                    # from `recommended_weights` as well would make
+                    # `build_trade_instructions` emit a full-liquidation trade
+                    # for a holding that is merely unobserved. A refusal is the
+                    # only answer that neither invents a number nor orders a
+                    # sale the data does not justify, and it is published.
+                    return self._empty_volatility_sizing(
+                        reason=(
+                            f"{UNMEASURABLE_CORRELATION_REASON}: "
+                            f"{', '.join(rec_unmeasurable)}; the recommended "
+                            "book cannot be scaled to a target volatility "
+                            "without inventing one"
+                        ),
+                        unmeasurable_pairs=rec_unmeasurable,
+                    )
                 rec_corr_values = rec_corr.to_numpy(dtype=float).copy()
                 np.fill_diagonal(rec_corr_values, 1.0)
                 rec_cov = rec_corr_values * np.outer(rec_vol_vec, rec_vol_vec)
@@ -4808,8 +4896,16 @@ class AnalyticsEngine:
                 "target_volatility": target_volatility,
                 "current_volatility": current_volatility,
                 "current_volatility_basis": (
-                    "correlation_x_ewma_volatility" if current_tickers else None
+                    "correlation_x_ewma_volatility"
+                    if current_tickers and current_volatility is not None
+                    else None
                 ),
+                # Why the figure above is absent, and which pairs had no
+                # correlation to measure. Published so that a null here is
+                # distinguishable from a payload that predates the key, and so
+                # the reader can see the book was refused rather than guessed.
+                "current_volatility_reason": current_volatility_reason,
+                "current_volatility_unmeasurable_pairs": current_unmeasurable,
                 "current_volatility_sample_covariance": (
                     round(current_volatility_sample, 6)
                     if current_volatility_sample is not None
@@ -4836,6 +4932,11 @@ class AnalyticsEngine:
                 # computed and thrown away.
                 "sizing_volatility": round(sizing_volatility, 6),
                 "sizing_volatility_basis": sizing_volatility_basis,
+                # Both empty on a book whose pairs are all measurable; a
+                # non-empty list is the refusal path's payload instead, and
+                # these two keys are what tell the two apart in one place.
+                "sizing_volatility_reason": None,
+                "sizing_volatility_unmeasurable_pairs": rec_unmeasurable,
                 # What the target becomes under the sizing covariance. An
                 # identity, published as one so it is never mistaken for a
                 # second, independent measurement.
@@ -6293,7 +6394,20 @@ class AnalyticsEngine:
             "error": "Insufficient data for stress testing"
         }
     
-    def _empty_volatility_sizing(self) -> Dict[str, Any]:
+    def _empty_volatility_sizing(
+        self,
+        reason: Optional[str] = None,
+        unmeasurable_pairs: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """The refusal payload.
+
+        `reason` / `unmeasurable_pairs` let a caller say WHICH measurement was
+        refused rather than falling back to the generic "insufficient data",
+        so a book rejected for an unmeasurable correlation is never mistaken
+        for a book that had no history at all.
+        """
+        unavailable = reason or "sizing unavailable: no measured return history"
+        pairs = list(unmeasurable_pairs or [])
         return {
             "current_weights": {},
             "recommended_weights": {},
@@ -6301,22 +6415,22 @@ class AnalyticsEngine:
             "target_volatility": 0.15,
             "current_volatility": None,
             "current_volatility_basis": None,
+            "current_volatility_reason": unavailable,
+            "current_volatility_unmeasurable_pairs": pairs,
             "current_volatility_sample_covariance": None,
-            "current_volatility_sample_covariance_reason": (
-                "sizing unavailable: no measured return history"
-            ),
+            "current_volatility_sample_covariance_reason": unavailable,
             # Absent, not zero and not the target: nothing was measured.
             "achieved_volatility": None,
             "achieved_volatility_basis": "sample_covariance_of_measured_returns",
-            "achieved_volatility_reason": "sizing unavailable: no measured return history",
+            "achieved_volatility_reason": unavailable,
             "sizing_volatility": None,
             "sizing_volatility_basis": None,
+            "sizing_volatility_reason": unavailable,
+            "sizing_volatility_unmeasurable_pairs": pairs,
             "imposed_target_volatility": None,
             "imposed_target_volatility_basis": None,
             "recommended_volatility_sample_covariance": None,
-            "recommended_volatility_sample_covariance_reason": (
-                "sizing unavailable: no measured return history"
-            ),
+            "recommended_volatility_sample_covariance_reason": unavailable,
             "error": "Insufficient data for volatility sizing"
         }
     

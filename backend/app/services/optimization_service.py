@@ -41,9 +41,11 @@ from scipy.cluster import hierarchy as sch
 from scipy.spatial.distance import squareform
 
 from app.services.analytics_engine import (
+    MIN_SHARED_ROWS_FOR_CORRELATION,
     UNCERTAINTY_CONFIDENCE_LEVEL,
     UNCERTAINTY_DECIMALS,
     UNCERTAINTY_MIN_OBSERVATIONS,
+    UNMEASURABLE_CORRELATION_REASON,
     measure_estimate_uncertainty,
 )
 from app.utils.logger import setup_logger
@@ -546,9 +548,101 @@ def _cluster_var(cov_ord: np.ndarray, items: list[int]) -> float:
     return float(ivp @ sub @ ivp)
 
 
+def unmeasurable_correlation_pairs(returns: pd.DataFrame) -> list[str]:
+    """Upper-triangle pairs whose correlation pandas could not measure.
+
+    Returns `"A/B"` labels in column order, i.e. the pairs for which
+    `returns.corr()` is NaN - either fewer than
+    `MIN_SHARED_ROWS_FOR_CORRELATION` shared finite rows, or no variation in
+    one of the two legs. A NaN here is UNKNOWN. It is the absence of a
+    measurement, and it is emphatically not the number 0.0.
+    """
+    if not isinstance(returns, pd.DataFrame) or returns.shape[1] < 2:
+        return []
+    corr = returns.corr()
+    columns = list(corr.columns)
+    return [
+        f"{columns[i]}/{columns[j]}"
+        for i in range(len(columns))
+        for j in range(i + 1, len(columns))
+        if not np.isfinite(corr.iat[i, j])
+    ]
+
+
+def measurable_clustering_universe(returns: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """The largest subset of legs in which EVERY pair has a correlation.
+
+    HRP needs a distance matrix to build a linkage tree, and
+    `sqrt(0.5 * (1 - r))` over a NaN pair is not a distance. The old code
+    filled those NaNs with `0.0`, which asserted the strongest claim a
+    correlation matrix can make - no relationship whatsoever - and handed the
+    linker `sqrt(0.5)`, the LARGEST distance in the matrix. Single-linkage then
+    pushed the unmeasurable name as far from every other name as it could go,
+    so a leg that was merely unobserved was allocated as though it were a
+    diversifier.
+
+    A distance cannot be invented, so the legs involved are left out of the
+    clustering instead. Which leg goes is decided by how little is measurable
+    about it: repeatedly drop the leg stuck in the most unmeasurable pairs,
+    breaking ties on the thinner history and then on the name so the choice is
+    deterministic. The dropped names are returned so the caller can publish
+    them - a holding may not leave the user's book silently.
+    """
+    columns = [str(c) for c in returns.columns]
+    kept = list(columns)
+    dropped: list[str] = []
+    if len(kept) < 3:
+        # One leg has no pair at all, two have exactly one; nothing to drop.
+        return kept, dropped
+    finite_counts = {
+        c: int(np.isfinite(returns[c].to_numpy(dtype=float)).sum()) for c in kept
+    }
+    while True:
+        frame = returns[kept]
+        corr = frame.corr()
+        offending = [
+            (kept[i], kept[j])
+            for i in range(len(kept))
+            for j in range(i + 1, len(kept))
+            if not np.isfinite(corr.iat[i, j])
+        ]
+        if not offending:
+            return kept, dropped
+        # Drop the leg that is LEAST measurable, which is not the same as the
+        # leg with the fewest rows: a leg that never moves has a full column of
+        # finite returns and no correlation to any of them, and dropping a
+        # healthy neighbour instead of it would fix nothing. So the count of
+        # unmeasurable pairs a leg is stuck in decides first, then the thinner
+        # history, then the name, so the choice is deterministic.
+        blame: Dict[str, int] = {}
+        for left, right in offending:
+            blame[left] = blame.get(left, 0) + 1
+            blame[right] = blame.get(right, 0) + 1
+        victim = min(blame, key=lambda c: (-blame[c], finite_counts[c], c))
+        kept.remove(victim)
+        dropped.append(victim)
+
+
 def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
-    """Lopez de Prado HRP via public scipy APIs only."""
-    corr = returns.corr().fillna(0.0)
+    """Lopez de Prado HRP via public scipy APIs only.
+
+    Only legs whose pairwise correlations are all measurable are clustered; see
+    `measurable_clustering_universe` for why the old `corr().fillna(0.0)` was
+    the worst available fill rather than a safe one. A dropped leg is absent
+    from the returned Series, and `optimize` re-publishes it at weight zero
+    with its reason.
+    """
+    kept, _dropped = measurable_clustering_universe(returns)
+    corr = returns[kept].corr()
+    if not np.isfinite(corr.to_numpy(dtype=float)).all():  # pragma: no cover
+        # `measurable_clustering_universe` guarantees a fully finite matrix, so
+        # this is unreachable. It stays because a NaN reaching `squareform`
+        # would surface as an opaque scipy error rather than a stated refusal.
+        raise ValueError(
+            "hrp: the correlation matrix is still not fully measurable after "
+            "restricting to the legs that share at least "
+            f"{MIN_SHARED_ROWS_FOR_CORRELATION} return rows"
+        )
     # pandas CoW: .values is read-only — take a writable copy before mutating
     corr_np = corr.to_numpy(copy=True)
     np.fill_diagonal(corr_np, 1.0)
@@ -580,7 +674,9 @@ def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
     ordered = _quasi_diag(link)
     labels = corr.index[ordered].tolist()
 
-    cov_ord = np.asarray(returns.cov().loc[labels, labels].values, dtype=float)
+    # Restricted to the clustered legs: the dropped names carry no measurable
+    # correlation, so their covariance belongs to no cluster here.
+    cov_ord = np.asarray(returns[kept].cov().loc[labels, labels].values, dtype=float)
     cov_ord = np.where(np.isfinite(cov_ord), cov_ord, 0.0)
     variances = np.diag(cov_ord)
     valid = variances[np.isfinite(variances) & (variances > 1e-12)]
@@ -779,15 +875,35 @@ def optimize(
     incumbent on the SAME mu, cov and sample. Without it `current_portfolio` is
     `available: false` with a reason, because a Sharpe printed beside a
     recommendation with nothing to compare it against is not actionable.
+
+    `excluded` / `excluded_reasons`: `hrp` cannot measure the distance between
+    two legs that share fewer than two return rows, so rather than invent one
+    it declines to cluster them. The declined legs are published here, at a
+    weight of zero, because a holding may not leave the user's book silently.
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy '{strategy}'. Choose from {list(STRATEGIES)}")
 
     mu, cov, assets = _as_matrices(returns)
+    excluded: list[str] = []
+    excluded_reasons: Dict[str, str] = {}
     if strategy == "hrp":
         # Keyed in scipy-linkage leaf order - deliberately NOT assumed to be
         # the column order. `_weight_vector` is what aligns it.
         solved: pd.Series = _hrp_weights(returns)
+        _kept, excluded = measurable_clustering_universe(returns)
+        if excluded:
+            unmeasurable = unmeasurable_correlation_pairs(returns[assets])
+            for ticker in excluded:
+                bad = [p for p in unmeasurable if ticker in p.split("/")]
+                excluded_reasons[ticker] = (
+                    f"{UNMEASURABLE_CORRELATION_REASON}; left out of the HRP "
+                    f"clustering with {', '.join(bad) if bad else 'the book'}"
+                )
+            # `_weight_vector` refuses a universe mismatch by design, so the
+            # declined legs are put back HERE, at an explicit zero, rather than
+            # by loosening that guard.
+            solved = solved.reindex(assets).fillna(0.0)
     else:
         if strategy == "min_vol":
             solved = pd.Series(_min_vol(cov), index=assets)
@@ -818,6 +934,11 @@ def optimize(
         "expected_sharpe": _round_or_none(moments["expected_sharpe"], MOMENT_DECIMALS),
         "solver": "cvxpy/clarabel" if strategy != "hrp" else "hierarchical-bisection",
         "objective": _objective_block(strategy),
+        # Which legs this strategy declined to reason about, and why. Empty for
+        # every strategy but `hrp` today; published unconditionally so a
+        # consumer never has to infer "nothing was dropped" from an absent key.
+        "excluded": excluded,
+        "excluded_reasons": excluded_reasons,
         "moments_basis": _moments_basis_block(returns, risk_free_rate, moments),
         # SI-5: the triple above is an ex-ante estimate from a fitted mu/cov,
         # not a measurement, so it carries the estimation error on that fit and
