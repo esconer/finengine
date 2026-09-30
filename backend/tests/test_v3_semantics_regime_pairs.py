@@ -470,11 +470,12 @@ class TestPairsCacheCompatibility:
     async def test_db_cache_read_backfills_roles_from_legacy_row(self):
         """A row legacy only in its DECLARATIONS is still served and upgraded.
 
-        Legacy is two different things. The role/depth fields are declarations,
-        so they can be backfilled from the engine's own constants. The hedge
-        regression's standard errors are MEASUREMENTS and cannot be, so a row
-        missing those is a miss and gets recomputed. This test covers the first
-        kind, which is the behaviour it was written for.
+        Legacy is three different things. The role/depth fields are
+        declarations, so they can be backfilled from the engine's own
+        constants. The hedge regression's standard errors and the per-leg
+        stationarity verdicts are MEASUREMENTS and cannot be, so a row missing
+        those is a miss and gets recomputed. This test covers the first kind,
+        which is the behaviour it was written for.
         """
         row = _legacy_pair_row()
         row.update(
@@ -485,6 +486,26 @@ class TestPairsCacheCompatibility:
                 "hedge_regression_std_error_basis": (
                     "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
                 ),
+                # The gate is a measurement, so a row that answers it is a hit
+                # even though every declaration is still absent.
+                "stationarity_leg_a": {
+                    "ticker": "NIFTYIETF.NS", "observations": 107,
+                    "transform": "log_price", "alpha": 0.05,
+                    "lag_rule": "adf:max_lags=1,lag_selection=aic",
+                    "adf_pvalue": 0.55, "adf_lags": 0, "kpss_pvalue": 0.0001,
+                    "kpss_bandwidth": 4, "verdict": "i1", "reason": "fixture",
+                },
+                "stationarity_leg_b": {
+                    "ticker": "NIFTYBEES.NS", "observations": 107,
+                    "transform": "log_price", "alpha": 0.05,
+                    "lag_rule": "adf:max_lags=1,lag_selection=aic",
+                    "adf_pvalue": 0.48, "adf_lags": 0, "kpss_pvalue": 0.0002,
+                    "kpss_bandwidth": 4, "verdict": "i1", "reason": "fixture",
+                },
+                "stationarity_gate": {
+                    "verdict": "both_legs_i1", "leg_a_verdict": "i1",
+                    "leg_b_verdict": "i1", "reason": "fixture",
+                },
             }
         )
         db_ticker, metric = _db_cache_keys("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")

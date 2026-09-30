@@ -68,6 +68,23 @@ def compute_days_to_liquidate(
     return result if math.isfinite(result) else None
 
 
+def _carries_value_input(position: PortfolioPosition) -> bool:
+    """Whether the row supplies any position value at all.
+
+    A transient position can be built with no market value, no quantity and no
+    last price -- an ad-hoc ``?tickers=A,B`` request has tickers but no
+    positions.  That is UNMEASURED, which is not the same fact as a fully
+    exited row whose value is a measured zero, and the two must not publish the
+    same number: the first has nothing to compute from, the second is worth
+    nothing.  Persisted rows always carry a value (``quantity`` is NOT NULL), so
+    this only fires for rows that were never given one.
+    """
+    return any(
+        getattr(position, attribute, None) is not None
+        for attribute in ("market_value", "quantity", "last_price")
+    )
+
+
 def _naive_date(value: datetime) -> datetime:
     return datetime(value.year, value.month, value.day)
 
@@ -491,14 +508,28 @@ class IndiaDataService:
         for position in positions:
             native_value, position_value, fx_rate, native_currency = position_values(position)
             if not math.isfinite(position_value) or position_value <= 0:
+                # A row that was never given a value has nothing to report, and
+                # must not inherit a placeholder notional through the shared
+                # quantity x price fallback: publishing 0.0 would claim a
+                # measured zero, and every liquidation figure below would be
+                # derived from a number the user never supplied.  A non-finite
+                # or negative value is unusable rather than zero, so it is named
+                # as unmeasured instead of being rounded into the payload.
+                measured = (
+                    _carries_value_input(position)
+                    and math.isfinite(position_value)
+                    and position_value >= 0
+                )
                 position_limits.append({
                     "ticker": position.ticker,
-                    "position_value": 0.0,
-                    "position_value_native": round(native_value, 2),
+                    "position_value": round(position_value, 2) if measured else None,
+                    "position_value_native": (
+                        round(native_value, 2) if measured and math.isfinite(native_value) else None
+                    ),
                     "native_currency": native_currency,
                     "base_currency": base_currency,
                     "fx_rate": fx_rate,
-                    "weight": 0.0,
+                    "weight": 0.0 if measured else None,
                     "adv_30d_shares": None,
                     "adv_30d_rupees": None,
                     "days_to_liquidate_10pct_adv": None,
@@ -507,6 +538,7 @@ class IndiaDataService:
                     "max_sane_position_value": None,
                     "liquidity_tier": "UNAVAILABLE",
                     "is_oversized_vs_adv": None,
+                    "position_value_status": "measured" if measured else "unmeasured",
                     "data_status": "unavailable",
                 })
                 continue
@@ -571,6 +603,7 @@ class IndiaDataService:
                 "max_sane_position_value": max_position,
                 "liquidity_tier": tier,
                 "is_oversized_vs_adv": oversized,
+                "position_value_status": "measured",
                 "data_status": data_status,
             })
 

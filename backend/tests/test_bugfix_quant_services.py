@@ -40,6 +40,15 @@ from app.services.volatility_service import DEFAULT_CONE_WINDOWS, VolatilityServ
 
 
 def _pair(a, b, pvalue=0.01):
+    # The stationarity block is a MEASUREMENT too, so it is a cache-hit
+    # requirement for the same reason the standard errors are: an absent gate
+    # is read as "not recorded" rather than as a pass, and a row served that way
+    # would keep publishing spread directives with nothing behind them. This is
+    # a cache-KEY test, so the block is a fixture in the row's own vocabulary.
+    leg = {"observations": 174, "transform": "log_price", "alpha": 0.05,
+           "lag_rule": "adf:max_lags=1,lag_selection=aic", "adf_pvalue": 0.61,
+           "adf_lags": 0, "kpss_pvalue": 0.0001, "kpss_bandwidth": 4,
+           "verdict": "i1", "reason": "fixture"}
     return CointPairResult(
         ticker_a=a,
         ticker_b=b,
@@ -65,6 +74,10 @@ def _pair(a, b, pvalue=0.01):
         hedge_regression_std_error_basis=(
             "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
         ),
+        stationarity_leg_a={**leg, "ticker": a},
+        stationarity_leg_b={**leg, "ticker": b},
+        stationarity_gate={"verdict": "both_legs_i1", "leg_a_verdict": "i1",
+                           "leg_b_verdict": "i1", "reason": "fixture"},
     )
 
 

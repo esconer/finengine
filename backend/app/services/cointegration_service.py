@@ -11,6 +11,7 @@ from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+from arch.unitroot import ADF, KPSS
 from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,6 +127,96 @@ SIGNAL_NON_DIRECTIONAL = "NON_DIRECTIONAL_HEDGE_RATIO"
 SIGNAL_UNCONFIRMED = "UNCONFIRMED_AFTER_MULTIPLE_TESTING_CORRECTION"
 SIGNAL_CORRECTION_PENDING = "DIRECTIVE_WITHHELD_PENDING_MULTIPLE_TESTING_CORRECTION"
 SIGNAL_DIRECTIVE_HEADS = ("LONG_SPREAD", "SHORT_SPREAD")
+
+# Two more heads, both in the same family as the rungs above: they withhold,
+# and neither contains a position token. They are NOT in
+# `SIGNAL_DIRECTIVE_HEADS`, so a consumer that filters on that tuple cannot
+# reach a pair these two describe.
+SIGNAL_SPURIOUS = "SPURIOUS_REGRESSION_REJECTED"
+SIGNAL_STATIONARITY_UNDETERMINED = "STATIONARITY_UNDETERMINED"
+
+# ---------------------------------------------------------------------------
+# Stationarity gate: the precondition cointegration is DEFINED on
+# ---------------------------------------------------------------------------
+# Cointegration is a statement about the RELATIONSHIP between two I(1)
+# series. `analyze_pair_cointegration` tested that relationship and never
+# tested the precondition: a pair of two already-stationary series routinely
+# returns a low Engle-Granger p-value, because the regression of a stationary
+# A on a stationary B has small residuals whatever their relationship is. That
+# is textbook spurious regression, and this scanner published it as a pair to
+# trade, with a p-value that reads as evidence.
+#
+# Prices are non-stationary by construction, so the object of the test is
+# log(price), never the price.
+#
+# BOTH tests must run and BOTH must agree, and the rule for each is published:
+#   ADF  - null is a unit root. `p < alpha` REJECTS it, i.e. the leg is I(0).
+#   KPSS - null is stationarity. `p < alpha` REJECTS it, i.e. the leg is I(1).
+# One test alone is how a spurious pair gets through with a confidence number
+# attached: each has a known false-positive rate in the OPPOSITE direction
+# (ADF has trouble detecting a root in a nearly-deterministic series; KPSS has
+# trouble detecting stationarity under serially correlated residuals), and
+# measuring a 200-draw Monte Carlo of daily random walks at alpha=0.05 put
+# ADF's false rejection of the unit root at 5/200 and KPSS's false acceptance
+# of stationarity at 11/200 - the pair rule mislabels a random walk on roughly
+# 0.1% of draws, where either test alone mislabels 2.5% and 5.5%.
+STATIONARITY_ALPHA = 0.05
+STATIONARITY_TRANSFORM = "log_price"
+
+# The lag rule, chosen explicitly and published with the result. `arch` would
+# otherwise default `ADF.max_lags` to Schwert's ceil(12 * (n/100)**0.25), which
+# is derived for MONTHLY macro series: at this scanner's real sample sizes
+# (107-174 sessions on the audited 14-name book) that is 13-14 candidate lags,
+# and 14 free lag coefficients on a 174-observation regression is the
+# autocorrelation of a monthly series, not of a daily one. Daily Indian equity
+# log returns are close to white noise - the lag-1 ACF on a simulated
+# NSE-shaped series is -0.087 - so the defensible rule for THIS data is a
+# small explicit ceiling that still lets the data add a lag when the
+# autocorrelation is genuinely there. `max_lags=1` with AIC selection chooses
+# 0 or 1 lags of dlog(price) per leg, which is the most an equity return series
+# at this frequency can justify, and the resolved count is published next to
+# the rule so a reader sees the number that was actually used.
+STATIONARITY_ADF_MAX_LAGS = 1
+STATIONARITY_ADF_LAG_SELECTION = "aic"
+# `trend="c"` (constant, no deterministic linear trend) on BOTH tests. A log
+# price over one to two years of sessions has no trend term to model, and
+# adding one would absorb real mean reversion and call a drifting random walk
+# stationary. The two tests must also be specified on the same trend: ADF's
+# `trend` is a regression term, KPSS's is the null being tested (level- vs
+# trend-stationarity), and a mismatched pair would disagree for a definitional
+# reason rather than an evidential one.
+STATIONARITY_TREND = "c"
+# KPSS's `lags` is a Newey-West/Bartlett bandwidth on the long-run variance
+# estimate, not a regression lag count, so it is specified on its own rule:
+# Newey-West (1994) automatic bandwidth floor(4 * (n/100)**(2/9)) = 3 at n=30
+# and 4 at n=174. It is named rather than left to `arch`'s data-dependent
+# default so the number in the payload is a stated rule, not a black box.
+STATIONARITY_KPSS_BANDWIDTH_RULE = "newey_west_1994_automatic_4x(n/100)^(2/9)"
+STATIONARITY_LAG_RULE = (
+    f"adf:max_lags={STATIONARITY_ADF_MAX_LAGS},"
+    f"lag_selection={STATIONARITY_ADF_LAG_SELECTION},"
+    f"kpss:bandwidth={STATIONARITY_KPSS_BANDWIDTH_RULE},"
+    f"trend={STATIONARITY_TREND},transform={STATIONARITY_TRANSFORM}"
+)
+
+# A leg below this many aligned observations has no verdict. `arch` does not
+# refuse them - it returns a confident p-value from a 5-point series - so the
+# floor is this module's to enforce, and the answer is `undetermined`, never
+# `stationary`.
+MIN_STATIONARITY_OBSERVATIONS = MIN_PAIR_OBSERVATIONS
+
+# Per-leg verdict vocabulary. `i1` and `stationary` are only ever written when
+# ADF and KPSS AGREE; anything else - a test that would not run, a
+# non-positive price, or the two tests contradicting each other - is
+# `undetermined` with a reason attached.
+STATIONARITY_I1 = "i1"
+STATIONARITY_STATIONARY = "stationary"
+STATIONARITY_UNDETERMINED = "undetermined"
+
+# Pair-level gate vocabulary.
+STATIONARITY_GATE_PASSED = "both_legs_i1"
+STATIONARITY_GATE_SPURIOUS = "spurious_regression_rejected"
+STATIONARITY_GATE_UNRESOLVED = "i1_not_established_on_both_legs"
 
 
 def _count_usable(series: Any) -> int:
@@ -478,6 +569,8 @@ def build_pair_signal(
     | rung                                    | head                            |
     |-----------------------------------------|---------------------------------|
     | Engle-Granger said not cointegrated     | `NOT_COINTEGRATED`              |
+    | a leg tested stationary (spurious)      | `SPURIOUS_REGRESSION_REJECTED`  |
+    | a leg never established I(1)            | `STATIONARITY_UNDETERMINED`     |
     | Johansen disagrees with the decision     | `CONTESTED_TESTS_DISAGREE`      |
     | `hedge_ratio_beta <= 0`                   | `NON_DIRECTIONAL_HEDGE_RATIO`   |
     | p-value fails the family correction       | `UNCONFIRMED_AFTER_...`         |
@@ -488,6 +581,12 @@ def build_pair_signal(
     hedge ratio, the notional convention, the comparison count and the
     corrected p-value it was allowed by. No rung ever names a direction it
     cannot size.
+
+    The two stationarity rungs sit directly under the cointegration verdict and
+    above the diagnostic, because a low Engle-Granger p-value is only evidence
+    of a relationship when both legs are I(1). A pair that fails the gate
+    reports the p-value it actually measured - the test result stays true - and
+    the reason it is not a spread to trade.
     """
     p_value = _pvalue_of(getattr(pair, "engle_granger_pvalue", None))
     alpha = float(family_alpha) if _is_real(family_alpha) else 0.05
@@ -502,6 +601,29 @@ def build_pair_signal(
 
     if not bool(getattr(pair, "is_cointegrated", False)):
         return SIGNAL_NOT_COINTEGRATED
+
+    # Stationarity, before anything that reads the p-value as evidence. The
+    # p-value is still quoted: the test ran and its answer is unchanged, which
+    # is exactly why the reason it is not a trade has to travel with it.
+    gate = getattr(pair, "stationarity_gate", None)
+    gate_verdict = stationarity_gate_of(pair)
+    if gate_verdict in (STATIONARITY_GATE_SPURIOUS, STATIONARITY_GATE_UNRESOLVED):
+        head = (
+            SIGNAL_SPURIOUS
+            if gate_verdict == STATIONARITY_GATE_SPURIOUS
+            else SIGNAL_STATIONARITY_UNDETERMINED
+        )
+        reason = (gate or {}).get("reason") if isinstance(gate, dict) else None
+        return (
+            f"{head} (engle_granger p={p_text} < {alpha:g} declared this pair "
+            f"cointegrated, but cointegration is defined between two I(1) series "
+            f"and the per-leg ADF/KPSS tests on log price did not establish that, "
+            f"under lag rule [{STATIONARITY_LAG_RULE}]: "
+            f"{reason or 'no stationarity reason was recorded for this pair.'} "
+            f"the p-value above is the cointegration test's real result and is "
+            f"published unchanged; it is not evidence of a spread to trade, so no "
+            f"direction is published.)"
+        )
 
     johansen = bool(getattr(pair, "johansen_cointegrated", False))
     if not johansen:
@@ -743,6 +865,263 @@ def test_johansen_cointegration(series_a: np.ndarray, series_b: np.ndarray) -> b
         return False
 
 
+# ---------------------------------------------------------------------------
+# The stationarity gate itself
+# ---------------------------------------------------------------------------
+
+
+def kpss_bandwidth(observations: int) -> int:
+    """Newey-West (1994) automatic Bartlett bandwidth, never below 1.
+
+    KPSS's `lags` bounds the long-run variance estimate, so a bandwidth of 0
+    would leave it undefined. Published alongside the p-value rather than left
+    to `arch`'s data-dependent default, so the number in the payload is a
+    stated rule a reader can re-derive from the observation count.
+    """
+    try:
+        n = int(observations)
+    except (TypeError, ValueError):
+        return 1
+    if n <= 0:
+        return 1
+    return max(1, int(4.0 * (n / 100.0) ** (2.0 / 9.0)))
+
+
+def _undetermined_leg(ticker: str, observations: int, reason: str) -> Dict[str, Any]:
+    """A leg with no verdict, carrying the reason it has none.
+
+    Never writes `stationary`: an absent measurement is not a negative one, and
+    a reader who cannot tell those apart is reading a fabrication.
+    """
+    return {
+        "ticker": ticker,
+        "observations": observations,
+        "transform": STATIONARITY_TRANSFORM,
+        "alpha": STATIONARITY_ALPHA,
+        "lag_rule": STATIONARITY_LAG_RULE,
+        "adf_pvalue": None,
+        "adf_lags": None,
+        "kpss_pvalue": None,
+        "kpss_bandwidth": None,
+        "verdict": STATIONARITY_UNDETERMINED,
+        "reason": reason,
+    }
+
+
+def assess_leg_stationarity(
+    prices: Any,
+    ticker: str = "",
+    *,
+    alpha: float = STATIONARITY_ALPHA,
+) -> Dict[str, Any]:
+    """Is this one leg of a pair I(1)? ADF and KPSS, and only if they agree.
+
+    Returns a dict that always carries the ADF p-value, the KPSS p-value, the
+    lag rule and a verdict of `i1` / `stationary` / `undetermined`. A verdict
+    is written ONLY when both tests ran and both pointed the same way:
+
+      leg A    ADF null: unit root    KPSS null: stationarity
+      i1       p >= alpha             p <  alpha
+      station.  p <  alpha             p >= alpha
+      undet.   anything else, including the two contradicting each other
+
+    `undetermined` is a real answer, not a fallback: it blocks the pair, and
+    it publishes the reason it is unresolved rather than a number nobody ran.
+    """
+    alpha = float(alpha) if _is_real(alpha) else STATIONARITY_ALPHA
+    try:
+        values = np.asarray(prices, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return _undetermined_leg(
+            ticker, 0, "the leg's prices are not a numeric array, so log(price) is undefined."
+        )
+
+    finite = values[np.isfinite(values)]
+    if finite.size and bool(np.any(finite <= 0.0)):
+        # log(price) is undefined on a non-positive print, and silently dropping
+        # those rows would make the stationarity verdict about a DIFFERENT
+        # window than the cointegration test that is being gated.
+        return _undetermined_leg(
+            ticker,
+            int(finite.size),
+            f"{int(np.sum(finite <= 0.0))} of {int(finite.size)} usable prices are "
+            f"not strictly positive, so log(price) is undefined for them and the leg "
+            f"was not tested on the window the cointegration test used.",
+        )
+
+    observations = int(values.size)
+    if observations < MIN_STATIONARITY_OBSERVATIONS:
+        return _undetermined_leg(
+            ticker,
+            observations,
+            f"{observations} observations is below the {MIN_STATIONARITY_OBSERVATIONS}"
+            f"-observation floor for a unit-root test, so no test was run and no "
+            f"stationarity verdict exists.",
+        )
+
+    log_prices = np.log(values)
+    try:
+        adf = ADF(
+            log_prices,
+            max_lags=STATIONARITY_ADF_MAX_LAGS,
+            method=STATIONARITY_ADF_LAG_SELECTION,
+            trend=STATIONARITY_TREND,
+        )
+        kpss = KPSS(
+            log_prices,
+            lags=kpss_bandwidth(observations),
+            trend=STATIONARITY_TREND,
+        )
+        adf_pvalue = _pvalue_of(adf.pvalue)
+        kpss_pvalue = _pvalue_of(kpss.pvalue)
+        adf_lags = int(adf.lags) if adf.lags is not None else None
+        kpss_lags = int(kpss.lags) if kpss.lags is not None else None
+    except Exception as exc:
+        # `arch` raises InfeasibleTestException on a locally constant leg
+        # rather than declining to answer. That is still no verdict.
+        logger.debug(f"Stationarity test unavailable for {ticker}: {exc}")
+        return _undetermined_leg(
+            ticker,
+            observations,
+            f"the unit-root test could not be estimated ({type(exc).__name__}), so "
+            f"no stationarity verdict exists for this leg.",
+        )
+
+    result: Dict[str, Any] = {
+        "ticker": ticker,
+        "observations": observations,
+        "transform": STATIONARITY_TRANSFORM,
+        "alpha": alpha,
+        "lag_rule": STATIONARITY_LAG_RULE,
+        "adf_pvalue": round(adf_pvalue, 6) if adf_pvalue is not None else None,
+        "adf_lags": adf_lags,
+        "kpss_pvalue": round(kpss_pvalue, 6) if kpss_pvalue is not None else None,
+        "kpss_bandwidth": kpss_lags,
+        "verdict": STATIONARITY_UNDETERMINED,
+        "reason": None,
+    }
+
+    if adf_pvalue is None or kpss_pvalue is None:
+        result["reason"] = (
+            "a test returned a p-value outside [0, 1] or not a number, so no "
+            "stationarity verdict exists."
+        )
+        return result
+
+    adf_text = f"adf_p={adf_pvalue:.6f}"
+    kpss_text = f"kpss_p={kpss_pvalue:.6f}"
+    adf_rejected = adf_pvalue < alpha
+    kpss_rejected = kpss_pvalue < alpha
+
+    if adf_rejected and not kpss_rejected:
+        result["verdict"] = STATIONARITY_STATIONARY
+        result["reason"] = (
+            f"{adf_text} rejected the unit root and {kpss_text} did not reject level "
+            f"stationarity; both tests agree the leg is I(0), so a low cointegration "
+            f"p-value against it is a regression of stationarity on stationarity."
+        )
+    elif not adf_rejected and kpss_rejected:
+        result["verdict"] = STATIONARITY_I1
+        result["reason"] = (
+            f"{adf_text} did not reject the unit root and {kpss_text} rejected level "
+            f"stationarity; both tests agree the leg is I(1), which is the "
+            f"precondition cointegration is defined on."
+        )
+    else:
+        # The two tests contradict each other. That is not a cointegration
+        # result and it is not a stationarity result either.
+        direction = (
+            "both tests reject their null, so each reads the leg the other's way"
+            if adf_rejected
+            else "neither test rejects its null, so neither reads a root or a level"
+        )
+        result["reason"] = (
+            f"{adf_text} against {kpss_text}: {direction}; the two tests disagree, "
+            f"so no stationarity verdict exists for this leg."
+        )
+    return result
+
+
+def assess_pair_stationarity(
+    leg_a: Dict[str, Any],
+    leg_b: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The pair-level gate: is a low cointegration p-value about a shared trend?
+
+    Returns the gate vocabulary plus a reason that names the leg and the test
+    that decided it. Both legs I(1) is the only state in which a cointegration
+    p-value means what a reader assumes it means.
+    """
+    verdict_a = (leg_a or {}).get("verdict")
+    verdict_b = (leg_b or {}).get("verdict")
+
+    def _name(leg: Dict[str, Any], verdict: Any) -> str:
+        return f"{leg.get('ticker') or 'a leg'} ({verdict})"
+
+    if verdict_a == STATIONARITY_STATIONARY or verdict_b == STATIONARITY_STATIONARY:
+        stationary = [
+            _name(leg, verdict)
+            for leg, verdict in ((leg_a, verdict_a), (leg_b, verdict_b))
+            if verdict == STATIONARITY_STATIONARY
+        ]
+        return {
+            "verdict": STATIONARITY_GATE_SPURIOUS,
+            "leg_a_verdict": verdict_a,
+            "leg_b_verdict": verdict_b,
+            "reason": (
+                f"{' and '.join(stationary)} failed to reject the unit root while "
+                f"failing to reject stationarity on the same leg: both tests agree "
+                f"that leg is already stationary. Engle-Granger tests a RELATIONSHIP "
+                f"between two I(1) series, so a low p-value here is a regression of "
+                f"stationarity on stationarity and the pair is not a spread to trade."
+            ),
+        }
+    if verdict_a == STATIONARITY_I1 and verdict_b == STATIONARITY_I1:
+        return {
+            "verdict": STATIONARITY_GATE_PASSED,
+            "leg_a_verdict": verdict_a,
+            "leg_b_verdict": verdict_b,
+            "reason": (
+                "both legs tested I(1) by ADF and KPSS, so the pair's "
+                "cointegration p-value is a statement about a relationship between "
+                "two non-stationary series."
+            ),
+        }
+    unresolved = [
+        _name(leg, verdict)
+        for leg, verdict in ((leg_a, verdict_a), (leg_b, verdict_b))
+        if verdict != STATIONARITY_I1
+    ]
+    return {
+        "verdict": STATIONARITY_GATE_UNRESOLVED,
+        "leg_a_verdict": verdict_a,
+        "leg_b_verdict": verdict_b,
+        "reason": (
+            f"cointegration is only defined between two I(1) series, and "
+            f"{' and '.join(unresolved) or 'a leg'} did not establish that. This is "
+            f"not a finding that the pair is spurious - it is an absent measurement, "
+            f"and the reason travels with the pair instead of a verdict nobody ran."
+        ),
+    }
+
+
+def stationarity_gate_of(pair: Any) -> Optional[str]:
+    """The pair-level stationarity gate carried by a result, or None.
+
+    None means "not recorded" - a row written before this gate existed. Absent
+    is not a pass and not a fail: the cache contract
+    (`CointegrationService._cached_pair_satisfies_contract`) is what stops an
+    unmeasured row from reaching a published payload, exactly as it does for
+    the hedge-regression standard errors.
+    """
+    gate = getattr(pair, "stationarity_gate", None)
+    if isinstance(gate, dict):
+        verdict = gate.get("verdict")
+    else:
+        verdict = gate
+    return verdict if isinstance(verdict, str) and verdict else None
+
+
 def analyze_pair_cointegration(
     ticker_a: str,
     ticker_b: str,
@@ -783,6 +1162,17 @@ def analyze_pair_cointegration(
         return None
 
     is_coint = bool(engle_granger_pvalue < p_value_threshold)
+
+    # 1b. The precondition the verdict above is read against. Measured on
+    # log(price) - prices are non-stationary by construction, so the LEVEL is
+    # not the object of the test - and on the same index-aligned window the
+    # Engle-Granger regression just used, so the two verdicts are about the
+    # same sample. This runs whether or not Engle-Granger was positive, so a
+    # negative pair also carries its legs' stationarity rather than leaving the
+    # reader to assume it was checked.
+    stationarity_leg_a = assess_leg_stationarity(p_a, ticker_a)
+    stationarity_leg_b = assess_leg_stationarity(p_b, ticker_b)
+    stationarity_gate = assess_pair_stationarity(stationarity_leg_a, stationarity_leg_b)
 
     # 2. OLS Hedge Ratio (beta) and Intercept (alpha): P_A = alpha + beta * P_B + epsilon
     try:
@@ -848,6 +1238,31 @@ def analyze_pair_cointegration(
 
     if not is_coint:
         signal = SIGNAL_NOT_COINTEGRATED
+    elif stationarity_gate["verdict"] in (
+        STATIONARITY_GATE_SPURIOUS,
+        STATIONARITY_GATE_UNRESOLVED,
+    ):
+        # `build_pair_signal` owns this rung so the scan's re-derivation and the
+        # single-pair string can never disagree; calling it here keeps the
+        # published string and the payload's own gate field from diverging.
+        signal = build_pair_signal(
+            CointPairResult(
+                ticker_a=ticker_a,
+                ticker_b=ticker_b,
+                engle_granger_pvalue=engle_granger_pvalue,
+                engle_granger_tstat=engle_granger_tstat,
+                is_cointegrated=True,
+                hedge_ratio_beta=beta,
+                intercept_alpha=alpha,
+                johansen_cointegrated=johansen_coint,
+                last_price_a=last_p_a,
+                last_price_b=last_p_b,
+                signal=SIGNAL_NEUTRAL,
+                stationarity_gate=stationarity_gate,
+            ),
+            family_alpha=p_value_threshold,
+            comparisons_made=1,
+        )
     elif not johansen_coint:
         # The diagnostic contradicts the decision. Publishing a direction here
         # is the SI-1 defect: two tests of different nulls disagreeing is a
@@ -942,6 +1357,13 @@ def analyze_pair_cointegration(
         decision_test=DECISION_TEST,
         johansen_role=JOHANSEN_ROLE,
         johansen_agrees_with_decision=bool(johansen_coint == is_coint),
+        # `is_cointegrated` above is unchanged: the p-value the test returned is
+        # still the p-value it returned. What the legs are made of travels
+        # beside it, because that is what decides whether the number is
+        # evidence of a relationship or an artefact of two stationary series.
+        stationarity_leg_a=stationarity_leg_a,
+        stationarity_leg_b=stationarity_leg_b,
+        stationarity_gate=stationarity_gate,
     )
 
 
@@ -1040,11 +1462,39 @@ class CointegrationService:
         as a miss and recomputed rather than served with the uncertainty silently
         absent -- otherwise the cache launders a contract hole into the artifact
         and the omission is indistinguishable from a deliberate `not_computed`.
+
+        The stationarity gate is the same kind of measurement and the same rule.
+        A row written before the gate existed carries no ADF or KPSS verdict, and
+        `build_pair_signal` reads an absent gate as "not recorded" rather than as
+        a pass - so serving it would publish a directive the gate was supposed to
+        have stopped, for up to `CACHE_TTL_HOURS` after a deploy, and the only
+        trace would be a pair with no stationarity field on it.
         """
         if not isinstance(pair_data, dict):
             return False
         if pair_data.get("hedge_ratio_beta_std_error") is None:
             return False
+        # The pair-level gate, and both legs' verdicts, are all measurements.
+        # Membership is checked against the published vocabulary rather than
+        # mere truthiness: a row whose verdict this build does not recognise is
+        # a row it cannot reason about, and "I could not parse it" must not
+        # reach a published payload as a gate that did not fire.
+        gate = pair_data.get("stationarity_gate")
+        if not isinstance(gate, dict) or gate.get("verdict") not in (
+            STATIONARITY_GATE_PASSED,
+            STATIONARITY_GATE_SPURIOUS,
+            STATIONARITY_GATE_UNRESOLVED,
+        ):
+            return False
+        for leg in ("stationarity_leg_a", "stationarity_leg_b"):
+            if not isinstance(pair_data.get(leg), dict):
+                return False
+            if pair_data[leg].get("verdict") not in (
+                STATIONARITY_I1,
+                STATIONARITY_STATIONARY,
+                STATIONARITY_UNDETERMINED,
+            ):
+                return False
         try:
             return int(pair_data.get("hedge_regression_observations") or 0) > 2
         except (TypeError, ValueError):

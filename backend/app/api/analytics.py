@@ -3032,18 +3032,90 @@ LIQUIDITY_TOTAL_VOLUME_BASIS = (
 # (CIPLA: 0.040271 vs a published spread of 0.0004). It is an ASSUMED bid-ask
 # spread derived from the position's average daily turnover by the tier formula
 # the score itself uses: nothing is read from a quote or measured intraday. The
-# formulas are restated here and RE-DERIVED from `avg_turnover`, so the
-# declaration is a reproduction of the published value, not a paraphrase: a leg
-# whose published spread the formulas do not reproduce publishes
-# `spread_formula_confirmed: false` rather than inheriting a claim.
+# formulas are restated here and RE-DERIVED, so the declaration is a reproduction
+# of the published value, not a paraphrase: a leg whose published spread the
+# formulas do not reproduce publishes `spread_formula_confirmed: false` rather
+# than inheriting a claim.
+#
+# TWO INPUTS CHOOSE THE LADDER ROW; ONLY ONE OF THEM SETS THE NUMBER.  Every
+# published `score_raw` and `spread` is a function of `avg_turnover` alone - each
+# formula below is linear in turnover and mentions nothing else.  WHICH ROW of
+# the ladder a leg is scored on is not: the engine's predicate
+# (`analytics_engine.liquidity_analysis`) is a DISJUNCTION,
+# `avg_turnover >= X or market_cap >= Y`, so a leg whose turnover clears no
+# threshold is still scored on tier_1, tier_2 or tier_3 through its market cap.
+# Re-deriving the published value therefore needs the cap even though the
+# formula does not, which is why the count block below is named for BOTH inputs
+# and why the note states the cap arm with its thresholds instead of calling the
+# whole thing a turnover-only computation.
 LIQUIDITY_SPREAD_UNIT = "fraction_of_price"
+#: The VALUE is a function of `avg_turnover` alone, so the name is true of the
+#: number; the TIER's predicate is turnover-OR-cap, which is stated in
+#: `LIQUIDITY_SPREAD_NOTE` and in `LIQUIDITY_TIER_LADDER` rather than folded into
+#: this enum.  Kept deliberately: renaming it would restate a correct claim as a
+#: vaguer one and would invalidate `spread_basis` on every published row.
 LIQUIDITY_SPREAD_DEFINITION = "assumed_bid_ask_spread_from_turnover_tier_formula"
 LIQUIDITY_SPREAD_NOTE = (
     "by_position.*.spread is NOT abs(score - score_raw). It is an ASSUMED "
-    "bid-ask spread as a fraction of price, computed from the position's average "
-    "daily turnover (avg_volume * last close of the window) by the tier formula "
-    "below. It is not read from a quote, not measured from intraday data and not "
-    "derived from the score, and it is rounded to 4 decimals."
+    "bid-ask spread as a fraction of price, rounded to 4 decimals: not read from "
+    "a quote, not measured from intraday data and not derived from the score. "
+    "THE NUMBER IS A FUNCTION OF avg_turnover ALONE - every score_raw and spread "
+    "formula in the ladder below is linear in the position's average daily "
+    "turnover (avg_volume * last close of the window) and in no other published "
+    "input. WHICH LADDER ROW APPLIES IS NOT: the engine's predicate is a "
+    "disjunction and its market-cap arm is part of the computation, not a "
+    "fallback. The rows are tier_1 when avg_turnover >= 5e8 or market_cap >= "
+    "5e11; tier_2 when avg_turnover >= 1e8 or market_cap >= 1e11; tier_3 when "
+    "avg_turnover >= 2e7 or market_cap >= 1e10; otherwise (avg_turnover < 2e7 and "
+    "market_cap < 1e10) tier_4. The first row whose predicate holds is the row "
+    "the engine scored the leg on, so a leg with subscale turnover and a large "
+    "cap publishes that tier's spread evaluated at its own turnover. The cap is "
+    "the engine's own by_position.*.market_cap, which is never absent - it is "
+    "measured, annualised from measured turnover, or the fixed INR 1bn floor, and "
+    "scoring.market_cap_provenance plus the section's estimated_market_cap_basis "
+    "say which per leg - so the cap arm is evaluated for every published leg. "
+    "These formulas are re-derived rather than paraphrased: a leg whose published "
+    "values no tier reproduces publishes spread_formula_confirmed: false instead "
+    "of inheriting a claim."
+)
+
+#: Canonical name of the re-derivation count block.  It re-derives on BOTH
+#: published inputs because the engine's predicate is
+#: `avg_turnover >= X or market_cap >= Y`: a leg that entered a tier on the cap
+#: arm alone is reproducible only when the cap is handed to the re-derivation.
+#: The name used to be `recomputed_from_avg_turnover`, which asserted turnover
+#: alone and was false for every cap-driven leg.
+LIQUIDITY_RECOMPUTATION_KEY = "recomputed_from_avg_turnover_and_market_cap"
+
+#: The retired spelling, kept as a POINTER rather than as a second key.  A second
+#: key is the defect this rename exists to remove: it would put two names for one
+#: block back into the payload, and a reader could not then tell which was the
+#: real one.  An alias map says which key to read, so a consumer keying on
+#: `recomputed_from_avg_turnover` is redirected rather than left silently empty.
+LIQUIDITY_RECOMPUTATION_ALIASES = {
+    "recomputed_from_avg_turnover": LIQUIDITY_RECOMPUTATION_KEY,
+}
+
+LIQUIDITY_RECOMPUTATION_BASIS = (
+    "the count block is named for the inputs the re-derivation is evaluated on, "
+    "not for the inputs the formulas use. Each tier's score_raw and spread are "
+    "linear in by_position.*.avg_turnover and in nothing else, but the tier a "
+    "leg is scored on is chosen by the engine's disjunction "
+    "`avg_turnover >= X or market_cap >= Y`, so a leg whose turnover clears no "
+    "threshold still enters a higher tier through its market cap. Dropping the "
+    "cap re-derives a ladder the engine never applied: the leg is stamped with a "
+    "spread from a tier that was never used, and no tier reproduces its published "
+    "score, so a correct score would be published as unconfirmed against a spread "
+    "the engine never computed. The engine's resolved market cap is never absent, "
+    "so the cap arm is always evaluated for a published leg; an entry handed to "
+    "the re-derivation without one is treated as having no cap and cannot satisfy "
+    "the arm. `canonical` is the key the counts are published under and "
+    "`aliases` maps every retired key name to it; only one of the two spellings "
+    "is published, because two keys for one block is the defect being fixed. "
+    "This block was published as 'recomputed_from_avg_turnover' and asserted "
+    "turnover alone while the predicate it re-derives had a market-cap arm. No "
+    "published count, ticker list or spread changed: this block was renamed and "
+    "described, not recomputed"
 )
 
 #: (id, turnover tier predicate, score formula, spread formula, plateau) mirroring
@@ -3085,27 +3157,38 @@ LIQUIDITY_TIER_LADDER: Tuple[Dict[str, Any], ...] = (
 )
 
 
-def _liquidity_tier_values(turnover: float) -> List[Tuple[str, float, float]]:
-    """(tier_id, score_raw, spread) this turnover produces under every tier.
+def _liquidity_tier_values(
+    turnover: float,
+    market_cap: Optional[float] = None,
+) -> List[Tuple[str, float, float]]:
+    """(tier_id, score_raw, spread) this leg produces under every tier.
 
     Every tier is evaluated and the ones that reproduce the published values are
     the evidence, so a leg whose tier cannot be identified publishes `null`
     instead of the first tier that happens to fit.
+
+    The engine's predicates are `turnover >= X or market_cap >= Y`
+    (analytics_engine._liquidity scoring, mirrored in `LIQUIDITY_TIER_LADDER`),
+    so a leg that entered a tier on market cap alone is only re-derivable when
+    the cap is passed in.  Dropping the cap arm silently re-derives a different
+    ladder: the leg gets a spread from a tier the engine never used and no tier
+    at all that reproduces the published score.  An absent cap is passed as
+    `None` and simply cannot satisfy the cap arm.
     """
     rows: List[Tuple[str, float, float]] = []
-    if turnover >= 500_000_000.0:
+    if turnover >= 500_000_000.0 or (market_cap is not None and market_cap >= 500_000_000_000.0):
         rows.append((
             "tier_1",
             round(min(10.0, 9.0 + min(1.0, (turnover / 1e9) * 0.2)), 6),
             round(max(0.0002, 0.0006 - min(0.0003, (turnover / 2e9) * 0.0003)), 4),
         ))
-    if turnover >= 100_000_000.0:
+    if turnover >= 100_000_000.0 or (market_cap is not None and market_cap >= 100_000_000_000.0):
         rows.append((
             "tier_2",
             round(min(8.9, 7.8 + (turnover / 5e8) * 1.1), 6),
             round(max(0.0006, 0.0014 - (turnover / 5e8) * 0.0006), 4),
         ))
-    if turnover >= 20_000_000.0:
+    if turnover >= 20_000_000.0 or (market_cap is not None and market_cap >= 10_000_000_000.0):
         rows.append((
             "tier_3",
             round(min(7.7, 6.2 + (turnover / 1e8) * 0.15), 6),
@@ -3126,6 +3209,11 @@ def _liquidity_score_spread_disclosure(
 
     Returns `(block, per_position)` so the route can stamp the per-position facts
     onto the rows they describe without a second pass over the engine result.
+
+    The re-derivation runs on `avg_turnover` AND `market_cap`, because the
+    engine's tier predicate is `turnover >= X or market_cap >= Y` even though
+    each tier's formulas are functions of turnover alone; the count block is
+    therefore published under `LIQUIDITY_RECOMPUTATION_KEY`, which names both.
     """
     scale_max = LIQUIDITY_SCORE_SCALE["max"]
     block: Dict[str, Any] = {
@@ -3150,6 +3238,15 @@ def _liquidity_score_spread_disclosure(
             turnover = float(entry.get("avg_turnover"))
         except (TypeError, ValueError):
             turnover = None
+        # The engine's tier predicates are `turnover >= X or market_cap >= Y`,
+        # so the cap has to come from the same published entry or the
+        # re-derivation evaluates a ladder the engine never applied.
+        try:
+            market_cap = float(entry.get("market_cap"))
+        except (TypeError, ValueError):
+            market_cap = None
+        if market_cap is not None and not math.isfinite(market_cap):
+            market_cap = None
         published_score = entry.get("score_raw")
         published_spread = entry.get("spread")
         try:
@@ -3160,7 +3257,7 @@ def _liquidity_score_spread_disclosure(
         tier_id = None
         recomputed_spread = None
         if turnover is not None and math.isfinite(turnover):
-            ladder = _liquidity_tier_values(turnover)
+            ladder = _liquidity_tier_values(turnover, market_cap)
             recomputed_spread = ladder[0][2]
             try:
                 published_score = float(published_score)
@@ -3214,7 +3311,13 @@ def _liquidity_score_spread_disclosure(
         if facts["spread_at_tier_plateau"]:
             spread_plateau.append(str(ticker))
         per_position[str(ticker)] = facts
-    block["recomputed_from_avg_turnover"] = {
+    block["recomputation"] = {
+        "canonical": LIQUIDITY_RECOMPUTATION_KEY,
+        "aliases": dict(LIQUIDITY_RECOMPUTATION_ALIASES),
+        "inputs": ["avg_turnover", "market_cap"],
+        "basis": LIQUIDITY_RECOMPUTATION_BASIS,
+    }
+    block[LIQUIDITY_RECOMPUTATION_KEY] = {
         "confirmed_count": len(confirmed),
         "unconfirmed_count": len(unconfirmed),
         "confirmed_tickers": confirmed,
@@ -11096,6 +11199,14 @@ def _pairs_estimate_uncertainty(
     }
 
 
+# The one stationarity-gate verdict this route publishes that the engine never
+# emits. `stationarity_gate_of` returns None for a row written before the gate
+# existed, and an unmeasured gate is neither a pass nor a fail - so the
+# aggregation that totals verdicts over delivered rows needs a bucket for it,
+# or it would silently fold unmeasured rows into `both_legs_i1`.
+GATE_VERDICT_NOT_RECORDED = "not_recorded"
+
+
 @router.get("/coint", response_model=CointScannerResponse)
 async def get_cointegration_pairs(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
@@ -11120,13 +11231,22 @@ async def get_cointegration_pairs(
     from app.services.cointegration_service import (
         DECISION_TEST,
         DIAGNOSTIC_TEST,
+        MIN_PAIR_DEPTH_RATIO,
         MULTIPLICITY_CORRECTION,
         SIGNAL_DIRECTIVE_HEADS,
+        SIGNAL_NOT_COINTEGRATED,
         SIGNAL_NOTIONAL_CONVENTION,
+        SIGNAL_SPURIOUS,
+        SIGNAL_STATIONARITY_UNDETERMINED,
         SIGNAL_ZSCORE_THRESHOLD,
         SIGNAL_ZSCORE_THRESHOLD_BASIS,
-        MIN_PAIR_DEPTH_RATIO,
+        STATIONARITY_ALPHA,
+        STATIONARITY_GATE_PASSED,
+        STATIONARITY_GATE_SPURIOUS,
+        STATIONARITY_GATE_UNRESOLVED,
+        STATIONARITY_LAG_RULE,
         multiplicity_report,
+        stationarity_gate_of,
     )
 
     class _PairsDisclosure(CointScannerResponse):
@@ -11245,6 +11365,62 @@ async def get_cointegration_pairs(
         text = str(signal or "").strip()
         return text.split(" ", 1)[0] if text else ""
 
+    def _withholding_counts(pairs: Iterable[Any]) -> Dict[str, int]:
+        """How many delivered rows the stationarity gate withheld, and under which head.
+
+        Counted off the published signal heads, exactly as `contested_pair_count`
+        counts the contested head: the gate decision was already made once, by
+        `build_pair_signal`, and re-deriving it here could disagree with the
+        verdict the row already carries. The two heads are the two distinct
+        withholdings - a leg measured stationary (a finding) and a leg whose
+        I(1) was never established (an absent measurement) - and they are kept
+        apart because collapsing them would say a quarter of the book was
+        spurious when part of it was simply not measured.
+        """
+        counts = {SIGNAL_SPURIOUS: 0, SIGNAL_STATIONARITY_UNDETERMINED: 0}
+        for pair in pairs:
+            head = _signal_head(getattr(pair, "signal", None))
+            if head in counts:
+                counts[head] += 1
+        return counts
+
+    def _verdict_counts(pairs: Iterable[Any]) -> Dict[str, int]:
+        """How many delivered rows carry each stationarity VERDICT, and why it is not
+        `_withholding_counts`.
+
+        The two count different things, and on a real scan they are not close: a
+        v28 export delivered 91 rows, twelve of them carrying the
+        `spurious_regression_rejected` verdict, and published
+        `spurious_regression_rejected_count: 1`. Both numbers were true. The
+        difference is that `build_pair_signal` returns `NOT_COINTEGRATED` at its
+        first rung, ABOVE the two stationarity rungs, so a pair Engle-Granger
+        never declared cointegrated was never a candidate - and such a row still
+        carries a verdict, because the verdict is a measurement of the two
+        legs and was taken whether or not anything downstream wanted it.
+
+        A stationary series is a property of the UNIVERSE, not of a pair: on
+        that scan ELECTCAST.NS measures stationary, so it forms eleven pairs
+        that inherit its verdict, and eleven of the twelve had p >= 0.10. So
+        "this pair's legs are not I(1)" and "this pair was tradeable and the
+        gate stopped it" are different facts, and a payload that publishes only
+        the second under the first's name is not merely terse - a reader who
+        counts the rows gets a different number with no way to reconcile it.
+
+        Every token is published, zeros included, and an unrecorded gate is
+        counted as `not_recorded` rather than dropped, so the map always sums
+        to the number of delivered rows. That is what makes it checkable.
+        """
+        counts = {
+            STATIONARITY_GATE_PASSED: 0,
+            STATIONARITY_GATE_SPURIOUS: 0,
+            STATIONARITY_GATE_UNRESOLVED: 0,
+            GATE_VERDICT_NOT_RECORDED: 0,
+        }
+        for pair in pairs:
+            verdict = stationarity_gate_of(pair)
+            counts[verdict if verdict in counts else GATE_VERDICT_NOT_RECORDED] += 1
+        return counts
+
     def _directives(
         response: CointScannerResponse,
         family: Mapping[str, Any],
@@ -11255,8 +11431,9 @@ async def get_cointegration_pairs(
         downstream agent may act on. Each entry carries the whole chain that
         allowed it - the two tests, the p-value, the corrected threshold, the
         comparison count, the z-score, its threshold, and the hedge ratio with
-        the notional convention that gives it a size - so acting on an entry
-        does not require re-deriving anything from prose.
+        the notional convention that gives it a size - plus the stationarity
+        gate and both leg verdicts, so acting on an entry does not require
+        re-deriving anything from prose.
         """
         corrected = family.get("corrected_threshold")
         published: List[Dict[str, Any]] = []
@@ -11274,6 +11451,17 @@ async def get_cointegration_pairs(
                     "johansen_agrees_with_decision": getattr(
                         pair, "johansen_agrees_with_decision", None
                     ),
+                    # The gate, restated on the entry itself. A directive can
+                    # only be reached when the gate is `both_legs_i1`, so this
+                    # is the per-pair evidence that the p-value beside it is a
+                    # statement about a relationship between two non-stationary
+                    # series rather than a regression of stationarity on
+                    # stationarity. Publishing it on the directive is what stops
+                    # a consumer having to re-derive the precondition from the
+                    # prose before it may act.
+                    "stationarity_gate": getattr(pair, "stationarity_gate", None),
+                    "stationarity_leg_a": getattr(pair, "stationarity_leg_a", None),
+                    "stationarity_leg_b": getattr(pair, "stationarity_leg_b", None),
                     "comparisons_made": family.get("comparisons_made"),
                     "correction_applied": MULTIPLICITY_CORRECTION,
                     "corrected_p_value_threshold": corrected,
@@ -11385,6 +11573,37 @@ async def get_cointegration_pairs(
             family_alpha=p_value_threshold,
             comparisons_made=getattr(response, "scanned_pairs_count", None),
         )
+        # `surviving_pairs` above reads the Engle-Granger p-value only, so a
+        # pair the stationarity gate rejected is still in it even though its
+        # signal withholds and it carries no directive. That family arithmetic
+        # is correct - the Bonferroni threshold comes from `comparisons_made`,
+        # the number of tests RUN, which is the family `statsmodels`'
+        # `multipletests` cannot express - so it is left exactly as it is. What
+        # was missing is the reader's ability to tell the two numbers apart, so
+        # the count of pairs that survived the correction AND passed the gate is
+        # published immediately beside `surviving_pairs`.
+        #
+        # Derived from the two things the service already returned, not
+        # recomputed: the surviving key set, and each delivered row's own
+        # recorded gate verdict. Nothing is inferred from the p-values. A row
+        # with no recorded gate is not counted, because the service's own
+        # contract reads an absent gate as "not recorded", never as a pass.
+        gate_open = {
+            f"{getattr(pair, 'ticker_a', None)}/{getattr(pair, 'ticker_b', None)}"
+            for pair in pairs
+            if stationarity_gate_of(pair) == STATIONARITY_GATE_PASSED
+        }
+        family["actionable_pairs_count"] = len(
+            set(family.get("surviving_pairs") or []) & gate_open
+        )
+        family["actionable_pairs_basis"] = (
+            "surviving_pairs intersected with the delivered rows whose recorded "
+            "stationarity_gate verdict is both_legs_i1. surviving_pairs is a "
+            "multiplicity measurement over the p-value alone, so it can be larger "
+            "than this; the difference is exactly the pairs whose cointegration "
+            "p-value survived the family correction but whose legs were never "
+            "shown to be I(1). The family arithmetic is unchanged."
+        )
         extras["multiple_testing"] = family
         extras["signal_policy"] = {
             "zscore_threshold": SIGNAL_ZSCORE_THRESHOLD,
@@ -11398,13 +11617,32 @@ async def get_cointegration_pairs(
             "gate": MULTIPLICITY_CORRECTION,
             "gate_rule": (
                 "A signal names a position only when all of: Engle-Granger "
-                "declared the pair cointegrated, the Johansen diagnostic agrees, "
-                "hedge_ratio_beta is positive, the p-value survives the "
+                "declared the pair cointegrated, the stationarity gate passed on "
+                "both legs, the Johansen diagnostic agrees, hedge_ratio_beta is "
+                "positive, the p-value survives the "
                 f"{MULTIPLICITY_CORRECTION} correction over the whole family, and "
                 f"the spread z-score is past +/-{SIGNAL_ZSCORE_THRESHOLD:g}. "
                 "Every other state is published under its own non-action head and "
                 "carries the reason inline."
             ),
+            # The stationarity gate, stated as a rule rather than left implicit
+            # in the per-pair reason strings. A bare verdict is unfalsifiable: a
+            # reader cannot tell whether I(1) was established on a defensible
+            # lag structure or an arbitrary one, and `arch`'s ADF default would
+            # have been Schwert's rule for MONTHLY macro series - 13-14
+            # candidate lags at this scanner's 107-174 daily sessions - so the
+            # lag rule is published next to the alpha for the same reason the
+            # corrected threshold is published next to the family size.
+            "stationarity_gate_rule": (
+                "both legs must agree I(1): ADF rejects the unit root AND KPSS "
+                "fails to reject stationarity, on log price"
+            ),
+            "stationarity_lag_rule": STATIONARITY_LAG_RULE,
+            "stationarity_alpha": STATIONARITY_ALPHA,
+            "stationarity_withholding_heads": [
+                SIGNAL_SPURIOUS,
+                SIGNAL_STATIONARITY_UNDETERMINED,
+            ],
             "action_naming_heads": list(SIGNAL_DIRECTIVE_HEADS),
         }
         directives = _directives(response, family)
@@ -11422,6 +11660,70 @@ async def get_cointegration_pairs(
             if _signal_head(getattr(pair, "signal", None)) == "CONTESTED_TESTS_DISAGREE"
         )
         extras["contested_pair_count"] = contested
+        # The stationarity gate's two withholdings, counted over the same
+        # delivered rows and published beside `contested_pair_count` because
+        # they are the same kind of disclosure: a row that reached the payload,
+        # ran every test, and is not a trade. `survivor_count` cannot carry
+        # them - a gate-rejected pair still sits in the surviving key set,
+        # because that set is a p-value measurement - so without these two
+        # counts a reader has no way to learn that a quarter of the declared
+        # cointegrations were rejected on the precondition the test assumes.
+        withholding = _withholding_counts(pairs)
+        extras["spurious_regression_rejected_count"] = withholding[SIGNAL_SPURIOUS]
+        extras["stationarity_undetermined_count"] = withholding[
+            SIGNAL_STATIONARITY_UNDETERMINED
+        ]
+        # The two withholdings and the two verdict totals are four numbers
+        # about one gate, and only three of them used to be published. The
+        # missing one is the one a reader can count off the rows, which is
+        # precisely why the other two read as a contradiction: a payload that
+        # publishes 1 beside twelve rows saying `spurious_regression_rejected`
+        # is not lying, it is answering a question the reader did not ask, in a
+        # vocabulary that invites the question that was asked. So the totals
+        # are published, and each count states its own scope.
+        extras["spurious_regression_rejected_count_basis"] = (
+            f"Rows whose published signal head is {SIGNAL_SPURIOUS}: pairs "
+            f"Engle-Granger declared cointegrated that the stationarity gate "
+            f"then withheld, because a leg measured stationary. This is a count "
+            f"of CANDIDATES SUPPRESSED, and it is NOT the number of rows "
+            f"carrying the {STATIONARITY_GATE_SPURIOUS} verdict - a pair that "
+            f"Engle-Granger did not declare cointegrated returns "
+            f"{SIGNAL_NOT_COINTEGRATED} at the first rung of "
+            f"`build_pair_signal`, above the stationarity rungs, so it was "
+            f"never a candidate, yet it still carries the verdict because the "
+            f"verdict measures the two legs. See "
+            f"stationarity_gate_verdict_counts for the row totals."
+        )
+        extras["stationarity_undetermined_count_basis"] = (
+            f"Rows whose published signal head is "
+            f"{SIGNAL_STATIONARITY_UNDETERMINED}: pairs Engle-Granger declared "
+            f"cointegrated that the stationarity gate then withheld, because a "
+            f"leg's I(1) was never established - an absent measurement, not a "
+            f"finding. This is a count of CANDIDATES SUPPRESSED, and it is NOT "
+            f"the number of rows carrying the {STATIONARITY_GATE_UNRESOLVED} "
+            f"verdict: a pair that Engle-Granger did not declare cointegrated "
+            f"returns {SIGNAL_NOT_COINTEGRATED} at the first rung of "
+            f"`build_pair_signal`, above the stationarity rungs, so it was "
+            f"never a candidate, yet it still carries the verdict because the "
+            f"verdict measures the two legs. See "
+            f"stationarity_gate_verdict_counts for the row totals."
+        )
+        extras["stationarity_gate_verdict_counts"] = _verdict_counts(pairs)
+        extras["stationarity_gate_verdict_counts_basis"] = (
+            f"Counts of all delivered rows by the stationarity_gate.verdict on "
+            f"the row itself, keyed by the engine's own verdict tokens "
+            f"({STATIONARITY_GATE_PASSED}, {STATIONARITY_GATE_SPURIOUS}, "
+            f"{STATIONARITY_GATE_UNRESOLVED}, {GATE_VERDICT_NOT_RECORDED}), and "
+            f"summing to returned_pairs_count. This is the family "
+            f"spurious_regression_rejected_count and "
+            f"stationarity_undetermined_count are drawn from, not its sum: each "
+            f"of those two counts only the subset of a verdict that "
+            f"Engle-Granger had already declared cointegrated, so a universe "
+            f"holding one stationary series contributes every pair it forms to "
+            f"the totals here and only the pairs that looked tradeable to the "
+            f"counts there. A stationary series is a fact about the universe, "
+            f"not about a pair."
+        )
 
         declared = family.get("declared_positive_count") or 0
         survivors = family.get("survivor_count") or 0
@@ -11587,6 +11889,21 @@ async def get_cointegration_pairs(
             (family_report.get("declared_positive_count") or 0)
             and not (family_report.get("survivor_count") or 0)
         )
+        # The same footing again, for the same reason. A scan that declared
+        # cointegrations and then rejected some of them on the precondition
+        # Engle-Granger assumes has not established what it says it
+        # established: `is_cointegrated` stayed `True` on every one of those
+        # rows and the p-value that produced it is still published, so a reader
+        # of the per-pair fields alone would take them at face value. Both
+        # withholdings demote - the spurious one because the pair was measured
+        # and failed, the undetermined one because the precondition was never
+        # measured at all - and a scan that withheld nothing is not degraded.
+        # Same measured counts `_disclosure` publishes; no second derivation.
+        gate_withholding = _withholding_counts(list(result.pairs))
+        stationarity_unresolved = bool(
+            gate_withholding[SIGNAL_SPURIOUS]
+            or gate_withholding[SIGNAL_STATIONARITY_UNDETERMINED]
+        )
         update: Dict[str, Any] = {
             "requested_tickers": coverage["requested_tickers"],
             "available_tickers": coverage["available_tickers"],
@@ -11609,6 +11926,7 @@ async def get_cointegration_pairs(
                     bool(result.unpairable_tickers)
                     or depth_status == "partial"
                     or multiplicity_unconfirmed
+                    or stationarity_unresolved
                 ),
             ),
             "universe_coverage": coverage,
@@ -11745,7 +12063,12 @@ async def get_liquidity_limits(
             parsed = _parse_tickers(tickers)
             ticker_list = [t for t in (parsed or "").split(",") if t]
             positions = [
-                PortfolioPosition(ticker=t, weight=1.0 / len(ticker_list), quantity=100.0, buy_price=100.0, last_price=100.0, market_value=10000.0)
+                # An ad-hoc request supplies tickers, not positions.  All three
+                # value fields stay null so the service has nothing to fall back
+                # on: seeding a notional here made every position-level
+                # liquidation figure a measurement of a number the user never
+                # gave us.
+                PortfolioPosition(ticker=t, weight=1.0 / len(ticker_list), quantity=None, buy_price=100.0, last_price=None, market_value=None)
                 for t in ticker_list
             ]
             ad_hoc = True
@@ -11818,15 +12141,29 @@ async def get_liquidity_limits(
             result_payload.setdefault("warnings", []).append(
                 "Missing price history: " + ", ".join(sorted(fetch_failures))
             )
-        if coverage["status"] == "unavailable":
-            result_payload["data_status"] = "unavailable"
-        elif coverage["status"] == "partial":
-            result_payload["data_status"] = "partial"
+        if not ad_hoc:
+            # Price coverage decides availability only when there is a
+            # portfolio to measure.  An ad-hoc request has none, so coverage
+            # must not upgrade a payload whose every position figure is null.
+            if coverage["status"] == "unavailable":
+                result_payload["data_status"] = "unavailable"
+            elif coverage["status"] == "partial":
+                result_payload["data_status"] = "partial"
         if ad_hoc:
             # Synthetic per-ticker placeholders must not masquerade as a real
             # portfolio valuation.
             result_payload["mode"] = "ad_hoc"
             result_payload["portfolio_value"] = None
+            result_payload["data_status"] = "unavailable"
+            result_payload["position_value_status"] = "unmeasured"
+            result_payload["note"] = (
+                "An ad-hoc request supplies tickers, not positions. Position "
+                "value, portfolio weight and every liquidation figure derived "
+                "from them are uncomputable, so they publish null (per position, "
+                "position_value_status='unmeasured') rather than a placeholder "
+                "notional. Price history and universe coverage below are still "
+                "measured and are reported for the tickers requested."
+            )
         return result_payload
     except HTTPException:
         raise

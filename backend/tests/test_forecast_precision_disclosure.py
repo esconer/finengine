@@ -1558,8 +1558,16 @@ class TestTheRefactorMovedNoPublishedValue:
         clean = returns.replace([np.inf, -np.inf], np.nan).dropna()
         clean = clean.clip(lower=-0.20, upper=0.20)
         values = clean.to_numpy(dtype=float)
-        var = float(np.var(values)) if len(values) else 0.0
-        for x in values[-min(len(values), 60):]:
+        # Restates the engine's seed, which is now the SAMPLE variance
+        # (ddof=1) of the window the recursion iterates.  This line was
+        # `np.var(values)` - the full-sample POPULATION variance - while the
+        # loop below iterated only the trailing 60, so the seed leaked a
+        # full-history statistic into a 60-row recursion.  Updated in lockstep
+        # with analytics_engine.py; the value movement is recorded in
+        # `TestTheOneStepPathDidNotMove.PRE_SEED_FIX_EWMA`.
+        window = values[-min(len(values), 60):]
+        var = float(np.var(window, ddof=1)) if len(window) > 1 else 0.0
+        for x in window:
             var = 0.94 * var + (1.0 - 0.94) * x * x
         raw = float(np.sqrt(max(0.0, var) * 252))
         vol = float(np.clip(raw, 0.05, 1.20))
@@ -1988,15 +1996,63 @@ class TestTheOneStepPathDidNotMove:
     #: `_returns()` (n=60, seed=3, rho=0.35).  Recompute with
     #: `git show HEAD:backend/app/services/analytics_engine.py` if these ever
     #: need to be re-derived; they are the regression baseline.
+    #:
+    #: The three EWMA rows are the ONE deliberate value movement in this file's
+    #: history, and BOTH numbers are recorded.  The seed was the FULL-sample
+    #: population variance while the recursion iterated only the trailing 60,
+    #: so the seed still carried 0.94**60 = 2.4 % of a full-history statistic
+    #: into a value that reads as a 60-observation recursion; the seed is now
+    #: the sample variance (ddof=1) of the window the recursion actually
+    #: iterates, matching `engine_risk_statistics.annual_volatility` at
+    #: analytics_engine.py:2213.
+    #:
+    #:     pre-seed-fix   0.1588270953
+    #:     post-seed-fix  0.1588643866   (+0.0000372913, +0.0235 %)
+    #:
+    #: GARCH and EGARCH are arch fits and did not move.  This is NOT the same
+    #: estimator as `volatility_service.calculate_ewma_volatility`, which is a
+    #: normalised weighted second moment over the FULL sample with no clipping
+    #: and no 60-row truncation; the two disagree by ~0.70 % on a common input
+    #: and are deliberately left unconsolidated.  See
+    #: `TestTheEwmaSeedIsComputedOverTheWindowItRecursesOver` below.
     PRE_FIX = {
         ("GARCH", 1): 0.1520577966,
         ("GARCH", 5): 0.1517606995,
         ("GARCH", 21): 0.1508373405,
-        ("EWMA", 1): 0.1588270953,
-        ("EWMA", 5): 0.1588270953,
-        ("EWMA", 21): 0.1588270953,
+        ("EWMA", 1): 0.1588643866,
+        ("EWMA", 5): 0.1588643866,
+        ("EWMA", 21): 0.1588643866,
         ("EGARCH", 1): 0.1125515650,
     }
+
+    #: The EWMA value published before the seed fix, kept so the movement is
+    #: asserted rather than merely narrated: a re-baseline that silently
+    #: replaced it would hide the only number this change was allowed to move.
+    PRE_SEED_FIX_EWMA = 0.1588270953
+
+    def test_the_ewma_seed_fix_moved_the_value_and_only_the_ewma_value(self):
+        """The one intended movement, pinned on both sides of it.
+
+        Guards the two ways this edit could be laundered: a silent
+        re-baseline of PRE_FIX, and a seed fix that quietly moved a GARCH or
+        EGARCH fit along with it.
+        """
+        series = _returns()
+        old = self.PRE_SEED_FIX_EWMA
+        new = self.PRE_FIX[("EWMA", 1)]
+        # The movement is real, small, and in the expected direction: the
+        # ddof=1 sample variance of a slightly wider effective window is a
+        # touch above the full-sample population variance it replaced.
+        assert new != old, "the seed fix must actually change the EWMA value"
+        assert 0 < abs(new - old) < 1e-3, (old, new)
+        # And it is the ONLY row that moved.
+        for (model, _horizon), value in self.PRE_FIX.items():
+            if model == "EWMA":
+                continue
+            assert value != 0.1588270953, f"{model} row was re-baselined"
+        # GARCH/EGARCH are arch fits: untouched by a python-level seed.
+        point = volatility_forecast_point(series, "GARCH", 1)
+        assert repr(round(point["volatility_forecast"], 10)) == "0.1520577966"
 
     def test_the_analytic_paths_publish_exactly_the_pre_fix_numbers(self):
         series = _returns()
@@ -2060,6 +2116,158 @@ class TestTheOneStepPathDidNotMove:
                         f"{point['forecast_method']!r}, expected "
                         f"{expected_method!r}"
                     )
+
+
+class TestTheEwmaSeedIsComputedOverTheWindowItRecursesOver:
+    """The EWMA recursion's seed is a statistic of the window it iterates.
+
+    THE DEFECT.  `volatility_forecast_point`'s EWMA branch seeded the recursion
+    with the FULL-sample population variance and then iterated only the
+    trailing 60 rows:
+
+        var = float(np.var(r))                    # full sample, ddof=0
+        for x in r[-min(len(r), 60):]:            # trailing 60 only
+            var = 0.94*var + 0.06*x*x
+
+    A single-pass recursion never forgets its seed, so the seed's own weight
+    after the last step is lambda**k.  At k=60 that is 0.94**60 = 2.4 % - the
+    published volatility carried a 2.4 % tail of a full-history statistic
+    while presenting itself as a 60-observation recursion.  The leak is WORSE
+    on short windows, which is where it is least defensible: at n=25 the seed
+    still carries 0.94**25 = 21.3 %, so more than a fifth of the answer came
+    from outside the window.  A return regime that ended thousands of rows ago
+    could not decay out of the number.
+
+    THE FIX.  Seed with the sample variance (ddof=1) of the window the loop
+    actually visits, so the seed's influence is bounded by that window by
+    construction.  ddof=1 matches `engine_risk_statistics.annual_volatility`
+    (analytics_engine.py:2213), the sibling restatement of this engine's own
+    realized volatility; the old ddof=0 disagreed with it.
+
+    WHAT THIS IS NOT.  A de-duplication.  There is a second live EWMA at
+    `volatility_service.calculate_ewma_volatility`, and it is a DIFFERENT
+    estimator: a normalised weighted second moment over the FULL sample, with
+    no +/-0.20 clip, no 60-row truncation, and no ddof.  Measured divergence
+    on a common input is in `test_the_two_live_ewma_estimators_are_not_the_same
+    _estimator` below.  Consolidating either way would move published numbers
+    by ~0.70 %, an order of magnitude more than this fix does, so it is left
+    to the parent as a separate decision.
+    """
+
+    @staticmethod
+    def _ewma_point(series: pd.Series) -> float:
+        return volatility_forecast_point(series, "EWMA", 1)["volatility_forecast"]
+
+    @staticmethod
+    def _expected(series: pd.Series, *, ddof: int, full_sample_seed: bool) -> float:
+        """An independent restatement of the recursion, both ways."""
+        clean = series.replace([np.inf, -np.inf], np.nan).dropna()
+        clean = clean.clip(lower=-0.20, upper=0.20)
+        r = clean.to_numpy(dtype=float)
+        seed_source = r if full_sample_seed else r[-min(len(r), 60):]
+        window = r[-min(len(r), 60):]
+        var = float(np.var(seed_source, ddof=ddof)) if len(seed_source) > 1 else 0.0
+        for x in window:
+            var = 0.94 * var + (1.0 - 0.94) * x * x
+        return float(np.sqrt(max(0.0, var) * 252))
+
+    def test_the_seed_matches_a_window_local_sample_variance(self):
+        """The published value is exactly the window-seeded recursion."""
+        for n in (25, 60, 90, 250, 1000):
+            series = _returns(observations=n, seed=3, rho=0.35)
+            got = self._ewma_point(series)
+            want = self._expected(series, ddof=1, full_sample_seed=False)
+            assert repr(round(got, 12)) == repr(round(want, 12)), (
+                f"n={n}: {got!r} != window-seeded ddof=1 {want!r}"
+            )
+
+    def test_the_seed_is_no_longer_a_full_sample_statistic(self):
+        """The long-history leak is closed, and it was closed by a real amount.
+
+        n=1000 is the case that separates the two: the old seed saw all 1000
+        rows, the loop saw 60, so the old value is measurably not the new one.
+        """
+        series = _returns(observations=1000, seed=3, rho=0.35)
+        got = self._ewma_point(series)
+        old = self._expected(series, ddof=0, full_sample_seed=True)
+        assert repr(round(got, 12)) != repr(round(old, 12)), (
+            "n=1000 still equals the full-sample ddof=0 seed: the leak is open"
+        )
+
+    def test_a_short_window_is_not_dominated_by_its_own_seed(self):
+        """n=25: the old seed still carried 21 % of itself into the answer.
+
+        This is the case where the defect was largest, and the reason the
+        published movement is allowed to exceed the n=60 movement.
+        """
+        series = _returns(observations=25, seed=1, rho=0.0)
+        got = self._ewma_point(series)
+        old = self._expected(series, ddof=0, full_sample_seed=True)
+        # 0.53 % at n=25/seed=1; recorded so the size of the fix is pinned.
+        assert 0.003 < abs(got - old) / old < 0.008, (got, old)
+
+    def test_the_seed_weight_actually_does_not_expire(self):
+        """The arithmetic that made this a defect, asserted as arithmetic."""
+        assert 0.94 ** 60 == pytest.approx(0.0244161, abs=1e-6)
+        assert 0.94 ** 25 == pytest.approx(0.2129102, abs=1e-6)
+        # Both are material. If either ever rounds to zero the defect argument
+        # weakens, and this test should be revisited rather than left passing.
+
+    def test_short_and_degenerate_windows_still_produce_a_number(self):
+        """EWMA has no minimum-sample gate and must not acquire one.
+
+        One observation has no sample variance, so the seed is the explicit
+        zero-assumption contract - never a crash, and never a value borrowed
+        from a window that does not exist.
+        """
+        for n in (1, 2, 3):
+            series = _returns(observations=n, seed=2, rho=0.0)
+            point = volatility_forecast_point(series, "EWMA", 1)
+            assert point["simulated"] is False
+            assert point["forecast_method"] == "riskmetrics_recursion"
+            assert np.isfinite(point["volatility_forecast"])
+            assert point["volatility_forecast"] > 0.0
+
+    def test_the_two_live_ewma_estimators_are_not_the_same_estimator(self):
+        """Why the seed fix stops short of a de-duplication, with numbers.
+
+        The two implementations disagree, and this fix does NOT reconcile
+        them: on the cases where the engine's clipped/truncated recursion and
+        the service's full-sample weighted moment differ most, the gap moves
+        but does not close.  Canonicalising either way is a published-value
+        decision for the parent, not a cleanup.
+        """
+        from app.services.volatility_service import VolatilityService
+
+        cases = [(25, 1, 0.0), (60, 3, 0.35), (60, 2, 0.0),
+                 (90, 2, 0.0), (1000, 5, 0.1)]
+        divergences = []
+        before = []
+        for n, seed, rho in cases:
+            series = _returns(observations=n, seed=seed, rho=rho)
+            service = VolatilityService.calculate_ewma_volatility(series)
+            old = self._expected(series, ddof=0, full_sample_seed=True)
+            new = self._expected(series, ddof=1, full_sample_seed=False)
+            assert service > 0.0
+            old_gap = abs(old - service) / service
+            new_gap = abs(new - service) / service
+            before.append(old_gap)
+            divergences.append(new_gap)
+            # The seed fix did not close the gap, on any case: this is the
+            # assertion that keeps the two from being silently merged.
+            assert new_gap > 0.001, (
+                f"n={n} seed={seed}: engine and service now agree to "
+                f"{new_gap:.4%} - re-measure before claiming they are one "
+                "estimator"
+            )
+        mean_gap = sum(divergences) / len(divergences)
+        assert 0.002 < mean_gap < 0.02, mean_gap
+        # Recorded so the before/after is visible in the assertion history:
+        # the seed fix moved the divergence from ~0.67 % to ~0.70 % on this set,
+        # i.e. it is NOT convergence. It is recorded rather than asserted
+        # against a direction, because which direction it moves depends on the
+        # window, and a test that pinned a direction would be asserting luck.
+        assert 0.002 < sum(before) / len(before) < 0.02
 
 
 class TestTheSimulationOverflowIsReal:

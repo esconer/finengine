@@ -176,6 +176,68 @@ async def test_liquidity_limits_ad_hoc_mode(async_client, test_db: AsyncSession)
         # Synthetic placeholder notional must not be reported as a real
         # portfolio valuation.
         assert data["portfolio_value"] is None
+        # ...and it must not survive anywhere else either.  An ad-hoc request
+        # supplies tickers, not positions, so every figure that needs a
+        # position is uncomputable.  The service falls back to
+        # `quantity * last_price` when market_value is absent, so nulling only
+        # market_value recomputes the identical 10000.0 base: all three value
+        # fields have to be absent, and the published values must be null.
+        assert data["data_status"] == "unavailable"
+        assert data["position_value_status"] == "unmeasured"
+        assert "not positions" in data["note"]
+        assert data["portfolio_weighted_days_to_liquidate_10pct"] is None
+        assert data["portfolio_weighted_days_to_liquidate_20pct"] is None
+        assert data["portfolio_amihud_score"] is None
+        rows = {row["ticker"]: row for row in data["positions"]}
+        assert set(rows) == {"AAA", "BBB"}
+        for row in rows.values():
+            assert row["position_value"] is None
+            assert row["position_value_native"] is None
+            assert row["weight"] is None
+            assert row["position_value_status"] == "unmeasured"
+            assert row["days_to_liquidate_10pct_adv"] is None
+            assert row["days_to_liquidate_20pct_adv"] is None
+            assert row["is_oversized_vs_adv"] is None
+            assert row["data_status"] == "unavailable"
+    finally:
+        app.dependency_overrides.pop(analytics_mod.get_data_service, None)
+
+
+@pytest.mark.api
+@pytest.mark.asyncio
+async def test_liquidity_limits_ad_hoc_publishes_no_value_even_with_full_price_coverage(
+    async_client, test_db: AsyncSession
+):
+    """Full price coverage must not resurrect a position figure.
+
+    The defect only looked correct because the service measured the invented
+    notional against real ADV.  With history present the old code published a
+    HIGHLY_LIQUID tier and a non-null days-to-liquidate for a position the user
+    never declared; coverage says nothing about whether a position exists, so
+    the ad-hoc payload must be null either way.
+    """
+    index = pd.bdate_range("2026-06-01", periods=45)
+    frame = pd.DataFrame(
+        {"close": [100.0] * 45, "volume": [1_000_000.0] * 45}, index=index
+    )
+    mock_ds = Mock()
+    mock_ds.fetch_historical_data = AsyncMock(return_value=frame)
+    from main import app
+    app.dependency_overrides[analytics_mod.get_data_service] = lambda: mock_ds
+    try:
+        resp = await async_client.get(
+            "/api/v1/analytics/liquidity-limits",
+            params={"tickers": "AAA,BBB"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["universe_coverage"]["status"] == "complete"
+        assert data["data_status"] == "unavailable"
+        assert data["portfolio_value"] is None
+        for row in data["positions"]:
+            assert row["position_value"] is None
+            assert row["liquidity_tier"] == "UNAVAILABLE"
+            assert row["days_to_liquidate_10pct_adv"] is None
     finally:
         app.dependency_overrides.pop(analytics_mod.get_data_service, None)
 

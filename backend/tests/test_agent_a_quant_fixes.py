@@ -432,7 +432,12 @@ async def test_a13_zero_variance_excluded_leg_does_not_poison_sizing():
     # it a restatement of the target wearing a measurement's name. It is now the
     # sample-covariance volatility of the recommended book, and the target it was
     # aiming at is published separately as `imposed_target_volatility`.
-    assert result["achieved_volatility"] == pytest.approx(0.109663, rel=1e-4)
+    #
+    # 0.109663 -> 0.109769 (+0.096 %) is the EWMA seed fix reaching this number
+    # through model="EWMA": the recursion is now seeded with the sample variance
+    # of the 60-row window it iterates rather than of the full 80-row sample.
+    # The ~9 % gap to the 0.1 target - the point of this test - is unchanged.
+    assert result["achieved_volatility"] == pytest.approx(0.109769, rel=1e-4)
     assert result["achieved_volatility"] != pytest.approx(0.1, rel=1e-9)
     assert result["achieved_volatility_basis"] == "sample_covariance_of_measured_returns"
     assert result["imposed_target_volatility"] == pytest.approx(0.1, rel=1e-9)

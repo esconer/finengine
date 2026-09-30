@@ -11,7 +11,9 @@ id*.  A rule that cannot be made to fail is a rule that does not work.
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -130,11 +132,115 @@ class TestBaselineFixture:
         assert len(ids) == len(set(ids))
 
     def test_every_rule_id_is_exercised_by_at_least_one_test(self) -> None:
-        """Guards against a rule being added to the table and never asserted."""
+        """Guards against a rule being added to the table and never asserted.
+
+        STRENGTHENED.  This used to compare the rule table against
+        ``EXERCISED_RULE_IDS``, a hand-written list of 57 id strings, which
+        made the guard a statement that somebody had written the ids down.  It
+        could not fail for the reason it existed: all 57 ids could be listed
+        with every corresponding test body stubbed to assert nothing, and the
+        set difference stayed empty.  ``EXERCISED_RULE_IDS`` is now DERIVED by
+        parsing this file (see ``_asserted_ids_by_test``), so a test that
+        stops asserting on its id stops claiming it, and the difference below
+        goes non-empty naming the rule whose exercise went missing.
+
+        Both original assertions are kept, not weakened: the first still
+        catches a rule added with no test, the second still catches an id
+        claimed for a rule that is not in the table.
+        """
         exercised = EXERCISED_RULE_IDS
         table = {rule.rule_id for rule in ca.RULES}
         assert table - exercised == set(), f"never exercised: {sorted(table - exercised)}"
-        assert exercised - table == set(), f"exercised but absent: {sorted(exercised - table)}"
+        assert exercised - table == DECLARED_NON_RULE_IDS, (
+            f"exercised but absent: {sorted(exercised - table)}"
+        )
+
+    def test_every_exercised_id_names_a_real_test_that_asserts_it(self) -> None:
+        """The witness for each id must be a test in THIS file, not a claim.
+
+        ``_asserted_ids_by_test`` maps id -> test names.  A name that is not a
+        test function of this module would mean the map was built from
+        something other than the tests, which is the property the whole guard
+        now rests on.  This is cheap and it is the check that would notice the
+        derivation silently widening to "any string in the file".
+        """
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        real_tests = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+        }
+        for rule_id, witnesses in sorted(_asserted_ids_by_test().items()):
+            assert witnesses, f"{rule_id} is claimed by no test"
+            assert witnesses <= real_tests, (
+                f"{rule_id} claimed by non-test names: {sorted(witnesses - real_tests)}"
+            )
+
+    def test_every_claimed_id_is_either_a_rule_or_a_declared_stranger(self) -> None:
+        """Holds the one hand-maintained exception to exactly what is needed.
+
+        ``DECLARED_NON_RULE_IDS`` is the only part of the coverage picture
+        that cannot be derived, because intent is not in the source: ``NOPE-999``
+        is asserted absent on purpose, to prove the CLI rejects an unknown
+        ``--rule``.  Declaring it is honest; leaving it unconstrained would let
+        the declaration absorb a real coverage hole.  So the set must be
+        exactly the ids the tests need declared -- no more.
+        """
+        claimed_strangers = EXERCISED_RULE_IDS - {rule.rule_id for rule in ca.RULES}
+        assert claimed_strangers == set(DECLARED_NON_RULE_IDS)
+        for stranger in DECLARED_NON_RULE_IDS:
+            assert stranger in _asserted_ids_by_test(), (
+                f"{stranger} is declared but no test asserts on it; "
+                f"the declaration has gone stale"
+            )
+
+    def test_the_rule_id_shape_covers_every_rule_in_the_table(self) -> None:
+        """The scan is keyed on a regex; a new id outside it would go unscanned.
+
+        Without this, adding e.g. ``NUMERIC-1`` to ``RULES`` would leave it out
+        of ``EXERCISED_RULE_IDS`` and the guard would report it as uncovered for
+        the wrong reason -- or, if it also happened to be listed, would not
+        notice at all.
+        """
+        mis_shaped = [
+            rule.rule_id for rule in ca.RULES if not _RULE_ID_SHAPE.fullmatch(rule.rule_id)
+        ]
+        assert mis_shaped == [], f"rule ids outside the scan's shape: {mis_shaped}"
+
+    def test_the_claim_scanner_tells_a_real_test_from_a_hollow_one(self) -> None:
+        """Locks the discrimination the coverage guard depends on.
+
+        Every case here is a way the id can appear in this file WITHOUT a test
+        exercising the rule.  They are written out as synthetic sources so the
+        predicate is pinned against a real edit rather than against my reading
+        of it: a future change that widens the scan to "any string in the file"
+        turns several of these red, which is the point.  The last two are the
+        real defects the old guard could not see -- an id surviving on the
+        strength of the assertion that DENIES it.
+        """
+        cases = {
+            # name: (source, should the id be claimed?)
+            "positive_in": ('def test_x():\n    assert "NUM-001" in out\n', True),
+            "positive_eq": ('def test_x():\n    assert ids == ["NUM-001"]\n', True),
+            "positive_assert_only": ('def test_x():\n    assert_only(export, "NUM-001")\n', True),
+            "negative_not_in": ('def test_x():\n    assert "NUM-001" not in out\n', False),
+            "negative_not_equals": ('def test_x():\n    assert ids != ["NUM-001"]\n', False),
+            "negative_not_wrapper": ('def test_x():\n    assert not ("NUM-001" in out)\n', False),
+            "docstring_only": ('def test_x():\n    """about NUM-001"""\n    assert ok\n', False),
+            "comment_only": ("def test_x():\n    # about NUM-001\n    assert ok\n", False),
+            "assignment_only": ('def test_x():\n    rid = "NUM-001"\n    assert ok\n', False),
+            "not_a_test_function": ('def helper():\n    assert "NUM-001" in out\n', False),
+            "helper_inside_test": (
+                'def test_x():\n    def helper():\n        assert "NUM-001" in out\n    assert ok\n',
+                False,
+            ),
+        }
+        for name, (source, expected) in cases.items():
+            claimed = _claimed_ids_in_source(source)
+            assert ("NUM-001" in claimed) is expected, (
+                f"{name}: expected claimed={expected}, got {sorted(claimed)}"
+            )
 
     def test_rule_categories_cover_the_three_documented_buckets(self) -> None:
         by_category: dict[str, list[str]] = {}
@@ -2658,6 +2764,500 @@ class TestNumericRules:
         )
         assert_only(export, "NUM-024")
 
+    # ---- NUM-025 (a state label against the posterior beside it)
+
+    def _posterior(self, posterior: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+        """A regime block publishing a settled state label beside the posterior
+        that decides it.
+
+        ``regime_probabilities_total`` and the rounding residual are published
+        because NUM-015 requires them, so the only thing a red case changes is
+        the relation NUM-025 is about.
+        """
+        data: dict[str, Any] = {
+            "data_status": "available",
+            "current_regime": "crisis",
+            "regime_probabilities": posterior,
+            "regime_probabilities_total": 100.0,
+            "regime_probabilities_rounding_residual": 0.0,
+            "stability_pct": 96.0,
+            "stability_pct_rule": "share of unchanged decoded labels",
+            "stability_pct_scope": "full_classification_sample",
+            **overrides,
+        }
+        return make_export({"regime": _section("regime", data)})
+
+    def test_num025_a_state_label_must_be_the_argmax_of_its_own_posterior(self) -> None:
+        """The one regime field a consumer acts on, against the distribution the
+        model published beside it.
+
+        Every rule above this one asks whether two fields the exporter emitted
+        TOGETHER are consistent.  This is the case where they are consistent and
+        the label is still wrong: ``current_regime='bull'`` beside ``crisis:
+        99.9967`` is an internally consistent document -- a string and a mapping
+        -- so nothing else in the table could see it.  Four of the five red arms
+        are the ways a posterior that does not single out a state gets a settled
+        one published against it anyway.
+        """
+        healthy = {"bull": 0.5, "crisis": 99.0, "calm": 0.5}
+        # The label IS the argmax.  Asserted silent FIRST and on its own line:
+        # a rule that fires here fires on everything, and every red case below
+        # is only meaningful because this one stays quiet.
+        assert rule_ids(self._posterior(healthy)) == set()
+
+        # 1/5 the reproduced defect: the label is wrong by a factor of a million
+        # on the model's own posterior.
+        contradiction = self._posterior(
+            {"bull": 0.0001, "crisis": 99.9967, "calm": 0.0032},
+            current_regime="bull",
+        )
+        assert_only(contradiction, "NUM-025")
+        message = find_for(contradiction, "NUM-025")[0].message
+        assert "wrong by a factor of" in message
+        assert "'crisis' at 99.9967" in message
+
+        # 2/5 a tie for the maximum.  The posterior does not single out a state,
+        # so publishing one as settled is an overclaim -- the label is not even
+        # checkable, let alone correct.
+        tied = self._posterior({"bull": 50.0, "crisis": 50.0, "calm": 0.0})
+        assert_only(tied, "NUM-025")
+        assert "tied at the top" in find_for(tied, "NUM-025")[0].message
+
+        # 3/5 an entirely null posterior: the state is undetermined, not correct.
+        nulled = self._posterior({"bull": None, "crisis": None, "calm": None})
+        assert_only(nulled, "NUM-025")
+        assert "undetermined, not correct" in find_for(nulled, "NUM-025")[0].message
+
+        # 4/5 no posterior beside the label at all.  The label is then an
+        # UNVERIFIED action input, which is the one thing this rule must never
+        # report as a pass.
+        unverified = self._posterior(healthy)
+        del unverified["sections"]["regime"]["data"]["regime_probabilities"]
+        assert_only(unverified, "NUM-025")
+        assert "unverified" in find_for(unverified, "NUM-025")[0].message
+
+        # 5/5 a state the posterior does not name.
+        unnamed = self._posterior(healthy, current_regime="melt_up")
+        assert_only(unnamed, "NUM-025")
+        assert "is not a state the posterior names" in find_for(unnamed, "NUM-025")[0].message
+
+    # ---- NUM-026 (a point estimate against the companion it summarises)
+
+    def _tail_mean(
+        self,
+        section: str,
+        point: str,
+        quantile: str,
+        *,
+        tail: float = -0.00874386,
+        cutoff: float = -0.00643209,
+    ) -> dict[str, Any]:
+        """A block publishing a conditional tail mean beside the quantile that
+        selects that tail, under either section's own vocabulary.
+
+        INERT SCAFFOLDING, NOT A MEASUREMENT.  ``var_95_standard_error`` below
+        is INVENTED -- it is not a standard error of anything, was not measured
+        off any series, and is not a figure the v5 exporter has ever published
+        (the real artifact carries exactly one interval, and NUM-022 exists to
+        reject it).  It is here solely as ENV-020's price of admission: a
+        section of naked point estimates fails ENV-020 whatever this rule says,
+        and ENV-020 firing alongside NUM-026 would make ``assert_only`` fail for
+        the wrong reason and hide the identity under test.
+
+        It must never be read as a real disclosure, and nothing about it is
+        asserted -- no rule is exercised on its value.  Verified: delete it and
+        this helper's exports fail ENV-020 instead of NUM-026.
+        """
+        return make_export(
+            {
+                section: _section(
+                    section,
+                    {
+                        "data_status": "available",
+                        point: tail,
+                        quantile: cutoff,
+                        # INVENTED, inert, ENV-020 admission price -- see docstring.
+                        f"{quantile}_standard_error": 0.001187,
+                    },
+                )
+            }
+        )
+
+    def _prob_success_table(self) -> tuple[float, dict[str, float]]:
+        """The synthetic terminal-percentile table the prob_success cases stand on.
+
+        Purely an input to :meth:`_prob_success_bracket`; nothing here is a
+        measurement.  Two properties are load-bearing and are checked on their
+        own terms by ``test_num026_the_percentile_table_the_prob_success_cases_
+        stand_on_is_consistent``, which runs first: the table is monotone, like
+        any table the exporter can publish (NUM-013's own precondition), and the
+        target sits STRICTLY inside the published range with a level on each
+        side of it, so neither the floor nor the ceiling is vacuous.
+        """
+        return 2.5, {"p5": 1.0, "p25": 2.0, "p50": 3.0, "p75": 4.0, "p95": 5.0}
+
+    @staticmethod
+    def _prob_success_bracket(
+        target: float, percentiles: dict[str, float]
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The bracket the published table requires, derived HERE from that table.
+
+        A SECOND, independent reading of the same published numbers.  It is not
+        the rule's bracket and never sees it; it exists so the assertions can be
+        about the RELATION -- do the rule's verdicts agree with what the table
+        implies? -- instead of about the rule's prose.  No expected bracket is
+        written down anywhere in this file, because the floor of this relation
+        has been re-derived twice and both times it was pinned in a test
+        assertion first, which is how an assertion about a number gets made and
+        how it then breaks the moment the number is corrected.
+
+        ``p_c`` is the published ``c``-th percentile of the terminal values of
+        the very paths ``prob_success`` counts, and ``t`` the published target.
+        The defining property of a quantile gives two inclusions:
+
+        * ``P(T <= p_c) >= c/100``, so mass at or BELOW a level that falls short
+          of ``t`` is mass that fails to clear it.  Every ``c`` with ``p_c < t``
+          therefore yields the CEILING ``1 - c/100``, and the weakest of them --
+          the one every correct derivation must respect whatever else it assumes
+          -- is the SMALLEST such ``c``.
+        * ``P(T < p_c) <= c/100``, so a level at or above ``t`` has at least
+          ``1 - c/100`` of the mass at or above it, and all of that mass clears
+          ``t``.  Every ``c`` with ``p_c >= t`` therefore yields the FLOOR
+          ``1 - c/100``, and the weakest of them is the LARGEST such ``c``.
+
+        Every floor in ``[1 - max/100, 1 - min/100]`` over the clearing levels,
+        and every ceiling in ``[1 - min/100, 1 - max/100]`` over the short ones,
+        is a correct reading of the same table, and which of them a rule chooses
+        is its own business.  So this returns the two extremes of that family --
+        ``(loose, tight)`` -- and the tests below only probe where the family
+        AGREES: inside ``tight`` the rule must stay silent under any correct
+        derivation, and outside ``loose`` it must fire.  The gap between them is
+        deliberately left unprobed: there, the verdict is a property of the
+        derivation the rule's owner owns, not of the published table.
+        """
+        below: list[float] = []
+        at_or_above: list[float] = []
+        for key, value in percentiles.items():
+            level = re.fullmatch(r"p(\d+(?:\.\d+)?)", str(key))
+            assert level is not None, f"{key!r} is not a published percentile level"
+            assert isinstance(value, (int, float)) and not isinstance(value, bool)
+            assert float("-inf") < float(value) < float("inf"), (
+                f"{key!r}={value!r} is not a finite terminal value"
+            )
+            (at_or_above if float(value) >= target else below).append(
+                float(level.group(1))
+            )
+        assert below and at_or_above, (
+            "the table has no level on one side of the target, so one bound is "
+            f"vacuous: below={sorted(below)} at_or_above={sorted(at_or_above)}"
+        )
+        tight = (1.0 - min(at_or_above) / 100.0, 1.0 - max(below) / 100.0)
+        loose = (1.0 - max(at_or_above) / 100.0, 1.0 - min(below) / 100.0)
+        return loose, tight
+
+    def test_num026_the_percentile_table_the_prob_success_cases_stand_on_is_consistent(
+        self,
+    ) -> None:
+        """The table is a distribution, not numbers picked until a rule went quiet.
+
+        Every prob_success case is decided by comparing a figure against a
+        bracket derived from this table, so if the table were incoherent the
+        comparison would be meaningless and the red cases would prove nothing.
+        A table with no level at or above the target has no floor at all, so an
+        arbitrary ``prob_success`` would sit inside it; a table that is not
+        monotone is not a table the exporter could publish.  So the fixture is
+        checked on its own terms here, before anything is asserted from it.
+        """
+        target, table = self._prob_success_table()
+
+        # 1/4 every key is a real percentile level, strictly inside (0, 100),
+        #     and no level is published twice.
+        levels: list[tuple[str, float]] = []
+        for key in table:
+            match = re.fullmatch(r"p(\d+(?:\.\d+)?)", str(key))
+            assert match is not None, f"{key!r} is not a published percentile level"
+            level = float(match.group(1))
+            assert 0.0 < level < 100.0, f"{key!r} is not an interior percentile"
+            levels.append((str(key), level))
+        assert len({level for _, level in levels}) == len(levels), (
+            f"duplicate levels: {sorted(level for _, level in levels)}"
+        )
+
+        # 2/4 the table is non-decreasing in its level, which is the very
+        #     precondition NUM-013 enforces on a published one.
+        ordered = sorted((level, float(table[key])) for key, level in levels)
+        for (low_level, low), (high_level, high) in zip(ordered, ordered[1:]):
+            assert low <= high, (
+                f"p{low_level:g}={low} exceeds p{high_level:g}={high}; a "
+                "percentile table that is not monotone is not a table"
+            )
+
+        # 3/4 the target is strictly inside the published range, so the table
+        #     really brackets it and the relation is testable in both directions.
+        values = [value for _, value in ordered]
+        assert values[0] < target < values[-1], (
+            f"target_value={target} is not strictly inside the published range "
+            f"[{values[0]}, {values[-1]}], so one bound is vacuous"
+        )
+
+        # 4/4 the two derivations of the bracket are well ordered and enclose a
+        #     band of real width -- not a point, and not an inverted interval.
+        loose, tight = self._prob_success_bracket(target, table)
+        assert 0.0 <= loose[0] < tight[0] <= tight[1] < loose[1] <= 1.0, (
+            f"the bracket the table requires is not well ordered: "
+            f"loose={loose} tight={tight}"
+        )
+
+    def test_num026_a_point_estimate_must_agree_with_its_companion(self) -> None:
+        """Every identity in ``COMPANION_MAP``, one red case each.
+
+        These are the identities a consumer ACTS on, and they are the ones with
+        no other rule: a string, a boolean or a single number is internally
+        consistent with everything the document says, so the table had nothing to
+        compare it against.  Each red case corrupts ONE leaf of its own healthy
+        document, and each healthy document is asserted silent -- a rule that
+        fires on all eight of them fires on anything.
+        """
+        # 1/8 prob_success against the percentile table of the same paths.
+        #
+        # NOT a restatement of the bracket the rule derives.  The bracket is
+        # derived here, by ``_prob_success_bracket``, from this fixture's own
+        # ``terminal_percentiles``; the rule derives its own from the same
+        # numbers; and what is asserted is that the two VERDICTS agree.  No
+        # expected bracket string appears anywhere in this test: the floor of
+        # this relation has been re-derived twice and both times it was pinned
+        # in an assertion here first, which is how an assertion about a number
+        # gets made and then breaks the moment the number is corrected.
+        #
+        # So the three probes are placed against the DERIVATION, in the two
+        # regions where every correct reading of the table gives the same
+        # answer: one inside the tightest bracket any of them can produce, and
+        # one outside the loosest.  Where they land is stated by assertion, so
+        # a fixture change that moved the table would be caught here instead of
+        # quietly turning the "silent" case into a meaningless one.
+        target_value, terminal_percentiles = self._prob_success_table()
+        monte_carlo = {
+            "target_value": target_value,
+            "terminal_percentiles": terminal_percentiles,
+            "prob_success_units": "fraction_of_paths_ending_at_or_above_target",
+            "initial_value": 42624.5,
+            "fan": [
+                {"year": 0.0, "p5": 42624.5, "p25": 42624.5, "p50": 42624.5,
+                 "p75": 42624.5, "p95": 42624.5},
+                {"year": 1.0, "p5": 40000.0, "p25": 45000.0, "p50": 52000.0,
+                 "p75": 60000.0, "p95": 70000.0},
+            ],
+        }
+        loose, tight = self._prob_success_bracket(target_value, terminal_percentiles)
+        satisfied = sum(tight) / 2.0
+        contradicts_low = loose[0] / 2.0
+        contradicts_high = (1.0 + loose[1]) / 2.0
+        assert tight[0] < satisfied < tight[1], (
+            "the silent probe must be inside the tightest bracket any correct "
+            f"derivation can produce, or the silent case proves nothing: {tight}"
+        )
+        assert 0.0 <= contradicts_low < loose[0], (
+            "the low red probe must fall outside the loosest bracket any correct "
+            "derivation can produce, or only this derivation fails it: "
+            f"loose={loose}"
+        )
+        assert loose[1] < contradicts_high <= 1.0, (
+            "the high red probe must fall outside the loosest bracket any correct "
+            "derivation can produce, or only this derivation fails it: "
+            f"loose={loose}"
+        )
+
+        # Silent: the figure SATISFIES the table, so no correct reading of it can
+        # fire.  Without this, a rule that fired on everything would satisfy the
+        # red case below and the pair would prove nothing.
+        assert rule_ids(
+            self._monte_carlo(prob_success=satisfied, **monte_carlo)
+        ) == set()
+        # Red on both sides: the table CONTRADICTS the figure.
+        impossible = self._monte_carlo(prob_success=contradicts_low, **monte_carlo)
+        assert_only(impossible, "NUM-026")
+        too_high = self._monte_carlo(prob_success=contradicts_high, **monte_carlo)
+        assert_only(too_high, "NUM-026")
+
+        # SECONDARY, and deliberately not load-bearing: the finding has to name
+        # the figure and the companion it contradicts, so an operator can act on
+        # it.  No expected bracket and no expected numeric appear here -- a
+        # derived value in this assertion is exactly what has to go.
+        message = find_for(impossible, "NUM-026")[0].message
+        assert "prob_success" in message
+        assert "target_value" in message
+
+        # 2/8 initial_value against the fan's own year-0 row: every simulated
+        # path starts there, so the origin row is that value repeated.  The
+        # prob_success it carries is the SAME probe case 1/8 proved silent, so
+        # this case isolates the origin identity instead of restating a figure
+        # that some other derivation of the bracket might also flag.
+        origin = self._monte_carlo(
+            prob_success=satisfied, **dict(monte_carlo, initial_value=51200.0)
+        )
+        assert_only(origin, "NUM-026")
+        assert "every simulated path starts at initial_value" in (
+            find_for(origin, "NUM-026")[0].message
+        )
+
+        # 3/8 effective_positions against the Herfindahl index it is 1/HHI of.
+        concentration = {
+            "data_status": "available",
+            "herfindahl_index": 0.0856,
+            "effective_positions": 11.68,
+            "effective_positions_note": "N_eff is computed on the UNROUNDED index",
+        }
+        assert rule_ids(
+            make_export({"concentration": _section("concentration", dict(concentration))})
+        ) == set()
+        overstated = dict(concentration, effective_positions=9.8)
+        export = make_export({"concentration": _section("concentration", overstated)})
+        assert_only(export, "NUM-026")
+        assert "N_eff is defined as 1/HHI" in find_for(export, "NUM-026")[0].message
+
+        # 4/8 cvar_95 against the var_95 whose tail it is the mean of.
+        annual = self._tail_mean("realized_risk", "cvar_95", "var_95")
+        assert rule_ids(annual) == set()
+        milder = clone(annual)
+        milder["sections"]["realized_risk"]["data"]["cvar_95"] = -0.0051
+        assert_only(milder, "NUM-026")
+        assert "cannot be the milder of the two" in find_for(milder, "NUM-026")[0].message
+
+        # 5/8 the same identity under risk_contribution's own vocabulary, on the
+        # daily figures rather than the annual ones.
+        daily = self._tail_mean(
+            "risk_contribution",
+            "portfolio_cvar_95_daily",
+            "portfolio_var_95_daily",
+            tail=-0.0341,
+            cutoff=-0.027846,
+        )
+        assert rule_ids(daily) == set()
+        shallower = clone(daily)
+        shallower["sections"]["risk_contribution"]["data"][
+            "portfolio_cvar_95_daily"
+        ] = -0.018
+        assert_only(shallower, "NUM-026")
+        message = find_for(shallower, "NUM-026")[0].message
+        assert "portfolio_var_95_daily" in message
+        assert "cannot be the milder of the two" in message
+
+        # 6/8 expected_sharpe rebuilt from the three moments beside it.
+        #
+        # INERT SCAFFOLDING, NOT A MEASUREMENT.
+        # ``expected_sharpe_standard_error`` is INVENTED.  It is not the
+        # standard error of this Sharpe, was not measured off any return series,
+        # and the v5 exporter publishes no such figure -- ENV-020's own docstring
+        # records that ``standard_error`` appears zero times in the real 876 KB
+        # artifact.  It exists only so ENV-020 (naked point estimates) does not
+        # also fire and confuse ``assert_only``; delete it and this document
+        # fails ENV-020 instead of NUM-026.  No rule is exercised on its value
+        # and it must not be read as real disclosure.
+        moments = {
+            "data_status": "available",
+            "expected_annual_return": 0.1614,
+            "expected_annual_volatility": 0.14,
+            "risk_free_rate": 0.02,
+            "expected_sharpe": 1.01,
+            # INVENTED, inert, ENV-020 admission price -- see comment above.
+            "expected_sharpe_standard_error": 0.2134,
+            "moments_basis": {
+                "display_rounding": {"moment_decimals": 4},
+                "formulas": "expected_sharpe = (expected_annual_return - "
+                            "risk_free_rate) / expected_annual_volatility",
+            },
+        }
+        assert rule_ids(
+            make_export({"optimization": _section("optimization", dict(moments))})
+        ) == set()
+        restated = dict(moments, expected_sharpe=1.7)
+        export = make_export({"optimization": _section("optimization", restated)})
+        assert_only(export, "NUM-026")
+        assert "one of them being restated rather than computed" in (
+            find_for(export, "NUM-026")[0].message
+        )
+
+        # 7/8 a test verdict against the p-value and threshold the same scan
+        # declares.  The p-value key and the threshold key are derived from the
+        # declared decision-test name, so the fixture declares the test too.
+        scan = {
+            "test_agreement": {
+                "decision_test": "engle_granger",
+                "agreement_count": 5,
+                "disagreement_count": 1,
+                "counted_pairs": 6,
+            },
+            "signal_policy": {
+                "p_value_threshold_comparison": "strictly_less_than",
+                "engle_granger_p_value_threshold": 0.05,
+            },
+            "pairs": [
+                {"ticker_a": "AAA.NS", "ticker_b": "BBB.NS",
+                 "is_cointegrated": True, "engle_granger_pvalue": 0.013557}
+            ],
+        }
+        assert rule_ids(self._pairs(**scan)) == set()
+        contradicted = self._pairs(**dict(scan, pairs=[
+            {"ticker_a": "AAA.NS", "ticker_b": "BBB.NS",
+             "is_cointegrated": True, "engle_granger_pvalue": 0.513557}
+        ]))
+        assert_only(contradicted, "NUM-026")
+        assert "is a label, not a result" in (
+            find_for(contradicted, "NUM-026")[0].message
+        )
+
+        # 8/8 the alert arm its own correlation selects.  A current correlation
+        # of 0.1483 is at or below the published 10th percentile, so the honest
+        # document is publishing ELEVATED/lower_tail_collapse/True.  The red
+        # case is the correlation moving to 0.4621 -- at or above the 90th
+        # percentile, the CRITICAL arm -- while those three labels stand still.
+        #
+        # INERT SCAFFOLDING, NOT A MEASUREMENT.
+        # ``current_avg_correlation_standard_error`` is INVENTED.  It is not the
+        # standard error of this correlation, was not measured off any window of
+        # pair correlations, and the v5 exporter publishes no such figure.  It
+        # exists only so ENV-020 (naked point estimates) does not also fire and
+        # confuse ``assert_only``; delete it and this document fails ENV-020
+        # instead of NUM-026.  No rule is exercised on its value and it must not
+        # be read as real disclosure.
+        stability = {
+            "data_status": "available",
+            "current_avg_correlation": 0.1483,
+            # INVENTED, inert, ENV-020 admission price -- see comment above.
+            "current_avg_correlation_standard_error": 0.0312,
+            "historical_threshold_10th": 0.2179,
+            "historical_threshold_75th": 0.4129,
+            "historical_threshold_90th": 0.459,
+            "alert_level": "ELEVATED",
+            "alert_direction": "lower_tail_collapse",
+            "is_regime_break": True,
+        }
+
+        def _stability(**figures: Any) -> dict[str, Any]:
+            return make_export(
+                {
+                    "risk_studio": _section(
+                        "risk_studio",
+                        {
+                            "data_status": "available",
+                            "components": {
+                                "correlation_stability": {
+                                    "data_status": "available",
+                                    **dict(stability, **figures),
+                                }
+                            },
+                        },
+                    )
+                }
+            )
+
+        assert rule_ids(_stability()) == set()
+        moved = _stability(current_avg_correlation=0.4621)
+        assert_only(moved, "NUM-026")
+        message = find_for(moved, "NUM-026")[0].message
+        assert "at or above" in message
+        assert "historical_threshold_90th" in message
+
 
 # --------------------------------------------------------------------------
 # diff
@@ -3044,23 +3644,190 @@ class TestCheckCommand:
 
 
 # --------------------------------------------------------------------------
-# Every rule id must be claimed by at least one test above.
-# Built by hand from the test bodies so adding a rule without a test is a
-# visible failure rather than a silent coverage hole.
+# Which rule ids this file actually exercises.
+#
+# DERIVATION DIRECTION, stated once because it is the whole point:
+#
+#     ca.RULES (the table)  ──>  the ids that MUST be covered
+#     this file's own source ──>  the ids that ARE covered
+#
+# ``EXERCISED_RULE_IDS`` is derived by PARSING THIS FILE and asking, of every
+# test function, "which rule ids do you name inside an assertion?".  It is not
+# typed out by hand.  A hand-written list is a promise; this is a reading of
+# the tests that are actually there, and the two disagree the moment a body
+# stops asserting.
+#
+# The previous hand-maintained 57-id set could not fail for the reason it
+# existed: it was a set difference between a list someone wrote down and the
+# rule table, so all 57 ids could be listed with zero tests and it stayed
+# green.  Stubbing a test body and leaving the id in the list was invisible to
+# it.  Deriving the set is what makes the stub visible.
+#
+# Why the three-tier predicate, and not a plain "does this string appear in the
+# file" scan:
+#
+#   * Only ``test_*`` functions count.  A helper that builds a fixture is not a
+#     test; ids inside one are claims nobody checked.
+#   * Only string CONSTANTS count, so a mention in a comment cannot claim a
+#     rule.  A raw text scan would be satisfied by the word "NUM-025" in a
+#     sentence, which is the failure mode a source scan is usually assumed to
+#     have and usually has.
+#   * Only constants inside an ASSERTING statement count -- a bare ``assert``
+#     or a call to ``assert_only`` -- and NOT under a negation.  This is what
+#     excludes the real counter-examples in this very file: ``assert "ENV-001"
+#     not in out`` (line ~3276) and the ``NOPE-999`` unknown-id case both name a
+#     rule id inside an assertion while proving the opposite of coverage.
+#     Counting them would let a test be deleted and the id survive on the
+#     evidence of the test that denies it.
+#   * Docstrings are excluded, so the prose that explains a rule cannot claim
+#     it.  ``test_num025_...`` and friends describe the rule in their docstring;
+#     a stubbed body with its docstring left behind would otherwise pass.
+#
+# What is still hand-maintained, and why it cannot be derived: the ids named in
+# a test that are NOT rules.  ``NOPE-999`` is a deliberately absent id used to
+# prove the CLI rejects an unknown ``--rule``.  It is not a coverage hole, and
+# nothing in the source distinguishes "an id I forgot to add to the table" from
+# "an id this test asserts is absent" -- so that one distinction is declared
+# here, and ``test_every_claimed_id_is_either_a_rule_or_a_declared_stranger``
+# holds the declaration to exactly what the tests actually need.
 # --------------------------------------------------------------------------
 
-EXERCISED_RULE_IDS: set[str] = {
-    # envelope
-    "ENV-001", "ENV-002", "ENV-003", "ENV-004", "ENV-005", "ENV-006",
-    "ENV-007", "ENV-008", "ENV-009", "ENV-010", "ENV-011", "ENV-012",
-    "ENV-013", "ENV-014", "ENV-015", "ENV-016", "ENV-017", "ENV-018",
-    "ENV-019", "ENV-020", "ENV-021",
-    # cross-section
-    "XS-001", "XS-002", "XS-003", "XS-004", "XS-005", "XS-006", "XS-007",
-    "XS-008", "XS-009", "XS-010",
-    # numeric
-    "NUM-001", "NUM-002", "NUM-003", "NUM-004", "NUM-005", "NUM-006",
-    "NUM-007", "NUM-008", "NUM-009", "NUM-010", "NUM-011", "NUM-012",
-    "NUM-013", "NUM-014", "NUM-015", "NUM-016", "NUM-017", "NUM-018",
-    "NUM-019", "NUM-020", "NUM-021", "NUM-022", "NUM-023", "NUM-024",
-}
+#: The shape every rule id in ``ca.RULES`` must have.  Derived from the table
+#: in the assertion below rather than trusted, so a new id cannot quietly fall
+#: outside the scan and go uncovered without anyone noticing.
+_RULE_ID_SHAPE = re.compile(r"[A-Z]{2,4}-\d{3}")
+
+#: Ids this file names inside an assertion that are deliberately NOT rules.
+#: Hand-maintained because the intent cannot be read from the source; asserted
+#: to be exactly the set the tests need in
+#: ``test_every_claimed_id_is_either_a_rule_or_a_declared_stranger``.
+DECLARED_NON_RULE_IDS: frozenset[str] = frozenset({"NOPE-999"})
+
+
+def _is_asserting_statement(node: ast.stmt) -> bool:
+    """True for a statement that can fail the test.
+
+    ``assert_only`` counts: it is this file's own assertion helper and it
+    raises, so a test that only calls it is a test.  Anything else -- an
+    assignment, a fixture call, a bare expression -- is not.
+    """
+    if isinstance(node, ast.Assert):
+        return True
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "assert_only"
+    )
+
+
+def _sits_under_negation(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    """True if ``node`` is an operand of a ``not`` / ``not in`` / ``!=``.
+
+    ``assert "ENV-001" not in out`` names ENV-001 inside an assertion, and it
+    is evidence that ENV-001 is NOT exercised there.  Counting it would let a
+    test be gutted while its id stayed alive on the strength of the assertion
+    that denies it.
+    """
+    child: ast.AST | None = node
+    parent = parents.get(node)
+    while parent is not None:
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.Compare):
+            # `x not in y` / `x is not y` / `x != y` each pair an op with an
+            # OPERAND: the first op owns `left`, every later op owns the
+            # comparator at the matching index.  Walking the operands
+            # independently of the ops is wrong -- `a != b` has one op and two
+            # operands, so a zip would silently skip `b` and let
+            # `assert ids != ["NUM-001"]` claim NUM-001.
+            operands = [parent.left, *parent.comparators]
+            negated = any(
+                isinstance(op, (ast.NotIn, ast.IsNot, ast.NotEq))
+                for op in parent.ops
+            )
+            if negated and child in ast.walk(ast.Tuple(elts=operands, ctx=ast.Load())):
+                return True
+        child, parent = parent, parents.get(parent)
+    return False
+
+
+def _claimed_ids_in_source(source: str) -> dict[str, set[str]]:
+    """Map rule id -> names of the ``test_*`` functions in ``source`` asserting it.
+
+    Split out from :func:`_asserted_ids_by_test` so the predicate is testable
+    against synthetic sources; ``test_the_claim_scanner_tells_a_real_test_from_a_hollow_one``
+    pins the cases that matter, and both the guard and that test go through
+    this one function.
+    """
+    tree = ast.parse(source)
+    parents = {
+        child: node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
+
+    # Docstrings explain rules; they do not exercise them.  Collected across
+    # the whole tree so a nested helper's docstring is excluded too.
+    docstrings: set[ast.AST] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = getattr(node, "body", None)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstrings.add(body[0])
+
+    claimed: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test"):
+            continue
+        # A nested def is not a test of its own, so its own asserts are not
+        # this test's evidence -- otherwise a test could delegate every
+        # assertion to a helper and still look like coverage.
+        for stmt in ast.walk(node):
+            if stmt in docstrings or not _is_asserting_statement(stmt):
+                continue
+            owner = parents.get(stmt)
+            while owner is not None and owner is not node:
+                if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+                owner = parents.get(owner)
+            else:
+                owner = None
+            if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(stmt):
+                if not (
+                    isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                    and _RULE_ID_SHAPE.fullmatch(child.value)
+                ):
+                    continue
+                if _sits_under_negation(child, parents):
+                    continue
+                claimed.setdefault(child.value, set()).add(node.name)
+    return claimed
+
+
+def _asserted_ids_by_test() -> dict[str, set[str]]:
+    """The same reading, taken from THIS file.
+
+    A test that stops asserting on an id simply stops appearing in that id's
+    set, which is what makes a stubbed body visible to the guard.
+    """
+    return _claimed_ids_in_source(Path(__file__).read_text(encoding="utf-8"))
+
+
+#: rule id -> names of the tests in THIS file that assert on it.  The guard
+#: below reads this, not a hand-written list.
+EXERCISED_RULE_IDS: set[str] = set(_asserted_ids_by_test())

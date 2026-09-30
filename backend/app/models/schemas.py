@@ -523,6 +523,29 @@ class CointPairResult(BaseModel):
     # because the reference is the deepest pair of the same scan.
     depth_ratio: Optional[float] = None
     depth_status: Optional[str] = None
+    # --- Stationarity: the precondition cointegration is defined on --------
+    # `is_cointegrated` is `engle_granger_pvalue < threshold` and stays exactly
+    # that. What these three carry is WHY the pair is or is not actionable on
+    # top of that verdict: Engle-Granger tests a relationship between two I(1)
+    # series, so a low p-value between two already-stationary series is a
+    # regression of stationarity on stationarity.
+    #
+    # Each leg dict holds `verdict` (`i1` / `stationary` / `undetermined`),
+    # `reason`, both p-values, the resolved lag counts and the `lag_rule` the
+    # p-values were produced under. `stationarity_gate` is the pair-level
+    # outcome: `both_legs_i1` (the p-value is about a relationship),
+    # `spurious_regression_rejected` (a leg tested stationary), or
+    # `i1_not_established_on_both_legs` (a leg's stationarity was never
+    # established - an absent measurement, which is NOT the same as a
+    # stationary one and is published with its reason rather than a verdict
+    # nobody ran).
+    #
+    # Optional-with-None for the same reason as every other field here: a
+    # cached row written before this gate existed must still load, and an
+    # absent gate means "not recorded", never "passed".
+    stationarity_leg_a: Optional[Dict[str, Any]] = None
+    stationarity_leg_b: Optional[Dict[str, Any]] = None
+    stationarity_gate: Optional[Dict[str, Any]] = None
 
 
 class CointScannerResponse(BaseModel):

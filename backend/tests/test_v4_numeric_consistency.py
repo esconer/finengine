@@ -43,8 +43,13 @@ from app.api.analytics import (
     CONTRIBUTION_UNIT,
     HOLDING_COVERED_DAYS_SCOPE,
     HOLDING_WIDE_FRAME_COVERED_DAYS_SCOPE,
+    LIQUIDITY_RECOMPUTATION_ALIASES,
+    LIQUIDITY_RECOMPUTATION_BASIS,
+    LIQUIDITY_RECOMPUTATION_KEY,
     LIQUIDITY_SPREAD_DEFINITION,
+    LIQUIDITY_SPREAD_NOTE,
     LIQUIDITY_SPREAD_UNIT,
+    LIQUIDITY_TIER_LADDER,
     PRICE_FRAME_COUNT_UNITS,
     RETURN_FRAME_COUNT_UNITS,
     TRADE_AGGREGATE_SCOPE,
@@ -67,6 +72,7 @@ from app.api.analytics import (
     run_optimization,
 )
 from app.models.database import PortfolioPosition
+from app.services.analytics_engine import AnalyticsEngine
 
 BARS = 700
 #: The routes read `datetime.now()` for their requested end, so the fixtures are
@@ -616,8 +622,8 @@ def test_spread_is_declared_as_an_assumed_tier_formula_not_a_score_difference():
     assert positions["CIPLA.NS"]["spread"] == 0.0004
     # The declared formulas REPRODUCE the published spread, which is what makes
     # the declaration evidence rather than a paraphrase.
-    assert block["recomputed_from_avg_turnover"]["confirmed_count"] == 2
-    assert block["recomputed_from_avg_turnover"]["unconfirmed_count"] == 0
+    assert block[LIQUIDITY_RECOMPUTATION_KEY]["confirmed_count"] == 2
+    assert block[LIQUIDITY_RECOMPUTATION_KEY]["unconfirmed_count"] == 0
     assert per_position["CIPLA.NS"]["spread_formula_confirmed"] is True
     assert per_position["CIPLA.NS"]["spread_tier"] == "tier_1"
     assert per_position["SELECTIPO.NS"]["spread_tier"] == "tier_4"
@@ -647,6 +653,282 @@ def test_score_ceiling_is_disclosed_when_a_leg_clamps_to_the_scale_maximum():
     assert block["spread_at_tier_plateau"]["positions"] == ["MCX.NS"]
 
 
+def test_a_leg_that_entered_its_tier_on_market_cap_is_still_reproduced():
+    """The engine's predicate is `turnover >= X or market_cap >= Y`.
+
+    RELIANCE-like leg: turnover 1e8 is a tier-2 turnover, but a 6e11 cap clears
+    tier 1's cap arm, so the engine published tier 1.  Re-deriving on turnover
+    alone evaluates [tier_2, tier_3, tier_4]: it reports tier 2's spread, which
+    the engine never published, and matches no tier's score, so a correct score
+    is stamped "unconfirmed" with a spread from the wrong tier.
+    """
+    turnover, market_cap = 1e8, 6e11
+    # Engine, analytics_engine.py:3935-3937: tier 1 by the cap arm.
+    engine_score_raw = round(min(10.0, 9.0 + min(1.0, (turnover / 1e9) * 0.2)), 6)
+    engine_spread = round(
+        max(0.0002, 0.0006 - min(0.0003, (turnover / 2e9) * 0.0003)), 4
+    )
+    assert engine_score_raw == 9.02
+    assert engine_spread == 0.0006
+
+    # Without the cap the leg is not in tier 1's ladder at all...
+    turnover_only = [row[0] for row in _liquidity_tier_values(turnover)]
+    assert turnover_only == ["tier_2", "tier_3", "tier_4"]
+    # ...and with it, tier 1 is present and reproduces the published values.
+    with_cap = {row[0]: row for row in _liquidity_tier_values(turnover, market_cap)}
+    assert list(with_cap) == ["tier_1", "tier_2", "tier_3", "tier_4"]
+    assert with_cap["tier_1"][1] == engine_score_raw
+    assert with_cap["tier_1"][2] == engine_spread
+
+    block, per_position = _liquidity_score_spread_disclosure({
+        "CAPDRIVEN.NS": {
+            "score": 9.0, "score_raw": engine_score_raw, "spread": engine_spread,
+            "avg_turnover": turnover, "market_cap": market_cap, "category": "High",
+        },
+    })
+    facts = per_position["CAPDRIVEN.NS"]
+    assert facts["spread_tier"] == "tier_1"
+    assert facts["spread_recomputed"] == 0.0006
+    assert facts["spread_formula_confirmed"] is True
+    assert block[LIQUIDITY_RECOMPUTATION_KEY]["unconfirmed_tickers"] == []
+
+
+def test_an_absent_market_cap_cannot_satisfy_the_cap_arm():
+    """A row with no cap must fall back to the turnover ladder, not guess one."""
+    assert [row[0] for row in _liquidity_tier_values(1e8)] == [
+        "tier_2", "tier_3", "tier_4",
+    ]
+    assert [row[0] for row in _liquidity_tier_values(1e8, None)] == [
+        "tier_2", "tier_3", "tier_4",
+    ]
+    _, per_position = _liquidity_score_spread_disclosure({
+        "NOCAP.NS": {
+            "score": 8.0, "score_raw": 8.02, "spread": 0.0013,
+            "avg_turnover": 1e8, "category": "High",
+        },
+    })
+    # An unknown cap cannot raise the ladder to a tier that was never measured.
+    # The confirmation still holds here because the published spread is
+    # reproduced by a tier the engine could have applied: had the cap arm added
+    # tier_1, the engine's published spread would be tier 1's and this leg would
+    # have come back unconfirmed instead.
+    assert per_position["NOCAP.NS"]["spread_tier"] == "tier_2"
+    assert per_position["NOCAP.NS"]["spread_recomputed"] == 0.0013
+    assert per_position["NOCAP.NS"]["spread_formula_confirmed"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7b. the count block and the note describe the PREDICATE, not one of its inputs
+# ---------------------------------------------------------------------------
+# The engine's tier predicate is a disjunction, `avg_turnover >= X or market_cap
+# >= Y`, but the block that re-derives the published values was named
+# `recomputed_from_avg_turnover` and the note described the spread as coming from
+# turnover alone. Both were published strings asserting something the code had
+# stopped doing, and they were easy to miss precisely because
+# `LIQUIDITY_TIER_LADDER` already published the `or market_cap` arm: the two
+# strings agreed with each other and with the table, and all three understated the
+# predicate. The rename is the visible fix; the tests below are the durable one -
+# they join the note, the ladder table, `_liquidity_tier_values` and the ENGINE
+# into one chain, so an arm added to any one of them and not the others fails.
+
+#: (avg_turnover, market_cap, tier the engine scores on), read off the engine's
+#: own if/elif chain - `analytics_engine.liquidity_analysis`, the four arms at
+#: `daily_turnover >= 500000000.0 or mc >= 500000000000.0` and the two `elif`s
+#: below it.  Restated independently on purpose: a table generated from
+#: `LIQUIDITY_TIER_LADDER` or from `_liquidity_tier_values` would agree with
+#: itself and catch nothing.  Values sit clear of every threshold so a float
+#: round-trip cannot land a case on a boundary.
+ENGINE_TIER_CASES = (
+    (6.0e8, None, "tier_1"),     # tier 1 by the TURNOVER arm
+    (1.2e8, 6.0e11, "tier_1"),   # tier 1 by the CAP arm alone
+    (1.2e8, 2.0e11, "tier_2"),   # tier 2 by the CAP arm alone
+    (1.2e8, None, "tier_2"),     # tier 2 by the TURNOVER arm
+    (5.0e7, 2.0e10, "tier_3"),   # tier 3 by the CAP arm alone
+    (5.0e7, None, "tier_3"),     # tier 3 by the TURNOVER arm
+    (1.0e6, None, "tier_4"),     # neither arm: the otherwise row
+)
+
+
+def _turnover_frame(daily_turnover: float) -> pd.DataFrame:
+    """Constant price/volume frame, so the engine's daily turnover is exact."""
+    periods = 30
+    return pd.DataFrame(
+        {
+            "Close": [1.0] * periods,
+            "Volume": [daily_turnover] * periods,
+        },
+        index=pd.date_range(start="2024-01-01", periods=periods, freq="D"),
+    )
+
+
+class TestTheReDerivationNamesBothInputs:
+    def test_the_count_block_is_named_for_the_inputs_it_is_evaluated_on(self):
+        """The canonical name may not assert turnover alone.  It is not a
+        function of turnover: `_liquidity_tier_values` is handed the cap as well,
+        and dropping it re-derives a ladder the engine never applied."""
+        assert LIQUIDITY_RECOMPUTATION_KEY == "recomputed_from_avg_turnover_and_market_cap"
+        assert "avg_turnover" in LIQUIDITY_RECOMPUTATION_KEY
+        assert "market_cap" in LIQUIDITY_RECOMPUTATION_KEY
+        block, _ = _liquidity_score_spread_disclosure({})
+        assert LIQUIDITY_RECOMPUTATION_KEY in block
+        assert block["recomputation"]["canonical"] == LIQUIDITY_RECOMPUTATION_KEY
+        assert block["recomputation"]["inputs"] == ["avg_turnover", "market_cap"]
+        assert block["recomputation"]["basis"] == LIQUIDITY_RECOMPUTATION_BASIS
+        assert "or market_cap >=" in block["recomputation"]["basis"]
+
+
+class TestTheRetiredCountKeyIsRedirectedNotDropped:
+    def test_the_old_key_resolves_through_the_alias_map(self):
+        """A consumer keying on `recomputed_from_avg_turnover` must be able to
+        find its way.  Dropping the name without publishing the rename is the same
+        defect from the other side: the key would resolve to nothing and nothing
+        would say why."""
+        assert LIQUIDITY_RECOMPUTATION_ALIASES == {
+            "recomputed_from_avg_turnover": LIQUIDITY_RECOMPUTATION_KEY,
+        }
+        block, _ = _liquidity_score_spread_disclosure({
+            "A.NS": {
+                "score": 9.2, "score_raw": 9.240271, "spread": 0.0004,
+                "avg_turnover": 1_201_357_007.8095238, "category": "High",
+            },
+        })
+        recomputation = block["recomputation"]
+        assert recomputation["aliases"] == LIQUIDITY_RECOMPUTATION_ALIASES
+        for retired, canonical in recomputation["aliases"].items():
+            assert canonical in recomputation["canonical"], (retired, canonical)
+            # the key it redirects to is one this block actually publishes
+            assert canonical in block, canonical
+            assert block[canonical] is block[LIQUIDITY_RECOMPUTATION_KEY]
+            assert block[canonical]["confirmed_tickers"] == ["A.NS"]
+        assert "recomputed_from_avg_turnover" in LIQUIDITY_RECOMPUTATION_BASIS
+
+    def test_the_retired_name_is_not_published_as_a_second_key(self):
+        """The failure mode an alias KEY would reintroduce.
+
+        A second key is not a migration aid here: it puts two names for one block
+        in one object, which is the original defect.
+        """
+        block, _ = _liquidity_score_spread_disclosure({})
+        assert not set(LIQUIDITY_RECOMPUTATION_ALIASES) & set(block)
+
+    def test_no_published_number_moved_under_the_rename(self):
+        """Pins the block's whole payload, so a rename that also recomputed
+        something would fail rather than read as a naming change."""
+        block, _ = _liquidity_score_spread_disclosure({
+            "CIPLA.NS": {
+                "score": 9.2, "score_raw": 9.240271, "spread": 0.0004,
+                "avg_turnover": 1_201_357_007.8095238, "category": "High",
+            },
+            "GHOST.NS": {
+                "score": 7.0, "score_raw": 7.0, "spread": 0.0099,
+                "avg_turnover": 1_000_000.0, "category": "High",
+            },
+        })
+        assert block[LIQUIDITY_RECOMPUTATION_KEY] == {
+            "confirmed_count": 1,
+            "unconfirmed_count": 1,
+            "confirmed_tickers": ["CIPLA.NS"],
+            "unconfirmed_tickers": ["GHOST.NS"],
+        }
+
+
+class TestTheNoteDescribesThePredicate:
+    def test_the_note_restates_every_predicate_the_ladder_publishes(self):
+        """The link that failed: the ladder published `or market_cap >= Y` and
+        the prose did not.  An arm added to the table and not the note is the
+        exact next drift, and this is the test that catches it."""
+        for tier in LIQUIDITY_TIER_LADDER:
+            assert tier["applies_when"] in LIQUIDITY_SPREAD_NOTE, tier["id"]
+
+    def test_the_note_states_the_cap_thresholds_rather_than_gesturing_at_them(self):
+        """A disclosure that cannot be checked against the code is worse than a
+        wrong one, because it looks like evidence."""
+        for threshold in ("5e11", "1e11", "1e10"):
+            assert f"market_cap >= {threshold}" in LIQUIDITY_SPREAD_NOTE, threshold
+        # And the fact that makes the arm matter: the NUMBER is turnover-only
+        # while the ROW is not.  Stated as the distinction, not as a hedge.
+        assert "THE NUMBER IS A FUNCTION OF avg_turnover ALONE" in LIQUIDITY_SPREAD_NOTE
+        assert "WHICH LADDER ROW APPLIES IS NOT" in LIQUIDITY_SPREAD_NOTE
+        assert "NOT abs(score - score_raw)" in LIQUIDITY_SPREAD_NOTE
+        # `LIQUIDITY_SPREAD_DEFINITION` is deliberately NOT renamed: the spread
+        # VALUE really is a function of a turnover formula, so the enum is true
+        # of the number and only the TIER is turnover-or-cap.  Pinned so a later
+        # wave cannot quietly fold the two together.
+        assert LIQUIDITY_SPREAD_DEFINITION == (
+            "assumed_bid_ask_spread_from_turnover_tier_formula"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("turnover, market_cap, engine_tier", ENGINE_TIER_CASES)
+    async def test_the_note_the_ladder_and_the_engine_agree_on_one_predicate(
+        self, turnover, market_cap, engine_tier
+    ):
+        """The whole chain, against the real engine rather than a restatement.
+
+        `_liquidity_tier_values` is the predicate the route actually evaluates,
+        `LIQUIDITY_TIER_LADDER` is the published table, `LIQUIDITY_SPREAD_NOTE` is
+        the published prose, and `liquidity_analysis` is what produced the
+        published number.  An arm added to any one of the four and not the other
+        three breaks a link here.
+        """
+        engine = AnalyticsEngine()
+        result = await engine.liquidity_analysis(
+            {"AAA.NS": _turnover_frame(turnover)},
+            market_caps=({"AAA.NS": market_cap} if market_cap is not None else None),
+        )
+        published = result["by_position"]["AAA.NS"]
+        # The engine's cap is never absent, which is what the note claims; the
+        # re-derivation is handed the same value the engine used.
+        assert published["market_cap"] > 0.0
+
+        ladder = _liquidity_tier_values(turnover, published["market_cap"])
+        # 1. the first row the re-derivation offers IS the tier the engine used
+        assert ladder[0][0] == engine_tier
+        assert ladder[0][1] == published["score_raw"]
+        assert ladder[0][2] == published["spread"]
+        # 2. the published table has a row for it...
+        row = next(t for t in LIQUIDITY_TIER_LADDER if t["id"] == engine_tier)
+        # 3. ...and the published prose restates that row's predicate verbatim.
+        assert row["applies_when"] in LIQUIDITY_SPREAD_NOTE
+        # 4. and the block confirms the leg rather than publishing a guess.
+        block, per_position = _liquidity_score_spread_disclosure(
+            result["by_position"]
+        )
+        assert per_position["AAA.NS"]["spread_tier"] == engine_tier
+        assert per_position["AAA.NS"]["spread_formula_confirmed"] is True
+        assert per_position["AAA.NS"]["spread_recomputed"] == published["spread"]
+        assert block[LIQUIDITY_RECOMPUTATION_KEY]["confirmed_count"] == 1
+        assert block[LIQUIDITY_RECOMPUTATION_KEY]["unconfirmed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dropping_the_cap_arm_would_break_the_chain(self):
+        """Why the cap arm is in the name, demonstrated rather than asserted.
+
+        Re-derive this leg on turnover alone and the ladder is a different
+        ladder: the engine published tier_1 through its cap, the turnover-only
+        ladder does not contain tier_1 at all, and the leg's published values
+        are unreproducible.  That is what the old key name asserted was not
+        happening.
+        """
+        engine = AnalyticsEngine()
+        result = await engine.liquidity_analysis(
+            {"AAA.NS": _turnover_frame(1.2e8)}, market_caps={"AAA.NS": 6.0e11}
+        )
+        published = result["by_position"]["AAA.NS"]
+        assert published["score_raw"] == pytest.approx(9.024, abs=1e-9)
+
+        without_cap = _liquidity_tier_values(published["avg_turnover"], None)
+        assert "tier_1" not in {row[0] for row in without_cap}
+        assert not any(row[1] == published["score_raw"] for row in without_cap)
+
+        _, per_position = _liquidity_score_spread_disclosure({
+            "AAA.NS": {k: v for k, v in published.items() if k != "market_cap"},
+        })
+        assert per_position["AAA.NS"]["spread_formula_confirmed"] is False
+        assert per_position["AAA.NS"]["spread_tier"] is None
+
+
+
 def test_a_leg_the_formulas_cannot_reproduce_says_so():
     positions = {
         "GHOST.NS": {
@@ -657,7 +939,7 @@ def test_a_leg_the_formulas_cannot_reproduce_says_so():
     block, per_position = _liquidity_score_spread_disclosure(positions)
     assert per_position["GHOST.NS"]["spread_formula_confirmed"] is False
     assert per_position["GHOST.NS"]["spread_tier"] is None
-    assert block["recomputed_from_avg_turnover"]["unconfirmed_tickers"] == ["GHOST.NS"]
+    assert block[LIQUIDITY_RECOMPUTATION_KEY]["unconfirmed_tickers"] == ["GHOST.NS"]
     assert per_position["GHOST.NS"]["score_ceiling_applied"] is False
 
 

@@ -515,6 +515,58 @@ async def test_b11_liquidity_uses_base_currency_values_and_fx(test_db):
 
 
 @pytest.mark.asyncio
+async def test_unmeasured_position_publishes_null_and_not_a_reconstructed_notional(test_db):
+    """A position with no value fields must not fall back to quantity x price.
+
+    The ad-hoc ``?tickers=A,B`` route builds transient positions, and its
+    service fallback is
+    ``market_value if market_value > 0 else quantity * last_price``.  Clearing
+    only ``market_value`` therefore recomputes the identical 100 * 100 = 10000
+    base and every test stays green with the defect intact, so all three value
+    fields have to be absent.  This test pins the distinction between an
+    unmeasured row and a fully exited one, which is worth a real zero.
+    """
+    service = IndiaDataService(test_db)
+    index = pd.bdate_range("2026-06-01", periods=40)
+    history = {"AAA": pd.DataFrame(
+        {"close": [100.0] * 40, "volume": [1_000_000.0] * 40}, index=index,
+    )}
+
+    unmeasured = PortfolioPosition(
+        ticker="AAA", weight=1.0, quantity=None, buy_price=100.0,
+        last_price=None, market_value=None,
+    )
+    row = (await service.calculate_portfolio_liquidity_limits([unmeasured], history))["positions"][0]
+    assert row["position_value"] is None
+    assert row["position_value_native"] is None
+    assert row["weight"] is None
+    assert row["position_value_status"] == "unmeasured"
+    assert row["days_to_liquidate_10pct_adv"] is None
+    assert row["data_status"] == "unavailable"
+
+    # The trap itself: nulling market_value alone must not reconstruct 10000.0
+    # from the quantity x price fallback the service shares with real rows.
+    half_cleared = PortfolioPosition(
+        ticker="AAA", weight=1.0, quantity=100.0, buy_price=100.0,
+        last_price=100.0, market_value=None,
+    )
+    trapped = (await service.calculate_portfolio_liquidity_limits([half_cleared], history))["positions"][0]
+    assert trapped["position_value"] == pytest.approx(10000.0)
+    assert trapped["position_value_status"] == "measured"
+
+    # A fully exited row is a measured zero, and stays one.
+    exited = PortfolioPosition(
+        ticker="AAA", weight=0.0, quantity=0.0, buy_price=100.0,
+        last_price=100.0, market_value=0.0,
+    )
+    exited_row = (await service.calculate_portfolio_liquidity_limits([exited], history))["positions"][0]
+    assert exited_row["position_value"] == 0.0
+    assert exited_row["position_value_native"] == 0.0
+    assert exited_row["weight"] == 0.0
+    assert exited_row["position_value_status"] == "measured"
+
+
+@pytest.mark.asyncio
 async def test_b12_fx_fallback_is_marked_and_currency_contract_honest():
     service = CurrencyConversionService()
     with patch("yfinance.Ticker", side_effect=ConnectionError("down")):

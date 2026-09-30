@@ -414,14 +414,33 @@ async def send_analytics_update():
                         candidate_vol = metrics.get("annual_volatility")
                         candidate_sharpe = metrics.get("sharpe_ratio")
                         candidate_dd = metrics.get("max_drawdown")
-                        if all(
-                            value is not None
-                            for value in (candidate_vol, candidate_sharpe, candidate_dd)
-                        ):
-                            realized_vol = float(candidate_vol)
-                            sharpe = float(candidate_sharpe)
-                            max_dd = float(candidate_dd)
-                            analytics_status = "measured"
+                        # Each metric carries its own measurement status and
+                        # they are not interchangeable.  The engine withholds
+                        # `sharpe_ratio` below ten return observations while
+                        # `annual_volatility` remains a real measurement over
+                        # the observed window, and a failed drawdown block
+                        # omits its key entirely.  Gating the three as one
+                        # `all(...)` therefore discarded a genuine volatility
+                        # reading whenever Sharpe was absent.  Publish every
+                        # field on its own evidence: an unmeasured metric is
+                        # null, never a substituted zero.
+                        realized_vol = None if candidate_vol is None else float(candidate_vol)
+                        sharpe = None if candidate_sharpe is None else float(candidate_sharpe)
+                        max_dd = None if candidate_dd is None else float(candidate_dd)
+                        # `data_status` uses the documented public vocabulary
+                        # (available | partial | unavailable, see
+                        # docs/ai-context.md) and answers "was there measured
+                        # data for this payload?".  The prior `measured` word
+                        # was a provenance word, not a data-existence one.
+                        measured_count = sum(
+                            1
+                            for value in (realized_vol, sharpe, max_dd)
+                            if value is not None
+                        )
+                        if measured_count == 3:
+                            analytics_status = "available"
+                        elif measured_count:
+                            analytics_status = "partial"
 
             def _rounded_or_none(value):
                 return None if value is None else round(float(value), 4)

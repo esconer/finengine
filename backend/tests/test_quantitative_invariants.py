@@ -398,6 +398,88 @@ class TestQuantitativeInvariants:
                 assert fan_pt["p50"] <= fan_pt["p75"]
                 assert fan_pt["p75"] <= fan_pt["p95"]
 
+    def test_prob_success_agrees_with_its_own_terminal_percentile_table(self):
+        """
+        prob_success is bracketed by the terminal_percentiles published beside it.
+
+        Both are summaries of ONE array -- the terminal values of the same
+        simulated paths, which is why the block now declares
+        `terminal_percentiles_basis` -- so the published table constrains the
+        figure:
+
+            * the SMALLEST published level whose value is AT OR ABOVE the target
+              puts a FLOOR under prob_success: the mass at or above that
+              percentile is at or above p_a, and p_a is at or above the target,
+              so at least (100 - a)% of the paths clear it;
+            * the SMALLEST published level whose value falls SHORT of the target
+              puts a CEILING on prob_success: the bottom a% of the paths sit at
+              or below p_a, and p_a is below the target, so at most (100 - a)%
+              of the paths clear it.
+
+        The floor is read off the SMALLEST clearing level, never the largest. A
+        floor read off the LARGEST would assert that 95% of paths clear any
+        target sitting below p95, which is false of every distribution
+        carrying mass between the target and p95 -- it rejects correct figures
+        instead of catching wrong ones, and it is what the real export tripped
+        on (prob_success=0.922 against a table whose p25 already clears the
+        target: a 7.8% share of failing paths sitting between p5 and p25,
+        exactly where the table puts it).
+        """
+        rng = np.random.default_rng(20260930)
+        returns = pd.Series(rng.normal(0.0005, 0.015, 309))
+
+        def run(method: str, target: float):
+            return simulate_goal(
+                portfolio_returns=returns,
+                initial_value=100_000.0,
+                target_value=target,
+                horizon_years=5,
+                method=method,
+                num_paths=1000,
+                seed=11,
+            )
+
+        for method in ("gbm", "student_t", "bootstrap"):
+            # Targets sit at fixed fractions of the run's own p25, so each one
+            # lands strictly BETWEEN two published levels and the bracket has
+            # both a floor and a ceiling to be checked against. A target above
+            # every level (or below every one) would leave the relation half
+            # vacuous, which is how a wrong floor can hide behind a passing
+            # assertion.
+            p25 = run(method, 150_000.0)["terminal_percentiles"]["p25"]
+            for target in (0.60 * p25, 1.40 * p25, 2.20 * p25):
+                out = run(method, target)
+
+                # The basis is declared, not inferred: a reader (or an audit
+                # rule) must be able to learn that the two figures come from
+                # one sample without reading the engine.
+                assert out["terminal_percentiles_basis"] == (
+                    "empirical_quantiles_of_simulated_terminal_paths"
+                )
+                detail = out["terminal_percentiles_basis_detail"]
+                assert "same 1000 simulated paths" in detail
+                assert "NOT a parametric fit" in detail
+
+                # Compare against the PUBLISHED (rounded) values, because that
+                # is what a consumer of the payload actually has.
+                published_target = out["target_value"]
+                levels = {
+                    int(key.lstrip("p")): float(value)
+                    for key, value in out["terminal_percentiles"].items()
+                }
+                clearing = [lvl for lvl, val in levels.items() if val >= published_target]
+                short = [lvl for lvl, val in levels.items() if val < published_target]
+                assert clearing, f"{method}: no level clears the target; nothing to check"
+
+                low = (100 - min(clearing)) / 100.0
+                high = 1.0 - min(short) / 100.0 if short else 1.0
+
+                assert low <= out["prob_success"] <= high, (
+                    f"{method} target={published_target}: "
+                    f"prob_success={out['prob_success']} lies outside the bracket "
+                    f"[{low}, {high}] its own percentile table requires"
+                )
+
     def test_deterministic_monthly_return_compounding(self):
         """
         Deterministic Return Compounding:
@@ -414,3 +496,140 @@ class TestQuantitativeInvariants:
 
         m_series = (1.0 + r).groupby([r.index.year, r.index.month]).prod() - 1.0
         assert abs(m_series.iloc[0] - expected_jan_geom) < 1e-12
+
+class TestShortWindowsWithholdRatherThanFabricate:
+    """A short return window publishes `None` plus a reason, never a number.
+
+    THE DEFECT.  `AnalyticsEngine._calculate_basic_metrics` had a
+    `len(returns) < 10` branch that published, for every position with fewer
+    than ten return observations:
+
+        annual_return = float(returns.sum())   # a CUMULATIVE PERIOD total
+        sharpe_ratio  = 0.0                    # a hard zero
+        sortino_ratio = 0.0                    # a hard zero
+
+    Three separate fabrications.  `returns.sum()` is a period total wearing
+    the key of an annual RATE, and it disagreed with
+    `engine_risk_statistics.annual_return` (analytics_engine.py:2209), which
+    has always used `mean(axis=0) * 252` on every window including short
+    ones - so the engine carried two different formulas for one field name.
+    And a hard 0.0 is the one value indistinguishable from a measured zero:
+    a reader cannot tell "we measured no excess return" from "we could not
+    measure excess return at all".
+
+    `annual_volatility` and `hit_ratio` deliberately STAY, because both are
+    genuine measurements over the observed window.  Whether a short window may
+    ANNUALIZE is the separate policy question owned by
+    `apply_annualization_gate` / `MIN_ANNUALIZE_DAYS` in app/utils/holdings.py,
+    which the routes already apply; that gate is untouched here.
+    """
+
+    @staticmethod
+    def _engine() -> AnalyticsEngine:
+        return AnalyticsEngine()
+
+    @staticmethod
+    def _returns(n: int, seed: int = 11) -> pd.Series:
+        rng = np.random.default_rng(seed)
+        return pd.Series(
+            rng.normal(0.0004, 0.012, n),
+            index=pd.bdate_range("2025-01-01", periods=n),
+        )
+
+    def test_the_three_are_none_below_ten_observations(self):
+        for n in range(1, 10):
+            metrics = self._engine()._calculate_basic_metrics(self._returns(n))
+            assert metrics["annual_return"] is None, n
+            assert metrics["sharpe_ratio"] is None, n
+            assert metrics["sortino_ratio"] is None, n
+
+    def test_no_period_sum_is_published_under_the_annual_return_key(self):
+        """The specific fabrication: a cumulative sum wearing an annual label."""
+        series = self._returns(7)
+        metrics = self._engine()._calculate_basic_metrics(series)
+        assert metrics["annual_return"] != float(series.sum())
+        # And the two formulas in this one file now agree on the boundary.
+        assert AnalyticsEngine.SHORT_SAMPLE_MIN_OBSERVATIONS == 10
+
+    def test_the_measured_two_survive(self):
+        """Withholding is scoped: volatility and hit rate are real numbers."""
+        series = self._returns(7)
+        metrics = self._engine()._calculate_basic_metrics(series)
+        assert isinstance(metrics["annual_volatility"], float)
+        assert metrics["annual_volatility"] == pytest.approx(
+            float(series.std() * np.sqrt(252))
+        )
+        assert metrics["hit_ratio"] == pytest.approx(float((series > 0).mean()))
+
+    def test_ten_observations_is_enough_and_the_values_are_real(self):
+        metrics = self._engine()._calculate_basic_metrics(self._returns(10))
+        for key in ("annual_return", "sharpe_ratio", "sortino_ratio"):
+            assert isinstance(metrics[key], float), key
+        assert np.isfinite(metrics["annual_return"])
+
+    def test_each_withheld_field_publishes_a_stated_reason(self):
+        """`None` without a reason is a silent hole, not a disclosure."""
+        engine = self._engine()
+        series = self._returns(7)
+        metrics = engine._calculate_basic_metrics(series)
+        block = engine._estimate_uncertainty_block(
+            series, metrics, scope="test short window"
+        )
+        for field in AnalyticsEngine.SHORT_SAMPLE_WITHHELD_FIELDS:
+            entry = block["estimates"][field]
+            assert entry["point"] is None, field
+            assert entry["status"] == "not_computed", field
+            reason = entry["reason"]
+            assert reason, field
+            # The reason must be specific enough to act on: it names the
+            # threshold, says the value is withheld rather than low, and says
+            # what to do about it.
+            assert "10" in reason, field
+            assert "withheld" in reason, field
+            assert "Widen the history window" in reason, field
+
+    def test_the_short_window_reason_beats_the_generic_null_reason(self):
+        """It must not be laundered into the generic `point is None` text."""
+        engine = self._engine()
+        series = self._returns(7)
+        metrics = engine._calculate_basic_metrics(series)
+        block = engine._estimate_uncertainty_block(
+            series, metrics, scope="test short window"
+        )
+        generic = "the point estimate itself is withheld (below the"
+        for field in AnalyticsEngine.SHORT_SAMPLE_WITHHELD_FIELDS:
+            assert generic not in block["estimates"][field]["reason"], field
+
+    def test_a_long_window_publishes_no_short_sample_reason(self):
+        """The reason is scoped to the short window, not stamped on always."""
+        engine = self._engine()
+        series = self._returns(60)
+        metrics = engine._calculate_basic_metrics(series)
+        block = engine._estimate_uncertainty_block(
+            series, metrics, scope="test long window"
+        )
+        for field in AnalyticsEngine.SHORT_SAMPLE_WITHHELD_FIELDS:
+            assert "Widen the history window" not in (
+                block["estimates"][field]["reason"] or ""
+            ), field
+
+    def test_the_measured_fields_are_unaffected_by_the_withholding(self):
+        """The disclosure for a measured field is still a real interval."""
+        engine = self._engine()
+        series = self._returns(60)
+        metrics = engine._calculate_basic_metrics(series)
+        block = engine._estimate_uncertainty_block(
+            series, metrics, scope="test long window"
+        )
+        annual_vol = block["estimates"]["annual_volatility"]
+        assert annual_vol["point"] is not None
+        assert annual_vol["conf_int"] is not None
+
+    def test_no_hard_zero_is_published_for_an_unmeasured_quantity(self):
+        """The general rule, asserted over the whole short-window block."""
+        metrics = self._engine()._calculate_basic_metrics(self._returns(5))
+        for field in AnalyticsEngine.SHORT_SAMPLE_WITHHELD_FIELDS:
+            assert metrics[field] is None, (
+                f"{field} published {metrics[field]!r} on an unmeasured "
+                "quantity"
+            )

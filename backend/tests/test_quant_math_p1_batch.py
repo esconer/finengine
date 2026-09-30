@@ -51,11 +51,28 @@ class TestEwmaSinglePass:
         r = pd.Series(np.random.default_rng(0).normal(0.0005, 0.012, 200))
         out = engine._ewma_forecast(r, 5)
         rc = np.clip(r.to_numpy(dtype=float), -0.20, 0.20)
-        var = float(np.var(rc))
-        for x in rc[-60:]:
+        # The seed is the SAMPLE variance (ddof=1) of the window the loop
+        # iterates. It was `np.var(rc)` - the full-sample POPULATION variance -
+        # while the loop below walked only the trailing 60, so the published
+        # value carried 0.94**60 = 2.4 % of a 200-row statistic into a
+        # 60-row recursion. n=200 > 60, so this test is exactly the case the
+        # fix changed. The value moved 0.1816469953 -> 0.1815386338 (-0.06 %);
+        # the single-pass, flat-term and RiskMetrics properties asserted here
+        # are unchanged, only the seed's sample.
+        window = rc[-60:]
+        var = float(np.var(window, ddof=1))
+        for x in window:
             var = 0.94 * var + 0.06 * x * x
         expected = float(np.clip(np.sqrt(var * 252), 0.05, 1.20))
         assert out["volatility_forecast"] == pytest.approx(expected, rel=1e-9)
+        # And the old full-sample seed is genuinely a different number, so
+        # this test is not passing by accident against a stale expectation.
+        old_var = float(np.var(rc))
+        for x in rc[-60:]:
+            old_var = 0.94 * old_var + 0.06 * x * x
+        old_expected = float(np.clip(np.sqrt(old_var * 252), 0.05, 1.20))
+        assert abs(old_expected - expected) > 1e-6
+        assert out["volatility_forecast"] != pytest.approx(old_expected, rel=1e-9)
         assert len(out["term_structure"]) == 5
         for v in out["term_structure"]:
             assert v == pytest.approx(expected, rel=1e-12)
@@ -331,7 +348,12 @@ class TestTargetVolatilityScaling:
         # the target by ~9% because the EWMA leg and the sample covariance are
         # different estimators. Both are published with their basis so the gap is
         # explicable rather than hidden.
-        assert res["achieved_volatility"] == pytest.approx(0.109099, rel=1e-4)
+        #
+        # This leg is the EWMA one, so the seed fix moved it: 0.109099 ->
+        # 0.109077, -0.020 %. The ~9 % gap to the 0.10 target is unchanged and
+        # is the point of the test; the 0.02 % is the corrected seed reaching
+        # this published number through `model="EWMA"`.
+        assert res["achieved_volatility"] == pytest.approx(0.109077, rel=1e-4)
         assert res["achieved_volatility"] != pytest.approx(0.10, rel=1e-6)
         assert res["achieved_volatility_basis"] == "sample_covariance_of_measured_returns"
         assert res["imposed_target_volatility"] == pytest.approx(0.10, rel=1e-6)

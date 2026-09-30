@@ -5317,18 +5317,47 @@ class AnalyticsEngine:
         except Exception:
             return pd.Series(dtype=float)
     
-    def _calculate_basic_metrics(self, returns: pd.Series) -> Dict[str, float]:
-        """Calculate basic return and risk metrics"""
+    def _calculate_basic_metrics(self, returns: pd.Series) -> Dict[str, Any]:
+        """Calculate basic return and risk metrics.
+
+        `annual_return`, `sharpe_ratio` and `sortino_ratio` are `None` below
+        10 observations, never a number.  A mean annualization needs a window
+        long enough to mean something, and the two ratios divide by a
+        dispersion estimated from the same short window, so they inherit its
+        thinness rather than correcting it.  The stated reason is published per
+        field in `estimate_uncertainty.estimates.<field>.reason`; see
+        `_SHORT_SAMPLE_ANNUALIZATION_REASON` and `_estimate_uncertainty_block`.
+        """
         try:
             if returns.empty:
                 return {}
             
             if len(returns) < 10:
-                # Insufficient sample size for reliable annualization: return period cumulative return and 0 Sharpe
-                annual_return = float(returns.sum())
+                # Insufficient sample size for reliable annualization.
+                #
+                # These three used to be published as a CUMULATIVE period sum
+                # under the key `annual_return`, and as a hard 0.0 for both
+                # ratios.  Both were fabrications rather than measurements: the
+                # sum is a period figure wearing an annual label (it disagrees
+                # with `engine_risk_statistics.annual_return` at :2209, which
+                # has always used mean x 252 on every window), and a 0.0
+                # Sharpe is indistinguishable from a measured zero, which is
+                # what makes a hard zero on an unmeasured quantity the one
+                # number a reader must never be handed.
+                #
+                # `annual_volatility` and `hit_ratio` STAY: both are genuine
+                # measurements over the observed window (a sample standard
+                # deviation and a proportion).  Whether a short window is
+                # allowed to ANNUALIZE is the separate, deliberate policy
+                # question owned by `apply_annualization_gate` /
+                # MIN_ANNUALIZE_DAYS in `app/utils/holdings.py`, which the
+                # routes already apply; that gate is not this method's to
+                # re-decide, and widening it here would change published
+                # numbers on the >= 30-day path this branch never reaches.
+                annual_return = None
                 annual_volatility = float(returns.std() * np.sqrt(252)) if len(returns) > 1 else 0.0
-                sharpe_ratio = 0.0
-                sortino_ratio = 0.0
+                sharpe_ratio = None
+                sortino_ratio = None
             else:
                 # Annual return and volatility
                 annual_return = float(returns.mean() * 252)
@@ -5443,6 +5472,41 @@ class AnalyticsEngine:
         "declared absent rather than approximated."
     )
 
+    #: Minimum observations before a mean-based annualization, and before the
+    #: two ratios that divide by a dispersion estimated from the same window,
+    #: are published at all.  Below it the three are `None` with this reason
+    #: attached; see `_calculate_basic_metrics`.
+    SHORT_SAMPLE_MIN_OBSERVATIONS = 10
+
+    #: The three fields `_calculate_basic_metrics` withholds on a short window.
+    SHORT_SAMPLE_WITHHELD_FIELDS = ("annual_return", "sharpe_ratio", "sortino_ratio")
+
+    _SHORT_SAMPLE_ANNUALIZATION_REASON = (
+        "withheld: fewer than {minimum} return observations were measured on "
+        "this window, which is too few for a mean-based annualization to be a "
+        "measurement rather than an extrapolation, and too few for the "
+        "dispersion that {ratios} divide by to be stable. No cumulative period "
+        "sum is published under the key 'annual_return', because a period "
+        "total and an annualized rate are different quantities, and no zero is "
+        "published for either ratio, because an unmeasured ratio is not a "
+        "measured zero. This is a missing measurement, not a low one: it says "
+        "nothing about whether performance was good. Widen the history window "
+        "or lower SHORT_SAMPLE_MIN_OBSERVATIONS to obtain the value. Note the "
+        "routes apply a separate annualization policy gate at "
+        "MIN_ANNUALIZE_DAYS (30) in app/utils/holdings.py, which is stricter "
+        "than this one and nulls these same keys on the published payload."
+    )
+
+    def _short_sample_reason(self) -> Dict[str, str]:
+        """The per-field reason published when a window is too short."""
+        return {
+            field: self._SHORT_SAMPLE_ANNUALIZATION_REASON.format(
+                minimum=self.SHORT_SAMPLE_MIN_OBSERVATIONS,
+                ratios="sharpe_ratio and sortino_ratio",
+            )
+            for field in self.SHORT_SAMPLE_WITHHELD_FIELDS
+        }
+
     def _estimate_uncertainty_block(
         self,
         returns: pd.Series,
@@ -5463,16 +5527,24 @@ class AnalyticsEngine:
         declared = {
             name: published.get(name) for name in self.REALIZED_RISK_ESTIMATE_FIELDS
         }
+        # A short window's withheld three get a FIELD-SPECIFIC reason rather
+        # than the generic `point is None` text further down, so a reader can
+        # see that the value is absent because the window is short and not
+        # because the resampler declined.  Keyed off the measured count, which
+        # is the same `len(returns)` `_calculate_basic_metrics` branched on.
+        not_computed = {
+            "skewness": self._DISTRIBUTION_SHAPE_REASON,
+            "kurtosis": self._DISTRIBUTION_SHAPE_REASON,
+        }
+        if 0 < int(values.size) < self.SHORT_SAMPLE_MIN_OBSERVATIONS:
+            not_computed.update(self._short_sample_reason())
         return measure_estimate_uncertainty(
             values,
             engine_risk_statistics(self.risk_free_rate),
             declared,
             scope=scope,
             point_tolerance=1e-9,
-            not_computed={
-                "skewness": self._DISTRIBUTION_SHAPE_REASON,
-                "kurtosis": self._DISTRIBUTION_SHAPE_REASON,
-            },
+            not_computed=not_computed,
             notes={
                 "estimator": (
                     "engine_risk_statistics: vectorised restatements of the "
@@ -6350,8 +6422,23 @@ def volatility_forecast_point(
         # floor that does apply to this section lives on
         # `AnalyticsEngine.forecast_volatility`, above the model dispatch.
         r = clean.to_numpy(dtype=float)
-        var = float(np.var(r)) if len(r) else 0.0
-        for x in r[-min(len(r), 60):]:
+        # The seed is the variance OF THE WINDOW THIS RECURSION ITERATES OVER,
+        # and was the FULL-sample population variance.  That let a full-history
+        # statistic survive into a number that reads as a 60-observation
+        # recursion: after the last recursion the seed still carries
+        # 0.94**60 = 2.4 % of itself, and on a SHORT window it carries far
+        # more - 0.94**25 = 21 % at n=25 - so the shorter the history, the more
+        # of the answer came from outside the window.  A regime that ended
+        # 300 rows ago could not decay out of the published volatility.
+        #
+        # ddof=1, not 0, to match `engine_risk_statistics.annual_volatility`
+        # (:2213), the sibling restatement of this engine's own realized
+        # volatility.  Below 2 window observations a sample variance is
+        # undefined, so the explicit zero-assumption contract applies - the
+        # same one `volatility_service.calculate_ewma_volatility` uses (:225).
+        window = r[-min(len(r), 60):]
+        var = float(np.var(window, ddof=1)) if len(window) > 1 else 0.0
+        for x in window:
             var = EWMA_LAMBDA * var + (1.0 - EWMA_LAMBDA) * x * x
         raw = float(np.sqrt(max(0.0, var) * 252))
         annualized = np.array([float(np.clip(raw, FORECAST_VOL_CLIP_LOW,

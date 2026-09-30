@@ -138,6 +138,18 @@ WEIGHT_DELTA_TOLERANCE = 1e-4
 
 PERCENT_TOTAL_TOLERANCE = 0.5
 
+#: Two states whose posterior probabilities are published to 4 decimals and sit
+#: within one display step of each other are not distinguishable from the export,
+#: so NUM-025 treats them as tied rather than as an argmax with a winner.
+POSTERIOR_TIE_TOLERANCE = 1e-4
+
+#: Relative slack on the tail-mean relation.  A tail mean is never allowed to be
+#: MILDER than the quantile that selects its tail, but it is not required to be
+#: strictly deeper either: on a small empirical sample the tail can be a single
+#: observation, and then the two figures coincide exactly.  The check is on
+#: magnitude, so it holds under either sign convention.
+TAIL_MEAN_REL_TOLERANCE = 1e-9
+
 #: How old a section ``as_of`` may be before ENV-012 calls it STALE.
 #:
 #: Seven calendar days, and not a smaller number, because the question is not
@@ -288,7 +300,37 @@ BREADTH_KEY_TOKENS = (
 )
 
 #: Key fragments that name a two-element INTERVAL.
-INTERVAL_KEY_TOKENS = ("confidence_interval", "interval", "_ci", "ci_")
+#:
+#: ``conf_int`` is this repo's own naming, and it was MISSING here.  The tuple was
+#: written when the only interval in the document was
+#: ``forecast_risk.data.portfolio.confidence_interval``; the export has since
+#: published 244 keys literally named ``conf_int`` (215 of them inside an
+#: ``estimate_uncertainty`` block), and none of the four tokens below is a
+#: substring of that word.  NUM-022 was therefore blind to every interval the
+#: system actually emits -- a rule written for a key name that no longer exists.
+#: A rule blind to the codebase's own vocabulary is not strict, it is broken, and
+#: the same hazard has now been measured three times (``data_status`` -> ENV-007,
+#: ``interval`` -> ENV-020, ``conf_int`` -> NUM-022).
+#:
+#: ``bounds`` closes the same gap for the clip bands, by the same measurement
+#: rather than by guesswork: the export publishes 14
+#: ``annualized_volatility_clip_bounds`` pairs under ``forecast_risk`` and four
+#: ``bounds`` pairs under ``stress_testing``, and ``bounds`` was not a substring
+#: any token here matched.  Adding it takes NUM-022's reach on two-element
+#: positive-ordered numeric pairs from 48 to 66 and produces ZERO new findings on
+#: the real export -- every one of the 18 newly visible pairs was measured
+#: against the rule's own round-multiple test first.  The substring also matches
+#: ``clip_bounds`` (32) and the string-valued ``bound_basis`` / ``at_clip_bound``
+#: (45), which the rule's own two-element-numeric gate discards, so the wider
+#: name costs nothing.
+INTERVAL_KEY_TOKENS = (
+    "confidence_interval",
+    "interval",
+    "_ci",
+    "ci_",
+    "conf_int",
+    "bounds",
+)
 
 #: A fabricated band is a round multiple of the estimate.  Multiples are
 #: accepted only on a 0.05 grid inside [0.5, 2.0], so a computed interval whose
@@ -3624,6 +3666,873 @@ def num_024_trade_directive_publishes_its_basis(export: Export) -> list[Finding]
     return findings
 
 
+def num_025_current_regime_is_its_own_argmax(export: Export) -> list[Finding]:
+    """A state LABEL that contradicts the model's own posterior behind it.
+
+    ``regime.data.current_regime`` is a state a consumer acts on -- it is the one
+    field in the section that is not a probability, a matrix or a residual -- and
+    the posterior published beside it decides which state that is.  The two
+    disagreeed by a factor of a million on the export this rule was written
+    against (``current_regime: "bull"`` beside ``crisis: 99.9967``), and nothing
+    in the document said so, because a label and a distribution are two fields
+    the system emitted together and every rule in the table is an identity
+    BETWEEN two such fields.
+
+    A label is the argmax of its posterior, with three cases handled explicitly
+    rather than by default:
+
+    * **a tie for the maximum** -- the posterior does not single out a state, so
+      publishing one as settled is an overclaim.  A finding, not a pass.
+    * **an absent, empty or wholly null posterior** -- the label is then
+      unverified rather than correct, and "unverified" is the one thing this
+      rule must never report as a pass.  Also a finding.
+    * **a label that is not a state the posterior names** -- a finding.
+
+    The tie tolerance is one display step of the published posterior
+    (percentages at 4 decimals), so two states the export cannot tell apart are
+    treated as tied.
+    """
+    findings: list[Finding] = []
+    for path, node in export.dicts:
+        label = node.get("current_regime")
+        if not (isinstance(label, str) and label.strip()):
+            continue
+        label = label.strip()
+        posterior = node.get("regime_probabilities")
+        if not isinstance(posterior, dict) or not posterior:
+            findings.append(
+                Finding(
+                    "NUM-025",
+                    _section_of(path),
+                    f"{path}.current_regime",
+                    f"current_regime={label!r} is published with no "
+                    "regime_probabilities beside it, so the label is an "
+                    "unverified action input rather than a verified one; an "
+                    "unverifiable label is not a passing label",
+                )
+            )
+            continue
+        published = {str(state): value for state, value in posterior.items()}
+        finite = {
+            state: float(value)
+            for state, value in published.items()
+            if _finite(value)
+        }
+        if not finite:
+            findings.append(
+                Finding(
+                    "NUM-025",
+                    _section_of(path),
+                    f"{path}.current_regime",
+                    f"current_regime={label!r} is published against a posterior "
+                    f"of {len(published)} state(s) and not one finite "
+                    "probability, so the state is undetermined, not correct",
+                )
+            )
+            continue
+        top = max(finite.values())
+        leaders = sorted(
+            state for state, value in finite.items()
+            if value >= top - POSTERIOR_TIE_TOLERANCE
+        )
+        if len(leaders) > 1:
+            findings.append(
+                Finding(
+                    "NUM-025",
+                    _section_of(path),
+                    f"{path}.current_regime",
+                    f"current_regime={label!r} but the posterior is tied at the "
+                    f"top between {leaders} at {top:g}%; a tied posterior does "
+                    "not single out a state, so publishing one as settled is an "
+                    "overclaim",
+                )
+            )
+            continue
+        if label not in finite:
+            findings.append(
+                Finding(
+                    "NUM-025",
+                    _section_of(path),
+                    f"{path}.current_regime",
+                    f"current_regime={label!r} is not a state the posterior "
+                    f"names; it publishes {sorted(finite)}",
+                )
+            )
+            continue
+        if finite[label] < top - POSTERIOR_TIE_TOLERANCE:
+            ranked = sorted(finite.items(), key=lambda item: -item[1])
+            findings.append(
+                Finding(
+                    "NUM-025",
+                    _section_of(path),
+                    f"{path}.current_regime",
+                    f"current_regime={label!r} carries {finite[label]:g}% while "
+                    f"the posterior published beside it puts "
+                    f"{ranked[0][0]!r} at {ranked[0][1]:g}%; the state label is "
+                    f"wrong by a factor of "
+                    f"{ranked[0][1] / finite[label]:.4g} on the model's own "
+                    "posterior",
+                )
+            )
+    return findings
+
+
+# --------------------------------------------------------------------------
+# AN ESTIMATE AGAINST THE COMPANION STATISTIC IT SUMMARISES
+# --------------------------------------------------------------------------
+#: A rule keyed on a key name checks that a field exists.  A rule keyed on a
+#: RELATION checks that a field means what its name says.  Everything in the
+#: table above is the first kind, which is why a fabricated precision band, a
+#: percentile-scale probability and a state label three million percent away
+#: from the posterior beside it all passed it: the document was internally
+#: consistent and each of those numbers was wrong.
+#:
+#: The identities below are the ones a consumer acts on, and they are declared as
+#: DATA -- a table of (point key, companion keys, relation) -- so a new pair is
+#: one line.  The rule fires on the relation, never on the key names alone: a
+#: section may publish ``cvar_95`` without a ``var_95`` beside it, or publish a
+#: ``var_95`` that is not comparable, and in both cases the pair is simply not
+#: testable and the rule says nothing.
+
+#: ``estimate_uncertainty.estimates.<stat>`` wraps its figure in a block whose
+#: point value is named ``point``.  Unwrapping it is what lets the tail-mean
+#: relation reach 16 nodes instead of the single headline block it would
+#: otherwise see, and it is the export's own name for the point estimate rather
+#: than a word matched by substring.
+ESTIMATE_POINT_KEY = "point"
+
+#: ``herfindahl_index`` is published at 4 decimals and ``effective_positions`` at
+#: 2, and the block states in ``effective_positions_note`` that N_eff is computed
+#: on the UNROUNDED index -- so the identity can only be checked against the band
+#: the published rounding admits, not against a point equality.  Both halves of
+#: that band are declared here so the tolerance is inspectable rather than
+#: emergent.
+HHI_DISPLAY_DECIMALS = 4
+EFFECTIVE_POSITIONS_DISPLAY_DECIMALS = 2
+
+#: The optimization moments carry NO declared step.  The block states
+#: ``moments_basis.display_rounding.moment_decimals`` (4) and is then printed
+#: inconsistently against it -- ``expected_annual_volatility`` 0.14 and
+#: ``risk_free_rate`` 0.02 at two decimals -- so the band is derived from the
+#: digits each figure was actually written with, by :func:`_display_step`, and
+#: the declared precision is used only as a ceiling.  The consequence is
+#: measured and is a finding about the exporter rather than about this rule: a
+#: reader holding only a 2-decimal volatility cannot pin the rebuilt ratio to
+#: better than +/-0.037, so ``optimization`` currently publishes a Sharpe ratio
+#: its own numbers can only corroborate to about four percent.
+
+#: The correlation-stability block does NOT round its four figures alike, so
+#: there is no one step to declare: measured on the real export it publishes
+#: ``current_avg_correlation`` 0.1483, ``historical_threshold_75th`` 0.4129 and
+#: ``historical_threshold_10th`` 0.2179 at four decimals but
+#: ``historical_threshold_90th`` 0.459 at THREE.  A single 4-decimal step is ten
+#: times too fine for that arm, and a current correlation of 0.4585 -- a value
+#: the export can express to the digit it published -- would be read as ELEVATED
+#: while the block itself called it CRITICAL.  The band is therefore DERIVED per
+#: figure by :func:`_display_step`, the fourth time in this file that a declared
+#: token or step stopped matching the export's own vocabulary (``data_status``
+#: -> ENV-007, ``interval`` -> ENV-020, ``conf_int`` -> NUM-022).  A correlation
+#: this far from every threshold is still decided exactly; the band only admits a
+#: figure the published digits cannot separate from the threshold, so it costs no
+#: discrimination on a correlation that actually moved.
+#:
+#: ``correlation_service.analyze_correlation_stability`` publishes these arms
+#: and sets ``alert_level``/``alert_direction``/``is_regime_break`` from the arm
+#: the numbers select.  The arms are reproduced here as data so the relation is
+#: inspectable, and they are read back out of the payload's own four figures --
+#: the rule does not ask which arm was intended.
+CORRELATION_ALERT_ARMS: tuple[tuple[str, float, str, str, bool], ...] = (
+    # (threshold key, comparison, level, direction, is_regime_break)
+    ("historical_threshold_90th", "ge", "CRITICAL", "upper_tail_critical", True),
+    ("historical_threshold_75th", "ge", "ELEVATED", "upper_tail_elevation", False),
+    ("historical_threshold_10th", "le", "ELEVATED", "lower_tail_collapse", True),
+)
+
+#: The four published percentile thresholds of the same block, for the arm that
+#: fires when none of the three tails does.
+CORRELATION_ALERT_NEUTRAL = ("NORMAL", "within_band", False)
+
+#: One declared identity: a POINT estimate and the COMPANION it summarises.
+#:
+#: ``companion_keys`` must all be present on the SAME mapping for the pair to be
+#: testable.  ``section_keys`` are dotted paths into the section's ``data`` for
+#: the companions a whole scan declares once beside its rows.
+@dataclass(frozen=True, slots=True)
+class Companion:
+    point_key: str
+    relation: str
+    companion_keys: tuple[str, ...] = ()
+    section_keys: tuple[str, ...] = ()
+    note: str = ""
+
+
+#: The companion map.  A new (point, companion) identity is one line here and
+#: nothing else: the rule walks this table, the relation decides.
+#:
+#: Nothing in this table names a section or a ticker.  The reach follows the key
+#: names, so a section that starts publishing one of these pairs is covered
+#: without an edit here, and a section that stops publishing it drops out
+#: silently -- which is the hazard the token sweep in the report exists to
+#: measure rather than hide.
+COMPANION_MAP: tuple[Companion, ...] = (
+    Companion(
+        "prob_success",
+        "probability_bounded_by_its_own_percentiles",
+        ("target_value", "terminal_percentiles", "success_definition",
+         "prob_success_units"),
+        note="the fraction of paths that end above the target cannot disagree "
+             "with the percentile table of those same paths",
+    ),
+    Companion(
+        "initial_value",
+        "point_equals_its_own_distribution_origin",
+        ("fan",),
+        note="every simulated path starts at the same value, so the row at "
+             "year 0 is the fan's own origin restated five times",
+    ),
+    Companion(
+        "effective_positions",
+        "reciprocal_of_its_own_index",
+        ("herfindahl_index",),
+        note="N_eff = 1 / HHI, checked against the band the published rounding "
+             "of both operands admits",
+    ),
+    Companion(
+        "cvar_95",
+        "tail_mean_not_milder_than_its_quantile",
+        ("var_95",),
+        note="the tail mean is the mean of the tail the quantile selects",
+    ),
+    Companion(
+        "portfolio_cvar_95_daily",
+        "tail_mean_not_milder_than_its_quantile",
+        ("portfolio_var_95_daily",),
+        note="the same identity on the section that publishes it under its own "
+             "vocabulary",
+    ),
+    Companion(
+        "expected_sharpe",
+        "ratio_of_its_own_operands",
+        ("expected_annual_return", "expected_annual_volatility",
+         "risk_free_rate"),
+        note="(return - risk_free_rate) / volatility, rebuilt from the operands "
+             "the block publishes beside it",
+    ),
+    Companion(
+        "is_cointegrated",
+        "verdict_under_its_own_declared_threshold",
+        (),
+        ("test_agreement.decision_test",
+         "signal_policy.p_value_threshold_comparison"),
+        note="the boolean the scan declares as its decision, against the "
+             "p-value and the threshold the same scan publishes. The p-value "
+             "key and the threshold key are DERIVED from the declared "
+             "decision-test name, so renaming the test cannot silently drop "
+             "the check the way a hardcoded key would.",
+    ),
+    Companion(
+        "alert_level",
+        "alert_arm_selected_by_its_own_correlation",
+        ("current_avg_correlation", "historical_threshold_10th",
+         "historical_threshold_75th", "historical_threshold_90th",
+         "alert_direction", "is_regime_break"),
+        note="the severity, the direction and the break flag are three fields "
+             "for one comparison; the numbers beside them decide which",
+    ),
+)
+
+
+def _point_estimate(value: Any) -> Any:
+    """The point figure of a published value, unwrapping an estimate block.
+
+    ``estimate_uncertainty.estimates.<stat>`` publishes
+    ``{"point": ..., "standard_error": ..., "conf_int": [...]}``.  A bare figure
+    is returned unchanged, so a relation written against a number accepts either
+    spelling.
+    """
+    if isinstance(value, dict):
+        return value.get(ESTIMATE_POINT_KEY)
+    return value
+
+
+def _dig(node: Any, dotted: str) -> Any:
+    """A dotted path into a mapping, or None if any step is missing."""
+    cursor: Any = node
+    for part in dotted.split("."):
+        if not isinstance(cursor, dict) or part not in cursor:
+            return None
+        cursor = cursor[part]
+    return cursor
+
+
+def _ok(*values: Any) -> bool:
+    return all(_finite(_point_estimate(value)) for value in values)
+
+
+def _declared_digits(value: Any) -> int:
+    """Decimal places the export WROTE for this figure, recovered from the float.
+
+    Python prints a float as the shortest string that reads back as the same
+    float, so for a value decoded from ``0.459`` that string carries no more
+    decimal places than the export wrote -- which makes the count an upper bound
+    on the published precision, and therefore a safe one to reason from.
+    """
+    text = repr(abs(float(_point_estimate(value))))
+    if "." not in text or "e" in text or "E" in text:
+        return 0
+    return len(text.partition(".")[2])
+
+
+def _display_step(value: Any, *, declared_decimals: int | None = None) -> float:
+    """Half the last decimal place the export actually WROTE for this figure.
+
+    A relation that compares two published numbers has to allow for their
+    rounding, and the export does not round them alike.  Measured on the real
+    export, ``risk_studio`` publishes ``historical_threshold_90th`` 0.459 at three
+    decimals beside ``historical_threshold_75th`` 0.4129 at four, ``pairs``
+    publishes its p-values to six, and ``optimization`` publishes
+    ``expected_annual_volatility`` 0.14 at two beside a
+    ``display_rounding.moment_decimals`` of four.  One declared step for a whole
+    block is therefore wrong on part of that block, and where it is too tight the
+    rule fires on a figure that is correct to the digit the export published.
+
+    So the step is derived from the figure itself, which -- see
+    :func:`_declared_digits` -- is never FINER than the published rounding, the
+    only direction in which a rounding band cannot manufacture a false positive.
+
+    ``declared_decimals`` is an optional ceiling, for a block that states the
+    precision it means to publish.  The narrower of the two is taken, because a
+    block claiming four decimals while writing ``0.14`` is claiming a precision
+    its own reader does not get.
+    """
+    places = _declared_digits(value)
+    if isinstance(declared_decimals, int) and declared_decimals >= 0:
+        places = min(places, declared_decimals)
+    return 0.5 * 10.0 ** -places
+
+
+def _rel_probability_bounded_by_its_own_percentiles(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """``prob_success`` inside the bracket the published percentile table implies.
+
+    Let ``T`` be a path's terminal value, ``t`` the published target, and
+    ``p_c`` the published ``c``-th percentile of the ``N`` paths.  The defining
+    property of a quantile is the pair ``P(T < p_c) <= c/100 <= P(T <= p_c)``,
+    and the whole relation is the two inclusions that follow from it.  Both are
+    written out rather than summarised, because this derivation has been got
+    wrong twice and a reader has to be able to check it rather than trust it.
+
+    * ``p_a >= t``.  At least ``a`` percent of the mass is at or BELOW ``p_a``,
+      so the mass at or above it -- ``100 - a`` percent -- is at or above
+      ``p_a`` and therefore at or above ``t``.  That gives the FLOOR
+      ``P(T >= t) >= 1 - a/100``.  Every clearing level yields such a floor and
+      the SMALLEST clearing level yields the TIGHTEST one, so the floor is
+      ``1 - min(at_or_above)/100``.  The direction is the whole content of the
+      clause: the share that clears the target is the share ABOVE the clearing
+      percentile, so the level enters complemented.  A target below ``p_a``
+      says nothing about the share above ``t`` except that it is at least the
+      share above ``p_a``.
+    * ``p_c < t``.  Symmetrically, at least ``c`` percent of the mass is at or
+      below ``p_c`` and all of it falls short of ``t``, so at most ``100 - c``
+      percent of the mass clears it: ``P(T >= t) <= 1 - c/100``.  The SMALLEST
+      falling-short level gives the WEAKEST ceiling, which is the one taken
+      here.  The strongest available ceiling is ``1 - max(below)/100``, and the
+      block's own ``terminal_percentiles_basis_detail`` publishes the weaker
+      bracket, so the rule checks the bracket the export declares for itself
+      rather than a tighter one it never claimed.
+
+    So the bracket is ``[1 - min(at_or_above)/100, 1 - min(below)/100]``, and on
+    this export's table -- target 85249.0, p5 79001.08 below it, p25 117447.13
+    above it -- that is ``[0.75, 0.95]``, which the published 0.922 sits inside.
+
+    The floor has been wrong twice, in mirror images, and both errors were
+    invisible because each coincided with the ceiling on a symmetric table.
+    ``1 - max(at_or_above)/100`` is the share ABOVE the LARGEST clearing level
+    -- a valid bound, but the weakest one available, so it reported
+    ``[0.05, 0.95]`` here and accepted a ``prob_success`` of 0.42 that the
+    distribution beside it contradicts.  ``max(at_or_above)/100`` is that
+    quantity's own mirror image -- the level read as the share -- and reported
+    ``[0.95, 0.95]``, rejecting the correct 0.922.  Only ``min`` inside the
+    complement is both a lower bound and the strongest one available, which is
+    what makes it the only one of the three that is worth publishing.
+
+    One path of the mass is the width of the band, and nothing else is.  The
+    levels are numpy percentiles under linear interpolation -- the block says so
+    in ``terminal_percentiles_basis_detail`` -- so each sits BETWEEN the two
+    order statistics it blends, and that is how far the bound can move.  With
+    ``h = a/100 * (N - 1)``, ``p_a`` is a blend of the ``floor(h)``-th and
+    ``(floor(h) + 1)``-th order statistics of the sorted sample, so the mass
+    strictly below it is at most ``(floor(h) + 1)/N`` -- within ``1/N`` of
+    ``a/100`` -- and the mass at or below it is at least ``(floor(h) + 1)/N``,
+    again within ``1/N``.  Repeated values do not break this: a blend of two
+    equal order statistics IS that shared value, whose mass below is smaller
+    still, and a blend of two distinct ones has no sample point strictly
+    between them, so its mass below is exactly the earlier count.  Each edge is
+    therefore widened OUTWARD by ``1/num_paths``, and by nothing else: at this
+    export's 2000 paths that is 0.0005 against a bracket 0.20 wide, one
+    four-hundredth of it.  It is derived from the interpolation rather than
+    fitted to a case, and it was checked rather than assumed -- over 30,991
+    (sample, target) pairs drawn from continuous, integer-tied, two-tone-gap
+    and half-tied samples, 1056 pairs sat outside the exact bracket, every one
+    of them inside one path of it and none outside.  A block that published the
+    table without a path count is checked with no width at all, which is the
+    stricter reading of the same derivation.
+
+    The block states in ``success_definition_detail`` that ``prob_success``
+    counts the very paths whose terminal percentiles are published beside it,
+    so the two are one sample and the bracket binds rather than merely
+    describing.
+    """
+    if not _ok(node.get(point_key)):
+        return False, None
+    target_key, target_value = companions[0]
+    percentiles = companions[1][1]
+    target = _point_estimate(target_value)
+    if not _finite(target) or not isinstance(percentiles, dict) or not percentiles:
+        return False, None
+    levels = {key: _percentile_sort_key(str(key)) for key in percentiles}
+    below = [
+        level for key, level in levels.items()
+        if level is not None
+        and _finite(percentiles[key])
+        and float(percentiles[key]) < float(target)
+    ]
+    at_or_above = [
+        level for key, level in levels.items()
+        if level is not None
+        and _finite(percentiles[key])
+        and float(percentiles[key]) >= float(target)
+    ]
+    if not below and not at_or_above:
+        return False, None
+    # See the docstring: the share that clears the target is the share AT OR
+    # ABOVE the clearing percentile, so the floor is the level COMPLEMENTED,
+    # and the tightest one is the SMALLEST clearing level.
+    clearing = min(at_or_above) if at_or_above else None
+    short = min(below) if below else None
+    low = 1.0 - clearing / 100.0 if clearing is not None else 0.0
+    high = 1.0 - short / 100.0 if short is not None else 1.0
+    paths = node.get("num_paths")
+    tolerance = (
+        1.0 / float(paths)
+        if _is_number(paths) and float(paths) > 0
+        else 0.0
+    )
+    value = float(_point_estimate(node[point_key]))
+    if low - tolerance <= value <= high + tolerance:
+        return True, None
+    floor = (
+        f"the published p{clearing:g} is at or above "
+        f"{target_key}={_fmt(target)}, so at least {low * 100:g}% of the paths "
+        f"clear it"
+        if clearing is not None else
+        f"no published percentile is at or above {target_key}={_fmt(target)}, "
+        f"so the table puts no floor under {point_key}"
+    )
+    ceiling = (
+        f"the published p{short:g} is below {target_key}={_fmt(target)}, "
+        f"so at most {high * 100:g}% of the paths clear it"
+        if short is not None else
+        f"no published percentile is below {target_key}={_fmt(target)}, so the "
+        f"table puts no ceiling on {point_key}"
+    )
+    return True, (
+        f"{point_key}={_fmt(value)} lies outside [{low:g}, {high:g}], the "
+        f"bracket the published percentile table requires: {floor}, and "
+        f"{ceiling}, so the fraction of paths that clear the target cannot be a "
+        "number the distribution behind it contradicts"
+    )
+
+
+def _rel_point_equals_its_own_distribution_origin(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """``initial_value`` is the value every simulated path starts from.
+
+    A Monte Carlo fan is a set of simulated paths, and all of them start at the
+    same value, so the fan's row at the earliest year is that value repeated
+    across its percentile columns.  A headline that says otherwise is a
+    simulation of a book the caller did not ask about.
+    """
+    point = node.get(point_key)
+    fan = companions[0][1]
+    if not _finite(point) or not isinstance(fan, list) or not fan:
+        return False, None
+    rows = [row for row in fan
+            if isinstance(row, dict) and _finite(row.get("year"))]
+    if not rows:
+        return False, None
+    origin = min(rows, key=lambda row: float(row["year"]))
+    columns = {
+        key: value for key, value in origin.items()
+        if key != "year" and _percentile_sort_key(str(key)) is not None
+    }
+    if not columns:
+        return False, None
+    drifted = sorted(
+        key for key, value in columns.items()
+        if not _money_close(float(value), float(point))
+    )
+    return True, None if not drifted else (
+        f"{point_key}={_fmt(point)} but the fan's own row at year "
+        f"{_fmt(origin['year'])} reads "
+        + ", ".join(f"{key}={_fmt(columns[key])}" for key in drifted)
+        + f"; every simulated path starts at {point_key}, so the origin row is "
+        f"the fan's starting value repeated across {len(columns)} columns"
+    )
+
+
+def _rel_reciprocal_of_its_own_index(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """``effective_positions`` is the reciprocal of the index beside it.
+
+    ``N_eff = 1 / HHI``, which is the identity the project's own CONTEXT states
+    and which the block's ``effective_positions_note`` explains it cannot be
+    checked at point equality through -- the note is right, and the reason is
+    the published rounding of both operands, so the check is made against the
+    band that rounding admits and not against a figure the export never claimed.
+    """
+    index_key, index = companions[0]
+    if not _ok(node.get(point_key), index):
+        return False, None
+    hhi = float(_point_estimate(index))
+    if not (0.0 < hhi < 1.0):
+        return False, None
+    step = 0.5 * 10.0 ** (-HHI_DISPLAY_DECIMALS)
+    point_step = 0.5 * 10.0 ** (-EFFECTIVE_POSITIONS_DISPLAY_DECIMALS)
+    low = 1.0 / (hhi + step) - point_step
+    high = 1.0 / (hhi - step) + point_step
+    value = float(_point_estimate(node[point_key]))
+    inside = low <= value <= high
+    return True, None if inside else (
+        f"{point_key}={_fmt(value)} but 1/{index_key}={1.0 / hhi:.6g} at the "
+        f"published {index_key}={_fmt(hhi)}; outside the band "
+        f"[{low:.6g}, {high:.6g}] that {HHI_DISPLAY_DECIMALS}-decimal "
+        f"{index_key} and {EFFECTIVE_POSITIONS_DISPLAY_DECIMALS}-decimal "
+        f"{point_key} rounding admit, and N_eff is defined as 1/HHI"
+    )
+
+
+def _rel_tail_mean_not_milder_than_its_quantile(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """A conditional tail mean can never be milder than the quantile selecting it.
+
+    CVaR/ES is the MEAN of the tail the VaR quantile cuts off, so it lies at
+    least as deep as that quantile.  The comparison is on magnitude, which makes
+    it sign-convention agnostic: it holds whether the block publishes losses as
+    negative returns or as positive loss fractions, and it is deliberately NOT
+    strict, because on a small empirical sample the tail can be a single
+    observation and the two figures then coincide exactly.
+    """
+    var_key, var = companions[0]
+    if not _ok(node.get(point_key), var):
+        return False, None
+    tail = abs(float(_point_estimate(node[point_key])))
+    quantile = abs(float(_point_estimate(var)))
+    if tail >= quantile - quantile * TAIL_MEAN_REL_TOLERANCE:
+        return True, None
+    return True, (
+        f"{point_key}={_fmt(node[point_key])} is {_fmt(tail)} in magnitude while "
+        f"{var_key} beside it is {_fmt(quantile)}; {point_key} is the MEAN of "
+        f"the tail {var_key} selects, so it cannot be the milder of the two"
+    )
+
+
+def _rel_ratio_of_its_own_operands(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """A ratio rebuilt from the operands published beside it.
+
+    ``expected_sharpe == (expected_annual_return - risk_free_rate) /
+    expected_annual_volatility`` -- the identity ``moments_basis.formulas``
+    publishes as prose in the same block.  The tolerance is the rounding of THIS
+    node's own published digits, propagated through the division, and not a
+    constant: a book whose volatility is an order of magnitude smaller gets an
+    order of magnitude wider tolerance, without anyone writing that down per node.
+
+    The digits are what the reader gets, and this block does not print them
+    alike.  It publishes ``expected_annual_return`` 0.1614 and
+    ``expected_sharpe`` 1.0102 at four decimals -- and ``moments_basis.
+    display_rounding.moment_decimals`` claims four -- but
+    ``expected_annual_volatility`` 0.14 and ``risk_free_rate`` 0.02 at TWO.  A
+    volatility carried to two decimals moves the rebuilt ratio by 0.037, so a
+    band declared at the claimed 4-decimal step (0.0015) would fire on a
+    re-export that printed nothing false.  The band is therefore derived from the
+    figures themselves, and the block's declared precision is used only as a
+    ceiling -- a block claiming more digits than it writes does not get a
+    tighter band than it wrote.
+    """
+    if not _ok(*(value for _key, value in companions)):
+        return False, None
+    return_key, return_value = companions[0]
+    vol_key, vol_value = companions[1]
+    free_key, free_value = companions[2]
+    volatility = float(_point_estimate(vol_value))
+    if volatility == 0.0:
+        return False, None
+    declared = _dig(section, "moments_basis.display_rounding.moment_decimals")
+    declared_decimals = int(declared) if _finite(declared) else None
+    excess = float(_point_estimate(return_value)) - float(_point_estimate(free_value))
+    rebuilt = excess / volatility
+    # d(r - f) / v  +  (r - f) * d(v) / v^2, then the ratio's own display step.
+    tolerance = (
+        (_display_step(return_value, declared_decimals=declared_decimals)
+         + _display_step(free_value, declared_decimals=declared_decimals))
+        / abs(volatility)
+        + abs(excess) / (volatility * volatility)
+        * _display_step(vol_value, declared_decimals=declared_decimals)
+        + _display_step(node[point_key], declared_decimals=declared_decimals)
+    )
+    published = float(_point_estimate(node[point_key]))
+    if abs(rebuilt - published) <= tolerance:
+        return True, None
+    return True, (
+        f"{point_key}={_fmt(published)} but ({return_key}-"
+        f"{free_key})/{vol_key} = ({_fmt(return_value)} - {_fmt(free_value)})"
+        f"/{_fmt(vol_value)} = {_fmt(rebuilt)}; the block publishes that formula "
+        f"in moments_basis.formulas, and a ratio that does not rebuild from its "
+        f"own operands (tolerance {_fmt(tolerance)}, the display step of the "
+        f"digits this block actually wrote: {return_key} and {free_key} and "
+        f"{vol_key} and {point_key} at "
+        f"{_declared_digits(return_value)}/{_declared_digits(free_value)}/"
+        f"{_declared_digits(vol_value)}/{_declared_digits(node[point_key])} "
+        f"decimals) is one of them being restated rather than computed"
+    )
+
+
+def _rel_verdict_under_its_own_declared_threshold(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """A test VERDICT against the p-value and the threshold the scan declares.
+
+    The scan publishes which test decides (``test_agreement.decision_test``),
+    what its p-value key is named, at what level, and with which comparison
+    (``signal_policy``).  The verdict is therefore checkable without knowing
+    anything about cointegration: the p-value key and the threshold key are
+    derived from the declared test name, so a scan that renames its decision
+    test is still checked.
+    """
+    if section is None:
+        return False, None
+    verdict = node.get(point_key)
+    if not isinstance(verdict, bool):
+        return False, None
+    test = _dig(section, "test_agreement.decision_test")
+    comparison = _dig(section, "signal_policy.p_value_threshold_comparison")
+    if not (isinstance(test, str) and test.strip() and isinstance(comparison, str)):
+        return False, None
+    test = test.strip()
+    comparison = comparison.strip().lower()
+    threshold = _dig(section, f"signal_policy.{test}_p_value_threshold")
+    pvalue_key = f"{test}_pvalue"
+    if not (_finite(threshold) and _finite(node.get(pvalue_key))):
+        return False, None
+    pvalue = float(node[pvalue_key])
+    level = float(threshold)
+    # The band is half a display step of the p-VALUE alone, and not of the
+    # threshold: the threshold is a declared policy constant, published exactly,
+    # while a p-value is a measured figure and one rounded onto the threshold
+    # from below does not make a verdict of False a contradiction.  The p-values
+    # under ``pairs`` are published to six decimals, so the band is 5e-7 -- four
+    # orders of magnitude below the tightest margin measured on the real export.
+    band = _display_step(pvalue)
+    if comparison == "strictly_less_than":
+        expected = pvalue < level - band
+    elif comparison in ("less_than", "at_most"):
+        expected = pvalue <= level + band
+    elif comparison == "strictly_greater_than":
+        expected = pvalue > level + band
+    elif comparison in ("greater_than", "at_least"):
+        expected = pvalue >= level - band
+    else:
+        return False, None
+    if expected == verdict:
+        return True, None
+    return True, (
+        f"{point_key}={verdict!r} while {pvalue_key}={_fmt(pvalue)} is "
+        f"{comparison} {test}_p_value_threshold {_fmt(level)} on the model's "
+        f"own declared decision test (tolerance {_fmt(band)}, half the last "
+        f"decimal place the {pvalue_key} was published to); a verdict its own "
+        "p-value contradicts is a label, not a result"
+    )
+
+
+def _rel_alert_arm_selected_by_its_own_correlation(
+    node: dict[str, Any],
+    point_key: str,
+    companions: tuple[tuple[str, Any], ...],
+    section: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """The alert arm must be the one the published correlation selects.
+
+    ``alert_level``, ``alert_direction`` and ``is_regime_break`` are three fields
+    describing ONE comparison of the current average correlation against the
+    10th / 75th / 90th percentiles of its own history, and the service sets all
+    three from the arm the numbers land in.  The arms are re-derived here from
+    the block's own four figures and compared to the three published labels, so
+    a correlation that moved while the labels stood still is a finding rather
+    than a sentence a reader has to re-check by hand.
+    """
+    published_level = node.get(point_key)
+    direction_key, direction = companions[4]
+    break_key, is_break = companions[5]
+    current = _point_estimate(companions[0][1])
+    if not (
+        isinstance(published_level, str)
+        and isinstance(direction, str)
+        and isinstance(is_break, bool)
+        and _finite(current)
+    ):
+        return False, None
+    value = float(current)
+    for threshold_key, comparison, level, arm_direction, arm_break in (
+        CORRELATION_ALERT_ARMS
+    ):
+        threshold = _point_estimate(node.get(threshold_key))
+        if not _finite(threshold):
+            return False, None
+        limit = float(threshold)
+        # The band is half a display step of BOTH figures the comparison is made
+        # from, so a current correlation the export cannot print as different
+        # from the threshold is not read as a different arm.
+        band = _display_step(current) + _display_step(threshold)
+        in_arm = (value >= limit - band if comparison == "ge"
+                  else value <= limit + band)
+        if not in_arm:
+            continue
+        if (published_level, direction, is_break) == (level, arm_direction,
+                                                       arm_break):
+            return True, None
+        return True, (
+            f"{point_key}={published_level!r} with {direction_key}="
+            f"{direction!r} and {break_key}={is_break!r}, but "
+            f"{companions[0][0]}={_fmt(value)} is "
+            f"{'at or above' if comparison == 'ge' else 'at or below'} "
+            f"{threshold_key}={_fmt(limit)}, which is the "
+            f"({level!r}, {arm_direction!r}, {arm_break!r}) arm"
+        )
+    neutral_level, neutral_direction, neutral_break = CORRELATION_ALERT_NEUTRAL
+    if (published_level, direction, is_break) == (neutral_level, neutral_direction,
+                                                  neutral_break):
+        return True, None
+    return True, (
+        f"{point_key}={published_level!r} with {direction_key}={direction!r} and "
+        f"{break_key}={is_break!r}, but {companions[0][0]}={_fmt(value)} is "
+        f"inside the {COMPANION_ALERT_BAND[0]}..{COMPANION_ALERT_BAND[1]} "
+        f"percentile band the three published thresholds describe, which is the "
+        f"({neutral_level!r}, {neutral_direction!r}, {neutral_break!r}) arm"
+    )
+
+
+#: Named in the message above so the reader is not left counting thresholds.
+COMPANION_ALERT_BAND = ("10th", "90th")
+
+#: Relation name -> the function that decides it.  Data in, data out: a
+#: relation returns ``(testable, violation)`` and never raises, never widens
+#: itself, and never returns a violation for a pair it could not test.
+RELATIONS: dict[str, Callable[
+    [dict[str, Any], str, tuple[tuple[str, Any], ...], dict[str, Any] | None],
+    tuple[bool, str | None],
+]] = {
+    "probability_bounded_by_its_own_percentiles":
+        _rel_probability_bounded_by_its_own_percentiles,
+    "point_equals_its_own_distribution_origin":
+        _rel_point_equals_its_own_distribution_origin,
+    "reciprocal_of_its_own_index": _rel_reciprocal_of_its_own_index,
+    "tail_mean_not_milder_than_its_quantile":
+        _rel_tail_mean_not_milder_than_its_quantile,
+    "ratio_of_its_own_operands": _rel_ratio_of_its_own_operands,
+    "verdict_under_its_own_declared_threshold":
+        _rel_verdict_under_its_own_declared_threshold,
+    "alert_arm_selected_by_its_own_correlation":
+        _rel_alert_arm_selected_by_its_own_correlation,
+}
+
+
+def num_026_estimate_agrees_with_its_own_companion(
+    export: Export,
+) -> list[Finding]:
+    """A point estimate must lie inside the companion statistic it summarises.
+
+    Every rule above asks whether two fields the system emitted TOGETHER are
+    consistent.  This one asks whether a single figure means what its name says,
+    by testing it against the distribution or the decision it was computed from
+    and the block publishes beside it: a success probability against the
+    percentile table of the paths it counts, a Monte Carlo origin against the
+    fan's own first row, an effective-position count against the Herfindahl index
+    it is the reciprocal of, a tail mean against the quantile that selects the
+    tail, a Sharpe ratio against the return and volatility it divides, a test
+    verdict against the p-value and threshold the same scan declares, a
+    correlation alert against the percentiles that arm it, and a regime label
+    against the posterior that produced it (NUM-025, which carries the state
+    case because a state label is an action input in its own right).
+
+    The identities are :data:`COMPANION_MAP` -- one line each -- and the rule
+    fires on the RELATION, so a section that publishes ``cvar_95`` with no
+    ``var_95`` beside it, or with a null one, is not testable and produces
+    nothing.  That is the failure mode a rule of this shape has to avoid: a gate
+    that is always red is not stricter, it is ignored, so the reach of this rule
+    is measured and printed rather than assumed.
+    """
+    findings: list[Finding] = []
+    section_data: dict[str, dict[str, Any]] = {
+        name: section["data"]
+        for name, section in export.sections().items()
+        if isinstance(section, dict) and isinstance(section.get("data"), dict)
+    }
+    for path, node in export.dicts:
+        for companion in COMPANION_MAP:
+            if companion.point_key not in node:
+                continue
+            if not all(key in node for key in companion.companion_keys):
+                continue
+            section = section_data.get(_section_of(path))
+            if companion.section_keys and (
+                section is None
+                or any(_dig(section, key) is None for key in companion.section_keys)
+            ):
+                continue
+            decide = RELATIONS[companion.relation]
+            testable, violation = decide(
+                node,
+                companion.point_key,
+                tuple((key, node[key]) for key in companion.companion_keys),
+                section,
+            )
+            if not testable or violation is None:
+                continue
+            findings.append(
+                Finding(
+                    "NUM-026",
+                    _section_of(path),
+                    f"{path}.{companion.point_key}",
+                    violation,
+                )
+            )
+    return findings
+
+
 # --------------------------------------------------------------------------
 # The rule table.  A new invariant is one entry here.
 # --------------------------------------------------------------------------
@@ -3806,6 +4715,19 @@ RULES: tuple[Rule, ...] = (
          "catches SI-1/G9: a trade directive publishes its threshold, diagnostic "
          "agreement, comparison count, multiplicity correction and size ratio",
          num_024_trade_directive_publishes_its_basis),
+    Rule("NUM-025", CATEGORY_NUMERIC,
+         "regime.current_regime is the argmax of the regime_probabilities "
+         "published beside it; a tied, absent or wholly null posterior is "
+         "undetermined, not a pass",
+         num_025_current_regime_is_its_own_argmax),
+    Rule("NUM-026", CATEGORY_NUMERIC,
+         "a point estimate agrees with the companion statistic it summarises: "
+         "the identities of COMPANION_MAP (success probability vs its own "
+         "percentile table, simulation origin vs its own fan, effective "
+         "positions vs its own HHI, tail mean vs the quantile selecting it, "
+         "Sharpe vs its own moments, a test verdict vs its own declared "
+         "p-value threshold, a correlation alert vs the percentiles that arm it)",
+         num_026_estimate_agrees_with_its_own_companion),
 )
 
 RULES_BY_ID: dict[str, Rule] = {rule.rule_id: rule for rule in RULES}
