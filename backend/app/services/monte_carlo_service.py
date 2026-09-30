@@ -407,6 +407,38 @@ def simulate_goal(
             "path-touch probability."
         ),
         "prob_success_units": "fraction_of_paths_0_to_1",
+        # --- Terminal percentile basis -----------------------------------
+        # `terminal_percentiles` and `prob_success` are two summaries of ONE
+        # array: the terminal values of the same `num_paths` simulated paths,
+        # from the same rng under the same seed, with no resample and no
+        # re-draw between them.  The basis is declared because it is not
+        # recoverable by inspection -- `method` reads like a parametric law,
+        # and a reader has no way to tell a fitted quantile from an empirical
+        # one without being told, which is how a correct pair of figures gets
+        # read as a contradiction.
+        "terminal_percentiles_basis": (
+            "empirical_quantiles_of_simulated_terminal_paths"
+        ),
+        "terminal_percentiles_basis_detail": (
+            "terminal_percentiles and prob_success are two summaries of ONE "
+            f"array: the terminal values of the same {num_paths} simulated "
+            "paths, drawn from one rng under one seed, with no resample, no "
+            "re-draw and no filtered subset between them. `method` names the "
+            "innovation law the PATHS were drawn from (for student_t, a "
+            "Student-t fit to the daily returns, moment-matched back); it is "
+            "NOT a parametric fit of these percentiles, so p95 here is the "
+            "empirical upper tail of the simulated paths, not a fitted "
+            "quantile. Each level is a numpy percentile of that same array "
+            "under linear interpolation between neighbouring order "
+            "statistics, so it sits within one path of the corresponding "
+            "order statistic. A reader can therefore bracket the figure "
+            "beside it rather than guess: the SMALLEST published level whose "
+            "value is below target_value puts a floor under the share of "
+            "paths below the target, and the SMALLEST published level whose "
+            "value is at or above target_value puts a ceiling on it, so "
+            "prob_success lies in [1 - smallest_clearing_level/100, "
+            "1 - smallest_short_level/100]."
+        ),
         # `annualized` describes the calibrated inputs only; the simulated
         # wealth levels are nominal currency amounts, not annualized rates.
         "annualized": True,
