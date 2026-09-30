@@ -8,6 +8,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import type { RiskContributionModelName, RiskContributionResponse } from '@/types';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -190,27 +191,6 @@ function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
   );
 }
 
-interface RiskContributionData {
-  window: { start: string; end: string };
-  positions: {
-    volatility: Record<string, number>;
-    cvar_tail: Record<string, number>;
-  };
-  sector_rollup: {
-    volatility: Record<string, number>;
-    // `cvar_tail`, not `cvar`: the route keys every container by the canonical
-    // model name and publishes the retired bare `cvar` as a pointer in
-    // `contribution_basis.model_names.aliases`. The old `cvar` key here was
-    // never on the wire, so the sector rollup read `undefined` and this panel
-    // rendered empty.
-    cvar_tail: Record<string, number>;
-  };
-  portfolio_volatility_annualized: number | null;
-  portfolio_var_95_daily: number;
-  portfolio_cvar_95_daily: number | null;
-  methodology: string;
-}
-
 function ContributionBars({
   entries,
   colorClass,
@@ -251,11 +231,11 @@ function ContributionBars({
 }
 
 export default function RiskContributionPage() {
-  const [data, setData] = useState<RiskContributionData | null>(null);
+  const [data, setData] = useState<RiskContributionResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
-  const [selectedSectorModel, setSelectedSectorModel] = useState<'volatility' | 'cvar_tail'>('volatility');
+  const [selectedSectorModel, setSelectedSectorModel] = useState<RiskContributionModelName>('volatility');
 
   const fetchRiskContribution = async () => {
     setLoading(true);

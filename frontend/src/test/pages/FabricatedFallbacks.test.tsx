@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import React from 'react';
+import type { RiskContributionResponse } from '@/types';
 
 const mocks = vi.hoisted(() => ({
   positions: [] as any[],
@@ -662,7 +665,10 @@ describe('fabricated fallbacks — risk contribution all-negative divergence', (
 // toggle showed "No sector risk contribution data available." — an empty
 // panel, with no error anywhere, for a model the route had measured.
 describe('risk contribution sector rollup reads the canonical model name', () => {
-  const payload = {
+  // Annotated as the SHARED type, not left to inference. If the route or the
+  // shared declaration drifts, this file stops compiling instead of quietly
+  // keeping a hand-made shape alive inside a green test.
+  const payload: RiskContributionResponse = {
     window: { start: '2025-01-01', end: '2026-01-01' },
     positions: {
       volatility: { 'A.NS': 0.6, 'B.NS': 0.4 },
@@ -680,6 +686,15 @@ describe('risk contribution sector rollup reads the canonical model name', () =>
 
   beforeEach(() => {
     mocks.getRiskContribution.mockResolvedValue(payload);
+  });
+
+  it('carries only the canonical model name in every container', () => {
+    // A fixture with `cvar` beside `cvar_tail` is how the lie stayed green: the
+    // key that is not on the wire was present, so the read succeeded and only
+    // the production payload was empty.
+    for (const container of [payload.positions, payload.sector_rollup]) {
+      expect(Object.keys(container).sort()).toEqual(['cvar_tail', 'volatility']);
+    }
   });
 
   it('renders the CVaR sector shares, not an empty panel', async () => {
@@ -702,5 +717,62 @@ describe('risk contribution sector rollup reads the canonical model name', () =>
     expect(screen.queryByText('No sector risk contribution data available.')).toBeNull();
     // The tail model's own share, 70% of the CVaR model total, is now drawn.
     expect(screen.getAllByText('70.0%').length).toBeGreaterThan(0);
+  });
+
+  // The render path was guarded by `|| {}`, so it degraded to an empty panel.
+  // The CSV export was not: it read the container unguarded and threw
+  // `TypeError: Cannot read properties of undefined`. The chart being soft
+  // masked the hard failure for the panel, and the click that exposed it was
+  // never covered by a test.
+  it('exports the sector rollup without throwing on a canonical-only payload', async () => {
+    const { default: RiskContributionPage } = await import('@/app/dashboard/risk-contribution/page');
+
+    const clicked: HTMLAnchorElement[] = [];
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        clicked.push(this);
+      });
+
+    try {
+      render(<RiskContributionPage />);
+      // The export control lives in the hero and exists before data arrives,
+      // while it stays `disabled` until it does.
+      const exportBtn = await screen.findByText('Export CSV');
+      await screen.findByText('Risk Contribution by Sector');
+      fireEvent.click(exportBtn);
+
+      expect(clicked).toHaveLength(1);
+      const csv = decodeURIComponent(clicked[0].getAttribute('href')!);
+      // Both models present for every sector, read off the canonical keys.
+      // (Sector names go through the shared CSV-injection guard, which always
+      // quotes; the shares are the page's own `toFixed` cells.)
+      expect(csv).toContain('"Technology",60.00%,70.00%');
+      expect(csv).toContain('"Energy",40.00%,30.00%');
+    } finally {
+      clickSpy.mockRestore();
+    }
+  });
+
+  // The render test above passes just as well against a local hand-copied
+  // interface, which is precisely how a duplicate survived: the fixture and
+  // the page agreed with each other and with neither the route nor the shared
+  // declaration. Pin the absence of the copy itself.
+  it('reads the shared response type instead of a local copy of it', () => {
+    const source = readFileSync(
+      resolve(process.cwd(), 'src', 'app', 'dashboard', 'risk-contribution', 'page.tsx'),
+      'utf8'
+    );
+
+    // No locally declared risk-contribution response interface.
+    expect(source).not.toMatch(/interface\s+\w*RiskContribut\w*/);
+    // The shared declaration is imported, and from the one place it lives.
+    expect(source).toMatch(
+      /import type \{[^}]*RiskContributionResponse[^}]*\} from '@\/types'/
+    );
+    // The panel reads the canonical key. `.cvar\b` cannot match `.cvar_tail`
+    // (`_` is a word character), so this is the retired spelling specifically.
+    expect(source).toContain('sector_rollup.cvar_tail');
+    expect(source).not.toMatch(/\.cvar\b/);
   });
 });
