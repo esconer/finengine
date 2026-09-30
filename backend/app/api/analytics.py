@@ -4496,13 +4496,30 @@ async def get_realized_risk(
                     s1 = float(pd.Series(own_series).iloc[-1])
                     total_ret = round((s1 / s0) - 1.0, 6) if s0 else None
                 row = {
+                    "annual_return": pm.get("annual_return"),
                     "annual_volatility": pm.get("annual_volatility"),
                     "sharpe_ratio": pm.get("sharpe_ratio"),
+                    "sortino_ratio": pm.get("sortino_ratio"),
                     "max_drawdown": pm.get("max_drawdown"),
+                    "var_95": pm.get("var_95"),
+                    "cvar_95": pm.get("cvar_95"),
+                    "hit_ratio": pm.get("hit_ratio"),
                     "total_return": total_ret,
                     "data_points": own_days,
                 }
-                apply_annualization_gate(row, ["annual_volatility", "sharpe_ratio"], own_days)
+                # Same measurement as `full_portfolio` beside it, so the same
+                # annualization policy. `_calculate_basic_metrics` withholds
+                # `annual_return`/`sortino_ratio` only below 10 return
+                # observations, so a leg with 10-29 of them has real numbers
+                # here that were never annualized by anyone -- publishing them
+                # would put a 19-day mean x 252 on a chart labelled "annual".
+                # `total_return` stays ungated: it is cumulative
+                # first-to-last, not an annualized ratio.
+                apply_annualization_gate(
+                    row,
+                    ["annual_return", "annual_volatility", "sharpe_ratio", "sortino_ratio"],
+                    own_days,
+                )
                 full_positions[tkr] = row
             instrument_risk = {"portfolio": full_portfolio, "positions": full_positions}
 
