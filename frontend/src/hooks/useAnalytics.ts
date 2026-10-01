@@ -325,15 +325,36 @@ export const useSectorAllocation = () => {
       return;
     }
 
-    // Calculate sector allocation from live portfolio market values
-    const totalMv = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+    // Calculate sector allocation from live portfolio market values.
+    //
+    // WHY `|| 0` IS WRONG HERE: it cannot tell "no market value was ever
+    // recorded for this holding" apart from "this holding is worth exactly
+    // zero". Collapsing the two put a real 0 into the denominator AND a real 0
+    // share into the holding's sector, so the sector's percentage was
+    // understated by a fabricated term while the published weights still summed
+    // to 100%. A share is a claim about a measured denominator, so a holding
+    // with no measured market value publishes none — it is dropped from the
+    // book, not counted as worthless.
+    const measured = positions.filter(
+      (p) => typeof p.market_value === 'number' && Number.isFinite(p.market_value)
+    );
+
+    // No measured holding means no denominator. Publishing a sector at 100%
+    // would be the worst form of the bug, so the chart is given nothing.
+    if (measured.length === 0) {
+      setSectorData([]);
+      return;
+    }
+
+    const totalMv = measured.reduce((sum, p) => sum + p.market_value, 0);
     const sectorMap = new Map<string, number>();
-    
-    positions.forEach(position => {
+
+    measured.forEach(position => {
       const sector = position.sector || 'Unknown';
-      const mv = position.market_value || 0;
+      const mv = position.market_value;
       const currentShare = sectorMap.get(sector) || 0;
-      const weight = totalMv > 0 ? (mv / totalMv) : (position.weight || 0);
+      // A measured 0 keeps its 0% share; only an unmeasured holding is refused.
+      const weight = totalMv > 0 ? (mv / totalMv) : (position.weight ?? 0);
       sectorMap.set(sector, currentShare + weight);
     });
 

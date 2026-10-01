@@ -19,6 +19,21 @@ describe('Frontend Utils', () => {
       expect(cn('px-2 py-1', 'bg-blue-500')).toBe('px-2 py-1 bg-blue-500');
       expect(cn('px-2', false && 'hidden', 'text-white')).toBe('px-2 text-white');
     });
+
+    it('resolves a conflicting Tailwind pair to the MERGE winner, not the positional one', () => {
+      // clsx alone appends, so `p-2 p-4` leaves the winner to the stylesheet's
+      // source order rather than to the call — the caller writes `p-4` last and
+      // gets `p-2`. tailwind-merge is what makes the call decide.
+      expect(cn('p-2', 'p-4')).toBe('p-4');
+      // A broader utility displaces the narrower one it conflicts with, and the
+      // unrelated utilities survive. `text-gray-600` is a colour and `text-lg` a
+      // font-size — different groups, so the colour is untouched.
+      expect(cn('px-2 py-1', 'p-4')).toBe('p-4');
+      expect(cn('text-sm text-gray-600', 'text-lg')).toBe('text-gray-600 text-lg');
+      // And the merge is positional, not "first wins".
+      expect(cn('p-2', 'px-4')).toBe('p-2 px-4');
+      expect(cn('px-4', 'p-2')).toBe('p-2');
+    });
   });
 
   describe('formatCurrency', () => {

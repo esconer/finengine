@@ -1,17 +1,27 @@
 /**
- * Utility function for conditionally joining class names together
- * This is a simplified version of the popular 'clsx' library
+ * Utility function for conditionally joining class names together and resolving
+ * conflicting Tailwind utilities in favour of the last one.
  */
 
 import { type ClassValue, clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 
 /**
- * Combines class names conditionally
+ * Combines class names conditionally, then merges conflicting Tailwind
+ * utilities so the LAST one wins.
+ *
+ * clsx alone only concatenates: `cn('p-2', 'p-4')` yields `"p-2 p-4"`, and
+ * which padding applies is then decided by the order of the utilities in the
+ * generated stylesheet rather than by the call. A caller writing `p-4` last
+ * gets `p-2`. twMerge is what makes the call site decide: `px-2 py-1` + `p-4`
+ * collapses to `p-4`, because `p-4` supersedes the `px-2` it conflicts with
+ * while `py-1` is untouched.
+ *
  * @param inputs - Class names to combine
- * @returns Combined class names string
+ * @returns Combined class names string, conflicting utilities merged
  */
 export function cn(...inputs: ClassValue[]) {
-  return clsx(inputs);
+  return twMerge(clsx(inputs));
 }
 
 /**

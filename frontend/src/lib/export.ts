@@ -1047,15 +1047,31 @@ export class ExportService {
         portfolioData.positions.forEach(p => {
             checkBreak(7);
             currentX = margin + 2;
+            // Quantity and weight: a number when one was recorded, the absent
+            // marker when none was. `String(p.quantity || 0)` and
+            // `(p.weight || 0) * 100` published "0" and "0.0%" for holdings the
+            // engine never priced or never weighed — indistinguishable, on a
+            // CONFIDENTIAL document, from a holding that is genuinely worth
+            // nothing. A MEASURED 0 still prints as 0 and 0.0%.
+            //
+            // The marker is the em dash, the one this same table already uses
+            // for an unrecorded sector. It is deliberately not a new codepoint:
+            // `write()` runs every string through `pdfFont.assertRenders`, and
+            // U+2014 is already in the subset's general-punctuation range and
+            // already proven to reach the page (see the "never fabricates a
+            // sector label" test).
+            const quantity = finiteNumber(p.quantity);
+            const weight = finiteNumber(p.weight);
+
             const values = [
                 String(p.ticker || ''),
-                String(p.quantity || 0),
+                quantity === null ? '—' : String(quantity),
                 money(p.buy_price),
                 money(p.last_price),
                 // Market value keeps en-IN lakh/crore grouping; the symbol comes
                 // from the same formatter as the price columns.
                 money(p.market_value),
-                `${((p.weight || 0) * 100).toFixed(1)}%`,
+                weight === null ? '—' : `${(weight * 100).toFixed(1)}%`,
                 // A holding with no sector is unclassified. "General" was a
                 // label this document invented and stamped as fact.
                 nonEmptyString(p.sector) ?? '—'

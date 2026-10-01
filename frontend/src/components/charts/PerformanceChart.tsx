@@ -120,10 +120,28 @@ const PerformanceChartImpl: React.FC<PerformanceChartProps> = ({
     );
   }
 
-  // Calculate portfolio return percentage from first to last
-  const startValue = data[0]?.portfolio_value || 0;
-  const endValue = data[data.length - 1]?.portfolio_value || 0;
-  const totalReturn = startValue > 0 ? ((endValue - startValue) / startValue) * 100 : 0;
+  // Total return is a RATIO, and a ratio needs both terms. An absent first
+  // reading used to be absorbed by `data[0]?.portfolio_value || 0`, which then
+  // satisfied `startValue > 0 ? … : 0` and published 0 — rendered green by
+  // `totalReturn >= 0` below. That is "no change" asserted about a portfolio
+  // that was never measured, and a fabricated 0 is indistinguishable from a real
+  // one. So the return is withheld unless it is computable, and the absence is
+  // rendered uncoloured: green would still read as "no change", red as "loss".
+  // House pattern: the same hasCompleteWindow gate at realized-risk/page.tsx.
+  const rawStart = data[0]?.portfolio_value;
+  const rawEnd = data[data.length - 1]?.portfolio_value;
+  const startValue =
+    typeof rawStart === 'number' && Number.isFinite(rawStart) ? rawStart : null;
+  const endValue =
+    typeof rawEnd === 'number' && Number.isFinite(rawEnd) ? rawEnd : null;
+  // A MEASURED start of 0 is not a starting point: the ratio is undefined, so
+  // it is absent for the same reason an absent start is. The distinction that
+  // matters downstream is start present + end present — a genuinely flat window
+  // is a real 0.00% and still renders green.
+  const totalReturn =
+    startValue !== null && startValue > 0 && endValue !== null
+      ? ((endValue - startValue) / startValue) * 100
+      : null;
 
   return (
     <div className={`bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 ${className}`}>
@@ -133,9 +151,18 @@ const PerformanceChartImpl: React.FC<PerformanceChartProps> = ({
         </h3>
         <div className="text-right">
           <div className="text-sm text-gray-600 dark:text-gray-400">Total Return</div>
-          <div className={`text-lg font-bold ${totalReturn >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-            {totalReturn >= 0 ? '+' : ''}{totalReturn.toFixed(2)}%
-          </div>
+          {totalReturn === null ? (
+            <div
+              className="text-lg font-bold text-gray-400 dark:text-gray-500"
+              title="Total return needs a recorded portfolio value at both ends of the window"
+            >
+              N/A
+            </div>
+          ) : (
+            <div className={`text-lg font-bold ${totalReturn >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+              {totalReturn >= 0 ? '+' : ''}{totalReturn.toFixed(2)}%
+            </div>
+          )}
         </div>
       </div>
       
@@ -156,13 +183,17 @@ const PerformanceChartImpl: React.FC<PerformanceChartProps> = ({
             />
             <Tooltip content={<PerformanceCustomTooltip currency={currency} />} />
             
-            {/* Reference line at 100% for normalized returns */}
-            <ReferenceLine 
-              y={startValue} 
-              stroke="#6b7280" 
-              strokeDasharray="2 2" 
-              strokeOpacity={0.5}
-            />
+            {/* Reference line at the starting value. Suppressed when there is no
+                measured start: drawn at a fabricated 0 it would assert a
+                baseline the data never had. */}
+            {startValue !== null && (
+              <ReferenceLine
+                y={startValue}
+                stroke="#6b7280"
+                strokeDasharray="2 2"
+                strokeOpacity={0.5}
+              />
+            )}
             
             <Line
               type="monotone"

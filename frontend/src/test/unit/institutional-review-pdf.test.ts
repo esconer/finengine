@@ -255,8 +255,17 @@ function contentSvg() {
   return el;
 }
 
-/** Runs the real export and returns a SNAPSHOT of what reached jsPDF. */
-async function exportWith(metrics?: RiskMetricsSnapshot | null, positions = POSITIONS) {
+/**
+ * Runs the real export and returns a SNAPSHOT of what reached jsPDF.
+ *
+ * `positions` is typed by the export's own contract, so a fixture may supply a
+ * null for a field the engine never recorded — which is exactly the case the
+ * absent-marker tests need to construct.
+ */
+async function exportWith(
+  metrics?: RiskMetricsSnapshot | null,
+  positions: Parameters<typeof ExportService.exportInstitutionalReviewPDF>[0]['positions'] = POSITIONS
+) {
   // Reset per call: the recorder is shared across the whole file, so a
   // snapshot taken without a reset would silently include the previous run.
   recorder.texts.length = 0;
@@ -726,6 +735,72 @@ describe('exportInstitutionalReviewPDF — currency, sector, prices', () => {
     });
     const total = recorder.texts.find((t) => t.startsWith('Total Portfolio Value:'));
     expect(total).toBe('Total Portfolio Value: $1,000.00');
+  });
+});
+
+// ===========================================================================
+// The holdings table's numeric columns.
+//
+// A CONFIDENTIAL document is the last place a fabricated zero should survive.
+// `String(p.quantity || 0)` published "0" and `(p.weight || 0) * 100` published
+// "0.0%" for a holding whose quantity and weight were never recorded — the
+// reader cannot tell that apart from a holding that is genuinely worth nothing.
+//
+// The marker is the em dash already used in this same table (the sector column,
+// `nonEmptyString(p.sector) ?? '—'`) rather than a new glyph: `write()` runs
+// every string through `pdfFont.assertRenders`, and the em dash is already in
+// the subset's general-punctuation range AND already proven renderable by the
+// test above ("never fabricates a sector label" asserts '—' reaches the page).
+// Introducing a fresh codepoint here would be a claim about the font that
+// nothing in this repo has verified.
+// ===========================================================================
+describe('exportInstitutionalReviewPDF — an unrecorded holding is not a 0.0% holding', () => {
+  it('writes the absent marker for a quantity and a weight that were never recorded', async () => {
+    const { texts } = await exportWith(undefined, [
+      {
+        ticker: 'A.NS', quantity: null, buy_price: 100, last_price: 200,
+        market_value: 5000, weight: null, sector: 'Tech',
+      },
+    ]);
+
+    // Absent, not "0" and not "0.0%".
+    expect(texts).toContain('—');
+    expect(texts).not.toContain('0.0%');
+    // The holding itself and its real money are untouched.
+    expect(texts).toContain('A.NS');
+    expect(texts).toContain('₹5,000.00');
+  });
+
+  it('still prints a MEASURED zero quantity and a MEASURED 0.0% weight', async () => {
+    // The other half of the rule. A holding that is genuinely zero-weighted is a
+    // real measurement; a guard written as `p.weight || '—'` would erase it.
+    const { texts } = await exportWith(undefined, [
+      {
+        ticker: 'A.NS', quantity: 0, buy_price: 100, last_price: 200,
+        market_value: 0, weight: 0, sector: 'Tech',
+      },
+    ]);
+
+    expect(texts).toContain('0.0%');
+    // money() already renders a measured 0 as a real ₹0.00, so the money column
+    // must not have picked up the absent marker either.
+    expect(texts).toContain('₹0.00');
+    expect(texts).not.toContain('N/A');
+    expect(texts).not.toContain('—');
+  });
+
+  it('leaves a real fractional weight on its own scale, unchanged', async () => {
+    // No published figure may move: 0.4213 is 42.1%, before and after.
+    const { texts } = await exportWith(undefined, [
+      {
+        ticker: 'A.NS', quantity: 40, buy_price: 100, last_price: 200,
+        market_value: 8426, weight: 0.4213, sector: 'Tech',
+      },
+    ]);
+
+    expect(texts).toContain('42.1%');
+    expect(texts).toContain('40');
+    expect(texts).not.toContain('—');
   });
 });
 

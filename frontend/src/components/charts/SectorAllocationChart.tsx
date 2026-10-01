@@ -25,6 +25,33 @@ interface SectorAllocationChartProps {
   className?: string;
 }
 
+/**
+ * Percentage formatter for this chart's own sector slices.
+ *
+ * SCALE CONTRACT — do not change: the input is a FRACTION and the output
+ * multiplies by 100 at one decimal (0.123 -> "12.3%"). This is deliberately
+ * NOT `utils.ts`'s `formatPercentage`: a different local formatter elsewhere in
+ * the tree takes an already-percent value, and swapping the two would multiply
+ * displayed shares by 100.
+ *
+ * Absent-value rule: a null/undefined/NaN measurement renders as the absent
+ * marker, never as "0.0%". `(null * 100).toFixed(1)` is "0.0" — a fabricated
+ * zero, indistinguishable from a sector measured at exactly zero. A *measured* 0
+ * still renders "0.0%". Guard mirrors the idiom in utils.ts:27-29.
+ *
+ * Module scope and exported so the guard is reachable from a test: it used to be
+ * a component-local const that no render path ever called, so it could not fail
+ * loudly and would have rotted unseen.
+ */
+export function formatPercentage(
+  value: number | null | undefined
+): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'N/A';
+  }
+  return `${(value * 100).toFixed(1)}%`;
+}
+
 // Color palette for different sectors
 const COLORS = [
   '#3b82f6', // Blue
@@ -98,10 +125,6 @@ const SectorAllocationChartImpl: React.FC<SectorAllocationChartProps> = ({
     percentage: totalValue > 0 ? item.value / totalValue : 0,
     color: COLORS[index % COLORS.length],
   }));
-
-  const formatPercentage = (value: number): string => {
-    return `${(value * 100).toFixed(1)}%`;
-  };
 
   const formatValue = (value: number): string => {
     return value.toFixed(2);
