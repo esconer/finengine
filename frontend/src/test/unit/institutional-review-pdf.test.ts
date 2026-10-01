@@ -431,8 +431,9 @@ describe('the SVG guard (inverted)', () => {
 
   it('ChartExporter.exportChart refuses a non-raster format it cannot honour', async () => {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    // The parameter stays `HTMLElement` for ExportPanel's benefit; the check
-    // is a runtime one, which is what the test above proves.
+    // The parameter stays `HTMLElement` — the promise the signature has always
+    // made, not a guarantee the runtime keeps; `assertExportSvg` is the gate.
+    // Hence the cast: the only accepted input is an `SVGSVGElement`.
     await expect(
       ChartExporter.exportChart(svg as unknown as HTMLElement, {
         filename: 'chart', format: 'pdf',

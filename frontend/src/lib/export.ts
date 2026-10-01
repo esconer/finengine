@@ -286,8 +286,16 @@ export class ChartExporter {
     /**
      * Rasterise a live chart surface to a PNG blob.
      *
-     * The parameter stays `HTMLElement` because `ExportPanel` passes one, but
-     * only an `<svg>` is accepted. A non-svg input used to fall into a branch
+     * The parameter stays `HTMLElement` because that is the promise this
+     * signature has always made to its callers, and it is deliberately not
+     * narrowed to `SVGSVGElement`: `assertExportSvg` takes `unknown` and is
+     * the real gate, so a tighter parameter would only add a second, weaker
+     * contract in front of it. It is not even accurate for the one input that
+     * works — recharts forwards a chart ref to `svg.recharts-surface`, an
+     * `SVGSVGElement`, which is not an `HTMLElement` and needs the
+     * `as unknown as HTMLElement` cast the tests still carry.
+     *
+     * Only an `<svg>` is accepted. A non-svg input used to fall into a branch
      * that called `toBlob` on a canvas nothing had ever drawn on, which
      * resolves a perfectly valid white PNG — the caller then saved a blank
      * image under a chart's name with no error anywhere. An input that cannot

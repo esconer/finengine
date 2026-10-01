@@ -17,7 +17,6 @@ import type {
 } from '@/lib/api';
 import { usePortfolioAnalytics, usePerformanceData } from '@/hooks/useAnalytics';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
-import { CSVExporter } from '@/lib/export';
 import {
   describeOwnHistory,
   holdingWindowCaption,
@@ -192,8 +191,13 @@ export default function RealizedRiskPage() {
     setLoading(false);
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (positionData.length > 0) {
+      // Dynamic import keeps jsPDF/xlsx/file-saver out of this route's initial
+      // chunk: a static import put the whole export stack on first paint of a
+      // page that only needs it after a click. Same split as Header.tsx:108
+      // and dashboard/forecast-risk/page.tsx:515.
+      const { CSVExporter } = await import('@/lib/export');
       CSVExporter.exportToCSV(positionData, 'realized_risk_positions');
     }
   };
