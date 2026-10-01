@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import React from 'react';
+import React, { useState } from 'react';
 import { PortfolioDropzone } from '@/components/portfolio/PortfolioDropzone';
 import apiClient, { portfolioApi } from '@/lib/api';
 
@@ -26,6 +26,21 @@ const dropFile = (file: File) => {
 
 const open = () =>
   render(<PortfolioDropzone isOpen={true} onClose={vi.fn()} onSuccess={vi.fn()} />);
+
+/**
+ * `screener-studio` opens this from a button, so `isOpen` is page state and
+ * there is no `DialogTrigger` for Radix to restore focus to. This harness
+ * gives the dialog wrapper a real opener to hand focus back to.
+ */
+const OpenedFromButton = () => {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>Import from CSV</button>
+      <PortfolioDropzone isOpen={open} onClose={() => setOpen(false)} onSuccess={vi.fn()} />
+    </>
+  );
+};
 
 describe('PortfolioDropzone', () => {
   it('renders CSV-only title when open', () => {
@@ -109,5 +124,21 @@ describe('PortfolioDropzone', () => {
     expect(payload.positions[0].weight + payload.positions[1].weight).toBeCloseTo(0.625, 5);
     expect(onSuccess).toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('takes focus on open and hands it back to the opener on close', async () => {
+    render(<OpenedFromButton />);
+    const opener = screen.getByRole('button', { name: 'Import from CSV' });
+    opener.focus();
+    fireEvent.click(opener);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(opener);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 });

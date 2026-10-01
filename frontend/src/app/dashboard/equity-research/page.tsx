@@ -34,6 +34,7 @@ import {
 } from 'recharts';
 
 import { equityResearchApi, companyDataApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import {
   EquityResearchProfile,
   ShareholdingDataResponse,
@@ -147,16 +148,6 @@ function EquityResearchContent() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [financialStmt, financialFreq, activeTab, activeTicker]);
-
-  // Close AI modal on Escape (a11y)
-  useEffect(() => {
-    if (!aiModalOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setAiModalOpen(false);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [aiModalOpen]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1153,22 +1144,19 @@ function EquityResearchContent() {
 
       {/* AI Prompt Modal */}
       {aiModalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
-          onClick={() => setAiModalOpen(false)}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={aiModalTitle}
-            onClick={(e) => e.stopPropagation()}
-            className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl"
+        // Radix owns Escape, the focus trap and focus restore; the backdrop
+        // click it adds on top of `setAiModalOpen(false)` is the behaviour this
+        // panel had.
+        <Dialog open onOpenChange={(open) => { if (!open) setAiModalOpen(false); }}>
+          <DialogContent
+            overlayClassName="bg-black/70 backdrop-blur-sm"
+            className="max-w-3xl max-h-[85vh] flex flex-col gap-0 p-0 sm:rounded-xl bg-slate-900 dark:bg-slate-900 border-slate-700 dark:border-slate-700 shadow-2xl"
           >
             <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-              <h3 className="font-bold text-white text-sm flex items-center gap-2">
+              <DialogTitle className="font-bold leading-normal text-white text-sm flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-indigo-400" />
                 {aiModalTitle}
-              </h3>
+              </DialogTitle>
               <button
                 onClick={() => setAiModalOpen(false)}
                 aria-label="Close dialog"
@@ -1192,8 +1180,8 @@ function EquityResearchContent() {
                 <span>{copiedPrompt ? 'Copied to Clipboard!' : 'Copy Prompt'}</span>
               </button>
             </div>
-          </div>
-        </div>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );

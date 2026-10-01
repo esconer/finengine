@@ -399,3 +399,39 @@ describe('optimize — an unmeasured trade leg is N/A, not a full-size buy', () 
     expect(screen.getByTestId('trade-delta-E.NS').textContent).toBe('+40.0%');
   });
 });
+
+/**
+ * The apply ticket is NOT a modal — it is an inline panel with no overlay and no
+ * portal — so it is deliberately not portalled through Radix. But it declares
+ * `role="dialog"`, and a user who opens a thing called a dialog expects Escape to
+ * dismiss it. The panel's own `Close` button was the only way out, and Escape did
+ * nothing at all. This pins the dismissal the markup already promises.
+ *
+ * Escape is fired on `document`, matching how the key actually reaches a
+ * listener in the tree under test.
+ */
+describe('optimize — the apply ticket is dismissible with Escape', () => {
+  it('closes the open apply ticket when Escape is pressed', async () => {
+    await runOptimizer(fundedResult);
+    fireEvent.click(screen.getByText('Apply these trades'));
+    expect(screen.queryByTestId('apply-ticket')).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByTestId('apply-ticket')).toBeNull());
+    // Dismissing is not committing: no target was ever submitted.
+    expect(mocks.rebalancePortfolio).not.toHaveBeenCalled();
+  });
+
+  it('leaves the ticket alone when Escape is pressed while it is closed', async () => {
+    await runOptimizer(fundedResult);
+    expect(screen.queryByTestId('apply-ticket')).toBeNull();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    // The handler is inert until the panel exists, so this cannot open or
+    // otherwise disturb the page.
+    expect(screen.queryByTestId('apply-ticket')).toBeNull();
+    expect(screen.getByTestId('apply-panel')).toBeDefined();
+  });
+});

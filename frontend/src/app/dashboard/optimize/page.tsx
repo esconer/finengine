@@ -5,7 +5,7 @@
 
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import {
   SectionProvenance,
@@ -409,6 +409,21 @@ export default function OptimizePage() {
     setApplySuccess(null);
     setApplyError(null);
   };
+
+  // The apply ticket declares `role="dialog"`, so Escape has to dismiss it. It
+  // is NOT portalled through Radix — it is an inline panel with no overlay and
+  // no backdrop, and a modal wrapper would both restyle it and move it out of
+  // the flow of the trade list it annotates. The listener is inert until the
+  // panel exists, and is torn down when it closes.
+  useEffect(() => {
+    if (!showApplyTicket) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeApplyTicket();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showApplyTicket]);
 
   const handleRunSimulation = async () => {
     // Fail closed: an ineligible target is never sent, not even to be simulated.

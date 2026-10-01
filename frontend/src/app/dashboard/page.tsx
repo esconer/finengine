@@ -4,13 +4,13 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 
 import { PerformanceChart } from '@/components/charts/PerformanceChart';
 import { SectorAllocationChart } from '@/components/charts/SectorAllocationChart';
 import { RiskMetricsDisplay } from '@/components/charts/RiskMetricsDisplay';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
-import { usePortfolioStore, useUIStore } from '@/lib/store';
+import { usePortfolioStore, useUIStore, type PortfolioPosition } from '@/lib/store';
 import { portfolioApi, analyticsApi } from '@/lib/api';
 import { usePortfolioAnalytics, usePerformanceData, useSectorAllocation } from '@/hooks/useAnalytics';
 import {
@@ -33,8 +33,6 @@ const REGIME_CHIP: Record<string, string> = {
   bull: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
   crisis: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
 };
-
-import { PortfolioPosition } from '@/types';
 
 // Relative-time formatter matching Header.tsx so every page reads the same.
 function formatLastUpdated(timestamp: string | null) {
@@ -248,12 +246,12 @@ export default function DashboardSummary() {
   }, [performanceFreshness]);
 
   // DataTable columns with enhanced functionality
-  const positionColumns = useMemo(() => [
+  const positionColumns = useMemo<DataTableColumn<PortfolioPosition>[]>(() => [
     {
       header: 'Ticker',
       accessorKey: 'ticker' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-medium text-gray-900 dark:text-white">
             {data.ticker || 'N/A'}
@@ -264,8 +262,8 @@ export default function DashboardSummary() {
     {
       header: 'Weight',
       accessorKey: 'weight' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const baseValue = typeof data.market_value_base === 'number'
           ? data.market_value_base
           : (typeof data.current_value_base === 'number' ? data.current_value_base : null);
@@ -285,8 +283,8 @@ export default function DashboardSummary() {
     {
       header: 'Market Value',
       accessorKey: 'market_value' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const baseValue = typeof data.market_value_base === 'number'
           ? data.market_value_base
           : (typeof data.current_value_base === 'number' ? data.current_value_base : null);
@@ -300,8 +298,8 @@ export default function DashboardSummary() {
     {
       header: 'Price',
       accessorKey: 'last_price' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const basePrice = typeof data.last_price_base === 'number'
           ? data.last_price_base
           : null;
@@ -315,8 +313,8 @@ export default function DashboardSummary() {
     {
       header: 'Sector',
       accessorKey: 'sector' as keyof PortfolioPosition,
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-600 dark:text-gray-400">
             {data.sector || 'N/A'}

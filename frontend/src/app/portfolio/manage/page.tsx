@@ -34,6 +34,7 @@ import { LoadingState } from '@/components/ui/LoadingState';
 import { PortfolioStats } from '@/components/portfolio/PortfolioStats';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { PortfolioDropzone } from '@/components/portfolio/PortfolioDropzone';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { cn, formatCurrency as sharedFormatCurrency } from '@/lib/utils';
@@ -276,6 +277,14 @@ export default function PortfolioManagePage() {
         }
     };
 
+    // Focus return is the dialog wrapper's job: it records the opener when the
+    // confirm mounts and hands focus back on teardown, skipping a row that a
+    // successful delete has already removed.
+    const closeDeleteConfirm = () => {
+        setDeleteConfirm(null);
+        setError(null);
+    };
+
     // Delete position
     const handleDeletePosition = async (ticker: string) => {
         setIsDeleting(true);
@@ -284,8 +293,7 @@ export default function PortfolioManagePage() {
 
             // Refresh portfolio data
             await fetchPortfolio();
-            setDeleteConfirm(null);
-            setError(null);
+            closeDeleteConfirm();
 
             return true;
         } catch (error) {
@@ -480,7 +488,7 @@ export default function PortfolioManagePage() {
 
                         <button
                             onClick={() => setShowImportModal(true)}
-                            className="flex items-center space-x-2 px-4 py-2 text-sm font-medium text-slate-200 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 focus:outline-none transition-colors"
+                            className="flex items-center space-x-2 px-4 py-2 text-sm font-medium text-slate-200 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
                         >
                             <UploadCloud className="w-4 h-4 text-blue-400" />
                             <span>Import CSV</span>
@@ -600,7 +608,12 @@ export default function PortfolioManagePage() {
                         <div className="flex items-center space-x-4">
                             <div className="flex-1">
                                 <input
+                                    id="portfolio-search"
                                     type="text"
+                                    // A placeholder is not an accessible name: it
+                                    // vanishes on focus and is skipped by several
+                                    // screen readers. This names the control.
+                                    aria-label="Search positions by ticker, name, or sector"
                                     placeholder="Search by ticker, name, or sector..."
                                     value={searchQuery}
                                     onChange={(e) => setSearchQuery(e.target.value)}
@@ -835,12 +848,14 @@ export default function PortfolioManagePage() {
                                                         <button
                                                             onClick={saveEditing}
                                                             className="text-green-600 hover:text-green-900"
+                                                            aria-label={`Save ${position.ticker}`}
                                                         >
                                                             <Check className="w-4 h-4" />
                                                         </button>
                                                         <button
                                                             onClick={cancelEditing}
                                                             className="text-red-600 hover:text-red-900"
+                                                            aria-label={`Cancel editing ${position.ticker}`}
                                                         >
                                                             <X className="w-4 h-4" />
                                                         </button>
@@ -850,12 +865,14 @@ export default function PortfolioManagePage() {
                                                         <button
                                                             onClick={() => startEditing(position)}
                                                             className="text-blue-600 hover:text-blue-900"
+                                                            aria-label={`Edit ${position.ticker}`}
                                                         >
                                                             <Edit2 className="w-4 h-4" />
                                                         </button>
                                                         <button
                                                             onClick={() => setDeleteConfirm(position.ticker)}
                                                             className="text-red-600 hover:text-red-900"
+                                                            aria-label={`Delete ${position.ticker}`}
                                                         >
                                                             <Trash2 className="w-4 h-4" />
                                                         </button>
@@ -903,49 +920,51 @@ export default function PortfolioManagePage() {
                 />
 
                 {/* Delete Confirmation Dialog */}
-                {deleteConfirm && (
-                    <div
-                        className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="delete-confirm-title"
-                        onKeyDown={(e) => { if (e.key === 'Escape') setDeleteConfirm(null); }}
+                <Dialog
+                    open={deleteConfirm !== null}
+                    onOpenChange={(open) => { if (!open) closeDeleteConfirm(); }}
+                >
+                    <DialogContent
+                        className="max-w-md gap-0 rounded-lg bg-white dark:bg-gray-900"
+                        closeOnOutsideClick={false}
                     >
-                        <div className="bg-white dark:bg-gray-900 rounded-lg p-6 max-w-md w-full mx-4">
-                            <h3 id="delete-confirm-title" className="text-lg font-medium text-gray-900 dark:text-white mb-4">
-                                Confirm Delete
-                            </h3>
-                            <p className="text-gray-600 dark:text-gray-400 mb-4">
-                                Are you sure you want to delete position {deleteConfirm}? This action cannot be undone.
-                            </p>
-                            {error && (
-                                <p className="text-sm text-red-600 dark:text-red-400 mb-4">{error}</p>
-                            )}
-                            <div className="flex justify-end space-x-3">
-                                <button
-                                    onClick={() => { setDeleteConfirm(null); setError(null); }}
-                                    className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={async () => {
-                                        try {
-                                            await handleDeletePosition(deleteConfirm);
-                                        } catch (err) {
-                                            // Keep the dialog open and surface the real message
-                                            setError(err instanceof Error ? err.message : 'Failed to delete position');
-                                        }
-                                    }}
-                                    disabled={isDeleting}
-                                    className="px-4 py-2 text-sm font-medium text-white bg-red-600 border border-transparent rounded-md hover:bg-red-700 disabled:opacity-50"
-                                >
-                                    {isDeleting ? 'Deleting…' : 'Delete'}
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )}
+                        {deleteConfirm !== null && (
+                            <>
+                                <DialogTitle className="text-lg font-medium text-gray-900 dark:text-white mb-4">
+                                    Confirm Delete
+                                </DialogTitle>
+                                <p className="text-gray-600 dark:text-gray-400 mb-4">
+                                    Are you sure you want to delete position {deleteConfirm}? This action cannot be undone.
+                                </p>
+                                {error && (
+                                    <p className="text-sm text-red-600 dark:text-red-400 mb-4">{error}</p>
+                                )}
+                                <div className="flex justify-end space-x-3">
+                                    <button
+                                        onClick={closeDeleteConfirm}
+                                        className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={async () => {
+                                            try {
+                                                await handleDeletePosition(deleteConfirm);
+                                            } catch (err) {
+                                                // Keep the dialog open and surface the real message
+                                                setError(err instanceof Error ? err.message : 'Failed to delete position');
+                                            }
+                                        }}
+                                        disabled={isDeleting}
+                                        className="px-4 py-2 text-sm font-medium text-white bg-red-600 border border-transparent rounded-md hover:bg-red-700 disabled:opacity-50"
+                                    >
+                                        {isDeleting ? 'Deleting…' : 'Delete'}
+                                    </button>
+                                </div>
+                            </>
+                        )}
+                    </DialogContent>
+                </Dialog>
             </div>
         </DashboardLayout>
     );

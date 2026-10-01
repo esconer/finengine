@@ -8,6 +8,12 @@
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
 import {
+  Dialog,
+  DialogContent,
+  DialogClose,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   SectionProvenance,
   sectionCoverage,
 } from '@/components/provenance/SectionProvenance';
@@ -189,41 +195,31 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
 function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
   const info = EXPLAINERS[itemKey];
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   if (!info) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={info.title}
-        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        // The wrapper defaults to `bg-white dark:bg-gray-800`; this panel has
+        // always been slate, and `twMerge` does not resolve `dark:` variants,
+        // so both have to be named explicitly.
+        className="max-w-xl max-h-[90vh] w-full overflow-y-auto gap-0 relative rounded-xl shadow-2xl bg-slate-900 dark:bg-slate-900 text-slate-100"
       >
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
-          aria-label="Close explainer"
-        >
-          <X className="w-5 h-5" />
-        </button>
+        <DialogClose asChild>
+          <button
+            className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+            aria-label="Close explainer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </DialogClose>
 
         <div className="flex items-center space-x-3 mb-4">
           <div className="p-2 bg-emerald-500/20 text-emerald-400 rounded-lg">
             <Info className="w-6 h-6" />
           </div>
-          <h3 className="text-xl font-bold text-white">{info.title}</h3>
+          <DialogTitle className="text-xl font-bold text-white">{info.title}</DialogTitle>
         </div>
 
         <div className="space-y-4 text-sm leading-relaxed">
@@ -255,24 +251,31 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
         </div>
 
         <div className="mt-6 flex justify-end">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-medium text-sm transition-colors"
-          >
-            Got It
-          </button>
+          <DialogClose asChild>
+            <button
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-medium text-sm transition-colors"
+            >
+              Got It
+            </button>
+          </DialogClose>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function HelpBtn({ onClick, label }: { onClick: () => void; label?: string }) {
+function HelpBtn({
+  onClick,
+  label,
+}: {
+  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  label?: string;
+}) {
   return (
     <button
       onClick={(e) => {
         e.stopPropagation();
-        onClick();
+        onClick(e);
       }}
       className="inline-flex items-center justify-center w-4 h-4 ml-1.5 text-slate-400 hover:text-emerald-400 rounded-full hover:bg-slate-800/60 transition-colors"
       title={label || 'Click to understand this metric'}
@@ -317,6 +320,17 @@ export default function TearSheetPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
+
+  // The explainer is opened by 20 different `HelpBtn`s and has no single
+  // trigger element to point at, so focus return is left to the dialog wrapper:
+  // it records whichever button was focused when the panel mounted.
+  const openExplainer = (itemKey: string) => () => {
+    setActiveExplainer(itemKey);
+  };
+
+  const closeExplainer = () => {
+    setActiveExplainer(null);
+  };
 
   const fetchTearSheet = async () => {
     setLoading(true);
@@ -452,10 +466,7 @@ export default function TearSheetPage() {
     <div className="space-y-6">
       {/* Active Explainer Modal */}
       {activeExplainer && (
-        <HelpExplainerModal
-          itemKey={activeExplainer}
-          onClose={() => setActiveExplainer(null)}
-        />
+        <HelpExplainerModal itemKey={activeExplainer} onClose={closeExplainer} />
       )}
 
       {/* Hero Section */}
@@ -582,7 +593,7 @@ export default function TearSheetPage() {
                 loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
-                <HelpBtn onClick={() => setActiveExplainer('total_return')} />
+                <HelpBtn onClick={openExplainer('total_return')} />
               </div>
             </div>
 
@@ -594,7 +605,7 @@ export default function TearSheetPage() {
                 loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
-                <HelpBtn onClick={() => setActiveExplainer('cagr')} />
+                <HelpBtn onClick={openExplainer('cagr')} />
               </div>
             </div>
 
@@ -606,7 +617,7 @@ export default function TearSheetPage() {
                 loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
-                <HelpBtn onClick={() => setActiveExplainer('sharpe_ratio')} />
+                <HelpBtn onClick={openExplainer('sharpe_ratio')} />
               </div>
             </div>
 
@@ -618,7 +629,7 @@ export default function TearSheetPage() {
                 loading={loading}
               />
               <div className="absolute top-4 right-4 z-10">
-                <HelpBtn onClick={() => setActiveExplainer('max_drawdown')} />
+                <HelpBtn onClick={openExplainer('max_drawdown')} />
               </div>
             </div>
           </div>
@@ -711,7 +722,7 @@ export default function TearSheetPage() {
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center space-x-2">
                 <h3 className="text-lg font-bold text-white">Against NIFTY 50 Benchmark</h3>
-                <HelpBtn onClick={() => setActiveExplainer('alpha_annualized')} />
+                <HelpBtn onClick={openExplainer('alpha_annualized')} />
               </div>
               <span className="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-mono">
                 Benchmark: ^NSEI
@@ -725,7 +736,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Beta</span>
-                    <HelpBtn onClick={() => setActiveExplainer('beta_vs_nifty')} />
+                    <HelpBtn onClick={openExplainer('beta_vs_nifty')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-white">
                     {fmtRatio(hlRel.beta_vs_nifty)}
@@ -736,7 +747,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-emerald-950/20 border border-emerald-800/40 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-emerald-400 uppercase tracking-wider">Alpha (Ann.)</span>
-                    <HelpBtn onClick={() => setActiveExplainer('alpha_annualized')} />
+                    <HelpBtn onClick={openExplainer('alpha_annualized')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-emerald-300">
                     {hlRel.alpha_annualized == null
@@ -749,7 +760,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Portfolio Sharpe</span>
-                    <HelpBtn onClick={() => setActiveExplainer('sharpe_ratio')} />
+                    <HelpBtn onClick={openExplainer('sharpe_ratio')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-teal-300">
                     {fmtRatio(hl.sharpe)}
@@ -760,7 +771,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Nifty Sharpe</span>
-                    <HelpBtn onClick={() => setActiveExplainer('sharpe_ratio')} />
+                    <HelpBtn onClick={openExplainer('sharpe_ratio')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-slate-300">
                     {fmtRatio(data.relative_vs_nifty.benchmark_sharpe)}
@@ -771,7 +782,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Portfolio Vol</span>
-                    <HelpBtn onClick={() => setActiveExplainer('portfolio_volatility')} />
+                    <HelpBtn onClick={openExplainer('portfolio_volatility')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-amber-300">
                     {fmt(hl.volatility, 2, '%')}
@@ -782,7 +793,7 @@ export default function TearSheetPage() {
                 <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50 relative group">
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Nifty Vol</span>
-                    <HelpBtn onClick={() => setActiveExplainer('benchmark_volatility')} />
+                    <HelpBtn onClick={openExplainer('benchmark_volatility')} />
                   </div>
                   <p className="text-xl font-bold font-mono text-slate-300">
                     {fmt(data.relative_vs_nifty.benchmark_volatility, 2, '%')}
@@ -809,7 +820,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Sortino Ratio</span>
-                  <HelpBtn onClick={() => setActiveExplainer('sortino_ratio')} />
+                  <HelpBtn onClick={openExplainer('sortino_ratio')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-emerald-400">{fmtRatio(data.metrics.sortino)}</p>
                 <span className="text-[10px] text-slate-500">Downside Adjusted</span>
@@ -818,7 +829,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Calmar Ratio</span>
-                  <HelpBtn onClick={() => setActiveExplainer('calmar_ratio')} />
+                  <HelpBtn onClick={openExplainer('calmar_ratio')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-teal-300">{fmtRatio(data.metrics.calmar)}</p>
                 <span className="text-[10px] text-slate-500">CAGR / Max DD</span>
@@ -827,7 +838,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Omega Ratio</span>
-                  <HelpBtn onClick={() => setActiveExplainer('omega_ratio')} />
+                  <HelpBtn onClick={openExplainer('omega_ratio')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-cyan-300">{fmtRatio(data.metrics.omega)}</p>
                 <span className="text-[10px] text-slate-500">Gain / Loss Mass</span>
@@ -836,7 +847,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Tail Ratio</span>
-                  <HelpBtn onClick={() => setActiveExplainer('tail_ratio')} />
+                  <HelpBtn onClick={openExplainer('tail_ratio')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-blue-300">{fmtRatio(data.metrics.tail_ratio)}</p>
                 <span className="text-[10px] text-slate-500">95th vs 5th Pct</span>
@@ -845,7 +856,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Skewness</span>
-                  <HelpBtn onClick={() => setActiveExplainer('skewness')} />
+                  <HelpBtn onClick={openExplainer('skewness')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-slate-200">{fmtRatio(data.metrics.skew)}</p>
                 <span className="text-[10px] text-slate-500">Return Asymmetry</span>
@@ -854,7 +865,7 @@ export default function TearSheetPage() {
               <div className="p-3.5 rounded-lg bg-slate-800/40 border border-slate-700/50">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-400">Kurtosis</span>
-                  <HelpBtn onClick={() => setActiveExplainer('kurtosis')} />
+                  <HelpBtn onClick={openExplainer('kurtosis')} />
                 </div>
                 <p className="text-lg font-bold font-mono text-slate-200">{fmtRatio(data.metrics.kurtosis)}</p>
                 <span className="text-[10px] text-slate-500">Fat-Tail Peak</span>
@@ -868,7 +879,7 @@ export default function TearSheetPage() {
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center space-x-2">
                   <h3 className="text-lg font-bold text-white">Monthly Returns Heatmap (%)</h3>
-                  <HelpBtn onClick={() => setActiveExplainer('monthly_returns')} />
+                  <HelpBtn onClick={openExplainer('monthly_returns')} />
                 </div>
                 <div className="flex items-center space-x-2">
                   {bookStart && (
@@ -947,7 +958,7 @@ export default function TearSheetPage() {
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center space-x-2">
                     <h3 className="text-lg font-bold text-white">Underwater Drawdown Curve</h3>
-                    <HelpBtn onClick={() => setActiveExplainer('underwater_curve')} />
+                    <HelpBtn onClick={openExplainer('underwater_curve')} />
                   </div>
                   <div className="flex items-center">
                     {bookStart && (
@@ -1005,7 +1016,7 @@ export default function TearSheetPage() {
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center space-x-2">
                   <h3 className="text-lg font-bold text-white">Weights Used ({Object.keys(data.holdings).length})</h3>
-                  <HelpBtn onClick={() => setActiveExplainer('weights_used')} />
+                  <HelpBtn onClick={openExplainer('weights_used')} />
                 </div>
                 <PieChart className="w-5 h-5 text-slate-400" />
               </div>

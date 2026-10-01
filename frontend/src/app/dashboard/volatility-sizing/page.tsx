@@ -6,6 +6,7 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { MetricCard } from '@/components/ui/MetricCard';
 import {
   SectionProvenance,
@@ -175,14 +176,6 @@ function HelpExplainerModal({
 }) {
   const info = EXPLAINERS[itemKey];
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   if (!info) return null;
 
   const howInferred =
@@ -191,16 +184,12 @@ function HelpExplainerModal({
       : info.howInferred;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={info.title}
-        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-xl gap-0 sm:rounded-xl bg-slate-900 dark:bg-slate-900 border-slate-700 dark:border-slate-700 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
       >
         <button
           onClick={onClose}
@@ -214,7 +203,7 @@ function HelpExplainerModal({
           <div className="p-2 bg-teal-500/20 text-teal-400 rounded-lg">
             <Info className="w-6 h-6" />
           </div>
-          <h3 className="text-xl font-bold text-white">{info.title}</h3>
+          <DialogTitle className="text-xl font-bold leading-normal text-white">{info.title}</DialogTitle>
         </div>
 
         <div className="space-y-4 text-sm leading-relaxed">
@@ -255,8 +244,8 @@ function HelpExplainerModal({
             Got It
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -770,16 +759,6 @@ export default function VolatilitySizingPage() {
     setRebalanceErrorMsg(null);
   };
 
-  useEffect(() => {
-    if (!showRebalanceModal) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeRebalanceModal();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showRebalanceModal]);
-
   const handleRunSimulation = async () => {
     if (!sizingData?.recommended_weights) return;
     // Fail closed: a leveraged target is not a rebalance, so it is never sent.
@@ -910,8 +889,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-semibold text-slate-100">
             {data.ticker}
@@ -927,8 +906,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'current_weight',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-slate-200 font-mono">
             {formatPercentage(data.current_weight)}
@@ -944,8 +923,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'recommended_weight',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-teal-300 font-mono font-semibold">
             {formatPercentage(data.recommended_weight)}
@@ -961,8 +940,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'volatility',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const risk = getVolRiskLabel(data.volatility);
         return (
           <div className="flex items-center space-x-2">
@@ -984,8 +963,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'weight_change',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const change = data.weight_change ?? null;
         return (
           <div className={`font-mono ${getChangeColor(change)}`}>
@@ -1002,8 +981,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'amount_delta',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-slate-200 font-mono">
             {formatAmount(data.amount_delta, sizingCurrency ?? 'INR')}
@@ -1019,8 +998,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'shares_delta',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         // N/A, never 0: a leg without a whole-share instruction has no count.
         return (
           <div className="text-slate-200 font-mono">
@@ -1037,8 +1016,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'trade',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const trade: TradeView = data.trade;
         return (
           <span
@@ -1058,8 +1037,8 @@ export default function VolatilitySizingPage() {
         </div>
       ),
       accessorKey: 'action',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const action = actionOf(data.weight_change ?? null);
         return (
           <span className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${action.colorClass}`}>
@@ -1071,10 +1050,18 @@ export default function VolatilitySizingPage() {
   ];
 
   // Calculate summary metrics
-  const totalWeightChange = positionData.reduce(
-    (sum, pos) => sum + Math.abs(pos.weight_change ?? 0),
-    0
-  );
+  // Gross turnover is a SUM over legs, so one absent leg makes the sum absent.
+  // `?? 0` absorbed a leg the engine never sized as "no change", and the total
+  // was published as if the book were fully covered. Withholding the total is
+  // the honest answer: a partial turnover is not a small turnover.
+  const totalWeightChange: number | null =
+    positionData.some(pos => pos.weight_change === null)
+      ? null
+      : positionData.reduce((sum, pos) => sum + Math.abs(pos.weight_change as number), 0);
+  // A published total needs a measurement behind it, so both call sites render
+  // this one string rather than re-deriving the guard themselves.
+  const turnoverLabel =
+    totalWeightChange === null ? NOT_AVAILABLE : `${(totalWeightChange * 100).toFixed(1)}%`;
   const buyCount = positionData.filter(pos => (pos.weight_change ?? 0) > 0.005).length;
   const sellCount = positionData.filter(pos => (pos.weight_change ?? 0) < -0.005).length;
   const holdCount = positionData.filter(
@@ -1131,7 +1118,20 @@ export default function VolatilitySizingPage() {
             </span>
             <span>
               <span className="text-slate-400">Net cash: </span>
-              <span className={`font-mono font-bold ${(execution.netCashWeight ?? 0) < 0 ? 'text-rose-300' : 'text-emerald-300'}`}>
+              {/* An absent net cash residue is NEITHER a deficit nor a surplus,
+                  so it is left uncoloured rather than `?? 0`-tested into the
+                  emerald branch — which painted a green "N/A", i.e. a healthy
+                  cash position the engine never measured. Same posture as
+                  MarginalImpactPanel: no colour encodes a judgement the data
+                  does not make. A MEASURED zero is still a real 0 and keeps
+                  the sign it deserves. */}
+              <span
+                className={`font-mono font-bold ${
+                  execution.netCashWeight === null ? 'text-slate-400'
+                    : execution.netCashWeight < 0 ? 'text-rose-300'
+                      : 'text-emerald-300'
+                }`}
+              >
                 {formatWeight(execution.netCashWeight)}
               </span>
             </span>
@@ -1226,16 +1226,13 @@ export default function VolatilitySizingPage() {
 
       {/* Rebalance Confirmation & Simulation Modal */}
       {showRebalanceModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fadeIn"
-          onClick={closeRebalanceModal}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={rebalanceMode === 'simulate' ? 'Simulate Rebalance' : 'Execute Live Rebalance'}
-            className="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
-            onClick={(e) => e.stopPropagation()}
+        // Radix owns Escape, the focus trap and focus restore. `closeOnOutsideClick`
+        // stays on: this ticket carries an uncommitted simulation, and the
+        // backdrop-dismiss behaviour it already had is the lesser surprise.
+        <Dialog open onOpenChange={(open) => { if (!open) closeRebalanceModal(); }}>
+          <DialogContent
+            overlayClassName="bg-black/75 backdrop-blur-sm"
+            className="max-w-2xl gap-0 sm:rounded-xl bg-slate-900 dark:bg-slate-900 border-slate-700 dark:border-slate-700 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
           >
             <button
               onClick={closeRebalanceModal}
@@ -1250,9 +1247,9 @@ export default function VolatilitySizingPage() {
                 <ShieldCheck className="w-6 h-6" />
               </div>
               <div>
-                <h3 className="text-xl font-bold text-white">
+                <DialogTitle className="text-xl font-bold leading-normal text-white">
                   {rebalanceMode === 'simulate' ? 'Simulate Rebalance (Dry-Run)' : 'Execute Live Rebalance'}
-                </h3>
+                </DialogTitle>
                 <p className="text-xs text-slate-400">
                   {rebalanceMode === 'simulate'
                     ? 'Test risk parity allocations and review exact cash / share deltas with zero database mutations.'
@@ -1329,7 +1326,11 @@ export default function VolatilitySizingPage() {
                   </div>
                   <div className="text-center">
                     <span className="text-xs text-slate-400">Turnover Delta</span>
-                    <p className="text-lg font-bold text-teal-400">{(totalWeightChange * 100).toFixed(1)}%</p>
+                    {/* N/A, in the same neutral the other absent values use: a
+                        withheld turnover is not a healthy teal 0.0%. */}
+                    <p className={`text-lg font-bold ${totalWeightChange === null ? 'text-slate-400' : 'text-teal-400'}`}>
+                      {turnoverLabel}
+                    </p>
                   </div>
                 </div>
 
@@ -1459,8 +1460,8 @@ export default function VolatilitySizingPage() {
                 </div>
               </div>
             )}
-          </div>
-        </div>
+          </DialogContent>
+        </Dialog>
       )}
 
       {/* Hero Section */}
@@ -1705,8 +1706,20 @@ export default function VolatilitySizingPage() {
                   <span className="text-sm font-semibold text-slate-200">
                     {position.ticker}
                   </span>
-                  <span className="text-xs text-slate-400 font-mono">
-                    Target: <span className="text-teal-300 font-bold">{formatPercentage(position.recommended_weight)}</span>
+                  <span className="flex items-center gap-2 text-xs font-mono">
+                    {/* The action is stated as a WORD. The fill colour was the
+                        only other carrier of buy-vs-hold-vs-sell, so a reader who
+                        cannot distinguish emerald from slate had no way to know
+                        what the engine was instructing. The word is neutral
+                        slate — the colour semantics are unchanged, this only
+                        stops colour being the sole carrier. A leg with no
+                        target says "No target", matching `actionOf`. */}
+                    <span className="text-slate-300 font-semibold">
+                      {actionOf(position.weight_change).label}
+                    </span>
+                    <span className="text-slate-400">
+                      Target: <span className="text-teal-300 font-bold">{formatPercentage(position.recommended_weight)}</span>
+                    </span>
                   </span>
                 </div>
                 <div className="flex items-center space-x-2">
@@ -1932,13 +1945,13 @@ export default function VolatilitySizingPage() {
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm">
         <h3 className="text-lg font-bold text-white mb-4">Volatility Sizing Insights</h3>
         <div className="space-y-3">
-          {totalWeightChange > 0.10 && (
+          {totalWeightChange !== null && totalWeightChange > 0.10 && (
             <div className="flex items-start space-x-3 p-3.5 bg-amber-950/20 border border-amber-800/40 rounded-xl">
               <AlertTriangle className="w-5 h-5 text-amber-400 mt-0.5 shrink-0" />
               <div>
                 <h4 className="text-xs font-bold text-amber-300 uppercase tracking-wider">Significant Rebalancing Opportunity</h4>
                 <p className="text-xs text-slate-300 mt-0.5 leading-relaxed">
-                  Total weight adjustment of {(totalWeightChange * 100).toFixed(1)}% will balance marginal risk contribution across all {universeCount || 'N/A'} holdings.
+                  Total weight adjustment of {turnoverLabel} will balance marginal risk contribution across all {universeCount || 'N/A'} holdings.
                 </p>
               </div>
             </div>

@@ -8,6 +8,12 @@
 
 import React, { useState, useEffect } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
+import {
+  Dialog,
+  DialogContent,
+  DialogClose,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { analyticsApi } from '@/lib/api';
 import { useUIStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
@@ -114,21 +120,33 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
   if (!info) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto">
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
-          aria-label="Close explainer"
-        >
-          <X className="w-5 h-5" />
-        </button>
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/65 backdrop-blur-sm"
+        // The wrapper defaults to `bg-white dark:bg-gray-800` and
+        // `border-gray-200 dark:border-gray-700`; this panel has always been
+        // slate, and `twMerge` does not resolve `dark:` variants, so both have
+        // to be named explicitly. `gap-0` because the panel spaces its sections
+        // with margins, and `sm:rounded-xl` because the wrapper's `sm:rounded-lg`
+        // would otherwise win inside its media query.
+        className="max-w-xl gap-0 rounded-xl sm:rounded-xl bg-slate-900 dark:bg-slate-900 border-slate-700 dark:border-slate-700 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+      >
+        <DialogClose asChild>
+          <button
+            className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+            aria-label="Close explainer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </DialogClose>
 
         <div className="flex items-center space-x-3 mb-4">
           <div className="p-2 bg-sky-500/20 text-sky-400 rounded-lg">
             <Info className="w-6 h-6" />
           </div>
-          <h3 className="text-xl font-bold text-white">{info.title}</h3>
+          <DialogTitle className="text-xl font-bold text-white">{info.title}</DialogTitle>
         </div>
 
         <div className="space-y-4 text-sm leading-relaxed">
@@ -160,15 +178,16 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
         </div>
 
         <div className="mt-6 flex justify-end">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg font-medium text-sm transition-colors"
-          >
-            Got It
-          </button>
+          <DialogClose asChild>
+            <button
+              className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg font-medium text-sm transition-colors"
+            >
+              Got It
+            </button>
+          </DialogClose>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import React from 'react';
+import React, { useState } from 'react';
 import { EditPositionModal } from '@/components/portfolio/EditPositionModal';
 import { PortfolioPosition } from '@/types';
 
@@ -24,6 +24,27 @@ const position: PortfolioPosition = {
   unrealized_gain_loss: 100,
   unrealized_gain_loss_pct: 10,
   current_value: 1100,
+};
+
+/**
+ * `portfolio/manage` opens this modal from a per-row Edit button, so `isOpen`
+ * is page state and there is no `DialogTrigger` for Radix to restore focus to.
+ * This harness gives the dialog wrapper a real opener to hand focus back to.
+ */
+const OpenedFromButton = () => {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>Edit INFY.NS</button>
+      <EditPositionModal
+        isOpen={open}
+        position={position}
+        onClose={() => setOpen(false)}
+        onUpdate={vi.fn()}
+        currency="INR"
+      />
+    </>
+  );
 };
 
 describe('EditPositionModal', () => {
@@ -89,5 +110,21 @@ describe('EditPositionModal', () => {
     await screen.findByRole('dialog');
     fireEvent.pointerDown(document.body);
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('takes focus on open and hands it back to the opener on close', async () => {
+    render(<OpenedFromButton />);
+    const opener = screen.getByRole('button', { name: 'Edit INFY.NS' });
+    opener.focus();
+    fireEvent.click(opener);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(opener);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 });

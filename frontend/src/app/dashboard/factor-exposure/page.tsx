@@ -12,6 +12,7 @@ import {
   sectionCoverage,
 } from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { usePortfolioStore } from '@/lib/store';
 import {
   Target,
@@ -138,8 +139,15 @@ function HelpExplainerModal({
   if (!explainer) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+    // Radix owns Escape, the focus trap and focus restore. `closeOnOutsideClick`
+    // is false because the hand-rolled backdrop this replaces had no click
+    // handler — a stray click must not dismiss an explainer.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        closeOnOutsideClick={false}
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-2xl gap-0 p-0 sm:rounded-xl dark:bg-gray-900 shadow-2xl max-h-[90vh] overflow-y-auto"
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-5 border-b border-gray-200 dark:border-gray-800 bg-gradient-to-r from-gray-50 to-white dark:from-gray-800/60 dark:to-gray-900">
           <div className="flex items-center space-x-3">
@@ -147,9 +155,9 @@ function HelpExplainerModal({
               <Info className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-lg font-bold text-gray-900 dark:text-white flex items-center gap-2">
+              <DialogTitle className="text-lg font-bold leading-normal text-gray-900 dark:text-white flex items-center gap-2">
                 {explainer.title}
-              </h3>
+              </DialogTitle>
               <span className="inline-block text-xs font-medium px-2 py-0.5 mt-0.5 rounded-full bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-800">
                 {explainer.badge}
               </span>
@@ -158,6 +166,7 @@ function HelpExplainerModal({
           <button
             onClick={onClose}
             className="p-1.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            aria-label="Close explainer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -227,8 +236,8 @@ function HelpExplainerModal({
             Got it, thanks!
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -249,10 +258,32 @@ function HelpBtn({
       }}
       className="inline-flex items-center justify-center w-4 h-4 ml-1.5 text-gray-400 hover:text-teal-600 dark:hover:text-teal-400 transition-colors focus:outline-none"
       title="Click to learn what this means, how it is calculated, and how to interpret it"
+      // The only one of the nine HelpBtn copies that relied on `title` alone;
+      // `title` is a weak name and this is the smallest hit target in the app.
+      // Mirrors `aria-label="Help"` in the sibling copies.
+      aria-label="Help"
     >
       <HelpCircle className="w-3.5 h-3.5" />
     </button>
   );
+}
+
+/**
+ * One row of the position-level factor table.
+ *
+ * `positions` is a `Record<string, any>` keyed by ticker, so the page flattens
+ * it to `{ ticker, ...factors }`. These are the fields the columns actually
+ * publish; declaring them is what makes `row.original` non-optional at compile
+ * time instead of a runtime `undefined` → `NaN%` (UA-01, 358fb49).
+ */
+interface FactorPositionRow {
+  ticker: string;
+  market?: number | null;
+  alpha?: number | null;
+  annualized_alpha?: number | null;
+  is_limited_history?: boolean;
+  history_warning?: string | null;
+  data_points?: number | null;
 }
 
 interface FactorData {
@@ -285,7 +316,7 @@ export default function FactorExposurePage() {
   const [lookbackDays, setLookbackDays] = useState(252);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [positionData, setPositionData] = useState<any[]>([]);
+  const [positionData, setPositionData] = useState<FactorPositionRow[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
   // Sequence guard so a stale response can never overwrite a newer lookback/positions result
   const reqIdRef = useRef(0);
@@ -306,10 +337,12 @@ export default function FactorExposurePage() {
       setFetchError(null);
 
       // Convert positions data for table
-      const positionsList = Object.entries(data.positions || {}).map(([ticker, factors]: [string, any]) => ({
-        ticker,
-        ...factors
-      }));
+      const positionsList: FactorPositionRow[] = Object.entries(data.positions || {}).map(
+        ([ticker, factors]: [string, any]) => ({
+          ticker,
+          ...factors,
+        })
+      );
       setPositionData(positionsList);
     } catch (error: any) {
       if (reqId !== reqIdRef.current) return;
@@ -401,13 +434,13 @@ export default function FactorExposurePage() {
   };
 
   // Position-level factor table columns with unicode Greek symbols and history warnings
-  const positionColumns: DataTableColumn<any>[] = useMemo(
+  const positionColumns: DataTableColumn<FactorPositionRow>[] = useMemo(
     () => [
       {
         header: 'Ticker',
         accessorKey: 'ticker',
-        cell: ({ row }: any) => {
-          const data = row.original || row;
+        cell: ({ row }) => {
+          const data = row.original;
           return (
             <div className="flex items-center space-x-2">
               <span className="font-semibold text-gray-900 dark:text-white">
@@ -428,8 +461,8 @@ export default function FactorExposurePage() {
       {
         header: 'Market Beta (β)',
         accessorKey: 'market',
-        cell: ({ row }: any) => {
-          const data = row.original || row;
+        cell: ({ row }) => {
+          const data = row.original;
           const beta = data.market ?? null;
           if (beta == null) {
             return <div className="font-mono text-gray-400">N/A</div>;
@@ -444,8 +477,8 @@ export default function FactorExposurePage() {
       {
         header: "Daily Alpha (α)",
         accessorKey: 'alpha',
-        cell: ({ row }: any) => {
-          const data = row.original || row;
+        cell: ({ row }) => {
+          const data = row.original;
           if (data.alpha == null) {
             return <div className="font-mono text-gray-400">N/A</div>;
           }
@@ -466,8 +499,8 @@ export default function FactorExposurePage() {
       {
         header: "Annualized Alpha (α p.a.)",
         accessorKey: 'annualized_alpha',
-        cell: ({ row }: any) => {
-          const data = row.original || row;
+        cell: ({ row }) => {
+          const data = row.original;
           const raw = data.annualized_alpha ?? (data.alpha != null ? data.alpha * 252 : null);
           if (raw == null) {
             return <div className="font-mono text-gray-400">N/A</div>;
@@ -489,8 +522,8 @@ export default function FactorExposurePage() {
       {
         header: 'Sensitivity',
         accessorKey: 'sensitivity',
-        cell: ({ row }: any) => {
-          const data = row.original || row;
+        cell: ({ row }) => {
+          const data = row.original;
           const beta = data.market ?? null;
           if (beta == null) {
             return (

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import React from 'react';
+import React, { useState } from 'react';
 import { AddPositionModalSimple } from '@/components/portfolio/AddPositionModalSimple';
 import { portfolioApi } from '@/lib/api';
 
@@ -26,6 +26,26 @@ const fillValidForm = async () => {
   fireEvent.change(screen.getByPlaceholderText('100.00'), { target: { value: '1500' } });
   // Wait for the portfolio fetch to resolve so weight auto-calc runs
   await screen.findByDisplayValue('100.00%');
+};
+
+/**
+ * A modal driven by external `open` state has no `DialogTrigger` for Radix to
+ * restore focus to, so this is where the modal is actually reached in the app.
+ * The dialog wrapper records the opener; this harness gives it a real one.
+ */
+const OpenedFromButton = () => {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>Add a position</button>
+      <AddPositionModalSimple
+        isOpen={open}
+        onClose={() => setOpen(false)}
+        onAdd={vi.fn()}
+        currency="INR"
+      />
+    </>
+  );
 };
 
 describe('AddPositionModalSimple Component', () => {
@@ -125,5 +145,21 @@ describe('AddPositionModalSimple Component', () => {
     fireEvent.click(screen.getByText('Retry'));
     await waitFor(() => expect(screen.queryByText(/Couldn't load portfolio total/)).toBeNull());
     expect(screen.getByRole('button', { name: /Add Position/ })).not.toBeDisabled();
+  });
+
+  it('takes focus on open and hands it back to the opener on close', async () => {
+    render(<OpenedFromButton />);
+    const opener = screen.getByRole('button', { name: 'Add a position' });
+    opener.focus();
+    fireEvent.click(opener);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(opener);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 });

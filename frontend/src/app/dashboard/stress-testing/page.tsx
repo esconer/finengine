@@ -12,6 +12,7 @@ import {
   sectionCoverage,
 } from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
 import {
@@ -34,6 +35,22 @@ import {
   ChevronRight,
   Info
 } from 'lucide-react';
+
+/**
+ * One row of the position-impact table.
+ *
+ * Derived by flattening `StressTestResult.position_impacts` (keyed by ticker).
+ * Declaring the fields the columns publish is what makes `row.original`
+ * non-optional at compile time instead of a runtime `undefined` → `NaN%`
+ * (UA-01, 358fb49).
+ */
+interface StressImpactRow {
+  ticker: string;
+  /** Simulated impact as a fraction; the severity band is derived from it. */
+  impact: number;
+  /** Duplicate of `impact`, kept as published by the table's own CSV export. */
+  change: number;
+}
 
 interface StressTestResult {
   scenario: string;
@@ -236,28 +253,16 @@ interface HelpExplainerModalProps {
 }
 
 function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   if (!itemKey || !EXPLAINERS[itemKey]) return null;
   const exp = EXPLAINERS[itemKey];
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={exp.title}
-        className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl p-6 relative text-gray-900 dark:text-gray-100"
-        onClick={(e) => e.stopPropagation()}
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-2xl gap-0 sm:rounded-2xl dark:bg-gray-900 shadow-2xl max-h-[90vh] overflow-y-auto relative text-gray-900 dark:text-gray-100"
       >
         {/* Header */}
         <div className="flex items-start justify-between pb-4 border-b border-gray-100 dark:border-gray-800">
@@ -269,9 +274,9 @@ function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
               <span className="text-xs font-semibold uppercase tracking-wider text-orange-600 dark:text-orange-400">
                 {exp.category}
               </span>
-              <h2 className="text-xl font-bold text-gray-900 dark:text-white">
+              <DialogTitle className="text-xl font-bold leading-normal text-gray-900 dark:text-white">
                 {exp.title}
-              </h2>
+              </DialogTitle>
             </div>
           </div>
           <button
@@ -360,8 +365,8 @@ function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
             Got it, close
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -584,7 +589,7 @@ export default function StressTestingPage() {
 
   // Derive active position table data based on activeScenarioName
   const activeResult = stressResults[activeScenarioName];
-  const positionData = useMemo(() => {
+  const positionData = useMemo<StressImpactRow[]>(() => {
     if (!activeResult || !activeResult.position_impacts) return [];
     return Object.entries(activeResult.position_impacts).map(([ticker, impact]) => ({
       ticker,
@@ -594,12 +599,12 @@ export default function StressTestingPage() {
   }, [activeResult]);
 
   // Position impact table columns
-  const positionColumns: DataTableColumn<any>[] = [
+  const positionColumns: DataTableColumn<StressImpactRow>[] = [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="flex items-center space-x-2">
             <span className="font-semibold text-gray-900 dark:text-white">
@@ -612,8 +617,8 @@ export default function StressTestingPage() {
     {
       header: 'Simulated Impact',
       accessorKey: 'impact',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className={`font-semibold ${getImpactColor(data.impact)}`}>
             {formatPercentage(data.impact, 1)}
@@ -624,8 +629,8 @@ export default function StressTestingPage() {
     {
       header: 'Severity Level',
       accessorKey: 'severity_level',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const sev = severityFor(data.impact);
         if (!sev) {
           return (
@@ -760,16 +765,21 @@ export default function StressTestingPage() {
             <button
               onClick={() => setShowCustomForm(false)}
               className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+              aria-label="Close custom scenario form"
             >
               <X className="w-5 h-5" />
             </button>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
             <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+              <label
+                htmlFor="custom-scenario-name"
+                className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5"
+              >
                 Scenario Name *
               </label>
               <input
+                id="custom-scenario-name"
                 type="text"
                 value={customScenario.name}
                 onChange={(e) => setCustomScenario(prev => ({ ...prev, name: e.target.value }))}
@@ -778,10 +788,14 @@ export default function StressTestingPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+              <label
+                htmlFor="custom-scenario-market-shock"
+                className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5"
+              >
                 Market Shock (%) *
               </label>
               <input
+                id="custom-scenario-market-shock"
                 type="number"
                 value={customScenario.market_shock}
                 onChange={(e) => setCustomScenario(prev => ({ ...prev, market_shock: e.target.value }))}

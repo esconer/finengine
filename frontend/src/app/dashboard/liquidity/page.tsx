@@ -13,6 +13,7 @@ import {
   sectionCoverage,
 } from '@/components/provenance/SectionProvenance';
 import { analyticsApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { usePortfolioStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
 import {
@@ -139,28 +140,16 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
 };
 
 function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={info.title}
-        onClick={(e) => e.stopPropagation()}
-        className="bg-slate-900 border border-slate-700 rounded-xl max-w-xl w-full p-6 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-xl gap-0 sm:rounded-xl bg-slate-900 dark:bg-slate-900 border-slate-700 dark:border-slate-700 shadow-2xl relative text-slate-100 max-h-[90vh] overflow-y-auto"
       >
         <button
           onClick={onClose}
@@ -174,7 +163,7 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
           <div className="p-2 bg-cyan-500/20 text-cyan-400 rounded-lg">
             <Info className="w-6 h-6" />
           </div>
-          <h3 className="text-xl font-bold text-white">{info.title}</h3>
+          <DialogTitle className="text-xl font-bold leading-normal text-white">{info.title}</DialogTitle>
         </div>
 
         <div className="space-y-4 text-sm leading-relaxed">
@@ -213,8 +202,8 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             Got It
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -475,8 +464,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-semibold text-gray-900 dark:text-white">
             {data.ticker}
@@ -492,8 +481,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'score',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className={`${getScoreColor(data.score)}`}>
             {formatScore(data.score)}
@@ -509,8 +498,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'category',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const colorClass = data.category === 'High' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' :
           data.category === 'Medium' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' :
             data.category === 'Low' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40' :
@@ -530,8 +519,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'volume_30d',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-900 dark:text-white font-mono">
             {formatVolume(data.volume_30d)}
@@ -547,8 +536,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'market_cap',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-900 dark:text-white font-mono font-medium">
             {formatCurrency(data.market_cap)}
@@ -564,8 +553,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'bid_ask_spread',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-900 dark:text-white font-mono">
             {formatPercentage(data.bid_ask_spread, 2)}
@@ -581,8 +570,8 @@ export default function LiquidityPage() {
         </div>
       ),
       accessorKey: 'liquidation_days',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-slate-300 font-medium">
             {data.liquidation_days ? `${data.liquidation_days} days` : 'N/A'}
@@ -771,14 +760,26 @@ export default function LiquidityPage() {
                     </div>
                     <div className="flex items-center space-x-3">
                       <div className="w-28 bg-slate-800 rounded-full h-2.5 overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all duration-500 ${
-                            position.category === 'High' ? 'bg-emerald-500' :
-                            position.category === 'Medium' ? 'bg-amber-500' :
-                            position.category === 'Low' ? 'bg-rose-500' : 'bg-slate-500'
-                          }`}
-                          style={{ width: `${((position.score ?? 0) / 10) * 100}%` }}
-                        />
+                        {/* An unscored holding draws NO fill. `?? 0` produced a
+                            0%-wide bar that is visually identical to a holding
+                            the engine genuinely scored zero — the score label
+                            beside it says N/A, the bar said "scored zero".
+                            A MEASURED 0 still draws its (empty) bar, because
+                            0 is a measurement. Same rule as the absent-state
+                            bars on factor-exposure. */}
+                        {isScored(position) && (
+                          <div
+                            data-testid={`liquidity-score-bar-${position.ticker}`}
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              position.category === 'High' ? 'bg-emerald-500' :
+                              position.category === 'Medium' ? 'bg-amber-500' :
+                              position.category === 'Low' ? 'bg-rose-500' : 'bg-slate-500'
+                            }`}
+                            /* `isScored` proved this is a finite number, so the
+                               width needs no null fallback of its own. */
+                            style={{ width: `${((position.score as number) / 10) * 100}%` }}
+                          />
+                        )}
                       </div>
                       <span className={`text-sm font-mono ${getScoreColor(position.score)} w-12 text-right`}>
                         {formatScore(position.score)}

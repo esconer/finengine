@@ -231,7 +231,7 @@ export default function ScreenerStudioPage() {
         accessorKey: 'symbol',
         header: 'Stock & Ticker',
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="flex flex-col">
               <div className="flex items-center gap-1.5">
@@ -263,7 +263,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono font-semibold text-white">
               ₹{data.price?.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
@@ -283,7 +283,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono text-slate-200">
               {formatCr(data.market_cap_cr)}
@@ -303,7 +303,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono text-slate-300">
               {data.pe_ratio !== null && data.pe_ratio !== undefined ? `${data.pe_ratio.toFixed(1)}x` : '-'}
@@ -323,7 +323,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono font-bold text-emerald-400">
               {data.roce_pct !== null && data.roce_pct !== undefined ? `${data.roce_pct.toFixed(1)}%` : '-'}
@@ -343,7 +343,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono font-bold text-emerald-400">
               {data.roe_pct !== null && data.roe_pct !== undefined ? `${data.roe_pct.toFixed(1)}%` : '-'}
@@ -363,7 +363,7 @@ export default function ScreenerStudioPage() {
           </button>
         ),
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           return (
             <div className="text-right font-mono text-cyan-300">
               {data.dividend_yield_pct !== null && data.dividend_yield_pct !== undefined
@@ -377,7 +377,7 @@ export default function ScreenerStudioPage() {
         id: 'actions',
         header: 'Action',
         cell: ({ row }) => {
-          const data = row.original || row;
+          const data = row.original;
           const isAdded = addedStocks[data.symbol];
           const isAdding = addingStock === data.symbol;
           return (

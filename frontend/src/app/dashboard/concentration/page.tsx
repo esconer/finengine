@@ -6,7 +6,7 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { MetricCard } from '@/components/ui/MetricCard';
-import { DataTable } from '@/components/ui/DataTable';
+import { DataTable, type DataTableColumn } from '@/components/ui/DataTable';
 import {
   SectionProvenance,
   sectionCoverage,
@@ -23,6 +23,7 @@ import {
   Legend,
 } from 'recharts';
 import { analyticsApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
 import { escapeCsvCell } from '@/lib/utils';
 import {
@@ -57,7 +58,8 @@ interface ConcentrationData {
   zero_metrics?: boolean;
   diversification_ratio: number;
   gini_coefficient?: number;
-  by_weight: Record<string, number>;
+  /** A weight the engine could not compute is `null`, not `0`. */
+  by_weight: Record<string, number | null>;
   by_sector: Record<string, number>;
   methodology?: string;
   /**
@@ -73,6 +75,29 @@ interface ConcentrationData {
   universe_coverage?: {
     missing_tickers?: string[] | null;
   } | null;
+}
+
+/**
+ * One row of the position concentration table, exactly as the `by_weight` map
+ * yields it. `weight` is `number | null` because a weight the engine could not
+ * compute is absent, not zero — declaring it `number` is what let a null flow
+ * into the CSV as a confident `0.00%` / `Low`.
+ */
+type ConcentrationPosition = {
+  ticker: string;
+  weight: number | null;
+  cumulative_weight: number | null;
+  sector: string | null;
+};
+
+/**
+ * A value is a measurement only if it is a finite number. `null`, `NaN` and
+ * `undefined` are all the same thing here: unmeasured. This is deliberately
+ * NOT a `value || fallback` guard — that would pass a null test and turn a
+ * MEASURED 0 into `N/A`, which is the same fabrication in the other direction.
+ */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 interface ConcentrationMetric {
@@ -218,28 +243,16 @@ interface HelpExplainerModalProps {
 }
 
 function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   if (!itemKey || !EXPLAINERS[itemKey]) return null;
   const exp = EXPLAINERS[itemKey];
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={exp.title}
-        className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl p-6 relative text-gray-900 dark:text-gray-100"
-        onClick={(e) => e.stopPropagation()}
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-2xl gap-0 sm:rounded-2xl dark:bg-gray-900 shadow-2xl max-h-[90vh] overflow-y-auto relative text-gray-900 dark:text-gray-100"
       >
         {/* Header */}
         <div className="flex items-start justify-between pb-4 border-b border-gray-100 dark:border-gray-800">
@@ -251,9 +264,9 @@ function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
               <span className="text-xs font-semibold uppercase tracking-wider text-purple-600 dark:text-purple-400">
                 {exp.category}
               </span>
-              <h2 className="text-xl font-bold text-gray-900 dark:text-white">
+              <DialogTitle className="text-xl font-bold leading-normal text-gray-900 dark:text-white">
                 {exp.title}
-              </h2>
+              </DialogTitle>
             </div>
           </div>
           <button
@@ -342,8 +355,8 @@ function HelpExplainerModal({ itemKey, onClose }: HelpExplainerModalProps) {
             Got it, close
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -367,7 +380,7 @@ export default function ConcentrationPage() {
   const [concentrationData, setConcentrationData] = useState<ConcentrationData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [positionData, setPositionData] = useState<any[]>([]);
+  const [positionData, setPositionData] = useState<ConcentrationPosition[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<string | null>(null);
 
   const { positions, fetchPortfolio } = usePortfolioStore();
@@ -380,14 +393,20 @@ export default function ConcentrationPage() {
     if (!positionData || positionData.length === 0) {
       return [{ assetPct: '0%', portfolioCumPct: 0, equalWeightPct: 0 }, { assetPct: '100%', portfolioCumPct: 100, equalWeightPct: 100 }];
     }
-    const n = positionData.length;
-    // Rank weights ascending for true Lorenz curve
-    const sortedWeights = [...positionData].map(p => p.weight).sort((a, b) => a - b);
+    // Rank weights ascending for true Lorenz curve. Unmeasured legs have no
+    // place on a Lorenz axis — they are dropped from the curve rather than
+    // sorted as if they were a 0% holding, which would flatten the line and
+    // understate real inequality. An absent weight is not the smallest weight.
+    const measured = positionData.filter(p => p.weight !== null).map(p => p.weight as number);
+    if (measured.length === 0) {
+      return [{ assetPct: '0%', portfolioCumPct: 0, equalWeightPct: 0 }, { assetPct: '100%', portfolioCumPct: 100, equalWeightPct: 100 }];
+    }
+    const sortedWeights = measured.sort((a, b) => a - b);
     const points = [{ assetPct: '0%', portfolioCumPct: 0, equalWeightPct: 0 }];
     let cumSum = 0;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < sortedWeights.length; i++) {
       cumSum += sortedWeights[i];
-      const assetPctNum = Math.round(((i + 1) / n) * 100);
+      const assetPctNum = Math.round(((i + 1) / sortedWeights.length) * 100);
       points.push({
         assetPct: `${assetPctNum}%`,
         portfolioCumPct: Number((cumSum * 100).toFixed(1)),
@@ -401,12 +420,22 @@ export default function ConcentrationPage() {
     if (!positionData || positionData.length === 0) return;
     const headers = ['Ticker', 'Weight', 'Cumulative Weight', 'Sector', 'Concentration Risk'];
     const rows = positionData.map(p => {
-      const weightVal = p.weight ?? 0;
-      const riskLevel = weightVal > 0.15 ? 'High' : weightVal > 0.10 ? 'Medium' : 'Low';
+      // `weightVal` and the weight column read the SAME value, so the tier and
+      // the number can no longer disagree. An unmeasured weight yields N/A in
+      // both: `?? 0` used to print a confident "0.00%" and then call it "Low",
+      // and the next column read `p.weight * 100` unguarded into "NaN%".
+      const weightVal = finiteOrNull(p.weight);
+      // A tier derived from an absent weight is itself absent. "Low" is a
+      // claim about a measurement the engine never made.
+      const riskLevel =
+        weightVal === null ? 'N/A'
+          : weightVal > 0.15 ? 'High'
+            : weightVal > 0.10 ? 'Medium'
+              : 'Low';
       return [
         p.ticker,
-        (p.weight * 100).toFixed(2) + '%',
-        (p.cumulative_weight * 100).toFixed(2) + '%',
+        weightVal === null ? 'N/A' : (weightVal * 100).toFixed(2) + '%',
+        p.cumulative_weight === null ? 'N/A' : (p.cumulative_weight * 100).toFixed(2) + '%',
         p.sector ?? 'N/A',
         riskLevel,
       ].map(escapeCsvCell).join(',');
@@ -445,14 +474,20 @@ export default function ConcentrationPage() {
         useUIStore.getState().updateLastUpdated();
 
         // Convert by_weight data for table with real sector and pre-calculated cumulative weights
-        let cumWeight = 0;
+        // A weight the engine could not compute stays null. It is NOT added to
+        // the running total as a zero: a partially-measured running sum is not a
+        // measurement either, so once an unmeasured leg is seen the cumulative
+        // weight is withheld from that point on rather than reported as a share
+        // of a denominator that no longer describes the book.
+        let cumWeight: number | null = 0;
         const sortedEntries = Object.entries(data.by_weight || {}).sort(([, a], [, b]) => (b as number) - (a as number));
-        const positionsList = sortedEntries.map(([ticker, weight]) => {
-          cumWeight += (weight as number);
+        const positionsList: ConcentrationPosition[] = sortedEntries.map(([ticker, rawWeight]) => {
+          const weight = finiteOrNull(rawWeight);
+          cumWeight = cumWeight === null || weight === null ? null : cumWeight + weight;
           const pos = positions.find(p => p.ticker === ticker);
           return {
             ticker,
-            weight: weight as number,
+            weight,
             cumulative_weight: cumWeight,
             sector: pos?.sector || null
           };
@@ -562,12 +597,12 @@ export default function ConcentrationPage() {
   ];
 
   // Position concentration table columns
-  const positionColumns = [
+  const positionColumns: DataTableColumn<ConcentrationPosition>[] = [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-medium text-gray-900 dark:text-white">
             {data.ticker}
@@ -578,8 +613,8 @@ export default function ConcentrationPage() {
     {
       header: 'Weight',
       accessorKey: 'weight',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="font-semibold text-gray-900 dark:text-white">
             {formatPercentage(data.weight)}
@@ -590,8 +625,8 @@ export default function ConcentrationPage() {
     {
       header: 'Cumulative %',
       accessorKey: 'cumulative_weight',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-700 dark:text-gray-300 font-mono text-xs">
             {formatPercentage(data.cumulative_weight)}
@@ -602,8 +637,8 @@ export default function ConcentrationPage() {
     {
       header: 'Sector',
       accessorKey: 'sector',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="text-gray-600 dark:text-gray-400 text-xs">
             {data.sector ?? 'N/A'}
@@ -614,13 +649,21 @@ export default function ConcentrationPage() {
     {
       header: 'Concentration Risk',
       accessorKey: 'concentration_risk',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
-        const weightVal = data.weight ?? 0;
-        const riskLevel = weightVal > 0.15 ? 'High' : weightVal > 0.10 ? 'Medium' : 'Low';
+      cell: ({ row }) => {
+        const data = row.original;
+        // Same rule as the CSV export: an unmeasured weight has no tier. `?? 0`
+        // painted a green "Low" badge beside an N/A weight, which reads as a
+        // clean bill of health for a holding the engine could not size.
+        const weightVal = finiteOrNull(data.weight);
+        const riskLevel =
+          weightVal === null ? 'N/A'
+            : weightVal > 0.15 ? 'High'
+              : weightVal > 0.10 ? 'Medium'
+                : 'Low';
         const colorClass = riskLevel === 'High' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300 border border-red-200 dark:border-red-800' :
           riskLevel === 'Medium' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-800' :
-            'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300 border border-green-200 dark:border-green-800';
+            riskLevel === 'N/A' ? 'bg-slate-100 text-slate-700 dark:bg-slate-800/60 dark:text-slate-400 border border-slate-300 dark:border-slate-700' :
+              'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300 border border-green-200 dark:border-green-800';
         return (
           <span className={`px-2.5 py-0.5 text-xs rounded-full font-semibold ${colorClass}`}>
             {riskLevel}

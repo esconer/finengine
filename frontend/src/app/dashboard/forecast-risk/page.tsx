@@ -23,6 +23,7 @@ import {
   CartesianGrid,
 } from 'recharts';
 import { analyticsApi } from '@/lib/api';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { usePortfolioStore, useUIStore } from '@/lib/store';
 import {
   TrendingUp,
@@ -194,27 +195,15 @@ function HelpExplainerModal({
   content: ExplainerContent | null;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   if (!content) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={content.title}
-        className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl shadow-2xl max-w-2xl w-full p-6 space-y-5 max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
+    // Radix owns Escape, the focus trap and focus restore; the backdrop click
+    // it adds on top of the `onClose` below is the behaviour this panel had.
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        overlayClassName="bg-black/60 backdrop-blur-sm"
+        className="max-w-2xl gap-0 space-y-5 sm:rounded-2xl dark:bg-gray-900 shadow-2xl max-h-[90vh] overflow-y-auto"
       >
         {/* Header */}
         <div className="flex items-start justify-between border-b border-gray-100 dark:border-gray-800 pb-4">
@@ -223,9 +212,9 @@ function HelpExplainerModal({
               <BookOpen className="w-6 h-6" />
             </div>
             <div>
-              <h3 className="text-xl font-bold text-gray-900 dark:text-white">
+              <DialogTitle className="text-xl font-bold leading-normal text-gray-900 dark:text-white">
                 {content.title}
-              </h3>
+              </DialogTitle>
               {content.subtitle && (
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                   {content.subtitle}
@@ -295,8 +284,8 @@ function HelpExplainerModal({
             Got it
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -323,6 +312,25 @@ function HelpBtn({
       <HelpCircle className="w-3.5 h-3.5" />
     </button>
   );
+}
+
+/**
+ * One row of the position-level forecast table.
+ *
+ * The page flattens `ForecastData.positions` (keyed by ticker) into an array and
+ * calibrates `risk_level` from the forward volatility. Declaring the fields the
+ * columns publish is what makes `row.original` non-optional at compile time
+ * instead of a runtime `undefined` → `NaN%` (UA-01, 358fb49).
+ */
+interface ForecastPositionRow {
+  ticker: string;
+  volatility_forecast: number | null;
+  var_forecast: number | null;
+  is_limited_history: boolean;
+  history_warning: string | null;
+  data_points: number | null;
+  /** Calibrated band: 'High' | 'Medium' | 'Low' | 'N/A'. */
+  risk_level: string;
 }
 
 interface ForecastData {
@@ -367,7 +375,7 @@ export default function ForecastRiskPage() {
   const [forecastData, setForecastData] = useState<ForecastData | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [positionData, setPositionData] = useState<any[]>([]);
+  const [positionData, setPositionData] = useState<ForecastPositionRow[]>([]);
   const [activeExplainer, setActiveExplainer] = useState<ExplainerContent | null>(null);
   const fetchSeq = useRef(0);
 
@@ -445,7 +453,7 @@ export default function ForecastRiskPage() {
       setForecastData(data);
 
       // Convert positions data for table with calibrated risk level
-      const positionsList = Object.entries(data.positions || {}).map(
+      const positionsList: ForecastPositionRow[] = Object.entries(data.positions || {}).map(
         ([ticker, posData]: [string, any]) => {
           const volValue = posData?.volatility_forecast ?? null;
           // Calibrate risk level by annualized forward volatility:
@@ -458,11 +466,11 @@ export default function ForecastRiskPage() {
 
           return {
             ticker,
-            volatility_forecast: posData?.volatility_forecast,
-            var_forecast: posData?.var_forecast,
-            is_limited_history: posData?.is_limited_history,
-            history_warning: posData?.history_warning,
-            data_points: posData?.data_points,
+            volatility_forecast: posData?.volatility_forecast ?? null,
+            var_forecast: posData?.var_forecast ?? null,
+            is_limited_history: posData?.is_limited_history ?? false,
+            history_warning: posData?.history_warning ?? null,
+            data_points: posData?.data_points ?? null,
             risk_level: riskLevel,
           };
         }
@@ -518,12 +526,12 @@ export default function ForecastRiskPage() {
   };
 
   // Position forecast table columns
-  const positionColumns: DataTableColumn<any>[] = useMemo(() => [
+  const positionColumns: DataTableColumn<ForecastPositionRow>[] = useMemo(() => [
     {
       header: 'Ticker',
       accessorKey: 'ticker',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         return (
           <div className="flex items-center space-x-2">
             <span className="font-semibold text-gray-900 dark:text-white">
@@ -544,8 +552,8 @@ export default function ForecastRiskPage() {
     {
       header: 'Volatility Forecast',
       accessorKey: 'volatility_forecast',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const volatility = data.volatility_forecast;
         const displayValue = formatPercentage(volatility);
 
@@ -563,8 +571,8 @@ export default function ForecastRiskPage() {
     {
       header: `${forecastHorizon}-Day VaR (95% Downside)`,
       accessorKey: 'var_forecast',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const varValue = data.var_forecast;
         const displayValue = formatPercentage(varValue);
 
@@ -582,8 +590,8 @@ export default function ForecastRiskPage() {
     {
       header: 'Risk Level',
       accessorKey: 'risk_level',
-      cell: ({ row }: any) => {
-        const data = row.original || row;
+      cell: ({ row }) => {
+        const data = row.original;
         const riskLevel = data.risk_level;
         if (riskLevel == null || riskLevel === 'N/A') {
           return (
@@ -911,7 +919,10 @@ export default function ForecastRiskPage() {
           {/* Custom Horizon Input */}
           <div className="mt-5 pt-4 border-t border-gray-100 dark:border-gray-700/60">
             <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300">
+              <label
+                htmlFor="forecast-risk-horizon"
+                className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-300"
+              >
                 Custom Horizon (1 - 30 days)
               </label>
               <span className="text-xs font-mono text-blue-600 dark:text-blue-400 font-bold">
@@ -919,10 +930,15 @@ export default function ForecastRiskPage() {
               </span>
             </div>
             <input
+              id="forecast-risk-horizon"
               type="range"
               min="1"
               max="30"
               value={forecastHorizon}
+              // A bare slider position ("1".."30") is the number alone; the unit
+              // only ever appears in the sibling span, which a screen reader
+              // reaches separately. Carry the day count in the value text.
+              aria-valuetext={`${forecastHorizon} ${forecastHorizon === 1 ? 'day' : 'days'}`}
               onChange={(e) => handleHorizonChange(parseInt(e.target.value) || 1)}
               className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
             />
