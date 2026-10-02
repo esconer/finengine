@@ -763,6 +763,36 @@ def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
     return np.asarray(w.value).flatten()
 
 
+def _black_litterman_posterior(
+    cov_ann: np.ndarray,
+    pi: np.ndarray,
+    P: np.ndarray,
+    Q: np.ndarray,
+    tau: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Blended posterior (mu_bl, cov_bl) from a prior and a set of views.
+
+    QM-1. The posterior covariance is `tau*Sigma - tau*Sigma P' (Omega +
+    P tau Sigma P')^-1 P tau Sigma`, the Woodbury reduction of the standard
+    `[(tau Sigma)^-1 + P' Omega^-1 P]^-1`. The leading coefficient is `tau`,
+    NOT `1 + tau`: the shipped form was exactly `Sigma + Sigma_BL`, i.e. the
+    prior covariance added back on top of the posterior, which INFLATES the
+    risk matrix where confident views must shrink it. `inv_inner` is the
+    `Omega + P tau Sigma P'` factor; `pinv` stays because `Omega`'s 1e-6 clip
+    floor can leave `inner` ill-conditioned for near-collinear views.
+    """
+    tau_sigma = tau * cov_ann
+    omega_diag = np.diag(P @ tau_sigma @ P.T)
+    omega_diag = np.clip(omega_diag, 1e-6, None)
+    Omega = np.diag(omega_diag)
+
+    inner = P @ tau_sigma @ P.T + Omega
+    inv_inner = np.linalg.pinv(inner)
+    mu_bl = pi + (tau_sigma @ P.T @ inv_inner @ (Q - P @ pi))
+    cov_bl = tau_sigma - (tau_sigma @ P.T @ inv_inner @ P @ tau_sigma)
+    return mu_bl, cov_bl
+
+
 def _black_litterman(
     returns: pd.DataFrame,
     views: Optional[Dict[str, float]] = None,
@@ -774,13 +804,22 @@ def _black_litterman(
     """Black-Litterman Bayesian Portfolio Optimization.
 
     - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt
-    - Incorporates views on the EXCESS-return convention (the prior Pi and
-      the final tangency both work in excess space: mu_bl - rf). Express
-      absolute-return views as view minus risk-free rate, e.g. an expected
-      15% return with rf=6% is passed as 0.09. Relative (long-short) view
-      diffs are rf-invariant and need no adjustment.
+    - EVERYTHING here is in EXCESS-return space. `Pi = delta * Sigma * w_mkt`
+      is the Black-Litterman risk premium `E[R] - rf*1`, so no `rf` term
+      appears in its construction and none is added afterwards; `mu_bl` is
+      `Pi` plus a linear combination of `Q - P Pi`, hence also excess. QM-5:
+      this function used to compute `mu_bl - risk_free_rate`, de-risking a
+      second time and shifting the tangency direction by
+      `Sigma^-1 (mu_bl - rf 1)`. `risk_free_rate` is consequently accepted for
+      signature stability with `optimize()` but does NOT enter the tangency.
+    - Views are read on the SAME convention. Express absolute-return views as
+      view minus risk-free rate, e.g. an expected 15% return with rf=6% is
+      passed as 0.09. Relative (long-short) view diffs are rf-invariant and
+      need no adjustment. That conversion happens once, at the edge, when the
+      view is written down - not again inside the posterior.
     - View uncertainty Omega = diag(P * (tau * Sigma) * P^T) (He-Litterman method)
-    - Blended posterior parameters mu_bl and cov_bl
+    - Blended posterior parameters mu_bl and cov_bl (see
+      `_black_litterman_posterior` for the covariance form)
     - Long-only tangency solution
     """
     mu_ann, cov_ann, assets = _as_matrices(returns)
@@ -818,20 +857,15 @@ def _black_litterman(
     if p_rows:
         P = np.array(p_rows)
         Q = np.array(q_vals)
-        tau_sigma = tau * cov_ann
-        omega_diag = np.diag(P @ tau_sigma @ P.T)
-        omega_diag = np.clip(omega_diag, 1e-6, None)
-        Omega = np.diag(omega_diag)
-
-        inner = P @ tau_sigma @ P.T + Omega
-        inv_inner = np.linalg.pinv(inner)
-        mu_bl = pi + (tau_sigma @ P.T @ inv_inner @ (Q - P @ pi))
-        cov_bl = (1.0 + tau) * cov_ann - (tau * tau) * (cov_ann @ P.T @ inv_inner @ P @ cov_ann)
+        mu_bl, cov_bl = _black_litterman_posterior(cov_ann, pi, P, Q, tau)
     else:
         mu_bl = pi
         cov_bl = cov_ann
 
-    excess = mu_bl - risk_free_rate
+    # QM-5: `mu_bl` is ALREADY excess, so `rf` is not subtracted here. The
+    # normalisation `excess @ y == 1` only fixes the scale of y, and the
+    # published weights are y/sum(y), so the scale never reaches the output.
+    excess = mu_bl
     if (excess <= 0).all():
         return _min_vol(cov_bl)
 
