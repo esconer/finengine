@@ -40,6 +40,23 @@ GOLDEN_PATH = (
     Path(__file__).parent / "fixtures" / "correlation_stability_pre_direction.json"
 )
 
+# The keys this service publishes that the captured golden cannot have, because
+# the golden was taken before either field existed. Both are ADDITIVE labels - a
+# new key beside the figures, never a changed figure - and this list is
+# deliberately CLOSED: a third entry means a published value moved without a
+# label saying so, which is the failure
+# `test_payload_is_byte_identical_to_the_pre_field_service` exists to catch. Do
+# not append to it to turn a red run green.
+#
+#   * `alert_direction` predates this file's golden. It names which of the four
+#     percentile comparisons fired, because `alert_level` cannot (see the module
+#     docstring).
+#   * `as_of_semantics` arrived with the disclosure field: `schemas.py` had to
+#     declare it before FastAPI would carry it, so every measured payload now
+#     carries the key, and the service sets it only where it can name the
+#     observation (see `analyze_correlation_stability`).
+ADDITIVE_KEYS_SINCE_GOLDEN = frozenset({"alert_direction", "as_of_semantics"})
+
 # Each shape is chosen so a DIFFERENT comparison decides the alert, which is what
 # makes the direction observable. `test_the_arm_each_shape_reaches` re-derives the
 # arm from the published percentiles, so a drifted shape fails loudly instead of
@@ -182,21 +199,29 @@ class TestNothingPublishedMoved:
     def test_payload_is_byte_identical_to_the_pre_field_service(
         self, monkeypatch, golden, arm
     ):
-        """The whole payload, minus the one new key, equals the payload the
-        unmodified service produced for the same book.
+        """The whole payload, minus the two additive labels, equals the payload
+        the unmodified service produced for the same book.
 
         The fixture was captured by running this same function before
-        `alert_direction` existed. A comparison of the full dumped dict (not a
-        selection of fields) means a changed percentile, threshold, median,
-        message or series row fails here.
+        `alert_direction` existed, and before `as_of_semantics` was declared in
+        schemas.py. A comparison of the full dumped dict (not a selection of
+        fields) means a changed percentile, threshold, median, message or series
+        row fails here. The key-set assertion above is what keeps the two pops
+        honest: it fails on an UNEXPECTED addition, so the comparison below can
+        only be reached with exactly the two known labels removed.
         """
         res = _analyze(monkeypatch, BOOKS[arm])
         dumped = res.model_dump()
 
-        assert set(dumped) - set(golden[arm]) == {"alert_direction"}
+        assert set(dumped) - set(golden[arm]) == ADDITIVE_KEYS_SINCE_GOLDEN
         assert set(golden[arm]) - set(dumped) == set()
-        dumped.pop("alert_direction")
-        assert dumped == golden[arm]
+        for additive in ADDITIVE_KEYS_SINCE_GOLDEN:
+            dumped.pop(additive)
+        assert dumped == golden[arm], (
+            "a published figure moved: once the additive labels "
+            f"{sorted(ADDITIVE_KEYS_SINCE_GOLDEN)} are removed, the payload "
+            "must equal the pre-field golden exactly"
+        )
 
     @pytest.mark.parametrize("arm", sorted(BOOKS))
     def test_the_new_key_is_the_only_addition(self, monkeypatch, golden, arm):

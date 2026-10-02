@@ -5428,6 +5428,22 @@ class AnalyticsEngine:
         thinness rather than correcting it.  The stated reason is published per
         field in `estimate_uncertainty.estimates.<field>.reason`; see
         `_SHORT_SAMPLE_ANNUALIZATION_REASON` and `_estimate_uncertainty_block`.
+
+        The two ratios have a SECOND way to have no value, and it needs no
+        short window at all: their OWN denominator measured nothing.  A window
+        whose every return is exactly `0.0` - one ticker that never moved, or a
+        stale-price frame that clears the ten-day `assert_not_stale` gate - has
+        `annual_volatility == 0.0`, and a window that never undershot the
+        Sortino target has a zero downside deviation.  Both used to publish
+        `0.0` off the ternary on the annualizing branch, which is the defect
+        the `< 10` branch above was fixed for, reproduced 30 lines below it:
+        the repair reached the short window and never reached the
+        zero-dispersion one.  Both are `None` now, with their own reason, for
+        the reason given there - a zero published for a ratio that was never
+        computed cannot be told apart from a measured zero.  See
+        `_zero_dispersion_reason`.  `annual_return` and `annual_volatility` are
+        NOT withheld on that window: a zero mean and a zero dispersion over a
+        flat series are real measurements over the observations that exist.
         """
         try:
             if returns.empty:
@@ -5465,7 +5481,21 @@ class AnalyticsEngine:
                 annual_volatility = float(returns.std() * np.sqrt(252))
                 
                 # Sharpe ratio
-                sharpe_ratio = float((annual_return - self.risk_free_rate) / annual_volatility) if annual_volatility > 0 else 0.0
+                #
+                # `None`, never 0.0, when the dispersion measured nothing.  A
+                # ratio over a zero denominator has no value, and publishing
+                # 0.0 there hands the reader a number that cannot be told apart
+                # from a measured zero Sharpe - the exact reason the sibling
+                # branch above withholds instead of substituting.  No epsilon
+                # floor and no small number: either would be a value this
+                # method did not measure.  `annual_volatility > 0` is False for
+                # a non-finite dispersion as well as a zero one, which is the
+                # same absence - a NaN denominator has no ratio either.
+                sharpe_ratio = (
+                    float((annual_return - self.risk_free_rate) / annual_volatility)
+                    if annual_volatility > 0
+                    else None
+                )
                 
                 # Sortino ratio (Sortino & Price 1994): downside deviation of the
                 # full return series below a target, not std of negative subsample.
@@ -5473,7 +5503,14 @@ class AnalyticsEngine:
                 target = self.risk_free_rate / 252
                 downside = np.minimum(0.0, returns.to_numpy(dtype=float) - target)
                 downside_deviation = float(np.sqrt(np.mean(downside ** 2)) * np.sqrt(252)) if len(returns) else 0.0
-                sortino_ratio = float((annual_return - self.risk_free_rate) / downside_deviation) if downside_deviation > 0 else 0.0
+                # Same contract as the Sharpe above, on its own denominator: a
+                # window that never undershot the target has no downside to
+                # divide by, so the ratio has no value rather than a zero one.
+                sortino_ratio = (
+                    float((annual_return - self.risk_free_rate) / downside_deviation)
+                    if downside_deviation > 0
+                    else None
+                )
             
             # Hit ratio
             hit_ratio = float((returns > 0).mean())
@@ -5608,6 +5645,68 @@ class AnalyticsEngine:
             for field in self.SHORT_SAMPLE_WITHHELD_FIELDS
         }
 
+    #: The zero-dispersion sibling of `_SHORT_SAMPLE_ANNUALIZATION_REASON`:
+    #: the OTHER way one of the two ratios has no value, and unlike the short
+    #: window it needs no short window to reach.  Reached when the ratio's own
+    #: denominator is not a positive, finite dispersion - a window whose every
+    #: return is exactly 0.0, or which never undershot the Sortino target.
+    #: Only the two ratios are withheld here; `annual_return` and
+    #: `annual_volatility` beside them are real measurements over a flat
+    #: window, which is why the sibling reason withholds three fields and this
+    #: one withholds two.
+    _ZERO_VOLATILITY_SHARPE_REASON = (
+        "withheld: sharpe_ratio divides by this window's own annualized "
+        "volatility, which measured {volatility} - not a positive finite "
+        "dispersion - so the ratio has no value rather than a low one. No zero "
+        "is published in its place, because a Sharpe published as 0.0 cannot "
+        "be told apart from a portfolio that was measured and produced none, "
+        "and a window with no dispersion is exactly the case where a reader "
+        "would most want to know which of the two happened. Such a window is "
+        "consistent with EVERY performance level, including an excellent one, "
+        "so this absence says nothing about whether performance was good or "
+        "bad. annual_return and annual_volatility beside it are still "
+        "measurements over the observations that exist. This is a missing "
+        "measurement, not a low one: it is a zero-dispersion window (a flat or "
+        "stale price series, where every return is the same number), not a "
+        "portfolio with no risk."
+    )
+
+    _ZERO_DOWNSIDE_SORTINO_REASON = (
+        "withheld: sortino_ratio divides by this window's downside deviation "
+        "below the risk-free target, which measured zero: the window never "
+        "undershot the target, so there is no downside to divide by and the "
+        "ratio has no value rather than a low one. No zero is published in its "
+        "place, because a Sortino published as 0.0 cannot be told apart from a "
+        "portfolio that was measured and suffered no downside. A window with "
+        "no downside deviation is consistent with EVERY performance level, "
+        "including an excellent one, so this absence says nothing about whether "
+        "performance was good or bad. This is a missing measurement, not a low "
+        "one."
+    )
+
+    def _zero_dispersion_reason(
+        self, declared: Mapping[str, Any]
+    ) -> Dict[str, str]:
+        """Per-field reason published when a ratio's own denominator is nothing.
+
+        Filtered to the fields whose point is actually withheld, so a window
+        that measured ONE of the two ratios keeps the interval that ratio
+        earned instead of losing it to its sibling's absence.  Read off
+        `declared` - the values the payload publishes - so the reason cannot
+        describe a different window than the point it is attached to.
+        """
+        reasons = {
+            "sharpe_ratio": self._ZERO_VOLATILITY_SHARPE_REASON.format(
+                volatility=declared.get("annual_volatility")
+            ),
+            "sortino_ratio": self._ZERO_DOWNSIDE_SORTINO_REASON,
+        }
+        return {
+            field: reason
+            for field, reason in reasons.items()
+            if declared.get(field) is None
+        }
+
     def _estimate_uncertainty_block(
         self,
         returns: pd.Series,
@@ -5639,6 +5738,14 @@ class AnalyticsEngine:
         }
         if 0 < int(values.size) < self.SHORT_SAMPLE_MIN_OBSERVATIONS:
             not_computed.update(self._short_sample_reason())
+        elif int(values.size) >= self.SHORT_SAMPLE_MIN_OBSERVATIONS:
+            # Long enough to annualize, but a ratio whose OWN denominator
+            # measured nothing: its point is withheld for THAT reason, and the
+            # reason has to name it rather than borrow the short-window one,
+            # which would send a reader off to widen a window that is already
+            # wide enough.  `_zero_dispersion_reason` filters to the fields
+            # that are actually absent, so a measured sibling keeps its band.
+            not_computed.update(self._zero_dispersion_reason(declared))
         return measure_estimate_uncertainty(
             values,
             engine_risk_statistics(self.risk_free_rate),
@@ -6592,10 +6699,21 @@ def volatility_forecast_point(
         # 300 rows ago could not decay out of the published volatility.
         #
         # ddof=1, not 0, to match `engine_risk_statistics.annual_volatility`
-        # (:2213), the sibling restatement of this engine's own realized
+        # (:2236), the sibling restatement of this engine's own realized
         # volatility.  Below 2 window observations a sample variance is
-        # undefined, so the explicit zero-assumption contract applies - the
-        # same one `volatility_service.calculate_ewma_volatility` uses (:225).
+        # undefined, so the seed falls back to 0.0 and the recursion - and
+        # every field derived from it below - publishes a 0.0 sigma.
+        #
+        # That is NOT the contract `volatility_service.calculate_ewma_volatility`
+        # (:231) uses: it WITHHOLDS instead, returning None for a single
+        # observation (:271-276) and raising ValueError on empty input
+        # (:267-270), because 0.0 is not a missing measurement but the
+        # strongest possible claim - "this book does not move" - and it stays
+        # rankable against the realized-vol distribution, where any
+        # non-negative p25 puts it in the CHEAP band.  A book with no
+        # measurable volatility is not cheap.  The two paths were previously
+        # documented as sharing one contract; they do not, and closing that
+        # difference here is a separate decision from this comment.
         window = r[-min(len(r), 60):]
         var = float(np.var(window, ddof=1)) if len(window) > 1 else 0.0
         for x in window:

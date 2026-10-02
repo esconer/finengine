@@ -23,13 +23,26 @@ def compute_rolling_avg_correlation(
     Compute rolling average pairwise correlation series:
     rho_bar_t = (2 / (N * (N - 1))) * sum_{i < j} rho_{i, j, t}
 
+    The prefactor is 1/C for C = N*(N-1)/2, so this is the average over ALL
+    pairs and is only defined on a date where every one of them is measurable.
+    That floor is enforced, not assumed: a date with a short leg (a holding
+    listed part-way through the lookback) is refused rather than reported from
+    the pairs that survived, and if the NEWEST measurable date is short the
+    whole series is refused, because a stale window labelled "current" is the
+    same defect one row later.
+
     Args:
         returns_df: Wide DataFrame of asset daily returns (index=Date, columns=tickers)
         window_days: Rolling window size (default 60 trading days)
         min_periods: Minimum number of observations in window (default min(window_days, 30))
 
     Returns:
-        pd.Series indexed by Date with rolling average pairwise correlation values
+        pd.Series indexed by Date with rolling average pairwise correlation values,
+        carrying only the dates on which all N*(N-1)/2 pairs were measurable
+
+    Raises:
+        ValueError: If no date clears the floor, or if the newest measurable date
+            does not - in which case no number is published for this book.
     """
     if returns_df is None or returns_df.empty:
         raise ValueError("Returns DataFrame is empty or None")
@@ -57,12 +70,48 @@ def compute_rolling_avg_correlation(
         pair_corr = s1.rolling(window=window_days, min_periods=min_periods).corr(s2)
         pair_corrs.append(pair_corr)
 
-    # Average across all N*(N-1)/2 pairs
+    # Average across all N*(N-1)/2 pairs.
+    #
+    # The prefactor 2/(N*(N-1)) in the docstring is 1/C, so the formula is the
+    # book's average pairwise correlation ONLY when all C pairs contributed on
+    # that date. `min_periods` leaves a pair unmeasurable whenever either leg is
+    # short - a holding listed part-way through the lookback - and `mean(axis=1)`
+    # skips those, which published the mean of whatever survived under the label
+    # "average pairwise correlation". That number then set the 75th/90th
+    # percentiles and therefore `alert_level` / `is_regime_break`: a book-wide
+    # diversification break read off a 2-pair mean. So the floor is all C pairs
+    # and a date below it is not a measurement of rho_bar at all.
     pairs_df = pd.concat(pair_corrs, axis=1)
-    avg_corr_series = pairs_df.mean(axis=1).dropna()
+    expected_pairs = len(pair_corrs)
+    measured_pairs = pairs_df.notna().sum(axis=1)
+
+    # The newest measurable date is the one the caller will read as CURRENT, so
+    # a short one refuses the whole series rather than being dropped: dropping it
+    # would leave `current_avg_correlation` reporting a stale window under
+    # today's label, which is the same defect one row earlier.
+    newest = measured_pairs.index[-1]
+    newest_measured = int(measured_pairs.iloc[-1])
+    if newest_measured < expected_pairs:
+        newest_label = (
+            newest.strftime("%Y-%m-%d") if hasattr(newest, "strftime") else str(newest)[:10]
+        )
+        raise ValueError(
+            f"Cannot report average pairwise correlation for {newest_label}: only "
+            f"{newest_measured} of {expected_pairs} pairs have {min_periods} "
+            f"pairwise-complete observations in the trailing {window_days}-day window. "
+            f"An average over the remaining {newest_measured} pair(s) is not the "
+            f"book-wide figure, so none is published."
+        )
+
+    fully_measured = measured_pairs.eq(expected_pairs)
+    avg_corr_series = pairs_df.mean(axis=1).where(fully_measured).dropna()
 
     if avg_corr_series.empty:
-        raise ValueError("Unable to compute rolling correlation: insufficient overlapping data points")
+        raise ValueError(
+            f"Unable to compute rolling correlation: insufficient overlapping data points "
+            f"(no date has all {expected_pairs} pairs measurable at {min_periods} "
+            f"pairwise-complete observations in a {window_days}-day window)"
+        )
 
     return avg_corr_series
 
@@ -196,8 +245,22 @@ def analyze_correlation_stability(
         else str(avg_corr_series.index[-1])[:10]
     )
 
+    # `as_of_date` is a DELIVERED BAR, not a request end. It is the last index
+    # of the series above, and that series' index is the returns frame's own date
+    # index; `compute_rolling_avg_correlation` refuses the entire series unless
+    # that LAST date has all C pairs pairwise-complete, so the date published
+    # beside the measurement is a date the measurement was actually taken on -
+    # never an interior date left behind by a refused tail. This function holds
+    # no clock (it imports none), so a request end is not even available to it.
+    #
+    # So the honest label is `latest_available_observation`: the token the
+    # schema's own vocabulary reserves for "a real, newest delivered bar", and
+    # the default on `CointScannerResponse`. It is REUSED rather than invented -
+    # a fifth token meaning the same thing would hand a consumer two names for
+    # one meaning, which is the defect the vocabulary exists to prevent.
     return CorrelationStabilityResponse(
         as_of=as_of_date,
+        as_of_semantics="latest_available_observation",
         current_avg_correlation=round(current_avg_corr, 4),
         historical_threshold_90th=round(threshold_90th, 4),
         historical_threshold_75th=round(threshold_75th, 4),

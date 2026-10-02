@@ -187,6 +187,59 @@ def _fat_tail_verdict(
     return verdict, basis
 
 
+# --------------------------------------------------------------------------- #
+# Tail dependence: the two quantities that must never be substituted.
+# --------------------------------------------------------------------------- #
+# `rho` is Pearson correlation of the paired raw legs, and `lambda_L` is a
+# function of it. Both are undefined - not zero - in two situations, and both
+# used to be filled with a number that passed every downstream check:
+#
+# 1. A CONSTANT leg. Pearson correlation there is 0/0: there is no measurement.
+#    The code published rho = 0.0, which is the strongest claim available -
+#    "no relationship whatsoever" - the exact opposite of unknown. It then fed
+#    `lambda_L` through the copula formula into a published N x N matrix and
+#    into the LOW risk band. A frozen leg looked like an independent one.
+#
+#    The dispersion guard is `np.ptp(...) > 0`, not `np.std(...) > 0`. The
+#    latter is not a test: `np.full(300, 0.004)` is a constant series whose
+#    sample std is 8.67e-19 (0.004 is not exactly representable), so the noise
+#    passed the guard and a frozen leg was published as rho ~ 0. Peak-to-peak
+#    range is exactly 0.0 for a constant series whatever the level's
+#    representation, and needs no tolerance.
+#
+# 2. A FAILED Student-t fit. The code substituted nu = 4.0, and 4.0 sits INSIDE
+#    the [2.1, 30.0] clip range the successful path is clamped to, so the
+#    stand-in was indistinguishable from a fit and was published as
+#    degrees_of_freedom: 4.0 with nothing marking it.
+#
+# The idiom is the GPD fit's own, in `calculate_evt_pot_var_es`: withhold the
+# value, and publish why. A `0.0` or a `4.0` standing where no measurement
+# exists is worse than an absence, because a reader cannot tell it apart from
+# one.
+TAIL_DEPENDENCE_ZERO_DISPERSION = "zero_dispersion_leg"
+TAIL_DEPENDENCE_T_FIT_FAILED = "marginal_t_fit_failed"
+
+TAIL_DEPENDENCE_RULE = (
+    "linear_correlation is Pearson rho of the paired raw legs and "
+    "lower_tail_lambda is the Student-t copula lower-tail coefficient "
+    "lambda_L = 2 * t_{nu+1}( -sqrt( (nu+1)(1-rho)/(1+rho) ) ), which is a "
+    "function of rho and of the marginal Student-t degrees of freedom nu. Both "
+    "are published only when measured. A leg with no dispersion (constant "
+    "series: peak-to-peak range exactly 0) has an undefined correlation, so "
+    "rho is null rather than 0.0 - 0.0 would be the strongest available claim, "
+    "'no relationship whatsoever', and it is the opposite of unknown - and "
+    "lambda_L is null with it. A failed or non-finite marginal Student-t fit "
+    "leaves nu null rather than a stand-in inside the [2.1, 30.0] clip range, "
+    "and lambda_L is null with it because the formula needs nu. "
+    "unmeasurable_pairs names every pair that was withheld and why; the "
+    "corresponding matrix cell is null, which cannot be confused with a "
+    "measured 0.0. Withheld pairs are excluded from high_tail_risk_pairs "
+    "because that list filters on lower_tail_lambda >= 0.20, so a pair with no "
+    "lambda cannot be a member. Fewer numbers is the correct answer here, not "
+    "a substitute"
+)
+
+
 class TailRiskService:
     """
     Institutional tail-risk suite implementing:
@@ -443,7 +496,7 @@ class TailRiskService:
         returns_b: Union[pd.Series, np.ndarray],
         marginal_df_a: Optional[float] = None,
         marginal_df_b: Optional[float] = None,
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
         """
         Calculate Bivariate Student-t Copula Lower Tail Dependence Coefficient (lambda_L).
 
@@ -463,8 +516,16 @@ class TailRiskService:
 
         Returns
         -------
-        Tuple[float, float, float]
-            (lambda_L, linear_correlation, degrees_of_freedom)
+        Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]
+            (lambda_L, linear_correlation, degrees_of_freedom,
+            unmeasurable_reason)
+
+            Any of the first three is ``None`` when it was not measured, and
+            ``unmeasurable_reason`` then names which input was missing -
+            ``"zero_dispersion_leg"`` or ``"marginal_t_fit_failed"`` - or is
+            ``None`` when everything was measured. This is the tuple form of
+            the same contract the GPD fit publishes as ``model_fitted=False``
+            plus a ``constraint_reason``.
 
         Notes
         -----
@@ -472,7 +533,10 @@ class TailRiskService:
         scale absorbs location/scale, so no standardization is needed), then
         averaged across the pair and used as the copula dependence df — an
         approximation, not a joint copula fit. rho is Pearson correlation of
-        the raw pair, used directly in the copula formula.
+        the raw pair, used directly in the copula formula. A failed t fit
+        publishes ``nu = None``, not a stand-in df: lambda_L is a function of
+        nu, so it is withheld with it. A constant leg publishes ``rho = None``,
+        not 0.0, for the reason set out in :data:`TAIL_DEPENDENCE_RULE`.
         """
         df_paired = pd.DataFrame({"a": returns_a, "b": returns_b}).dropna()
         if len(df_paired) < 10:
@@ -484,14 +548,17 @@ class TailRiskService:
         r_a = df_paired["a"].values
         r_b = df_paired["b"].values
 
-        # Linear correlation rho
-        if np.std(r_a) > 0 and np.std(r_b) > 0:
-            rho = float(np.corrcoef(r_a, r_b)[0, 1])
+        # Linear correlation rho. Peak-to-peak range, not std: see the module
+        # note on TAIL_DEPENDENCE_RULE.
+        if np.ptp(r_a) > 0 and np.ptp(r_b) > 0:
+            rho: Optional[float] = float(np.corrcoef(r_a, r_b)[0, 1])
         else:
-            rho = 0.0
-        rho = float(np.clip(rho, -0.9999, 0.9999))
+            rho = None
+        if rho is not None:
+            rho = float(np.clip(rho, -0.9999, 0.9999))
 
         # Degrees of freedom: caller-cached marginal fits, else fit here.
+        nu: Optional[float]
         if marginal_df_a is not None and marginal_df_b is not None:
             nu = float(np.clip((marginal_df_a + marginal_df_b) / 2.0, 2.1, 30.0))
         else:
@@ -500,19 +567,38 @@ class TailRiskService:
                 df_b, _, _ = stats.t.fit(r_b)
                 nu = float(np.clip((df_a + df_b) / 2.0, 2.1, 30.0))
             except Exception:
-                nu = 4.0
+                # No substitution. nu = 4.0 sat inside the [2.1, 30.0] clip the
+                # successful path is clamped to, so it cleared every downstream
+                # plausibility check and was published as if it had been fitted.
+                nu = None
+        if nu is not None and not np.isfinite(nu):
+            # np.clip propagates NaN, so a non-finite marginal df arrives here
+            # as NaN rather than as the clip bound. A NaN df is not a measurement.
+            nu = None
 
         # Copula lower-tail dependence formula
-        if rho <= -0.999:
+        lambda_l: Optional[float]
+        unmeasurable_reason: Optional[str]
+        if rho is None:
+            lambda_l = None
+            unmeasurable_reason = TAIL_DEPENDENCE_ZERO_DISPERSION
+        elif nu is None:
+            lambda_l = None
+            unmeasurable_reason = TAIL_DEPENDENCE_T_FIT_FAILED
+        elif rho <= -0.999:
             lambda_l = 0.0
+            unmeasurable_reason = None
         elif rho >= 0.999:
             lambda_l = 1.0
+            unmeasurable_reason = None
         else:
             arg = -np.sqrt(((nu + 1.0) * (1.0 - rho)) / (1.0 + rho))
             lambda_l = float(2.0 * stats.t.cdf(arg, df=nu + 1.0))
+            unmeasurable_reason = None
 
-        lambda_l = float(np.clip(lambda_l, 0.0, 1.0))
-        return lambda_l, rho, nu
+        if lambda_l is not None:
+            lambda_l = float(np.clip(lambda_l, 0.0, 1.0))
+        return lambda_l, rho, nu, unmeasurable_reason
 
     @classmethod
     def calculate_tail_dependence_matrix(
@@ -530,7 +616,14 @@ class TailRiskService:
         Returns
         -------
         Dict[str, Any]
-            Dictionary compliant with TailDependenceMatrix schema.
+            Dictionary compliant with TailDependenceMatrix schema, plus
+            ``unmeasurable_pairs``: the pairs whose correlation could not be
+            measured, each with the reason. A withheld pair publishes a ``null``
+            matrix cell, is excluded from ``high_tail_risk_pairs`` (which
+            filters on ``lower_tail_lambda >= 0.20``, and there is no lambda to
+            compare), and is named in ``unmeasurable_pairs`` so its absence is
+            readable rather than looking like a zero. See
+            :data:`TAIL_DEPENDENCE_RULE`.
         """
         tickers = list(returns_df.columns)
         n = len(tickers)
@@ -540,6 +633,7 @@ class TailRiskService:
                 "tickers": [],
                 "matrix": [],
                 "high_tail_risk_pairs": [],
+                "unmeasurable_pairs": [],
             }
 
         if n == 1:
@@ -547,10 +641,12 @@ class TailRiskService:
                 "tickers": tickers,
                 "matrix": [[1.0]],
                 "high_tail_risk_pairs": [],
+                "unmeasurable_pairs": [],
             }
 
         matrix = np.eye(n, dtype=float)
         pairs_list = []
+        unmeasurable_pairs = []
 
         # Fit marginal t df once per ticker (O(n) fits instead of O(n²) —
         # each scipy t-fit is tens of hundreds of ms, previously the source
@@ -572,18 +668,31 @@ class TailRiskService:
             for j in range(i + 1, n):
                 t_i = tickers[i]
                 t_j = tickers[j]
-                lambda_l, rho, nu = cls.calculate_bivariate_tail_dependence(
-                    returns_df[t_i],
-                    returns_df[t_j],
-                    marginal_df_a=marginal_dfs[t_i],
-                    marginal_df_b=marginal_dfs[t_j],
+                lambda_l, rho, nu, unmeasurable_reason = (
+                    cls.calculate_bivariate_tail_dependence(
+                        returns_df[t_i],
+                        returns_df[t_j],
+                        marginal_df_a=marginal_dfs[t_i],
+                        marginal_df_b=marginal_dfs[t_j],
+                    )
                 )
 
-                matrix[i, j] = lambda_l
-                matrix[j, i] = lambda_l
+                # NaN, deliberately: the matrix is a float array and the cell
+                # has to stay "no measurement" all the way through to the JSON
+                # conversion below. A builtin min/max would swallow it.
+                cell = np.nan if lambda_l is None else lambda_l
+                matrix[i, j] = cell
+                matrix[j, i] = cell
 
-                # Determine risk category
-                if lambda_l >= 0.50:
+                if lambda_l is None:
+                    # An unmeasurable pair has no band. "LOW" would be a
+                    # verdict on a quantity nobody measured.
+                    category = "UNMEASURABLE"
+                    unmeasurable_pairs.append({
+                        "pair": [t_i, t_j],
+                        "reason": unmeasurable_reason,
+                    })
+                elif lambda_l >= 0.50:
                     category = "VERY_HIGH"
                 elif lambda_l >= 0.35:
                     category = "HIGH"
@@ -594,26 +703,46 @@ class TailRiskService:
 
                 pairs_list.append({
                     "pair": [t_i, t_j],
-                    "lower_tail_lambda": round(lambda_l, 4),
-                    "linear_correlation": round(rho, 4),
-                    "degrees_of_freedom": round(nu, 2),
+                    "lower_tail_lambda": round(lambda_l, 4) if lambda_l is not None else None,
+                    "linear_correlation": round(rho, 4) if rho is not None else None,
+                    "degrees_of_freedom": round(nu, 2) if nu is not None else None,
                     "risk_category": category,
                 })
 
-        # Sort pairs by lower_tail_lambda descending
-        pairs_list.sort(key=lambda p: p["lower_tail_lambda"], reverse=True)
+        # Sort pairs by lower_tail_lambda descending, measured pairs first and
+        # withheld ones after them in discovery order. Comparing None with a
+        # float is a TypeError, and flattening them onto one scale would put a
+        # missing measurement in a position that reads as a rank.
+        pairs_list = sorted(
+            (p for p in pairs_list if p["lower_tail_lambda"] is not None),
+            key=lambda p: p["lower_tail_lambda"],
+            reverse=True,
+        ) + [p for p in pairs_list if p["lower_tail_lambda"] is None]
 
         # High tail risk pairs: lambda >= 0.20 only. Never backfill with
         # lower-risk pairs — an empty list honestly means "none found".
-        high_risk_pairs = [p for p in pairs_list if p["lower_tail_lambda"] >= 0.20]
+        high_risk_pairs = [
+            p for p in pairs_list
+            if p["lower_tail_lambda"] is not None and p["lower_tail_lambda"] >= 0.20
+        ]
 
-        # Convert matrix to rounded list of lists
-        matrix_list = [[round(float(matrix[r, c]), 4) for c in range(n)] for r in range(n)]
+        # Convert matrix to rounded list of lists. NaN is the withheld cell and
+        # must survive to the wire as null: round(nan, 4) is nan, and a bare
+        # nan would serialise as a JSON-invalid NaN rather than as an absence.
+        matrix_list = [
+            [
+                None if np.isnan(matrix[r, c]) else round(float(matrix[r, c]), 4)
+                for c in range(n)
+            ]
+            for r in range(n)
+        ]
 
         return {
             "tickers": tickers,
             "matrix": matrix_list,
             "high_tail_risk_pairs": high_risk_pairs,
+            "unmeasurable_pairs": unmeasurable_pairs,
+            "unmeasurable_pairs_rule": TAIL_DEPENDENCE_RULE,
         }
 
     @classmethod

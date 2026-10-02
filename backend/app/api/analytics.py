@@ -7181,8 +7181,17 @@ async def get_factor_exposure(
             "universe_coverage": coverage,
             "data_status": data_status,
             "warnings": warnings_list,
-            "r_squared": factor_result.get("r_squared", 0.0),
-            "adjusted_r_squared": factor_result.get("adjusted_r_squared", 0.0),
+            # No fabrication default. `factor_exposure_analysis` publishes
+            # BOTH keys on every exit path it can take - the fitted dict
+            # (analytics_engine 6271/6272) and the three not-fitted dicts
+            # (6279, 6294, 6301), plus `_empty_factor_exposure` (6357/6358)
+            # which the empty-input and exception arms both return - so the
+            # old `0.0` was unreachable. An unreachable default is still the
+            # wrong shape: it is what a future edit that drops a key would
+            # silently publish as a measured zero. Without one, a missing key
+            # reads None ("not measured") and a measured zero stays 0.0.
+            "r_squared": factor_result.get("r_squared"),
+            "adjusted_r_squared": factor_result.get("adjusted_r_squared"),
             "data_range": {"start": start, "end": end},
             "latest_observation_date": _latest_observation_date(price_data),
             "model_window": full_history.get("window"),
@@ -9323,6 +9332,460 @@ async def resolve_holdings(
         out[p.ticker] = {"added_on": coerce_holding_date(p.added_on), "buy_price": buy}
     return out
 
+def _tear_sheet_holding_metrics(
+    port_ret: pd.Series,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The holding-window metrics block and its precision disclosure.
+
+    Synchronous on purpose. Every step here is CPU-bound on the event loop
+    if the caller awaits it inline: 11 `quantstats` ratio statistics plus a
+    `measure_estimate_uncertainty` moving-block bootstrap over
+    :data:`UNCERTAINTY_BOOTSTRAP_RESAMPLES` (1000) resamples. `get_tear_sheet`
+    hands this to `_run_cpu` so it runs in a worker thread, exactly as
+    `/optimize`, `/backtest`, `/regime`, `/correlation-stability`, `/vol-cone`
+    and `/tails` hand their own heaviest call.
+
+    `quantstats` is imported here rather than at module scope because it is
+    the only importer of it in the whole backend: lifting the import to the
+    module body would put matplotlib/seaborn on every process's startup path
+    to save a `sys.modules` hit. Inside the worker thread it is off the event
+    loop either way, which is what the offload is for.
+
+    Nothing here reads shared state and the bootstrap is seeded
+    (`resample_seed`), so the numbers are the same on a worker thread as they
+    were on the loop.
+    """
+    import quantstats as qs
+
+    metrics = {
+        "total_return": _q(qs.stats.comp, port_ret),
+        "cagr": _q(qs.stats.cagr, port_ret),
+        "sharpe": _q(qs.stats.sharpe, port_ret, rf=0.02),
+        "sortino": _q(qs.stats.sortino, port_ret, rf=0.02),
+        "calmar": _q(qs.stats.calmar, port_ret),
+        "omega": _q(qs.stats.omega, port_ret),
+        "tail_ratio": _q(qs.stats.tail_ratio, port_ret),
+        "volatility": _q(qs.stats.volatility, port_ret),
+        "max_drawdown": _q(qs.stats.max_drawdown, port_ret),
+        "skew": _q(qs.stats.skew, port_ret),
+        "kurtosis": _q(qs.stats.kurtosis, port_ret),
+    }
+    apply_annualization_gate(
+        metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(port_ret)
+    )
+    # SI-5: precision for the eleven numbers above, over exactly the series
+    # they were measured from. Built AFTER the annualization gate, so a
+    # withheld metric reports "the point estimate itself is withheld"
+    # rather than lending a band to a null.
+    metrics_uncertainty = _tear_sheet_uncertainty(
+        port_ret,
+        {field: metrics.get(field) for field in (
+            "total_return", "cagr", "sharpe", "sortino", "calmar", "omega",
+            "tail_ratio", "volatility", "max_drawdown", "skew", "kurtosis",
+        )},
+        scope=(
+            "tear_sheet metrics: the holding-window portfolio return series "
+            "every metric in this block was computed from"
+        ),
+        not_computed={
+            "skew": _SHAPE_STATISTIC_REASON,
+            "kurtosis": _SHAPE_STATISTIC_REASON,
+        },
+    )
+    return metrics, metrics_uncertainty
+
+
+def _tear_sheet_payload(
+    *,
+    ticker_list: List[str],
+    weights: Mapping[str, float],
+    returns_df: pd.DataFrame,
+    port_ret: pd.Series,
+    full_returns_df: pd.DataFrame,
+    full_port_ret: pd.Series,
+    full_leg_coverage: Mapping[str, Any],
+    bench_ret: Optional[pd.Series],
+    start: str,
+    end: str,
+    full_start: str,
+    history_coverage: Dict[str, Any],
+    covered_days: int,
+    metrics: Dict[str, Any],
+    metrics_uncertainty: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The tear-sheet payload from the full-depth series onward.
+
+    The second half of `get_tear_sheet`, split out for the same reason as
+    `_tear_sheet_holding_metrics`: it holds the other four
+    `_tear_sheet_uncertainty` blocks (the full-depth metrics band, the two
+    market-model bands and the benchmark-slice band), a `to_drawdown_series`
+    walk over up to 250 rows, and the full-history evidence assembly. All of it
+    is a pure function of the frames the route already holds, so
+    `_run_cpu` can run it in a worker thread.
+
+    The split falls here, and not somewhere else, because the full-depth
+    `_build_wide_returns` call is the only `await` between the two halves:
+    moving it across the metrics block would let this be one closure, and
+    would also reorder two independent data-service reads for no gain. The
+    awaits stay in the order they have always run in.
+    """
+    import quantstats as qs
+
+    full_metrics = {
+        "total_return": _q(qs.stats.comp, full_port_ret),
+        "cagr": _q(qs.stats.cagr, full_port_ret),
+        "sharpe": _q(qs.stats.sharpe, full_port_ret, rf=0.02),
+        "sortino": _q(qs.stats.sortino, full_port_ret, rf=0.02),
+        "calmar": _q(qs.stats.calmar, full_port_ret),
+        "volatility": _q(qs.stats.volatility, full_port_ret),
+        "max_drawdown": _q(qs.stats.max_drawdown, full_port_ret),
+        "days": int(len(full_port_ret)),
+    }
+    apply_annualization_gate(
+        full_metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(full_port_ret)
+    )
+    full_metrics_uncertainty = _tear_sheet_uncertainty(
+        full_port_ret,
+        {field: full_metrics.get(field) for field in (
+            "total_return", "cagr", "sharpe", "sortino", "calmar",
+            "volatility", "max_drawdown",
+        )},
+        scope=(
+            "tear_sheet full_history metrics: the hypothetical-current-"
+            "weights portfolio return series over the full cache depth, "
+            "which is a DIFFERENT sample from the holding-window block"
+        ),
+    )
+    try:
+        full_history_start = str(full_port_ret.index.min().date())
+    except Exception:
+        full_history_start = full_start
+    # Same evidence shape Factor Exposure and Risk Contribution publish: the
+    # full-history leg carries its own window, observation count, scope and
+    # truncation flag, so it can never be read as the holding window and
+    # the holding window can never be read as this model's sample.
+    #
+    # NEW-7: the shape was the problem. This block is described by
+    # `full_returns_df` (2486 rows, every date ANY leg was measurable on)
+    # while `full_metrics` above is measured on `full_port_ret` (307 rows,
+    # every date the WHOLE positive-weight book cleared coverage). Declaring
+    # the 2486-day window and annualising on 307 is a 9.11x recompute error
+    # for anyone who trusts the declared window, so the block now publishes
+    # the metrics' own count and bounds, and the coverage leg this route used
+    # to discard into `_` explains exactly which dates the difference is.
+    full_history_evidence = _full_history_evidence(
+        full_returns_df,
+        requested_start=start,
+        requested_end=end,
+        metrics_series=full_port_ret,
+    )
+    if isinstance(full_leg_coverage, Mapping):
+        for key in (
+            "measurable_return_rows",
+            "partial_coverage_days",
+            "partial_coverage_days_reason",
+        ):
+            if full_leg_coverage.get(key) is not None:
+                full_history_evidence[key] = full_leg_coverage[key]
+    full_history_evidence["measurement_frame_note"] = (
+        "`window`/`observation_count` describe the wide per-ticker return "
+        "frame. `metrics_observation_count`/`metrics_window` describe the "
+        "shorter portfolio return series the `metrics` block was measured "
+        "on. The difference between the two counts is "
+        "`partial_coverage_days`: dates on which the surviving "
+        "positive-weight constituents did not cover 100% of gross weight, "
+        "which were refused rather than renormalised into a partial-basket "
+        "portfolio return."
+    )
+
+    full_relative: Dict[str, Any] = {}
+    full_bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
+    # Both legs are pre-declared, not just the portfolio: the uncertainty
+    # block below is handed the PAIR, and a benchmark that never arrived
+    # must reach it as an explicit absence rather than an unbound name.
+    full_overlap_p: Optional[pd.Series] = None
+    full_overlap_b: Optional[pd.Series] = None
+    full_overlap_days = 0
+    if full_bench_available:
+        common_full = full_port_ret.index.intersection(bench_ret.index)
+        full_overlap_days = int(len(common_full))
+        # The intersection frames are built whether or not the gate passes:
+        # the disclosure below has to name the sample the gate judged, and a
+        # window can only be described from the rows it would have used.
+        full_overlap_p = full_port_ret.loc[common_full]
+        full_overlap_b = bench_ret.loc[common_full]
+        if full_overlap_days >= MIN_ANNUALIZE_DAYS:
+            p, b = full_overlap_p, full_overlap_b
+            var_b = float(b.var())
+            beta = float(p.cov(b) / var_b) if var_b > 0 else None
+            alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
+            full_relative = {
+                "beta_vs_nifty": round(beta, 4) if beta is not None else None,
+                "alpha_annualized": round(alpha_ann, 4) if beta is not None else None,
+                "overlap_days": full_overlap_days,
+            }
+    # QM-2: this leg publishes only beta and alpha, but it is still a
+    # two-sample block (the full-depth series and the joint overlap), so it
+    # carries the same per-field disclosure. It declares no benchmark-window
+    # record because it publishes no `benchmark_*` field, and a declared
+    # window no field uses is one a reader will trust by mistake.
+    full_relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
+        metrics_series=full_port_ret,
+        metrics_basis=FULL_HISTORY_BASIS,
+        metrics_description=(
+            "the hypothetical-current-weights portfolio return series over "
+            "the full cache depth, which is the same sample the "
+            "full_history metrics block was measured from"
+        ),
+        benchmark_series=bench_ret,
+        benchmark_window=bench_ret,
+        overlap_series=full_overlap_p,
+        overlap_observations=full_overlap_days,
+        benchmark_available=full_bench_available,
+        published_fields=RELATIVE_MARKET_MODEL_FIELDS,
+        metrics_block_path="tear_sheet.full_history.metrics",
+        observation_count_path="tear_sheet.full_history.metrics.days",
+    )
+
+    # Three different samples live in `relative_vs_nifty` and its full-
+    # history sibling: the ALIGNED portfolio/benchmark pair, the benchmark
+    # sliced back to the requested window, and (above) the aligned pair over
+    # the full cache depth. Each gets its own block, because an interval
+    # whose n belongs to a different window than its point estimate is the
+    # defect this block exists to remove.
+    #
+    # The pair handed over is the SAME `common_full` intersection beta and
+    # alpha were fitted on, not the full-depth series beside the full-depth
+    # benchmark. Those are 307 against 2620 rows on disjoint calendars, so
+    # the interval belonged to a different decade than the estimate it sat
+    # beside. Both series are `None` when the benchmark is unavailable, and
+    # the block then reports the absence rather than a band.
+    full_relative_uncertainty = _tear_sheet_relative_uncertainty(
+        full_overlap_p, full_overlap_b, full_relative,
+        scope=(
+            "tear_sheet full_history relative_vs_nifty: beta and alpha over "
+            "the full-depth portfolio/benchmark overlap"
+        ),
+    )
+
+    relative: Dict[str, Any] = {}
+    relative_uncertainty: Dict[str, Any] = {
+        "market_model": _tear_sheet_relative_uncertainty(
+            None, None, {},
+            scope=(
+                "tear_sheet relative_vs_nifty: beta and alpha over the "
+                "holding-window portfolio/benchmark overlap"
+            ),
+        ),
+        "benchmark": _tear_sheet_uncertainty(
+            None,
+            {field: None for field in RELATIVE_BENCHMARK_FIELDS},
+            scope=(
+                "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
+                "return series sliced back to the requested window"
+            ),
+            statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
+        ),
+    }
+    bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
+    bench_window: Any = None
+    holding_overlap_p: Optional[pd.Series] = None
+    overlap_days = 0
+    if bench_available:
+        # Holding leg stays on the requested window: slice the (possibly
+        # deeper) benchmark back down. Benchmark standalone stats describe
+        # the index over the requested window (no holding concept applies
+        # to NIFTY itself) -- which is why QM-2 labels that window rather
+        # than re-slicing the index onto this book's holding window.
+        bench_window = bench_ret
+        try:
+            bench_window = bench_ret[bench_ret.index >= start]
+        except Exception:
+            bench_window = bench_ret
+        relative = {
+            "beta_vs_nifty": None,
+            "alpha_annualized": None,
+            "benchmark_sharpe": _q(qs.stats.sharpe, bench_window, rf=0.02),
+            "benchmark_volatility": _q(qs.stats.volatility, bench_window),
+            "benchmark_max_drawdown": _q(qs.stats.max_drawdown, bench_window),
+            "benchmark_total_return": _q(qs.stats.comp, bench_window),
+        }
+        # Beta/alpha genuinely need joint history: gate on the common
+        # window so a handful of overlapping days never annualizes noise.
+        common = port_ret.index.intersection(bench_ret.index)
+        overlap_days = int(len(common))
+        # The intersection slice is taken unconditionally: even when the
+        # gate withholds the point estimate, the reader is owed the window
+        # the gate judged and how far short of the policy minimum it fell.
+        holding_overlap_p = port_ret.loc[common]
+        aligned_p = aligned_b = None
+        if overlap_days >= MIN_ANNUALIZE_DAYS:
+            p, b = holding_overlap_p, bench_ret.loc[common]
+            # The frames the interval will be built from are exactly the
+            # frames the estimate was fitted on. When the gate withholds
+            # beta/alpha they stay None, and the block then says the point
+            # estimate is withheld rather than lending a band to a null.
+            aligned_p, aligned_b = p, b
+            var_b = float(b.var())
+            beta = float(p.cov(b) / var_b) if var_b > 0 else None
+            alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
+            relative["beta_vs_nifty"] = round(beta, 4) if beta is not None else None
+            relative["alpha_annualized"] = round(alpha_ann, 4) if alpha_ann is not None else None
+        relative["overlap_days"] = overlap_days
+        relative_uncertainty["market_model"] = _tear_sheet_relative_uncertainty(
+            aligned_p, aligned_b,
+            {
+                "beta_vs_nifty": relative.get("beta_vs_nifty"),
+                "alpha_annualized": relative.get("alpha_annualized"),
+            },
+            scope=(
+                "tear_sheet relative_vs_nifty: beta and alpha over the "
+                "holding-window portfolio/benchmark overlap"
+            ),
+        )
+        relative_uncertainty["benchmark"] = _tear_sheet_uncertainty(
+            bench_window,
+            {field: relative.get(field) for field in RELATIVE_BENCHMARK_FIELDS},
+            scope=(
+                "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
+                "return series sliced back to the requested window"
+            ),
+            statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
+        )
+    # QM-2: the block publishes three different samples (the joint
+    # portfolio/benchmark overlap, the index over the requested window, and
+    # -- one level up -- the holding-window `metrics` block), and before
+    # this disclosure the only one named was the first, via `overlap_days`.
+    # No value above changed to get here: the estimates are computed on the
+    # series they were always computed on, and this only says which.
+    relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
+        metrics_series=port_ret,
+        metrics_basis=MEASURED_WINDOW_COVERED_DAYS_SCOPE,
+        metrics_description=(
+            "the holding-window portfolio return series, measured on the "
+            "whole-book complete return rows; this is the same sample the "
+            "tear sheet's `metrics` block was measured from"
+        ),
+        benchmark_series=bench_ret,
+        benchmark_window=bench_window,
+        overlap_series=holding_overlap_p,
+        overlap_observations=overlap_days,
+        benchmark_available=bench_available,
+        requested_window={"start": start, "end": end},
+    )
+
+    monthly: Dict[str, Dict[str, float]] = {}
+    try:
+        if not port_ret.empty:
+            m_series = (1.0 + port_ret).groupby([port_ret.index.year, port_ret.index.month]).prod() - 1.0
+            for (y, m), val in m_series.items():
+                ys = str(y)
+                ms = str(m)
+                if ys not in monthly:
+                    monthly[ys] = {}
+                monthly[ys][ms] = round(float(val), 6)
+    except Exception:  # noqa: BLE001
+        logger.debug("Monthly returns unavailable")
+
+    underwater = []
+    try:
+        dd = qs.stats.to_drawdown_series(port_ret)
+        for ts, val in list(dd.items())[-250:]:
+            underwater.append({"date": str(ts)[:10], "drawdown": round(float(val), 6)})
+    except Exception:  # noqa: BLE001
+        logger.debug("Drawdown series unavailable")
+
+    active_tickers = _active_weight_tickers(weights)
+    coverage = _universe_coverage(ticker_list, returns_df.columns, active=active_tickers)
+    full_coverage = _universe_coverage(
+        ticker_list, full_returns_df.columns, active=active_tickers
+    )
+    tear_sheet_status = _data_status(
+        coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
+    )
+    # `window` is the REQUEST. The metrics beside it are measured over the
+    # holding window, so the request is labelled as such and the measured
+    # window and its observation count are published next to it: a 365-day
+    # request must never sit on 39 days of numbers unlabelled.
+    measured_first, measured_last = _observation_bounds(port_ret)
+    holding_window_start = history_coverage.get("intersection_start")
+    # `start` here is the first date the WHOLE book was measurable on, which
+    # is later than the holding window's own start whenever an early session
+    # has a leg without a price. Both dates are true and they describe
+    # different things, so publishing them side by side without the gap looks
+    # like a contradiction. State the gap: it is the visible consequence of
+    # refusing to renormalise a partial basket into a portfolio return.
+    leading_gap_days = None
+    if holding_window_start and measured_first:
+        try:
+            leading_gap_days = (
+                datetime.strptime(measured_first, "%Y-%m-%d")
+                - datetime.strptime(str(holding_window_start)[:10], "%Y-%m-%d")
+            ).days
+        except (TypeError, ValueError):
+            leading_gap_days = None
+    measured_window = {
+        "start": measured_first,
+        "end": measured_last or _latest_observation_date(port_ret),
+        "days": int(covered_days),
+        "observation_count": int(covered_days),
+        "covered_days_scope": MEASURED_WINDOW_COVERED_DAYS_SCOPE,
+        "truncated_to_holding_window": bool(history_coverage.get("truncated")),
+        "holding_window_start": holding_window_start,
+        "holding_window_to_measured_start_gap_days": leading_gap_days,
+        "measured_start_basis": (
+            "first date on which every held position had a measurable return; "
+            "earlier holding-window sessions had at least one leg without a "
+            "price and were refused rather than renormalised into a "
+            "partial-basket portfolio return"
+        ),
+    }
+    return {
+        "window": {
+            "start": start,
+            "end": end,
+            "kind": "requested_analytics_window",
+        },
+        "requested_window": {"start": start, "end": end},
+        "measured_window": measured_window,
+        "observation_count": int(covered_days),
+        "annualized": annualizable(covered_days),
+        "holdings": weights,
+        "universe_coverage": coverage,
+        "data_status": tear_sheet_status,
+        "latest_observation_date": _latest_observation_date(port_ret),
+        "calculation_basis": {
+            "realized": "holding_truthed_current_composition",
+            "full_history": "hypothetical_current_weights",
+        },
+        "metrics": metrics,
+        # SI-5: one precision block per SAMPLE, not per section. The
+        # holding-window, the full-depth and the benchmark-slice blocks sit
+        # on three different series, so an interval can never be read
+        # against a point estimate measured on another one.
+        "estimate_uncertainty": {
+            "metrics": metrics_uncertainty,
+            "relative_vs_nifty": relative_uncertainty,
+        },
+        "full_history": {
+            **full_history_evidence,
+            "metrics": full_metrics,
+            "universe_coverage": full_coverage,
+            "relative_vs_nifty": full_relative,
+            "estimate_uncertainty": {
+                "metrics": full_metrics_uncertainty,
+                "relative_vs_nifty": full_relative_uncertainty,
+            },
+            "start": full_history_start,
+        },
+        "relative_vs_nifty": relative,
+        "monthly_returns": monthly,
+        "underwater": underwater,
+        "history_coverage": history_coverage,
+        "methodology": "quantstats metric suite over cached OHLCV adj-close returns",
+    }
+
+
 
 @router.get("/tear-sheet")
 async def get_tear_sheet(
@@ -9337,7 +9800,6 @@ async def get_tear_sheet(
     Pro-style performance tear-sheet for the real holdings vs NIFTY.
     Metrics via quantstats; every metric degrades to null independently.
     """
-    import quantstats as qs
 
     try:
         start, end = _date_window(start, end, default_days=365)
@@ -9408,40 +9870,16 @@ async def get_tear_sheet(
             logger.warning("Benchmark data unavailable")
             bench_ret = None
 
-        metrics = {
-            "total_return": _q(qs.stats.comp, port_ret),
-            "cagr": _q(qs.stats.cagr, port_ret),
-            "sharpe": _q(qs.stats.sharpe, port_ret, rf=0.02),
-            "sortino": _q(qs.stats.sortino, port_ret, rf=0.02),
-            "calmar": _q(qs.stats.calmar, port_ret),
-            "omega": _q(qs.stats.omega, port_ret),
-            "tail_ratio": _q(qs.stats.tail_ratio, port_ret),
-            "volatility": _q(qs.stats.volatility, port_ret),
-            "max_drawdown": _q(qs.stats.max_drawdown, port_ret),
-            "skew": _q(qs.stats.skew, port_ret),
-            "kurtosis": _q(qs.stats.kurtosis, port_ret),
-        }
-        apply_annualization_gate(
-            metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(port_ret)
-        )
-        # SI-5: precision for the eleven numbers above, over exactly the series
-        # they were measured from. Built AFTER the annualization gate, so a
-        # withheld metric reports "the point estimate itself is withheld"
-        # rather than lending a band to a null.
-        metrics_uncertainty = _tear_sheet_uncertainty(
-            port_ret,
-            {field: metrics.get(field) for field in (
-                "total_return", "cagr", "sharpe", "sortino", "calmar", "omega",
-                "tail_ratio", "volatility", "max_drawdown", "skew", "kurtosis",
-            )},
-            scope=(
-                "tear_sheet metrics: the holding-window portfolio return series "
-                "every metric in this block was computed from"
-            ),
-            not_computed={
-                "skew": _SHAPE_STATISTIC_REASON,
-                "kurtosis": _SHAPE_STATISTIC_REASON,
-            },
+        # Everything below the awaits is CPU-bound: 11 `quantstats` ratio
+        # statistics and one 1000-resample moving-block bootstrap per field
+        # (`_tear_sheet_uncertainty` -> `measure_estimate_uncertainty`,
+        # `UNCERTAINTY_BOOTSTRAP_RESAMPLES`). Run on the event loop it stalls
+        # every other request - dashboard, websockets, health - for its whole
+        # duration, so it goes through `_run_cpu`, the per-loop
+        # `asyncio.Semaphore(2)` offload `/optimize`, `/backtest`, `/regime`,
+        # `/correlation-stability`, `/vol-cone` and `/tails` already use.
+        metrics, metrics_uncertainty = await _run_cpu(
+            _tear_sheet_holding_metrics, port_ret,
         )
 
         # --- Full-history instrument risk (DSP-10) ---------------------------
@@ -9453,359 +9891,29 @@ async def get_tear_sheet(
         full_returns_df, full_port_ret, full_leg_coverage = await _build_wide_returns(
             ticker_list, weights, full_start, end, data_service,
         )
-        full_metrics = {
-            "total_return": _q(qs.stats.comp, full_port_ret),
-            "cagr": _q(qs.stats.cagr, full_port_ret),
-            "sharpe": _q(qs.stats.sharpe, full_port_ret, rf=0.02),
-            "sortino": _q(qs.stats.sortino, full_port_ret, rf=0.02),
-            "calmar": _q(qs.stats.calmar, full_port_ret),
-            "volatility": _q(qs.stats.volatility, full_port_ret),
-            "max_drawdown": _q(qs.stats.max_drawdown, full_port_ret),
-            "days": int(len(full_port_ret)),
-        }
-        apply_annualization_gate(
-            full_metrics, ["cagr", "sharpe", "sortino", "calmar", "volatility"], len(full_port_ret)
+        # The rest of the payload is CPU-bound for the same reason: the other
+        # four `_tear_sheet_uncertainty` blocks, the drawdown walk, and the
+        # full-history evidence assembly. The full-depth fetch above is the
+        # only `await` left, which is why the offload is two closures and not
+        # one.
+        return await _run_cpu(
+            _tear_sheet_payload,
+            ticker_list=ticker_list,
+            weights=weights,
+            returns_df=returns_df,
+            port_ret=port_ret,
+            full_returns_df=full_returns_df,
+            full_port_ret=full_port_ret,
+            full_leg_coverage=full_leg_coverage,
+            bench_ret=bench_ret,
+            start=start,
+            end=end,
+            full_start=full_start,
+            history_coverage=history_coverage,
+            covered_days=covered_days,
+            metrics=metrics,
+            metrics_uncertainty=metrics_uncertainty,
         )
-        full_metrics_uncertainty = _tear_sheet_uncertainty(
-            full_port_ret,
-            {field: full_metrics.get(field) for field in (
-                "total_return", "cagr", "sharpe", "sortino", "calmar",
-                "volatility", "max_drawdown",
-            )},
-            scope=(
-                "tear_sheet full_history metrics: the hypothetical-current-"
-                "weights portfolio return series over the full cache depth, "
-                "which is a DIFFERENT sample from the holding-window block"
-            ),
-        )
-        try:
-            full_history_start = str(full_port_ret.index.min().date())
-        except Exception:
-            full_history_start = full_start
-        # Same evidence shape Factor Exposure and Risk Contribution publish: the
-        # full-history leg carries its own window, observation count, scope and
-        # truncation flag, so it can never be read as the holding window and
-        # the holding window can never be read as this model's sample.
-        #
-        # NEW-7: the shape was the problem. This block is described by
-        # `full_returns_df` (2486 rows, every date ANY leg was measurable on)
-        # while `full_metrics` above is measured on `full_port_ret` (307 rows,
-        # every date the WHOLE positive-weight book cleared coverage). Declaring
-        # the 2486-day window and annualising on 307 is a 9.11x recompute error
-        # for anyone who trusts the declared window, so the block now publishes
-        # the metrics' own count and bounds, and the coverage leg this route used
-        # to discard into `_` explains exactly which dates the difference is.
-        full_history_evidence = _full_history_evidence(
-            full_returns_df,
-            requested_start=start,
-            requested_end=end,
-            metrics_series=full_port_ret,
-        )
-        if isinstance(full_leg_coverage, Mapping):
-            for key in (
-                "measurable_return_rows",
-                "partial_coverage_days",
-                "partial_coverage_days_reason",
-            ):
-                if full_leg_coverage.get(key) is not None:
-                    full_history_evidence[key] = full_leg_coverage[key]
-        full_history_evidence["measurement_frame_note"] = (
-            "`window`/`observation_count` describe the wide per-ticker return "
-            "frame. `metrics_observation_count`/`metrics_window` describe the "
-            "shorter portfolio return series the `metrics` block was measured "
-            "on. The difference between the two counts is "
-            "`partial_coverage_days`: dates on which the surviving "
-            "positive-weight constituents did not cover 100% of gross weight, "
-            "which were refused rather than renormalised into a partial-basket "
-            "portfolio return."
-        )
-
-        full_relative: Dict[str, Any] = {}
-        full_bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
-        # Both legs are pre-declared, not just the portfolio: the uncertainty
-        # block below is handed the PAIR, and a benchmark that never arrived
-        # must reach it as an explicit absence rather than an unbound name.
-        full_overlap_p: Optional[pd.Series] = None
-        full_overlap_b: Optional[pd.Series] = None
-        full_overlap_days = 0
-        if full_bench_available:
-            common_full = full_port_ret.index.intersection(bench_ret.index)
-            full_overlap_days = int(len(common_full))
-            # The intersection frames are built whether or not the gate passes:
-            # the disclosure below has to name the sample the gate judged, and a
-            # window can only be described from the rows it would have used.
-            full_overlap_p = full_port_ret.loc[common_full]
-            full_overlap_b = bench_ret.loc[common_full]
-            if full_overlap_days >= MIN_ANNUALIZE_DAYS:
-                p, b = full_overlap_p, full_overlap_b
-                var_b = float(b.var())
-                beta = float(p.cov(b) / var_b) if var_b > 0 else None
-                alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
-                full_relative = {
-                    "beta_vs_nifty": round(beta, 4) if beta is not None else None,
-                    "alpha_annualized": round(alpha_ann, 4) if beta is not None else None,
-                    "overlap_days": full_overlap_days,
-                }
-        # QM-2: this leg publishes only beta and alpha, but it is still a
-        # two-sample block (the full-depth series and the joint overlap), so it
-        # carries the same per-field disclosure. It declares no benchmark-window
-        # record because it publishes no `benchmark_*` field, and a declared
-        # window no field uses is one a reader will trust by mistake.
-        full_relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
-            metrics_series=full_port_ret,
-            metrics_basis=FULL_HISTORY_BASIS,
-            metrics_description=(
-                "the hypothetical-current-weights portfolio return series over "
-                "the full cache depth, which is the same sample the "
-                "full_history metrics block was measured from"
-            ),
-            benchmark_series=bench_ret,
-            benchmark_window=bench_ret,
-            overlap_series=full_overlap_p,
-            overlap_observations=full_overlap_days,
-            benchmark_available=full_bench_available,
-            published_fields=RELATIVE_MARKET_MODEL_FIELDS,
-            metrics_block_path="tear_sheet.full_history.metrics",
-            observation_count_path="tear_sheet.full_history.metrics.days",
-        )
-
-        # Three different samples live in `relative_vs_nifty` and its full-
-        # history sibling: the ALIGNED portfolio/benchmark pair, the benchmark
-        # sliced back to the requested window, and (above) the aligned pair over
-        # the full cache depth. Each gets its own block, because an interval
-        # whose n belongs to a different window than its point estimate is the
-        # defect this block exists to remove.
-        #
-        # The pair handed over is the SAME `common_full` intersection beta and
-        # alpha were fitted on, not the full-depth series beside the full-depth
-        # benchmark. Those are 307 against 2620 rows on disjoint calendars, so
-        # the interval belonged to a different decade than the estimate it sat
-        # beside. Both series are `None` when the benchmark is unavailable, and
-        # the block then reports the absence rather than a band.
-        full_relative_uncertainty = _tear_sheet_relative_uncertainty(
-            full_overlap_p, full_overlap_b, full_relative,
-            scope=(
-                "tear_sheet full_history relative_vs_nifty: beta and alpha over "
-                "the full-depth portfolio/benchmark overlap"
-            ),
-        )
-
-        relative: Dict[str, Any] = {}
-        relative_uncertainty: Dict[str, Any] = {
-            "market_model": _tear_sheet_relative_uncertainty(
-                None, None, {},
-                scope=(
-                    "tear_sheet relative_vs_nifty: beta and alpha over the "
-                    "holding-window portfolio/benchmark overlap"
-                ),
-            ),
-            "benchmark": _tear_sheet_uncertainty(
-                None,
-                {field: None for field in RELATIVE_BENCHMARK_FIELDS},
-                scope=(
-                    "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
-                    "return series sliced back to the requested window"
-                ),
-                statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
-            ),
-        }
-        bench_available = bool(bench_ret is not None and len(bench_ret) > 20)
-        bench_window: Any = None
-        holding_overlap_p: Optional[pd.Series] = None
-        overlap_days = 0
-        if bench_available:
-            # Holding leg stays on the requested window: slice the (possibly
-            # deeper) benchmark back down. Benchmark standalone stats describe
-            # the index over the requested window (no holding concept applies
-            # to NIFTY itself) -- which is why QM-2 labels that window rather
-            # than re-slicing the index onto this book's holding window.
-            bench_window = bench_ret
-            try:
-                bench_window = bench_ret[bench_ret.index >= start]
-            except Exception:
-                bench_window = bench_ret
-            relative = {
-                "beta_vs_nifty": None,
-                "alpha_annualized": None,
-                "benchmark_sharpe": _q(qs.stats.sharpe, bench_window, rf=0.02),
-                "benchmark_volatility": _q(qs.stats.volatility, bench_window),
-                "benchmark_max_drawdown": _q(qs.stats.max_drawdown, bench_window),
-                "benchmark_total_return": _q(qs.stats.comp, bench_window),
-            }
-            # Beta/alpha genuinely need joint history: gate on the common
-            # window so a handful of overlapping days never annualizes noise.
-            common = port_ret.index.intersection(bench_ret.index)
-            overlap_days = int(len(common))
-            # The intersection slice is taken unconditionally: even when the
-            # gate withholds the point estimate, the reader is owed the window
-            # the gate judged and how far short of the policy minimum it fell.
-            holding_overlap_p = port_ret.loc[common]
-            aligned_p = aligned_b = None
-            if overlap_days >= MIN_ANNUALIZE_DAYS:
-                p, b = holding_overlap_p, bench_ret.loc[common]
-                # The frames the interval will be built from are exactly the
-                # frames the estimate was fitted on. When the gate withholds
-                # beta/alpha they stay None, and the block then says the point
-                # estimate is withheld rather than lending a band to a null.
-                aligned_p, aligned_b = p, b
-                var_b = float(b.var())
-                beta = float(p.cov(b) / var_b) if var_b > 0 else None
-                alpha_ann = float((p.mean() - beta * b.mean()) * 252) if beta is not None else None
-                relative["beta_vs_nifty"] = round(beta, 4) if beta is not None else None
-                relative["alpha_annualized"] = round(alpha_ann, 4) if alpha_ann is not None else None
-            relative["overlap_days"] = overlap_days
-            relative_uncertainty["market_model"] = _tear_sheet_relative_uncertainty(
-                aligned_p, aligned_b,
-                {
-                    "beta_vs_nifty": relative.get("beta_vs_nifty"),
-                    "alpha_annualized": relative.get("alpha_annualized"),
-                },
-                scope=(
-                    "tear_sheet relative_vs_nifty: beta and alpha over the "
-                    "holding-window portfolio/benchmark overlap"
-                ),
-            )
-            relative_uncertainty["benchmark"] = _tear_sheet_uncertainty(
-                bench_window,
-                {field: relative.get(field) for field in RELATIVE_BENCHMARK_FIELDS},
-                scope=(
-                    "tear_sheet relative_vs_nifty benchmark block: the NIFTY "
-                    "return series sliced back to the requested window"
-                ),
-                statistic_names=dict(_BENCHMARK_STATISTIC_NAMES),
-            )
-        # QM-2: the block publishes three different samples (the joint
-        # portfolio/benchmark overlap, the index over the requested window, and
-        # -- one level up -- the holding-window `metrics` block), and before
-        # this disclosure the only one named was the first, via `overlap_days`.
-        # No value above changed to get here: the estimates are computed on the
-        # series they were always computed on, and this only says which.
-        relative[RELATIVE_WINDOW_DISCLOSURE_KEY] = _relative_window_disclosure(
-            metrics_series=port_ret,
-            metrics_basis=MEASURED_WINDOW_COVERED_DAYS_SCOPE,
-            metrics_description=(
-                "the holding-window portfolio return series, measured on the "
-                "whole-book complete return rows; this is the same sample the "
-                "tear sheet's `metrics` block was measured from"
-            ),
-            benchmark_series=bench_ret,
-            benchmark_window=bench_window,
-            overlap_series=holding_overlap_p,
-            overlap_observations=overlap_days,
-            benchmark_available=bench_available,
-            requested_window={"start": start, "end": end},
-        )
-
-        monthly: Dict[str, Dict[str, float]] = {}
-        try:
-            if not port_ret.empty:
-                m_series = (1.0 + port_ret).groupby([port_ret.index.year, port_ret.index.month]).prod() - 1.0
-                for (y, m), val in m_series.items():
-                    ys = str(y)
-                    ms = str(m)
-                    if ys not in monthly:
-                        monthly[ys] = {}
-                    monthly[ys][ms] = round(float(val), 6)
-        except Exception:  # noqa: BLE001
-            logger.debug("Monthly returns unavailable")
-
-        underwater = []
-        try:
-            dd = qs.stats.to_drawdown_series(port_ret)
-            for ts, val in list(dd.items())[-250:]:
-                underwater.append({"date": str(ts)[:10], "drawdown": round(float(val), 6)})
-        except Exception:  # noqa: BLE001
-            logger.debug("Drawdown series unavailable")
-
-        active_tickers = _active_weight_tickers(weights)
-        coverage = _universe_coverage(ticker_list, returns_df.columns, active=active_tickers)
-        full_coverage = _universe_coverage(
-            ticker_list, full_returns_df.columns, active=active_tickers
-        )
-        tear_sheet_status = _data_status(
-            coverage, partial=len(port_ret) < MIN_ANNUALIZE_DAYS
-        )
-        # `window` is the REQUEST. The metrics beside it are measured over the
-        # holding window, so the request is labelled as such and the measured
-        # window and its observation count are published next to it: a 365-day
-        # request must never sit on 39 days of numbers unlabelled.
-        measured_first, measured_last = _observation_bounds(port_ret)
-        holding_window_start = history_coverage.get("intersection_start")
-        # `start` here is the first date the WHOLE book was measurable on, which
-        # is later than the holding window's own start whenever an early session
-        # has a leg without a price. Both dates are true and they describe
-        # different things, so publishing them side by side without the gap looks
-        # like a contradiction. State the gap: it is the visible consequence of
-        # refusing to renormalise a partial basket into a portfolio return.
-        leading_gap_days = None
-        if holding_window_start and measured_first:
-            try:
-                leading_gap_days = (
-                    datetime.strptime(measured_first, "%Y-%m-%d")
-                    - datetime.strptime(str(holding_window_start)[:10], "%Y-%m-%d")
-                ).days
-            except (TypeError, ValueError):
-                leading_gap_days = None
-        measured_window = {
-            "start": measured_first,
-            "end": measured_last or _latest_observation_date(port_ret),
-            "days": int(covered_days),
-            "observation_count": int(covered_days),
-            "covered_days_scope": MEASURED_WINDOW_COVERED_DAYS_SCOPE,
-            "truncated_to_holding_window": bool(history_coverage.get("truncated")),
-            "holding_window_start": holding_window_start,
-            "holding_window_to_measured_start_gap_days": leading_gap_days,
-            "measured_start_basis": (
-                "first date on which every held position had a measurable return; "
-                "earlier holding-window sessions had at least one leg without a "
-                "price and were refused rather than renormalised into a "
-                "partial-basket portfolio return"
-            ),
-        }
-        return {
-            "window": {
-                "start": start,
-                "end": end,
-                "kind": "requested_analytics_window",
-            },
-            "requested_window": {"start": start, "end": end},
-            "measured_window": measured_window,
-            "observation_count": int(covered_days),
-            "annualized": annualizable(covered_days),
-            "holdings": weights,
-            "universe_coverage": coverage,
-            "data_status": tear_sheet_status,
-            "latest_observation_date": _latest_observation_date(port_ret),
-            "calculation_basis": {
-                "realized": "holding_truthed_current_composition",
-                "full_history": "hypothetical_current_weights",
-            },
-            "metrics": metrics,
-            # SI-5: one precision block per SAMPLE, not per section. The
-            # holding-window, the full-depth and the benchmark-slice blocks sit
-            # on three different series, so an interval can never be read
-            # against a point estimate measured on another one.
-            "estimate_uncertainty": {
-                "metrics": metrics_uncertainty,
-                "relative_vs_nifty": relative_uncertainty,
-            },
-            "full_history": {
-                **full_history_evidence,
-                "metrics": full_metrics,
-                "universe_coverage": full_coverage,
-                "relative_vs_nifty": full_relative,
-                "estimate_uncertainty": {
-                    "metrics": full_metrics_uncertainty,
-                    "relative_vs_nifty": full_relative_uncertainty,
-                },
-                "start": full_history_start,
-            },
-            "relative_vs_nifty": relative,
-            "monthly_returns": monthly,
-            "underwater": underwater,
-            "history_coverage": history_coverage,
-            "methodology": "quantstats metric suite over cached OHLCV adj-close returns",
-        }
     except HTTPException:
         raise
     except ValueError:
@@ -10867,6 +10975,25 @@ async def run_monte_carlo(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+#: What `as_of` IS on this route's fewer-than-two-holdings branch, which
+#: fetched no price series and measured no observation: pairwise correlation is
+#: undefined below two names, so the branch answers before any fetch runs and
+#: stamps the REQUEST end. Nothing else in the payload denies that - the chart
+#: is empty rather than dated - so this token is the only thing telling a
+#: reader that the date names nothing.
+#:
+#: Deliberately its own token, not either of the two `/analytics/coint`
+#: publishes. That route's sibling branch reports price series that came back
+#: unusable (`request_end_no_usable_price_data`), and its own short-universe
+#: branch reports the same cause in the pairs scanner's language
+#: (`request_end_universe_too_small_for_pairs`). Reusing either would put a
+#: statement about a different route's failure mode in this payload; the cause
+#: here is its own - no pair to correlate, not no data and not a failed fetch.
+CORRELATION_NO_PAIR_UNIVERSE_AS_OF_SEMANTICS = (
+    "request_end_universe_too_small_for_pairwise_correlation"
+)
+
+
 @router.get("/correlation-stability", response_model=CorrelationStabilityResponse)
 async def get_correlation_stability(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers or portfolio"),
@@ -10887,8 +11014,15 @@ async def get_correlation_stability(
 
         if len(ticker_list) < 2:
             coverage = _universe_coverage(ticker_list, [])
+            # `as_of` is the REQUEST end, the same `datetime.now()` the fitted
+            # branch below derives `end` from, so the DATE does not move. What
+            # moves is the claim about what it means: this branch measured no
+            # observation - the null correlation and empty series say so - so
+            # the date now says so in words too, instead of leaving a reader to
+            # assume a stamp this fresh came from a bar.
             return CorrelationStabilityResponse(
                 as_of=datetime.now().strftime("%Y-%m-%d"),
+                as_of_semantics=CORRELATION_NO_PAIR_UNIVERSE_AS_OF_SEMANTICS,
                 current_avg_correlation=None,
                 historical_threshold_90th=None,
                 historical_threshold_75th=None,
@@ -11275,6 +11409,21 @@ def _pairs_estimate_uncertainty(
 # aggregation that totals verdicts over delivered rows needs a bucket for it,
 # or it would silently fold unmeasured rows into `both_legs_i1`.
 GATE_VERDICT_NOT_RECORDED = "not_recorded"
+
+#: What `as_of` IS on the fewer-than-two-tickers branch, which fetched no
+#: price series and measured no observation at all. The response publishes
+#: `latest_observation_date: None` beside it, so the token is the only thing
+#: standing between a reader and the reading that this date is a
+#: MEASUREMENT. `latest_available_observation` said it was one.
+#:
+#: It is deliberately NOT the `request_end_no_usable_price_data` token the
+#: sibling branch below uses. That branch asked for price series and got
+#: none; this one never asked, because fewer than two tickers leaves no
+#: pair to test. Reusing the token would trade one false statement for
+#: another - a data problem reported where the cause is the universe.
+COINT_NO_PAIR_UNIVERSE_AS_OF_SEMANTICS = (
+    "request_end_universe_too_small_for_pairs"
+)
 
 
 @router.get("/coint", response_model=CointScannerResponse)
@@ -11916,10 +12065,16 @@ async def get_cointegration_pairs(
 
         if len(ticker_list) < 2:
             coverage = _universe_coverage(ticker_list, [])
+            # `as_of` is the REQUEST end either way - the same
+            # `datetime.now()` the fitted branch below calls `end` - so the
+            # DATE does not move. What moved is the claim about what it
+            # means: this branch measured no observation, so labelling it
+            # `latest_available_observation` asserted a measurement that
+            # `latest_observation_date: None` two lines below denies.
             response = CointScannerResponse(
                 as_of=datetime.now().strftime("%Y-%m-%d"),
                 latest_observation_date=None,
-                as_of_semantics="latest_available_observation",
+                as_of_semantics=COINT_NO_PAIR_UNIVERSE_AS_OF_SEMANTICS,
                 universe_size=len(ticker_list),
                 requested_universe_size=len(ticker_list),
                 requested_tickers=coverage["requested_tickers"],

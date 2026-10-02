@@ -19,6 +19,7 @@ from app.services.cache_service import (
     cache_generation_is_current,
     get_cache_generation,
 )
+from app.services.data_service import SessionDbLock, session_db_lock
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -104,6 +105,12 @@ class IndiaDataService:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+        # `get_db_session` hands this service the SAME AsyncSession that
+        # `DataService` receives, and SQLAlchemy sessions are not
+        # concurrency-safe: parallel commits/rollbacks on one session collide.
+        # Resolving the gate per session (not per instance) is what makes one
+        # service's write exclude the other's -- two instance locks would not.
+        self._db_lock: SessionDbLock = session_db_lock(db)
         os.makedirs(DATA_NSE_DIR, exist_ok=True)
 
     def _normalize_bhav_record(self, record: Dict[str, Any], date_dt: datetime) -> Optional[Dict[str, Any]]:
@@ -148,6 +155,11 @@ class IndiaDataService:
 
     async def ingest_bhavcopy_records(self, records: List[Dict[str, Any]], date_dt: datetime) -> int:
         """Validate, deduplicate, and upsert bhavcopy rows; invalid rows are quarantined."""
+        async with self._db_lock:
+            return await self._upsert_bhavcopy_records(records, date_dt)
+
+    async def _upsert_bhavcopy_records(self, records: List[Dict[str, Any]], date_dt: datetime) -> int:
+        """Bhavcopy upsert body; the caller must hold `_db_lock`."""
         if not records:
             return 0
         generation = get_cache_generation()
@@ -229,6 +241,13 @@ class IndiaDataService:
         self, date_dt: datetime, category: str, buy_crores: float, sell_crores: float
     ) -> bool:
         """Upsert one FII/DII flow row, including same-day corrections."""
+        async with self._db_lock:
+            return await self._upsert_institutional_flow(date_dt, category, buy_crores, sell_crores)
+
+    async def _upsert_institutional_flow(
+        self, date_dt: datetime, category: str, buy_crores: float, sell_crores: float
+    ) -> bool:
+        """Institutional-flow upsert body; the caller must hold `_db_lock`."""
         if not category or not str(category).strip():
             return False
         category = str(category).upper().strip()
@@ -325,6 +344,11 @@ class IndiaDataService:
         actually stored.  A missing FII/DII leg must not be rendered as a
         measured zero flow.
         """
+        async with self._db_lock:
+            return await self._read_institutional_flows(lookback_days, return_metadata)
+
+    async def _read_institutional_flows(self, lookback_days: int, return_metadata: bool) -> Any:
+        """Institutional-flow read body; the caller must hold `_db_lock`."""
         if not isinstance(lookback_days, int) or isinstance(lookback_days, bool) or lookback_days < 1:
             raise ProviderInvalidInputError("lookback_days must be a positive integer", provider="india_data")
         result = await self.db.execute(
@@ -393,6 +417,19 @@ class IndiaDataService:
         sigma_threshold: float = 2.0,
         return_metadata: bool = False,
     ) -> Any:
+        async with self._db_lock:
+            return await self._read_delivery_anomalies(
+                symbols, lookback_days, sigma_threshold, return_metadata
+            )
+
+    async def _read_delivery_anomalies(
+        self,
+        symbols: List[str],
+        lookback_days: int,
+        sigma_threshold: float,
+        return_metadata: bool,
+    ) -> Any:
+        """Delivery-anomaly read body; the caller must hold `_db_lock`."""
         anomalies = []
         covered_symbols = set()
         latest_date: Optional[str] = None

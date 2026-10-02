@@ -342,10 +342,86 @@ def test_a11_tail_confidence_uses_neutral_fields_for_non_default_level():
     assert result["confidence_level"] == pytest.approx(0.95)
 
 
-def test_a12_one_observation_ewma_uses_explicit_zero_contract():
-    assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) == 0.0
-    with pytest.raises(ValueError):
+def test_a12_one_observation_ewma_is_withheld_never_ranked_as_cheap(monkeypatch):
+    """The single-observation `0.0` is RETIRED; `None` is what replaces it.
+
+    WHY, because the old name said "explicit zero contract" and the reason
+    matters more than the value does.  A one-observation book has no
+    measurable dispersion, and the old answer published `0.0` - which is not a
+    missing measurement but the strongest claim the field can make ("this book
+    does not move").  Worse, it was not inert: `calculate_volatility_cone`
+    ranks the forecast level against the realized-volatility distribution, and
+    `0.0` sits at or below EVERY non-negative p25, so it took the 25th-
+    percentile-or-below branch and shipped `valuation: "cheap"` as though it
+    were a reading off the distribution.  That is the fabrication this project
+    exists to remove: a refusal is a valid answer, a stand-in number is the
+    defect.  The retired value is reproduced below so this stays falsifiable
+    rather than merely absent.
+
+    The EMPTY-series half of the original contract is untouched and is meant to
+    be: there is no ambiguity about an empty series, so it still raises.
+    """
+    # 1. The refusal itself.
+    assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) is None
+
+    # 2. ...and the half of the contract that survives: empty still raises.
+    with pytest.raises(ValueError, match="empty"):
         VolatilityService.calculate_ewma_volatility(pd.Series(dtype=float))
+
+    # 3. Downstream, on the real single-observation book: nothing is measured,
+    #    so every window refuses and the forecast level is withheld outright.
+    cone = VolatilityService.calculate_volatility_cone(pd.Series([0.05]))
+    forecast = cone["current_forecast"]
+    assert forecast["annualized_vol"] is None, forecast
+    assert forecast["valuation"] == "unknown", forecast
+    assert all(row["insufficient_data"] for row in cone["windows"]), cone["windows"]
+    assert all(row["percentile_rank"] is None for row in cone["windows"])
+
+    # 4. The differential, which is the part with teeth.  A withheld level has
+    #    to differ from a published one, so this pins the LINKAGE on a book
+    #    that CAN be ranked - where the cheap verdict is genuinely reachable -
+    #    and injects the retired value to show it is reached by that number.
+    #    `None` must withhold the verdict; `0.0` must not.  If someone restored
+    #    the zero, or defaulted the cone's level to 0.0 when the estimate is
+    #    refused, or let a refused level fall through to the p25 comparison,
+    #    one of these four assertions fails.
+    rng = np.random.default_rng(5)
+    ranked_book = pd.Series(
+        rng.normal(0.0004, 0.011, 300),
+        index=pd.bdate_range("2024-01-01", periods=300),
+    )
+    real = VolatilityService.calculate_volatility_cone(ranked_book, forecast_model="EWMA")
+    # Non-vacuity: this book really does carry a rankable distribution and a
+    # real measurement, and really does land on a discriminating verdict.  A
+    # "cheap" verdict below would otherwise be unfalsifiable on a book whose
+    # p25 is absent (where every level compares as "unknown").
+    assert real["current_forecast"]["annualized_vol"] > 0
+    assert real["current_forecast"]["valuation"] in ("cheap", "normal", "rich")
+
+    def _with(level):
+        monkeypatch.setattr(
+            VolatilityService, "calculate_ewma_volatility", staticmethod(lambda *a, **k: level)
+        )
+        return VolatilityService.calculate_volatility_cone(
+            ranked_book, forecast_model="EWMA"
+        )["current_forecast"]
+
+    retired = _with(0.0)
+    assert retired["annualized_vol"] == 0.0
+    assert retired["valuation"] == "cheap", (
+        "the retired 0.0 was not inert: ranked against this book's realized-vol "
+        "p25 it publishes the CHEAP band. This test exists to keep that "
+        "unreachable, so if the number is ever back, this is what it buys."
+    )
+
+    refused = _with(None)
+    assert refused["annualized_vol"] is None, refused
+    assert refused["valuation"] == "unknown", refused
+    # A withheld level is not merely absent - it says why, and it does not
+    # smuggle a verdict through the rank field.
+    assert refused["annualized_vol_withheld_reason"]
+    assert refused["percentile_rank_withheld_reason"]
+    assert refused["percentile_rank"] is None
 
 
 @pytest.mark.asyncio

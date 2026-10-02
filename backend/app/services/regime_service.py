@@ -225,8 +225,18 @@ def classify(
        means and covariances. Callers must not read persistence out of the
        transition matrix. (A sticky HDP-HMM in the Fox et al., 2011 sense is
        out of scope.)
-    3. Compound CAGR & Realized Volatility:
-       - Computes geometric CAGR for each state to eliminate arithmetic Jensen's inequality skew.
+    3. Compound CAGR & Realized Volatility (both descriptive; neither feeds
+       the estimator, which consumed only `feats` above and was decoded before
+       these figures are computed):
+       - Computes geometric CAGR for each state to eliminate arithmetic
+         Jensen's inequality skew. When the state's compounded product is not
+         positive that extrapolation is unavailable and an arithmetic mean is
+         used instead; `ann_ret_method` publishes which definition produced
+         each number.
+       - Annualized volatility is sqrt(252 * variance of the state's daily
+         returns): the variance is pooled and the sqrt taken ONCE. Averaging
+         per-window ANNUALIZED sigmas would apply Jensen's inequality in the
+         wrong direction and understate the state's volatility.
        - Each state's observation count and its 252/n annualization
          extrapolation factor are published beside the annualized figure,
          because the figure is a geometric mean over that count extrapolated to
@@ -335,15 +345,64 @@ def classify(
         mask = states == s
         r_sub = ret_1d.loc[common].values[mask]
         n_sub = len(r_sub)
+        # `ann_ret` is a GEOMETRIC figure: the state's compounded product raised
+        # to 252/n. It is reported as such, except when the product cannot be
+        # raised to a fractional power or has been wiped out, in which case the
+        # definition silently changed to an ARITHMETIC mean and said nothing.
+        # `ann_ret_method` now publishes which of the three produced the number.
         if n_sub > 0:
             cum_prod = np.prod(1.0 + r_sub)
-            cagr = float((cum_prod ** (252.0 / n_sub)) - 1.0) if cum_prod > 0 else float(r_sub.mean() * 252)
+            if cum_prod > 0:
+                cagr = float((cum_prod ** (252.0 / n_sub)) - 1.0)
+                ann_ret_method = "geometric_cagr_from_compounded_state_returns"
+            elif cum_prod == 0:
+                # A zero product means the state's wealth was total. Here the
+                # geometric extrapolation IS defined (0 ** positive - 1 ==
+                # -1.0), so routing to the arithmetic mean discards a correct
+                # answer and substitutes a different quantity that ignores the
+                # wipeout entirely -- it can even come out POSITIVE. Measured
+                # as unreachable through `classify` today: the day that zeroes
+                # the product also zeroes the reconstructed `close`, so ret21
+                # is -inf there, survives `dropna()` (which drops NaN, not
+                # -inf) and the StandardScaler refuses the matrix. Kept
+                # because the value is now published with its method, so a
+                # future caller reaching it is disclosed rather than misled.
+                cagr = float(r_sub.mean() * TRADING_DAYS_PER_YEAR)
+                ann_ret_method = "arithmetic_mean_fallback_product_wiped_out"
+            else:
+                # Negative product: a negative base has no real fractional
+                # power, so genuinely no geometric annualization exists and
+                # bailing out is the right call. Also measured as unreachable
+                # through `classify`: a return below -100% flips the sign of
+                # the reconstructed `close`, which makes that row's ret21 NaN,
+                # and `dropna()` removes the wiping day before it can reach any
+                # state's `r_sub`. Kept, and disclosed, for the same reason.
+                cagr = float(r_sub.mean() * TRADING_DAYS_PER_YEAR)
+                ann_ret_method = "arithmetic_mean_fallback_product_negative"
         else:
             cagr = 0.0
-        ann_v = float(vol21.loc[common].values[mask].mean()) if n_sub > 0 else 0.0
+            ann_ret_method = "no_observations"
+        # `ann_vol` pools the state's DAILY return variance and takes ONE
+        # sqrt. It used to be the MEAN of the `vol21` feature's already
+        # annualised sigmas, which Jensen's inequality biases DOWNWARD
+        # (E[sqrt(v)] <= sqrt(E[v])) -- the exact trap the Parkinson block
+        # above avoids by pooling mean(logHL^2) before the sqrt. This is a
+        # published descriptive field only: `vol21` reaches the estimator
+        # through `feats`, and `states` is decoded before this loop runs, so
+        # the fit, the transition matrix and the state labels are untouched.
+        # ddof=1 matches `vol21` itself (pandas rolling std) and the other
+        # `ann_vol` publishers in this codebase (analytics.py, holdings.py).
+        # A state with fewer than two observations has no measurable variance;
+        # publishing 0.0 would claim a volatility that was never observed.
+        ann_v = (
+            float(np.sqrt(TRADING_DAYS_PER_YEAR * np.var(r_sub, ddof=1)))
+            if n_sub > 1
+            else None
+        )
         rows.append({
             "state": s,
             "ann_ret": cagr,
+            "ann_ret_method": ann_ret_method,
             "cagr": cagr,
             "ann_vol": ann_v,
             "days_pct": float(mask.mean() * 100),
@@ -384,6 +443,11 @@ def classify(
             label_map[int(j)]: round(float(hmm.transmat_[i, j]) * 100, 1)
             for j in range(n_components)
         }
+    # Read off `hmm.transmat_`, but under params="mc" Baum-Welch does NOT
+    # re-estimate transmat: it is the sticky prior assigned above, republished.
+    # The `classify` docstring said so and the payload did not, so a reader
+    # could treat it as a fitted statistic and infer persistence from it.
+    transition_matrix_basis = "configured_sticky_prior_not_fitted"
 
     history = [
         {"date": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10], "regime": label_map[int(s)]}
@@ -405,13 +469,20 @@ def classify(
         },
         "regime_probabilities": current_probs,
         "transition_matrix": transition_matrix,
+        "transition_matrix_basis": transition_matrix_basis,
         "realtime_ewma_vol": round(ewma_vol, 4) if ewma_vol is not None else None,
         "realtime_parkinson_vol": round(parkinson_vol, 4) if parkinson_vol is not None else None,
         "states": [
             {
                 "regime": label_map[int(row.state)],
                 "ann_ret": round(row.ann_ret, 4),
-                "ann_vol": round(row.ann_vol, 4),
+                # One published key, two definitions: this says which one the
+                # number above is. Without it a reader cannot tell a geometric
+                # CAGR from the arithmetic fallback that replaced it.
+                "ann_ret_method": row.ann_ret_method,
+                # None (not 0.0) when the state has fewer than two daily
+                # returns, because a variance was never measurable.
+                "ann_vol": round(row.ann_vol, 4) if row.ann_vol is not None else None,
                 "historical_days_pct": round(row.days_pct, 1),
                 "observations": int(row.observations),
                 "annualization_factor": (
@@ -593,12 +664,47 @@ def _regime_metadata(
         "units": {
             "regime_probabilities": "percent_0_to_100",
             "transition_matrix": "percent_0_to_100",
+            "transition_matrix_basis": (
+                "'configured_sticky_prior_not_fitted' means transition_matrix is "
+                "the 96%-diagonal sticky prior assigned before fit() and "
+                "republished unchanged: the estimator runs with params=\"mc\", so "
+                "Baum-Welch re-estimates the state means and covariances but NOT "
+                "the transition matrix. Persistence must therefore be read from "
+                "stability_pct (measured off the decoded path), never out of "
+                "transition_matrix"
+            ),
             "stability_pct": "percent_0_to_100",
             "states[].historical_days_pct": "percent_0_to_100",
             "label_overrides.crash_veto_days": "count_trading_days",
             "label_overrides.crash_veto_threshold": "fraction_log_return_21d",
             "states[].ann_ret": "annualized_fraction_geometric_cagr",
+            # `states[].ann_ret` used to carry ONE definition under one key: a
+            # geometric CAGR normally, and an arithmetic mean times 252 whenever
+            # the compounded product was not positive, with the switch
+            # undisclosed. `ann_ret_method` is now the co-published qualifier
+            # that names the definition each number actually used.
+            "states[].ann_ret_method": (
+                "definition_qualifier_for_states[].ann_ret: "
+                "'geometric_cagr_from_compounded_state_returns' means ann_ret is "
+                "the geometric CAGR named above (compounded product raised to "
+                "252/n, minus 1); 'arithmetic_mean_fallback_product_wiped_out' "
+                "and 'arithmetic_mean_fallback_product_negative' mean the "
+                "compounded product was not positive and ann_ret is instead an "
+                "ARITHMETIC mean of the state's daily returns times 252 -- a "
+                "different quantity, not another estimate of the same one; "
+                "'no_observations' means the state captured no trading days and "
+                "ann_ret is 0.0 by construction rather than by measurement"
+            ),
             "states[].ann_vol": "annualized_fraction",
+            "states[].ann_vol_basis": (
+                "states[].ann_vol is sqrt(252 * variance of the state's daily "
+                "benchmark returns, ddof=1): the daily variance is pooled and "
+                "the sqrt taken ONCE, because the mean of already-annualised "
+                "sigmas is biased downward by Jensen's inequality "
+                "(E[sqrt(v)] <= sqrt(E[v])). It is null when the state has "
+                "fewer than two daily returns, because no variance was then "
+                "measurable"
+            ),
             "states[].observations": "count_trading_days",
             "states[].annualization_factor": (
                 "ratio_trading_days_per_year_over_state_observations"

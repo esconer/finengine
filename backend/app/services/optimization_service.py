@@ -405,6 +405,166 @@ def _moments_basis_block(
     }
 
 
+#: The Black-Litterman equilibrium prior is built from this constant, not from
+#: market data. EL-1 publishes the string in the payload (see
+#: `_w_mkt_basis_block`) so the assumption is a number the reader can see.
+W_MKT_BASIS_EQUAL_WEIGHT = "equal_weight_synthetic"
+
+#: Path names for the `long_only_clip.solution_path` field. The four
+#: `min_vol_fallback_*` branches exist because the tangency QP could not be
+#: solved as posed; they publish a DIFFERENT portfolio's weights, so the clip
+#: field has to say which of them produced the record or it would be asserting
+#: something about a solver answer that does not exist.
+BL_PATH_TANGENCY = "black_litterman_tangency"
+BL_PATH_NO_POSITIVE_EXCESS = "min_vol_fallback_no_positive_excess"
+BL_PATH_SOLVER_FAILURE = "min_vol_fallback_solver_failure"
+BL_PATH_NONPOSITIVE_GROSS = "min_vol_fallback_nonpositive_gross"
+BL_PATH_NOT_APPLICABLE = "not_applicable"
+
+
+def _w_mkt_basis_block(strategy: str) -> Dict[str, Any]:
+    """Name the market portfolio behind the equilibrium prior (EL-1).
+
+    `black_litterman` is the only strategy here that reverses
+    `pi = delta * Sigma @ w_mkt` out of a covariance matrix, and the `w_mkt` it
+    uses is `np.ones(n) / n` -- an equal-weight vector over whatever legs were
+    supplied, built inside `_black_litterman`. There is no `market_caps`
+    parameter on `_black_litterman` or `optimize()` and no caller supplies one
+    (`OptimizeRequest` carries `strategy`, `risk_free_rate`, `tickers`,
+    `views`, `relative_views` -- nothing else), so the equal-weight vector is
+    not a fallback that a better input would displace: it is the only prior this
+    service can compute.
+
+    The prior is a real number that reaches a reader, and it was not disclosed
+    anywhere in the payload. Sourcing a genuine cap-weighted market portfolio is
+    a DATA dependency (market caps per ticker, with their own provenance
+    question), not a defect that can be repaired inside this function, so the
+    honest scope here is to publish what the prior is. A cap-weighted prior must
+    not be synthesised to make the disclosure go away: a fabricated weight is
+    exactly the defect being disclosed.
+
+    With no views the tangency of this prior is equal weight exactly
+    (`Sigma^-1 pi = delta * 1/n`), so every published weight is "what equal
+    weight would have held, tilted by the supplied views".
+    """
+    if strategy == "black_litterman":
+        return {
+            "w_mkt_basis": W_MKT_BASIS_EQUAL_WEIGHT,
+            "w_mkt_basis_reason": (
+                "pi = delta * (cov_annual @ w_mkt) is the equilibrium "
+                "excess-return prior these weights are built on, and w_mkt is "
+                "NOT a market portfolio: it is 1/n over the legs supplied to "
+                "this call, synthesised inside the optimizer. The prior "
+                "therefore embeds an equal-weight assumption presented as a "
+                "market equilibrium, and the published weights inherit it -- "
+                "with no views at all the tangency of this prior is equal "
+                "weight exactly, so this record is 'what equal weight would "
+                "have held, tilted by the supplied views', not 'what the "
+                "market is expected to hold'. A genuine cap-weighted prior "
+                "needs market-cap data this optimizer does not receive and "
+                "does not fabricate. Published so a reader never has to infer "
+                "the assumption from its absence."
+            ),
+        }
+    return {
+        "w_mkt_basis": BL_PATH_NOT_APPLICABLE,
+        "w_mkt_basis_reason": (
+            f"{strategy} does not reverse an equilibrium prior out of a "
+            "covariance matrix, so no w_mkt was constructed and none entered "
+            "these weights. Published so a consumer never has to infer 'no "
+            "market prior was used' from an absent key."
+        ),
+    }
+
+
+def _long_only_clip_block(
+    strategy: str, clip: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Say whether the solver's answer was clipped before publication (EL-2).
+
+    `_black_litterman` clipped `raw = np.clip(raw, 0.0, None)` and then
+    renormalised, with no marker. A long-only constraint the solver FAILED to
+    satisfy and a clip that silently repaired it are different claims about the
+    same number, and the payload let a reader assume the first whenever the
+    clip fired. Note what the clip is NOT: `y >= 0` is already a constraint of
+    the QP, so a negative weight in the solver's answer is its own residual
+    tolerance, not a short position being converted into a long one.
+
+    The renormalisation that follows is a SCALE change and nothing else. The QP
+    pins `excess @ y == 1`, which fixes the scale of y arbitrarily, so
+    `y / sum(y)` is the scale-free published weight and equals the solver's own
+    direction. It would only hide an infeasibility if some leg were still
+    negative going in, which `solution_path` plus `applied` now report instead
+    of concealing.
+
+    `clip is None` means the strategy has no post-solve clip at all: the other
+    four solvers carry `w >= 0` inside their own constraint sets and never
+    rewrite the answer afterwards.
+    """
+    if strategy != "black_litterman":
+        return {
+            "solution_path": BL_PATH_NOT_APPLICABLE,
+            "applied": False,
+            "clipped_legs": [],
+            "max_clipped_weight": None,
+            "max_effect_on_published_weight": None,
+            "basis": (
+                f"{strategy} carries its own long-only constraint inside the "
+                "solver and does not clip the answer afterwards, so no solver "
+                "weight was rewritten before publication. Published so a "
+                "consumer never has to infer that from an absent key."
+            ),
+        }
+
+    applied = bool(clip and clip["applied"])
+    path = clip["solution_path"] if clip else BL_PATH_TANGENCY
+    if applied:
+        detail = (
+            f"{len(clip['clipped_legs'])} leg(s) came back from the solver with "
+            f"a negative weight and were clipped to 0 before publication: "
+            f"{', '.join(clip['clipped_legs'])}, largest magnitude "
+            f"{clip['max_clipped_weight']:.3e}. `y >= 0` is a constraint of the "
+            "QP, so this is the solver's residual tolerance rather than a short "
+            "position repaired into a long one; the largest effect on any "
+            f"published weight was {clip['max_effect_on_published_weight']:.3e}. "
+            "This record's weights are NOT the solver's unmodified answer."
+        )
+    elif path != BL_PATH_TANGENCY:
+        # These weights did not come from the tangency solve at all, so "the
+        # solver's answer was clean" would be a claim about an answer that
+        # does not exist. `_min_vol` carries its own `w >= 0` constraint and
+        # never rewrites the answer afterwards, which is the true statement.
+        detail = (
+            f"No clip was applied, and none was possible: the tangency solve "
+            f"did not produce this record ({path}), so the weights published "
+            "here are the _min_vol solution on the same posterior covariance, "
+            "which carries its own long-only constraint and is not rewritten "
+            "afterwards. Read solution_path before comparing these weights to "
+            "a Black-Litterman tangency."
+        )
+    else:
+        detail = (
+            "No clip was applied: every leg of the solver's answer was already "
+            "non-negative, so these weights are the solver's own solution."
+        )
+    return {
+        "solution_path": path,
+        "applied": applied,
+        "clipped_legs": list(clip["clipped_legs"]) if clip else [],
+        "max_clipped_weight": clip["max_clipped_weight"] if clip else None,
+        "max_effect_on_published_weight": (
+            clip["max_effect_on_published_weight"] if clip else None
+        ),
+        "basis": (
+            f"{detail} The division by the weight sum is a SCALE "
+            "normalisation only: the QP's `excess @ y == 1` fixes the scale of "
+            "y arbitrarily, so y/sum(y) is the scale-free published weight and "
+            "leaves the solver's direction intact. Every published leg is "
+            "non-negative and the published weights sum to 1."
+        ),
+    }
+
+
 def _current_uncertainty(
     returns_frame: Optional[pd.DataFrame],
     w: pd.Series,
@@ -793,17 +953,26 @@ def _black_litterman_posterior(
     return mu_bl, cov_bl
 
 
-def _black_litterman(
+def _black_litterman_solved(
     returns: pd.DataFrame,
     views: Optional[Dict[str, float]] = None,
     relative_views: Optional[list[dict[str, Any]]] = None,
     risk_free_rate: float = 0.02,
     tau: float = 0.05,
     delta: float = 2.5,
-) -> np.ndarray:
+) -> tuple[np.ndarray, Dict[str, Any]]:
     """Black-Litterman Bayesian Portfolio Optimization.
 
-    - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt
+    Returns `(weights, clip)` where `clip` is the evidence `_long_only_clip_block`
+    publishes: whether the solver's own answer was modified before it became a
+    published number, on which legs, by how much, and which branch produced it.
+
+    - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt, where
+      `w_mkt` is the synthetic equal-weight vector. EL-1: that vector is not a
+      market portfolio and no caller can replace it -- `_black_litterman` and
+      `optimize()` take no market caps, and `OptimizeRequest` sends none. It is
+      disclosed in the payload via `_w_mkt_basis_block` rather than dressed up
+      as an equilibrium.
     - EVERYTHING here is in EXCESS-return space. `Pi = delta * Sigma * w_mkt`
       is the Black-Litterman risk premium `E[R] - rf*1`, so no `rf` term
       appears in its construction and none is added afterwards; `mu_bl` is
@@ -821,12 +990,22 @@ def _black_litterman(
     - Blended posterior parameters mu_bl and cov_bl (see
       `_black_litterman_posterior` for the covariance form)
     - Long-only tangency solution
+
+    EL-2: the clip is measured, not assumed. `raw` is inspected BEFORE
+    `np.clip` rewrites it, so the disclosure reports the solver's actual answer
+    rather than the repaired one. QM-1 made this matter more: the corrected
+    `cov_bl` is ~30x smaller than the inflated one it replaced, so `y` is
+    larger in magnitude and the long-only constraint binds on books where it
+    previously did not -- a bound leg is exactly where a solver can return a
+    few 1e-11 of tolerance dust, which the clip then removed with no marker.
     """
     mu_ann, cov_ann, assets = _as_matrices(returns)
     n = len(assets)
     asset_to_idx = {a: i for i, a in enumerate(assets)}
 
-    # Prior market portfolio (equal weight if market caps not specified)
+    # EL-1: prior market portfolio. This is an equal-weight SYNTHESIS over the
+    # supplied legs, not a market portfolio, and nothing can override it here.
+    # Published as `w_mkt_basis` by `optimize()`.
     w_mkt = np.ones(n) / n
     # Implied equilibrium excess returns
     pi = delta * (cov_ann @ w_mkt)
@@ -867,7 +1046,9 @@ def _black_litterman(
     # published weights are y/sum(y), so the scale never reaches the output.
     excess = mu_bl
     if (excess <= 0).all():
-        return _min_vol(cov_bl)
+        return _min_vol(cov_bl), _clip_record(
+            BL_PATH_NO_POSITIVE_EXCESS, None, assets
+        )
 
     y = cp.Variable(n)
     prob = cp.Problem(
@@ -875,15 +1056,97 @@ def _black_litterman(
         [excess @ y == 1, y >= 0],
     )
     prob.solve(solver=cp.CLARABEL)
-    if y.value is None or np.isnan(y.value).any():
-        return _min_vol(cov_bl)
+    # `np.isnan` alone let a `-inf` through, and `np.clip(-inf, 0, None)` is
+    # 0.0 -- so a diverged solver would have had its answer quietly turned into
+    # a zero weight here. `isfinite` keeps the NaN behaviour identical and adds
+    # the infinities, which fall back to `_min_vol` and are reported as such.
+    if y.value is None or not np.isfinite(y.value).all():
+        return _min_vol(cov_bl), _clip_record(
+            BL_PATH_SOLVER_FAILURE, None, assets
+        )
 
     raw = np.asarray(y.value).flatten()
-    raw = np.clip(raw, 0.0, None)
-    total_raw = raw.sum()
+    # EL-2: measure the solver's answer BEFORE repairing it. `raw < 0` is the
+    # test that a leg was actually negative -- not a tolerance guess -- so
+    # `applied` cannot claim a clip that did nothing, nor miss one that did.
+    clip = _clip_record(BL_PATH_TANGENCY, raw, assets)
+    total_raw = float(np.clip(raw, 0.0, None).sum())
     if total_raw <= 0:
-        return _min_vol(cov_bl)
-    return raw / total_raw
+        return _min_vol(cov_bl), _clip_record(
+            BL_PATH_NONPOSITIVE_GROSS, raw, assets
+        )
+    # Unchanged arithmetic: the long-only bound is already a constraint of the
+    # QP, so this only erases the solver's own tolerance dust. It stays because
+    # the published contract is long-only -- but it is now reported.
+    raw = np.clip(raw, 0.0, None)
+    return raw / total_raw, clip
+
+
+def _clip_record(
+    solution_path: str,
+    measured: Optional[np.ndarray],
+    assets: list[str],
+) -> Dict[str, Any]:
+    """Evidence for `_long_only_clip_block`, read off the PRE-clip answer.
+
+    `measured` is the vector the tangency solver actually returned, or `None`
+    when no tangency answer exists (every `_min_vol` fallback branch). Passing
+    `None` is what stops a fallback from being reported as though a solver had
+    returned a negative weight and had it quietly clipped.
+    """
+    record = {
+        "solution_path": solution_path,
+        "applied": False,
+        "clipped_legs": [],
+        "max_clipped_weight": None,
+        "max_effect_on_published_weight": None,
+    }
+    if measured is None:
+        return record
+    negatives = measured[measured < 0.0]
+    gross = float(np.clip(measured, 0.0, None).sum())
+    if negatives.size == 0 or not np.isfinite(gross) or gross <= 0:
+        # Nothing was clipped into the published number. On the
+        # nonpositive-gross branch the tangency answer WAS discarded, which
+        # `solution_path` reports in its own right.
+        return record
+    record["applied"] = True
+    # The WORST negative is `min`, not `max`: `negatives` holds negative
+    # numbers, so its largest element is the one closest to zero and negating
+    # it under-reports the repair by the ratio of the two magnitudes.
+    worst = -float(negatives.min())
+    record["max_clipped_weight"] = worst
+    # The clipped magnitude was divided by the gross, so this is the most the
+    # repair could move any single published weight.
+    record["max_effect_on_published_weight"] = worst / gross
+    record["clipped_legs"] = [
+        assets[i] for i in np.flatnonzero(measured < 0.0)
+    ]
+    return record
+
+
+def _black_litterman(
+    returns: pd.DataFrame,
+    views: Optional[Dict[str, float]] = None,
+    relative_views: Optional[list[dict[str, Any]]] = None,
+    risk_free_rate: float = 0.02,
+    tau: float = 0.05,
+    delta: float = 2.5,
+) -> np.ndarray:
+    """The published weight vector alone; see `_black_litterman_solved`.
+
+    Kept as the array-returning entry point so the quantitative gate in
+    `tests/test_black_litterman_quant.py` pins the numbers through one contract.
+    """
+    weights, _clip = _black_litterman_solved(
+        returns,
+        views=views,
+        relative_views=relative_views,
+        risk_free_rate=risk_free_rate,
+        tau=tau,
+        delta=delta,
+    )
+    return weights
 
 
 def optimize(
@@ -921,6 +1184,10 @@ def optimize(
     mu, cov, assets = _as_matrices(returns)
     excluded: list[str] = []
     excluded_reasons: Dict[str, str] = {}
+    # EL-2: only `black_litterman` rewrites a solver answer after the solve, so
+    # only it produces clip evidence. `None` means "this strategy has no
+    # post-solve clip", which `_long_only_clip_block` states rather than hides.
+    bl_clip: Optional[Dict[str, Any]] = None
     if strategy == "hrp":
         # Keyed in scipy-linkage leaf order - deliberately NOT assumed to be
         # the column order. `_weight_vector` is what aligns it.
@@ -944,10 +1211,17 @@ def optimize(
         elif strategy == "max_sharpe":
             solved = pd.Series(_max_sharpe(mu, cov, risk_free_rate), index=assets)
         elif strategy == "black_litterman":
-            solved = pd.Series(
-                _black_litterman(returns, views=views, relative_views=relative_views, risk_free_rate=risk_free_rate),
-                index=assets,
+            # `_black_litterman_solved` also hands back the pre-clip solver
+            # evidence, so the payload below can say whether these weights are
+            # the solver's own answer. `_black_litterman` returns the array
+            # alone and is kept for the quantitative gate.
+            bl_weights, bl_clip = _black_litterman_solved(
+                returns,
+                views=views,
+                relative_views=relative_views,
+                risk_free_rate=risk_free_rate,
             )
+            solved = pd.Series(bl_weights, index=assets)
         else:
             solved = pd.Series(_min_cvar(returns, beta=beta), index=assets)
 
@@ -973,6 +1247,14 @@ def optimize(
         # consumer never has to infer "nothing was dropped" from an absent key.
         "excluded": excluded,
         "excluded_reasons": excluded_reasons,
+        # EL-1: the equilibrium prior behind `black_litterman` is a synthetic
+        # equal-weight vector, not a market portfolio. Published for every
+        # strategy so a consumer never has to infer "no market prior was used"
+        # from an absent key.
+        **_w_mkt_basis_block(strategy),
+        # EL-2: whether the solver's answer was clipped before publication, on
+        # which legs, and which branch produced these weights.
+        "long_only_clip": _long_only_clip_block(strategy, bl_clip),
         "moments_basis": _moments_basis_block(returns, risk_free_rate, moments),
         # SI-5: the triple above is an ex-ante estimate from a fitted mu/cov,
         # not a measurement, so it carries the estimation error on that fit and

@@ -34,8 +34,8 @@ produces - and `effective_n_cap_applied` says whether the cap bound.
 
 from __future__ import annotations
 
-from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from datetime import date, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -55,25 +55,68 @@ from app.services.analytics_engine import (
 
 TEST_RESAMPLES = 120
 
-#: 21 calendar days, derived from the clock rather than written down.  Three
-#: tests in this project have broken on hard-dated fixtures; the frame below is
-#: stamped relative to today and `_clearance` asserts the window is recent
-#: enough, so nothing here depends on a literal date.
+#: The clearance these fixtures are held to, in calendar days.  Three tests in
+#: this project have broken on hard-dated fixtures; the frames below are
+#: stamped relative to today and `_clearance` asserts each one is recent
+#: enough - which means within `RECENT_DAYS` of today - so nothing here
+#: depends on a literal date.  This is the bound the guard actually uses.
 RECENT_DAYS = 21
 WINDOW = 300
 
 
+def _cleared(frame_end: date, today: date) -> bool:
+    """Whether a frame ending `frame_end` is recent enough as of `today`.
+
+    PURE, and it takes both dates, so the rule can be exercised against
+    representative days - a weekday, a Saturday, a Sunday, a weekday market
+    holiday, a stale frame - without freezing the clock, without a date
+    parameter on `_clearance`, and without a new dependency.  The rule is the
+    one this module's header claims: the frame's last observation must fall
+    within `RECENT_DAYS` of today.
+
+    WHAT THIS REPLACED, because the difference is the whole defect.  The guard
+    used to compute its reach against `pd.bdate_range(..., periods=1)[0]` -
+    the LAST BUSINESS DAY at or before today - and assert `reach <= 0`.  That
+    expression says nothing about this fixture.  It says `today is a business
+    day`, so it went red on every Saturday (reach 1), every Sunday (reach 2)
+    and every market holiday, putting fourteen tests here red on a Saturday
+    with a message blaming a clock that had not moved at all.  `RECENT_DAYS`
+    was declared in this module and referenced nowhere; this is what it was
+    declared for.
+    """
+    return (today - frame_end).days <= RECENT_DAYS
+
+
+def _index(n: int = WINDOW) -> pd.DatetimeIndex:
+    """The fixture's index, stamped from the clock rather than written down.
+
+    The single source of the frame's last observation: `_clearance` checks the
+    very index its callers will get, not a separately re-derived one.
+    """
+    return pd.bdate_range(end=datetime.now().date(), periods=n)
+
+
 def _clearance() -> None:
-    reach = (datetime.now().date() - pd.bdate_range(
-        end=pd.Timestamp.now().normalize(), periods=1
-    )[0].date()).days
-    assert reach <= 0, f"the clock moved backwards relative to the frame: {reach}"
+    """The frame is stamped from the clock; assert it is still recent enough.
+
+    The guard for the module header's warning about hard-dated fixtures: if a
+    frame stops being stamped relative to today, this says so HERE, rather than
+    letting the assertions further down quietly run against stale data.  Its
+    rule is `_cleared`, i.e. `RECENT_DAYS`; its own verdict does not depend on
+    what day of the week the suite is run on.
+    """
+    frame_end = _index()[-1].date()
+    today = datetime.now().date()
+    assert _cleared(frame_end, today), (
+        f"the fixture's last observation ends {(today - frame_end).days} days "
+        f"before today, past the {RECENT_DAYS}-day clearance it is stamped "
+        f"against, so it no longer models a recent book"
+    )
 
 
 def _series(seed: int = 5, n: int = WINDOW) -> pd.Series:
     rng = np.random.default_rng(seed)
-    index = pd.bdate_range(end=datetime.now().date(), periods=n)
-    return pd.Series(rng.normal(0.0004, 0.011, n), index=index)
+    return pd.Series(rng.normal(0.0004, 0.011, n), index=_index(n))
 
 
 def _block(seed: int = 5, n: int = WINDOW):
@@ -344,6 +387,155 @@ def support_scope() -> str:
     from app.api.analytics import RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE
 
     return RISK_CONTRIBUTION_TAIL_SUPPORT_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# the clearance guard.  It shipped asserting the wrong thing and turned the
+# whole file red every weekend, so its rule is pinned here in BOTH
+# directions: what it must accept (weekends, holidays) and what it must still
+# reject (a frame that stopped being recent).
+# ---------------------------------------------------------------------------
+def _pinned(moment: datetime) -> type:
+    """A `datetime` stand-in whose `now()` is `moment`, for one `with` only.
+
+    This is the whole clock override in this module: scoped to a single test,
+    restored on exit by `mock.patch`, and never installed globally.  The
+    alternative - a freezegun-style dependency - is not permitted here, and
+    freezing time for the suite would be worse than not testing the guard.
+    """
+    return type(
+        "_Pinned", (datetime,),
+        {"now": classmethod(lambda _cls, _tz=None: moment)},
+    )
+
+
+class TestTheClearanceGuard:
+    def test_the_rule_it_replaced_was_only_ever_a_business_day_assertion(self):
+        """THE RED PROOF: what the old guard actually computed.
+
+        The old body, reproduced verbatim and run over the measured table.  Its
+        reach is measured against the last business day at or before today, so
+        `reach <= 0` reduces to `weekday < 5` - which is why fourteen tests
+        here went red every Saturday and Sunday with a message about a clock
+        that had not moved.  The table is asserted in full, so this is a check
+        rather than a restatement: a wrong transcription fails it.
+        """
+        def superseded_reach(day: date) -> int:
+            return (day - pd.bdate_range(
+                end=pd.Timestamp(day), periods=1
+            )[0].date()).days
+
+        measured = {
+            date(2026, 10, 1): 0,   # Thursday
+            date(2026, 10, 2): 0,   # Friday
+            date(2026, 10, 3): 1,   # Saturday - the whole defect
+            date(2026, 10, 4): 2,   # Sunday
+            date(2026, 10, 5): 0,   # Monday
+        }
+        for day, reach in measured.items():
+            assert superseded_reach(day) == reach, (day, day.strftime("%A"))
+            # and the old verdict is EXACTLY the weekday: nothing about the
+            # fixture, the window, or RECENT_DAYS enters into it
+            assert (reach <= 0) is (day.weekday() < 5), (day, day.strftime("%A"))
+
+        # the fixed rule disagrees on the two weekend rows and agrees elsewhere
+        frame_end = date(2026, 10, 2)   # the frame stamped on that Friday
+        for day in measured:
+            assert _cleared(frame_end, day) is True, (day, day.strftime("%A"))
+
+    def test_the_rule_clears_a_weekend_regardless_of_the_day_it_is_run(self):
+        """FIX PROOF: weekday-independence across representative dates.
+
+        One frame, stamped on a Thursday, read on each later day.  The weekend
+        rows are the ones the old guard rejected; the point is that they now
+        pass for the stated reason - within `RECENT_DAYS` of today - and that
+        no row depends on what day of the week the suite happens to run.
+        """
+        frame_end = pd.bdate_range(
+            end=date(2026, 10, 1), periods=1
+        )[0].date()
+        for day, verdict in (
+            (date(2026, 10, 1), True),   # Thursday, the day it was stamped
+            (date(2026, 10, 2), True),   # Friday
+            (date(2026, 10, 3), True),   # Saturday
+            (date(2026, 10, 4), True),   # Sunday
+            (date(2026, 10, 5), True),   # Monday
+        ):
+            assert _cleared(frame_end, day) is verdict, (day, day.strftime("%A"))
+
+    def test_a_genuinely_stale_frame_is_still_rejected(self):
+        """STILL FAILS: the fix must not have made the check vacuous.
+
+        The defect inverted - a guard that passes anything - would be the same
+        bug the other way round.  So the boundary is asserted from both sides:
+        exactly `RECENT_DAYS` old clears, one day more does not.
+        """
+        frame_end = pd.bdate_range(
+            end=date(2026, 10, 1), periods=1
+        )[0].date()
+        assert _cleared(frame_end, frame_end + timedelta(days=RECENT_DAYS))
+        assert not _cleared(
+            frame_end, frame_end + timedelta(days=RECENT_DAYS + 1)
+        )
+        # and a frame from last year is nowhere near the clearance
+        assert not _cleared(frame_end, date(2027, 10, 1))
+
+    def test_market_holidays_are_ordinary_weekdays_to_this_index(self):
+        """Market holidays explicitly, since the old guard died on them too.
+
+        `pd.bdate_range` skips Saturday and Sunday and knows nothing about
+        exchange holidays, so on a weekday the frame is stamped to that very
+        day - Christmas, Diwali, a national closure - and the guard reads a
+        reach of 0.  Swept across a full year, EVERY day clears, and the worst
+        reach any day can produce is 2: a Sunday.  That margin is why a single
+        market holiday cannot turn this file red, and why neither can a run that
+        straddles one.
+        """
+        days = pd.date_range("2026-01-01", "2026-12-31", freq="D").date
+        worst = 0
+        for day in days:
+            frame_end = pd.bdate_range(
+                end=pd.Timestamp(day), periods=1
+            )[0].date()
+            assert _cleared(frame_end, day), (day, day.strftime("%A"))
+            worst = max(worst, (day - frame_end).days)
+        assert worst == 2, worst
+        assert worst < RECENT_DAYS
+
+    def test_the_shipped_guard_itself_survives_a_weekend_clock(self):
+        """`_clearance` end to end with the clock pinned to each of those days.
+
+        The pure rule is tested above; this proves the guard that actually
+        runs in the other fourteen tests reaches the same verdict, so the rule
+        and the call site cannot drift apart.
+        """
+        for moment in (
+            datetime(2026, 10, 1, 12, 0),   # Thursday
+            datetime(2026, 10, 2, 12, 0),   # Friday
+            datetime(2026, 10, 3, 12, 0),   # Saturday
+            datetime(2026, 10, 4, 12, 0),   # Sunday
+            datetime(2026, 10, 5, 12, 0),   # Monday
+            datetime(2026, 12, 25, 12, 0),  # Christmas, a weekday
+        ):
+            with patch(f"{__name__}.datetime", _pinned(moment)):
+                _clearance()
+
+    def test_the_shipped_guard_rejects_a_hard_dated_frame(self):
+        """The negative half of the previous test, on the real guard.
+
+        A pinned clock CANNOT stage this: `_index` stamps from the same clock
+        it reads, so moving the clock moves both ends and `reach` stays 0.  The
+        only way this fixture goes stale is the failure the module header names
+        - someone replaces `end=datetime.now().date()` with a literal - so that
+        is what is staged here, with `_index` patched to a frame from last year
+        and the clock left alone.  The guard must refuse it, loudly, by name.
+        """
+        stale = pd.bdate_range(
+            end=datetime.now().date() - timedelta(days=365), periods=WINDOW
+        )
+        with patch(f"{__name__}._index", return_value=stale):
+            with pytest.raises(AssertionError, match="clearance"):
+                _clearance()
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,8 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import os
+import asyncio
+from types import SimpleNamespace
 
 # FastAPI and testing
 from fastapi.testclient import TestClient
@@ -243,9 +245,65 @@ def _override_get_db(session: AsyncSession):
     return _gen
 
 
+@pytest.fixture
+def isolated_database(tmp_path, monkeypatch) -> Generator[SimpleNamespace, None, None]:
+    """Repoint EVERY database entry point at a temp sqlite file. Not daisy.db.
+
+    Single owner of the rebinding for both client fixtures. `client` and
+    `async_client` used to hand-roll this independently, and `async_client`
+    shipped with only the `get_db_session` dependency override -- so anything
+    that opens a session without going through `Depends(get_db_session)` reached
+    production. Two hand-rolled copies is how that drift happened; one fixture
+    that both depend on is the fix.
+
+    Four bindings, all four required:
+
+    * `db_mod.engine` -- `init_db()` / `create_tables()` / `close_db_connections()`
+      read it as a module global. `TestClient(app)` enters the FastAPI lifespan
+      -> `init_db()`, whose self-heal (analytics_cache dedupe + CREATE UNIQUE
+      INDEX) would otherwise mutate production backend/data/daisy.db on every
+      full-suite run.
+    * `db_mod.SessionLocal` -- `get_db_session()` yields it (database.py:82).
+    * `ws_mod.SessionLocal` -- a SEPARATE module global in app/api/websocket.py,
+      bound by `from app.db.database import SessionLocal` at import (line 19) and
+      read at call time by the three background senders (lines 299, 353, 466).
+      Because it is its own binding, patching `db_mod.SessionLocal` does NOT
+      move it; verified in test_client_db_isolation_invariants.
+    * `settings.database_url` -- read at runtime to resolve the file that
+      `apply_migrations` rewrites, independently of `engine`.
+
+    Sync fixture on purpose: `client` cannot depend on an async fixture. That
+    also means teardown cannot `await engine.dispose()`, so the pool is closed
+    via a short-lived loop instead of being left to the GC.
+    """
+    import app.api.websocket as ws_mod
+    import app.db.database as db_mod
+
+    db_file = tmp_path / "isolated.db"
+    url = f"sqlite+aiosqlite:///{db_file.as_posix()}"
+    tmp_engine = create_async_engine(url, echo=False)
+    factory = async_sessionmaker(tmp_engine, class_=AsyncSession, expire_on_commit=False)
+
+    monkeypatch.setattr(db_mod, "engine", tmp_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", factory)
+    monkeypatch.setattr(ws_mod, "SessionLocal", factory)
+    monkeypatch.setattr(db_mod.settings, "database_url", url)
+
+    yield SimpleNamespace(url=url, path=db_file, engine=tmp_engine, session_factory=factory)
+
+    asyncio.run(tmp_engine.dispose())
+
+
 @pytest_asyncio.fixture
-async def async_client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
-    """Async test client bound to the ISOLATED test database (never daisy.db)."""
+async def async_client(
+    test_db: AsyncSession, isolated_database: SimpleNamespace
+) -> AsyncGenerator[AsyncClient, None]:
+    """Async test client bound to the ISOLATED test database (never daisy.db).
+
+    `dependency_overrides` only covers code that goes through
+    `Depends(get_db_session)`; `isolated_database` covers the rest, which is why
+    this fixture takes both.
+    """
     app = _current_app()
     app.dependency_overrides[get_db_session] = _override_get_db(test_db)
     transport = ASGITransport(app=app)
@@ -255,30 +313,13 @@ async def async_client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, Non
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
+def client(isolated_database: SimpleNamespace) -> Generator[TestClient, None, None]:
     """Test client whose lifespan runs against a TEMP db, never daisy.db.
 
-    TestClient(app) enters the FastAPI lifespan -> init_db(), whose self-heal
-    (analytics_cache dedupe + CREATE UNIQUE INDEX) would otherwise mutate the
-    production backend/data/daisy.db on every full-suite run. Mirrors the
-    monkeypatch pattern of test_bugfix_cache_index_selfheal; also rebinds
-    SessionLocal (get_db_session) and the WS background sender's alias so no
-    code reachable from this fixture can touch the real engine. monkeypatch
-    and tmp_path undo/clean up automatically.
+    All the rebinding lives in `isolated_database`; see that fixture for why
+    `init_db()` under the TestClient lifespan would otherwise rewrite
+    production backend/data/daisy.db.
     """
-    import app.api.websocket as ws_mod
-    import app.db.database as db_mod
-
-    url = f"sqlite+aiosqlite:///{(tmp_path / 'client.db').as_posix()}"
-    tmp_engine = create_async_engine(url, echo=False)
-    monkeypatch.setattr(db_mod, "engine", tmp_engine)
-    monkeypatch.setattr(
-        db_mod,
-        "SessionLocal",
-        async_sessionmaker(tmp_engine, class_=AsyncSession, expire_on_commit=False),
-    )
-    monkeypatch.setattr(ws_mod, "SessionLocal", db_mod.SessionLocal)
-    monkeypatch.setattr(db_mod.settings, "database_url", url)
     with TestClient(_current_app()) as client:
         yield client
 
@@ -547,6 +588,7 @@ class AsyncContextManager:
 # Export commonly used fixtures
 __all__ = [
     "test_db", 
+    "isolated_database",
     "async_client",
     "client",
     "mock_data_service",

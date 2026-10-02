@@ -405,8 +405,27 @@ class CorrelationStabilityResponse(BaseModel):
 
     Pairwise correlation is undefined for a single holding; the nullable
     fields preserve that fact instead of publishing a fabricated 1.0.
+
+    `as_of_semantics` is a free-form `str` - no enum, no Literal - so nothing
+    machine-checks the token and this docstring is where its vocabulary lives:
+    `latest_available_observation` (a real, newest delivered bar; the default on
+    `CointScannerResponse`), `request_end_no_usable_price_data` (price series
+    were requested and none came back) and
+    `request_end_universe_too_small_for_pairs` (fewer than two names, so no pair
+    was ever tested). The fewer-than-two-holdings branch of
+    `/correlation-stability` publishes its own
+    `request_end_universe_too_small_for_pairwise_correlation` beside those
+    three rather than borrowing a sibling's token for a different cause.
+
+    `None` means the label was NOT recorded, never "no observation": it is what
+    a caller that built this model without naming one produces. Both branches of
+    `/correlation-stability` now set one, so null is not a state this route can
+    publish - the fewer-than-two-holdings branch with its own token above, and
+    the measured branch with `latest_available_observation`, because its `as_of`
+    is the newest delivered bar of the rolling series rather than a request end.
     """
     as_of: str
+    as_of_semantics: Optional[str] = None
     current_avg_correlation: Optional[float] = None
     historical_threshold_90th: Optional[float] = None
     historical_threshold_75th: Optional[float] = None

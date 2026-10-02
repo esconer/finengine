@@ -89,9 +89,22 @@ class TestVolatilityService:
         # Empty input must not fabricate a forecast (was: hardcoded 0.20)
         with pytest.raises(ValueError, match="empty"):
             VolatilityService.calculate_ewma_volatility(pd.Series(dtype=float))
-        # One observation has no sample dispersion; use the explicit
-        # insufficient/zero contract rather than abs(return).
-        assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) == 0.0
+        # One observation has no sample dispersion, so the level is REFUSED,
+        # not zeroed. This line previously pinned `== 0.0` and called it the
+        # "explicit insufficient/zero contract"; that zero was not inert — the
+        # volatility cone ranks the forecast against the realized-vol
+        # distribution, and 0.0 sits at or below every non-negative p25, so it
+        # shipped `valuation: "cheap"` for a book that could not be measured.
+        # A refusal is a valid answer; a stand-in number is the defect.
+        #
+        # Kept here (corrected, not deleted) because this file is where a reader
+        # auditing `VolatilityService` lands, and deleting it would leave this
+        # surface silent about the one-observation rule. The consequence that
+        # actually matters — that the withheld level withholds the verdict
+        # instead of scoring it cheap — is pinned once, in
+        # test_agent_a_quant_fixes.py::test_a12_one_observation_ewma_is_withheld_never_ranked_as_cheap.
+        # Do not re-pin the cone linkage here; that duplicate would drift.
+        assert VolatilityService.calculate_ewma_volatility(pd.Series([0.05])) is None
 
     def test_forecast_garch_volatility(self):
         s = pd.Series(np.random.normal(0, 0.015, 200))

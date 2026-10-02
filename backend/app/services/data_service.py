@@ -9,6 +9,7 @@ import inspect
 import math
 import numbers
 import time
+import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -224,6 +225,76 @@ def canonical_ticker(ticker: str) -> str:
     return t
 
 
+class SessionDbLock:
+    """Re-entrant async gate for ONE AsyncSession.
+
+    ``asyncio.Lock`` is not re-entrant, and the callers that reach a DB-touching
+    helper are not all lock-free: ``fetch_historical_data`` already holds the
+    gate when it calls ``_store_timeseries_data``, so a plain lock taken inside
+    that helper would deadlock instead of protecting it.  Ownership is therefore
+    tracked per task: the owning task re-takes the gate by counting depth, and
+    every other task queues behind it exactly as it would behind an
+    ``asyncio.Lock`` -- so no new deadlock class is introduced.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional[asyncio.Task] = None
+        self._depth = 0
+
+    async def acquire(self) -> None:
+        task = asyncio.current_task()
+        if self._owner is task:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._owner is not asyncio.current_task():
+            raise RuntimeError("Session DB gate released by a task that does not hold it")
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+    async def __aenter__(self) -> "SessionDbLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        self.release()
+        return False
+
+
+_SESSION_DB_LOCKS: "weakref.WeakKeyDictionary[Any, SessionDbLock]" = weakref.WeakKeyDictionary()
+
+
+def session_db_lock(db_session: Any) -> SessionDbLock:
+    """The one gate for ``db_session``, shared by every service holding it.
+
+    ``get_db_session`` yields the SAME AsyncSession to several services --
+    ``api/analytics.py:12095,12147,12252`` build ``IndiaDataService(db=db)``
+    from the session ``api/portfolio.py:107`` gives ``DataService`` -- so the
+    gate has to hang off the session.  Two per-instance locks would not exclude
+    each other, which is why the invariant recorded in ``DataService`` cannot be
+    enforced by an instance attribute alone.
+    """
+    try:
+        lock = _SESSION_DB_LOCKS.get(db_session)
+        if lock is not None:
+            return lock
+        lock = SessionDbLock()
+        _SESSION_DB_LOCKS[db_session] = lock
+        return lock
+    except TypeError:
+        # `None` and other non-weak-referenceable stand-ins (`DataService(None)`
+        # in the test suite) cannot key the registry.  Hand back a throwaway gate
+        # so such a caller still fails on its own DB call, as it did before.
+        return SessionDbLock()
+
+
 class DataService:
     """Main data service for fetching market data"""
 
@@ -239,8 +310,10 @@ class DataService:
         # AsyncSession. SQLAlchemy sessions are not concurrency-safe: parallel
         # commits/rollbacks on one session collide ("commit() can't be called
         # here", "transaction is closed", ...). Network calls stay parallel;
-        # only DB operations are serialized through this gate.
-        self._db_lock = asyncio.Lock()
+        # only DB operations are serialized through this gate, which hangs off
+        # the SESSION (see session_db_lock) so a sibling service built from the
+        # same Depends(get_db_session) session is excluded by it too.
+        self._db_lock: SessionDbLock = session_db_lock(db_session)
 
         # Indian market defaults
         self.default_region = DEFAULT_REGION
@@ -1623,7 +1696,23 @@ class DataService:
         source_used: str = "yfinance",
         generation: Optional[int] = None,
     ) -> bool:
-        """Persist valid rows under the caller's captured cache generation."""
+        """Persist valid rows under the caller's captured cache generation.
+
+        Takes the session gate itself: `_fetch_from_alpha_vantage` reaches this
+        helper directly, holding nothing. The gate is re-entrant, so the callers
+        that already hold it at the fetch-persist sites are unaffected.
+        """
+        async with self._db_lock:
+            return await self._write_timeseries_rows(ticker, df, source_used, generation)
+
+    async def _write_timeseries_rows(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        source_used: str = "yfinance",
+        generation: Optional[int] = None,
+    ) -> bool:
+        """Upsert valid rows; the caller must hold `_db_lock`."""
         try:
             # Direct helper callers get the same pre-await fence as the public
             # fetch path; fetch callers pass the generation captured at entry.
@@ -1787,7 +1876,17 @@ class DataService:
             logger.error("Error in storage error analysis: %s", type(analysis_error).__name__)
             
     async def check_data_integrity(self, ticker: Optional[str] = None) -> Dict[str, Any]:
-        """Check data integrity for specified ticker or entire database"""
+        """Check data integrity for specified ticker or entire database.
+
+        Holds the session gate: these counts must not be taken while another
+        coroutine is mid-commit on the same AsyncSession, even though the method
+        only reads.
+        """
+        async with self._db_lock:
+            return await self._run_integrity_check(ticker)
+
+    async def _run_integrity_check(self, ticker: Optional[str]) -> Dict[str, Any]:
+        """Integrity report body; the caller must hold `_db_lock`."""
         try:
             if ticker:
                 # Check specific ticker

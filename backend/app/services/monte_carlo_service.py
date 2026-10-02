@@ -469,6 +469,10 @@ def simulate_goal(
         },
         "fan": _fan_from_checkpoints(checkpoint_values, checkpoint_steps),
         "expected_shortfall_vs_target": expected_shortfall,
+        # The set the mean above was taken over. Without it the 0.0 is
+        # indistinguishable from "missed by nothing": the conditioning set is
+        # empty when every path clears the target, and its mean is undefined.
+        "expected_shortfall_paths_failing": int(len(failing)),
         "historical_mu_annual": round(mu_annual, 4),
         "historical_sigma_annual": round(sigma_annual, 4),
         "student_t_df": round(student_t_df, 2) if student_t_df is not None else None,

@@ -49,6 +49,46 @@ EFFECTIVE_N_RULE = (
 #: `_percentile_rank_basis`.
 _PERCENTILE_RANK_SUBJECTS = frozenset({"row", "forecast"})
 
+# ---------------------------------------------------------------------------
+# `current_forecast.horizon_days`: one field name, two quantities.
+# ---------------------------------------------------------------------------
+# An EWMA (RiskMetrics) estimate is a one-step conditional variance: it is a
+# weighted average of squared returns ending at the last observation and is not
+# a function of any horizon. The GARCH branch really does forecast
+# `forecast_horizon` steps ahead. So `horizon_days: 21` published beside an
+# `"EWMA"` label claimed a 21-day quantity for a 1-day number, and a reader
+# comparing an EWMA row against a GARCH row on the same field was comparing two
+# different things without being able to tell.
+#
+# The label "EWMA" reaches the overlay two ways - the direct
+# `forecast_model="EWMA"` branch, and `forecast_garch_volatility`'s own EWMA
+# fallback (too few returns, or a failed GARCH fit) - so the horizon is withheld
+# on the LABEL, not on the branch the caller asked for.
+EWMA_HORIZON_NOTE = (
+    "horizon_days is null because the forecast named in model above is an EWMA "
+    "(RiskMetrics) estimate, which is a one-step conditional volatility: it is "
+    "a decayed weighted average of squared returns ending at the last "
+    "observation and is not a function of any horizon, so no number of days can "
+    "be published for it. A GARCH(1,1) row publishes the real multi-step "
+    "horizon it was fitted for, and the two rows therefore cannot be compared "
+    "on this field - compare annualized_vol instead, and note that "
+    "ranked_against_window_days names the realized distribution the rank was "
+    "taken against."
+)
+
+#: Published beside `annualized_vol: null`. The level is withheld, not replaced:
+#: a caller that invents a number here invents a verdict with it, because the
+#: valuation branch reads this field.
+FORECAST_VOL_WITHHELD_REASON = (
+    "withheld: no dispersion estimate is measurable from this return series - "
+    "an EWMA volatility needs at least two observations and the series has one, "
+    "so annualized_vol, percentile_rank and valuation are all withheld rather "
+    "than filled with a stand-in. An earlier version published 0.0 here, which "
+    "is not a missing measurement but the strongest claim available ('this "
+    "book does not move'), and 0.0 sits at or below every non-negative p25 of "
+    "the realized-vol distribution, so it ranked as the CHEAP band."
+)
+
 
 def _effective_window_count(n_windows: int, window_days: int) -> float:
     """Independent-observation count behind `n_windows` overlapping windows."""
@@ -192,7 +232,7 @@ class VolatilityService:
         returns: Union[pd.Series, np.ndarray],
         decay: float = 0.94,
         annualization_factor: float = np.sqrt(252.0),
-    ) -> float:
+    ) -> Optional[float]:
         """
         Calculate EWMA (RiskMetrics) annualized volatility.
 
@@ -207,9 +247,15 @@ class VolatilityService:
 
         Returns
         -------
-        float
-            Annualized EWMA volatility.  Empty input raises; a single
-            observation returns 0.0 because sample dispersion is undefined.
+        Optional[float]
+            Annualized EWMA volatility, or ``None`` when there is no
+            dispersion estimate to publish.  Empty input raises; a single
+            observation returns ``None`` because a one-observation sample has
+            no dispersion.  It previously returned ``0.0``, which is not a
+            missing measurement but the strongest possible claim - "this book
+            does not move" - and it was rankable against the realized-vol
+            distribution, where any non-negative p25 puts it in the CHEAP band.
+            A book with no measurable volatility is not cheap.
         """
         if isinstance(returns, pd.Series):
             r = returns.replace([np.inf, -np.inf], np.nan).dropna().values
@@ -223,11 +269,11 @@ class VolatilityService:
             # nothing (route/garch callers guard non-empty inputs).
             raise ValueError("Cannot compute EWMA volatility on empty returns")
         if n == 1:
-            # A single return contains no dispersion estimate.  Returning its
-            # absolute value conflates return level with volatility; use the
-            # explicit zero-assumption contract until a second observation is
-            # available.
-            return 0.0
+            # A single return contains no dispersion estimate. Returning its
+            # absolute value conflates return level with volatility, and
+            # returning 0.0 states as a measurement the one thing we cannot
+            # know. Withhold, and let the caller publish its own reason.
+            return None
 
         # Vectorized exponential weights: (1 - lambda) * lambda^(N-1-t)
         weights = (1.0 - decay) * (decay ** np.arange(n)[::-1])
@@ -261,7 +307,12 @@ class VolatilityService:
         Returns
         -------
         Dict[str, Any]
-            Dictionary with annualized volatility forecast and fitted model parameters.
+            Dictionary with annualized volatility forecast and fitted model
+            parameters. ``horizon`` is the number of days the returned number was
+            actually forecast for, and is ``None`` when the answer came from the
+            EWMA fallback: that fallback is a one-step spot estimate that ignores
+            ``horizon`` entirely, so publishing the requested horizon beside it
+            claimed coverage the number does not have.
         """
         if isinstance(returns, pd.Series):
             r = returns.replace([np.inf, -np.inf], np.nan).dropna().values
@@ -275,7 +326,7 @@ class VolatilityService:
             return {
                 "annualized_vol": ewma_vol,
                 "model": "EWMA",
-                "horizon": horizon,
+                "horizon": None,
                 "params": {"decay": 0.94, "fallback": True},
             }
 
@@ -312,7 +363,10 @@ class VolatilityService:
             return {
                 "annualized_vol": ewma_vol,
                 "model": "EWMA",
-                "horizon": horizon,
+                # Same reason as the too-few-returns fallback above: the EWMA
+                # number is a spot estimate, so the requested horizon does not
+                # describe it.
+                "horizon": None,
                 "params": {"decay": 0.94, "fallback": True, "error": str(e)},
             }
 
@@ -439,10 +493,20 @@ class VolatilityService:
         if forecast_model.upper() == "EWMA":
             ann_vol_forecast = cls.calculate_ewma_volatility(clean_returns)
             model_label = "EWMA"
+            # An EWMA spot estimate takes no horizon (see EWMA_HORIZON_NOTE).
+            forecast_horizon_days: Optional[int] = None
         else:
             garch_res = cls.forecast_garch_volatility(clean_returns, horizon=forecast_horizon)
             ann_vol_forecast = garch_res["annualized_vol"]
             model_label = garch_res["model"]
+            # `forecast_garch_volatility` answers "EWMA" itself when it cannot
+            # fit GARCH - too few returns, or a failed fit - and that answer is
+            # the same horizon-free spot estimate. The horizon is therefore a
+            # property of the LABEL that actually produced the number, not of
+            # the branch the caller asked for.
+            forecast_horizon_days = (
+                int(forecast_horizon) if model_label == "GARCH(1,1)" else None
+            )
 
         # Positioning valuation against 21-day benchmark window (or closest available window)
         target_w = 21 if 21 in realized_vols_by_window else windows[0]
@@ -460,7 +524,8 @@ class VolatilityService:
         )
         forecast_rank_basis["ranked_against_window_days"] = int(target_w)
         if (
-            len(benchmark_vol_series) >= 2
+            ann_vol_forecast is not None
+            and len(benchmark_vol_series) >= 2
             and forecast_rank_basis["percentile_rank_sufficient_data"]
         ):
             forecast_rank: float | None = float(
@@ -471,8 +536,23 @@ class VolatilityService:
         else:
             forecast_rank = None
 
-        if p25_bench is None or p75_bench is None:
-            # Benchmark window has no realized distribution — no honest valuation
+        if ann_vol_forecast is None:
+            # A withheld rank still ships with a reason, and here the count
+            # basis is not the whole story: there is no level to place on the
+            # distribution at all. Keep whatever `_percentile_rank_basis`
+            # measured - it is still true - as the trailing clause.
+            forecast_rank_basis["percentile_rank_withheld_reason"] = (
+                "withheld: annualized_vol is null, so there is no forecast level "
+                "to place on the observed overlapping-window distribution. "
+                + (forecast_rank_basis["percentile_rank_withheld_reason"] or "")
+            ).strip()
+
+        if ann_vol_forecast is None or p25_bench is None or p75_bench is None:
+            # Either the benchmark window has no realized distribution, or there
+            # is no forecast to judge against it. No honest valuation either
+            # way; the branches below would otherwise compare None with a
+            # quantile, or publish CHEAP for a book whose volatility could not
+            # be measured.
             valuation = "unknown"
         elif ann_vol_forecast <= p25_bench:
             valuation = "cheap"
@@ -483,12 +563,25 @@ class VolatilityService:
 
         forecast_overlay = {
             "model": model_label,
-            "annualized_vol": round(ann_vol_forecast, 4),
-            "horizon_days": int(forecast_horizon),
+            "annualized_vol": (
+                round(ann_vol_forecast, 4) if ann_vol_forecast is not None else None
+            ),
+            "horizon_days": forecast_horizon_days,
             "percentile_rank": round(forecast_rank, 1) if forecast_rank is not None else None,
             "valuation": valuation,
             **forecast_rank_basis,
         }
+        # These two are published ONLY where the value they explain is absent.
+        # They are not always-present keys on purpose: a GARCH(1,1) row's
+        # horizon is a measurement and needs no excuse, and its level is always
+        # measured. An always-present null would be indistinguishable from a
+        # key that was simply forgotten.
+        if forecast_horizon_days is None:
+            forecast_overlay["horizon_note"] = EWMA_HORIZON_NOTE
+        if ann_vol_forecast is None:
+            forecast_overlay["annualized_vol_withheld_reason"] = (
+                FORECAST_VOL_WITHHELD_REASON
+            )
 
         return {
             "symbol": symbol,
