@@ -1,0 +1,2184 @@
+{
+  "annualized": true,
+  "calculation_basis": {
+    "full_history": "hypothetical_current_weights",
+    "realized": "holding_truthed_current_composition"
+  },
+  "data_status": "available",
+  "estimate_uncertainty": {
+    "metrics": {
+      "autocorrelation": {
+        "ar1": -0.067387,
+        "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+        "ar1_decimals": 6,
+        "effective_n": 594.0018,
+        "effective_n_basis": "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to the sample mean. It is the count of independent observations that carries the same information about the mean as the measured n; below n whenever the returns are positively autocorrelated.",
+        "effective_n_decimals": 4,
+        "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+        "effective_n_reproducibility": {
+          "bound_basis": "effective_n is computed from the UNROUNDED ar1 and ar1 is published rounded, so substituting the published ar1 and the published n into the published formula does not return the published effective_n exactly. The difference is bounded by the half-ulp of effective_n's own last published place plus the ar1 rounding amplified through the formula's sensitivity d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound published here. That bound is a statement about the rounding, not an error: neither figure was moved to make the other agree, and a reader who recomputes from the published inputs will land inside the bound rather than on the last digit",
+          "recomputation_deviation": 5.6075349675666075e-05,
+          "recomputation_deviation_bound": 0.000646712167586858,
+          "recomputes_from_published_ar1": false
+        },
+        "naive_n_would_assume": "independent observations, which the measured AR(1) does not support",
+        "observations": 519,
+        "reason": null,
+        "status": "computed"
+      },
+      "band_provenance_tolerance_basis": "a BAND-PROVENANCE test, not a truth test. An interval is published only after the resampling estimator's own point value reproduces the published value to within this tolerance, which is what makes the band belong to the statistic the reader can see. It says nothing about whether either number is CORRECT: on its own the test cannot tell which of the two is wrong. A disagreement is adjudicated against an independent witness - see estimates.<field>.point_status, which states which side failed, and witness_status / witness_tolerance on this block.",
+      "block_size": 8,
+      "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) trading days",
+      "bootstrap_resamples": 1000,
+      "confidence_level": 0.95,
+      "dropped_non_finite_observations": 0,
+      "estimates": {
+        "cagr": {
+          "conf_int": [
+            -0.242084,
+            0.121983
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.072815,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.092566,
+          "status": "computed"
+        },
+        "calmar": {
+          "conf_int": [
+            -0.524687,
+            0.890784
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.349848,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.360567,
+          "status": "computed"
+        },
+        "kurtosis": {
+          "conf_int": null,
+          "conf_int_basis": null,
+          "conf_int_level": null,
+          "conf_int_method": null,
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.13697,
+          "point_status": "unverified",
+          "point_within_conf_int": null,
+          "point_within_conf_int_note": null,
+          "reason": "not computed: quantstats' skew and kurtosis are pandas bias-corrected shape statistics whose adjustment coefficients are not reimplemented here, so a resampling distribution over the SAME statistic cannot be produced. Re-deriving the correction by hand to satisfy an interval rule would trade a declared gap for a second, unverified implementation. The point estimate stands; its precision is declared absent rather than approximated.",
+          "standard_error": null,
+          "status": "not_computed"
+        },
+        "max_drawdown": {
+          "conf_int": [
+            -0.48298,
+            -0.128978
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.208134,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.091938,
+          "status": "computed"
+        },
+        "omega": {
+          "conf_int": [
+            0.780405,
+            1.134005
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": 0.942173,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.089863,
+          "status": "computed"
+        },
+        "sharpe": {
+          "conf_int": [
+            -1.703251,
+            0.666299
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.499711,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.604725,
+          "status": "computed"
+        },
+        "skew": {
+          "conf_int": null,
+          "conf_int_basis": null,
+          "conf_int_level": null,
+          "conf_int_method": null,
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": 0.066634,
+          "point_status": "unverified",
+          "point_within_conf_int": null,
+          "point_within_conf_int_note": null,
+          "reason": "not computed: quantstats' skew and kurtosis are pandas bias-corrected shape statistics whose adjustment coefficients are not reimplemented here, so a resampling distribution over the SAME statistic cannot be produced. Re-deriving the correction by hand to satisfy an interval rule would trade a declared gap for a second, unverified implementation. The point estimate stands; its precision is declared absent rather than approximated.",
+          "standard_error": null,
+          "status": "not_computed"
+        },
+        "sortino": {
+          "conf_int": [
+            -2.232814,
+            0.987812
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.693118,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.819424,
+          "status": "computed"
+        },
+        "tail_ratio": {
+          "conf_int": [
+            0.853659,
+            1.100693
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": 0.952347,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.071685,
+          "status": "computed"
+        },
+        "total_return": {
+          "conf_int": [
+            -0.434962,
+            0.2675
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": -0.144189,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.179143,
+          "status": "computed"
+        },
+        "volatility": {
+          "conf_int": [
+            0.154227,
+            0.174055
+          ],
+          "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+          "conf_int_level": 0.95,
+          "conf_int_method": "circular_moving_block_bootstrap_percentile",
+          "effective_n": 594.0018,
+          "observations": 519,
+          "point": 0.164032,
+          "point_status": "reproduced_by_estimator",
+          "point_within_conf_int": true,
+          "point_within_conf_int_note": null,
+          "reason": null,
+          "standard_error": 0.005019,
+          "status": "computed"
+        }
+      },
+      "estimator_withheld": null,
+      "estimator_withheld_basis": null,
+      "method": "circular_moving_block_bootstrap_percentile",
+      "method_basis": "Circular moving-block bootstrap (Politis & Romano 1994) of the measured return series, reported as a percentile interval at the stated level. Contiguous blocks are resampled rather than individual observations because daily equity returns are serially dependent: an iid bootstrap would destroy the dependence that makes the naive sqrt(n) interval too narrow. The standard error is the sample standard deviation (ddof=1) of the resampled statistic.",
+      "notes": {
+        "annualization_periods": 252,
+        "estimator": "quantstats_ratio_statistics: vectorised restatements of the quantstats functions this route already calls, verified to reproduce each published metric before the band is attached",
+        "risk_free_rate": 0.02,
+        "risk_free_rate_basis": "the annualized rf this route passes to quantstats; quantstats deannualises it COMPOUNDED as (1 + rf) ** (1/252) - 1 and the resampling statistics use the same deannualisation"
+      },
+      "observation_columns": 1,
+      "observation_filter": "complete_case_all_columns_finite",
+      "observation_filter_basis": "complete case: a row is measured only when every column is finite, which is the right reading for a statistic that is a function of the columns jointly. A pairwise statistic (a mean of pairwise Pearson correlations) is defined on a different population - the rows on which the PAIR is finite - and a caller with one passes row_filter so the band is measured on the sample its point value was measured on.",
+      "observations": 519,
+      "point_tolerance": 1e-05,
+      "reason": null,
+      "resample_seed": 20260925,
+      "resampling_basis": "For each draw, ceil(n / block_size) start offsets are drawn uniformly from 0..n-1 and concatenated circularly, then truncated to n. Indices wrap modulo n, so every observation enters every resample and none is dropped.",
+      "scope": "tear_sheet metrics: the holding-window portfolio return series every metric in this block was computed from",
+      "status": "computed",
+      "witness_status": "not_supplied",
+      "witness_status_basis": "an independent second derivation of the published point value, by a different code path over the sample the point was published from, used ONLY to decide which side of a failed reproduction test is wrong. It never produces an interval: the band still comes from the resampling estimator, and it is withheld whenever the estimator's own point value misses the published one. Not available: no independent witness was supplied for this block.",
+      "witness_tolerance": 1e-05
+    },
+    "relative_vs_nifty": {
+      "benchmark": {
+        "autocorrelation": {
+          "ar1": 0.041728,
+          "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+          "ar1_decimals": 6,
+          "effective_n": 478.341,
+          "effective_n_basis": "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to the sample mean. It is the count of independent observations that carries the same information about the mean as the measured n; below n whenever the returns are positively autocorrelated.",
+          "effective_n_decimals": 4,
+          "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+          "effective_n_reproducibility": {
+            "bound_basis": "effective_n is computed from the UNROUNDED ar1 and ar1 is published rounded, so substituting the published ar1 and the published n into the published formula does not return the published effective_n exactly. The difference is bounded by the half-ulp of effective_n's own last published place plus the ar1 rounding amplified through the formula's sensitivity d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound published here. That bound is a statement about the rounding, not an error: neither figure was moved to make the other agree, and a reader who recomputes from the published inputs will land inside the bound rather than on the last digit",
+            "recomputation_deviation": 0.00021766910367659875,
+            "recomputation_deviation_bound": 0.0005291760306053667,
+            "recomputes_from_published_ar1": false
+          },
+          "naive_n_would_assume": "independent observations, which the measured AR(1) does not support",
+          "observations": 520,
+          "reason": null,
+          "status": "computed"
+        },
+        "band_provenance_tolerance_basis": "a BAND-PROVENANCE test, not a truth test. An interval is published only after the resampling estimator's own point value reproduces the published value to within this tolerance, which is what makes the band belong to the statistic the reader can see. It says nothing about whether either number is CORRECT: on its own the test cannot tell which of the two is wrong. A disagreement is adjudicated against an independent witness - see estimates.<field>.point_status, which states which side failed, and witness_status / witness_tolerance on this block.",
+        "block_size": 8,
+        "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) trading days",
+        "bootstrap_resamples": 1000,
+        "confidence_level": 0.95,
+        "dropped_non_finite_observations": 0,
+        "estimates": {
+          "benchmark_max_drawdown": {
+            "conf_int": [
+              -0.370823,
+              -0.109436
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 520 measured observations (effective_n 478.341)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 478.341,
+            "observations": 520,
+            "point": -0.207332,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.069355,
+            "status": "computed"
+          },
+          "benchmark_sharpe": {
+            "conf_int": [
+              -0.747238,
+              2.150343
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 520 measured observations (effective_n 478.341)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 478.341,
+            "observations": 520,
+            "point": 0.728381,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.740926,
+            "status": "computed"
+          },
+          "benchmark_total_return": {
+            "conf_int": [
+              -0.235783,
+              1.223975
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 520 measured observations (effective_n 478.341)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 478.341,
+            "observations": 520,
+            "point": 0.319262,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.375293,
+            "status": "computed"
+          },
+          "benchmark_volatility": {
+            "conf_int": [
+              0.168328,
+              0.189313
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 520 measured observations (effective_n 478.341)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 478.341,
+            "observations": 520,
+            "point": 0.179236,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.005316,
+            "status": "computed"
+          }
+        },
+        "estimator_withheld": null,
+        "estimator_withheld_basis": null,
+        "method": "circular_moving_block_bootstrap_percentile",
+        "method_basis": "Circular moving-block bootstrap (Politis & Romano 1994) of the measured return series, reported as a percentile interval at the stated level. Contiguous blocks are resampled rather than individual observations because daily equity returns are serially dependent: an iid bootstrap would destroy the dependence that makes the naive sqrt(n) interval too narrow. The standard error is the sample standard deviation (ddof=1) of the resampled statistic.",
+        "notes": {
+          "annualization_periods": 252,
+          "estimator": "quantstats_ratio_statistics: vectorised restatements of the quantstats functions this route already calls, verified to reproduce each published metric before the band is attached",
+          "risk_free_rate": 0.02,
+          "risk_free_rate_basis": "the annualized rf this route passes to quantstats; quantstats deannualises it COMPOUNDED as (1 + rf) ** (1/252) - 1 and the resampling statistics use the same deannualisation"
+        },
+        "observation_columns": 1,
+        "observation_filter": "complete_case_all_columns_finite",
+        "observation_filter_basis": "complete case: a row is measured only when every column is finite, which is the right reading for a statistic that is a function of the columns jointly. A pairwise statistic (a mean of pairwise Pearson correlations) is defined on a different population - the rows on which the PAIR is finite - and a caller with one passes row_filter so the band is measured on the sample its point value was measured on.",
+        "observations": 520,
+        "point_tolerance": 1e-05,
+        "reason": null,
+        "resample_seed": 20260925,
+        "resampling_basis": "For each draw, ceil(n / block_size) start offsets are drawn uniformly from 0..n-1 and concatenated circularly, then truncated to n. Indices wrap modulo n, so every observation enters every resample and none is dropped.",
+        "scope": "tear_sheet relative_vs_nifty benchmark block: the NIFTY return series sliced back to the requested window",
+        "status": "computed",
+        "witness_status": "not_supplied",
+        "witness_status_basis": "an independent second derivation of the published point value, by a different code path over the sample the point was published from, used ONLY to decide which side of a failed reproduction test is wrong. It never produces an interval: the band still comes from the resampling estimator, and it is withheld whenever the estimator's own point value misses the published one. Not available: no independent witness was supplied for this block.",
+        "witness_tolerance": 1e-05
+      },
+      "market_model": {
+        "autocorrelation": {
+          "ar1": -0.067387,
+          "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+          "ar1_decimals": 6,
+          "effective_n": 594.0018,
+          "effective_n_basis": "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to the sample mean. It is the count of independent observations that carries the same information about the mean as the measured n; below n whenever the returns are positively autocorrelated.",
+          "effective_n_decimals": 4,
+          "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+          "effective_n_reproducibility": {
+            "bound_basis": "effective_n is computed from the UNROUNDED ar1 and ar1 is published rounded, so substituting the published ar1 and the published n into the published formula does not return the published effective_n exactly. The difference is bounded by the half-ulp of effective_n's own last published place plus the ar1 rounding amplified through the formula's sensitivity d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound published here. That bound is a statement about the rounding, not an error: neither figure was moved to make the other agree, and a reader who recomputes from the published inputs will land inside the bound rather than on the last digit",
+            "recomputation_deviation": 5.6075349675666075e-05,
+            "recomputation_deviation_bound": 0.000646712167586858,
+            "recomputes_from_published_ar1": false
+          },
+          "naive_n_would_assume": "independent observations, which the measured AR(1) does not support",
+          "observations": 519,
+          "reason": null,
+          "status": "computed"
+        },
+        "band_provenance_tolerance_basis": "a BAND-PROVENANCE test, not a truth test. An interval is published only after the resampling estimator's own point value reproduces the published value to within this tolerance, which is what makes the band belong to the statistic the reader can see. It says nothing about whether either number is CORRECT: on its own the test cannot tell which of the two is wrong. A disagreement is adjudicated against an independent witness - see estimates.<field>.point_status, which states which side failed, and witness_status / witness_tolerance on this block.",
+        "block_size": 8,
+        "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) trading days",
+        "bootstrap_resamples": 1000,
+        "confidence_level": 0.95,
+        "dropped_non_finite_observations": 0,
+        "estimates": {
+          "alpha_annualized": {
+            "conf_int": [
+              -0.262676,
+              0.131419
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.0614,
+            "point_status": "verified_against_independent_witness",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.100438,
+            "status": "computed"
+          },
+          "beta_vs_nifty": {
+            "conf_int": [
+              -0.075975,
+              0.062717
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.0048,
+            "point_status": "verified_against_independent_witness",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.035685,
+            "status": "computed"
+          }
+        },
+        "estimator_withheld": null,
+        "estimator_withheld_basis": null,
+        "method": "circular_moving_block_bootstrap_percentile",
+        "method_basis": "Circular moving-block bootstrap (Politis & Romano 1994) of the measured return series, reported as a percentile interval at the stated level. Contiguous blocks are resampled rather than individual observations because daily equity returns are serially dependent: an iid bootstrap would destroy the dependence that makes the naive sqrt(n) interval too narrow. The standard error is the sample standard deviation (ddof=1) of the resampled statistic.",
+        "notes": {
+          "alignment_basis": "the two columns are paired on their shared DATE index and are never truncated to a common length, so a row of the frame is one session for both legs",
+          "annualization_periods": 252,
+          "estimator": "market_model_statistics: the tear sheet's own closed form, beta = cov(p, b) / var(b) and alpha = (p.mean() - beta * b.mean()) * 252, both on ddof=1, with the portfolio and the benchmark resampled as aligned pairs",
+          "resampling_basis": "the portfolio and benchmark are resampled on the SAME index draw, so the joint distribution the covariance is estimated from is preserved inside every block",
+          "witness": "market_model_witness: np.linalg.lstsq on the [1, b] design matrix, which shares no arithmetic with the estimator's closed form, evaluated on the same date-aligned frame. When the estimator's own point value misses the published one, this block names which side failed instead of asserting the published point is wrong; see estimates.<field>.point_status"
+        },
+        "observation_columns": 2,
+        "observation_filter": "complete_case_all_columns_finite",
+        "observation_filter_basis": "complete case: a row is measured only when every column is finite, which is the right reading for a statistic that is a function of the columns jointly. A pairwise statistic (a mean of pairwise Pearson correlations) is defined on a different population - the rows on which the PAIR is finite - and a caller with one passes row_filter so the band is measured on the sample its point value was measured on.",
+        "observations": 519,
+        "point_tolerance": 0.0001,
+        "reason": null,
+        "resample_seed": 20260925,
+        "resampling_basis": "For each draw, ceil(n / block_size) start offsets are drawn uniformly from 0..n-1 and concatenated circularly, then truncated to n. Indices wrap modulo n, so every observation enters every resample and none is dropped.",
+        "scope": "tear_sheet relative_vs_nifty: beta and alpha over the holding-window portfolio/benchmark overlap",
+        "status": "computed",
+        "witness_status": "witness_ran",
+        "witness_status_basis": "an independent second derivation of the published point value, by a different code path over the sample the point was published from, used ONLY to decide which side of a failed reproduction test is wrong. It never produces an interval: the band still comes from the resampling estimator, and it is withheld whenever the estimator's own point value misses the published one. The witness was evaluated over 519 finite observation(s) and 2 column(s) - the sample the PUBLISHED value was measured on, which is not necessarily the frame the resampling estimator was handed (519 observation(s), 2 column(s), published above as observation_columns). A witness run over a mis-aligned frame would agree with a mis-aligned ESTIMATOR rather than with the published value and would withhold a correct point, which is why the two frame sizes are published side by side. Caller's basis: np.linalg.lstsq on the [1, b] design matrix, evaluated on the same date-aligned frame the resampling estimator was handed, which is the frame beta_vs_nifty and alpha_annualized were published from.",
+        "witness_tolerance": 0.0001
+      }
+    }
+  },
+  "full_history": {
+    "annualization_tested_frame_observations": 519,
+    "annualization_tested_minimum_ticker_return_observations": 519,
+    "annualized": true,
+    "annualized_population": "the wide per-ticker return frame: True when the frame itself has at least 30 rows AND every ticker's own return observation count reaches that minimum. It is NOT a statement about the `metrics` block beside it, which is measured on a different and usually far shorter series -- read metrics_observation_count for that population.",
+    "basis": "full_exchange_history_current_weights",
+    "estimate_uncertainty": {
+      "metrics": {
+        "autocorrelation": {
+          "ar1": -0.067387,
+          "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+          "ar1_decimals": 6,
+          "effective_n": 594.0018,
+          "effective_n_basis": "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to the sample mean. It is the count of independent observations that carries the same information about the mean as the measured n; below n whenever the returns are positively autocorrelated.",
+          "effective_n_decimals": 4,
+          "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+          "effective_n_reproducibility": {
+            "bound_basis": "effective_n is computed from the UNROUNDED ar1 and ar1 is published rounded, so substituting the published ar1 and the published n into the published formula does not return the published effective_n exactly. The difference is bounded by the half-ulp of effective_n's own last published place plus the ar1 rounding amplified through the formula's sensitivity d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound published here. That bound is a statement about the rounding, not an error: neither figure was moved to make the other agree, and a reader who recomputes from the published inputs will land inside the bound rather than on the last digit",
+            "recomputation_deviation": 5.6075349675666075e-05,
+            "recomputation_deviation_bound": 0.000646712167586858,
+            "recomputes_from_published_ar1": false
+          },
+          "naive_n_would_assume": "independent observations, which the measured AR(1) does not support",
+          "observations": 519,
+          "reason": null,
+          "status": "computed"
+        },
+        "band_provenance_tolerance_basis": "a BAND-PROVENANCE test, not a truth test. An interval is published only after the resampling estimator's own point value reproduces the published value to within this tolerance, which is what makes the band belong to the statistic the reader can see. It says nothing about whether either number is CORRECT: on its own the test cannot tell which of the two is wrong. A disagreement is adjudicated against an independent witness - see estimates.<field>.point_status, which states which side failed, and witness_status / witness_tolerance on this block.",
+        "block_size": 8,
+        "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) trading days",
+        "bootstrap_resamples": 1000,
+        "confidence_level": 0.95,
+        "dropped_non_finite_observations": 0,
+        "estimates": {
+          "cagr": {
+            "conf_int": [
+              -0.242084,
+              0.121983
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.072815,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.092566,
+            "status": "computed"
+          },
+          "calmar": {
+            "conf_int": [
+              -0.524687,
+              0.890784
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.349848,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.360567,
+            "status": "computed"
+          },
+          "max_drawdown": {
+            "conf_int": [
+              -0.48298,
+              -0.128978
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.208134,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.091938,
+            "status": "computed"
+          },
+          "sharpe": {
+            "conf_int": [
+              -1.703251,
+              0.666299
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.499711,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.604725,
+            "status": "computed"
+          },
+          "sortino": {
+            "conf_int": [
+              -2.232814,
+              0.987812
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.693118,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.819424,
+            "status": "computed"
+          },
+          "total_return": {
+            "conf_int": [
+              -0.434962,
+              0.2675
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.144189,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.179143,
+            "status": "computed"
+          },
+          "volatility": {
+            "conf_int": [
+              0.154227,
+              0.174055
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": 0.164032,
+            "point_status": "reproduced_by_estimator",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.005019,
+            "status": "computed"
+          }
+        },
+        "estimator_withheld": null,
+        "estimator_withheld_basis": null,
+        "method": "circular_moving_block_bootstrap_percentile",
+        "method_basis": "Circular moving-block bootstrap (Politis & Romano 1994) of the measured return series, reported as a percentile interval at the stated level. Contiguous blocks are resampled rather than individual observations because daily equity returns are serially dependent: an iid bootstrap would destroy the dependence that makes the naive sqrt(n) interval too narrow. The standard error is the sample standard deviation (ddof=1) of the resampled statistic.",
+        "notes": {
+          "annualization_periods": 252,
+          "estimator": "quantstats_ratio_statistics: vectorised restatements of the quantstats functions this route already calls, verified to reproduce each published metric before the band is attached",
+          "risk_free_rate": 0.02,
+          "risk_free_rate_basis": "the annualized rf this route passes to quantstats; quantstats deannualises it COMPOUNDED as (1 + rf) ** (1/252) - 1 and the resampling statistics use the same deannualisation"
+        },
+        "observation_columns": 1,
+        "observation_filter": "complete_case_all_columns_finite",
+        "observation_filter_basis": "complete case: a row is measured only when every column is finite, which is the right reading for a statistic that is a function of the columns jointly. A pairwise statistic (a mean of pairwise Pearson correlations) is defined on a different population - the rows on which the PAIR is finite - and a caller with one passes row_filter so the band is measured on the sample its point value was measured on.",
+        "observations": 519,
+        "point_tolerance": 1e-05,
+        "reason": null,
+        "resample_seed": 20260925,
+        "resampling_basis": "For each draw, ceil(n / block_size) start offsets are drawn uniformly from 0..n-1 and concatenated circularly, then truncated to n. Indices wrap modulo n, so every observation enters every resample and none is dropped.",
+        "scope": "tear_sheet full_history metrics: the hypothetical-current-weights portfolio return series over the full cache depth, which is a DIFFERENT sample from the holding-window block",
+        "status": "computed",
+        "witness_status": "not_supplied",
+        "witness_status_basis": "an independent second derivation of the published point value, by a different code path over the sample the point was published from, used ONLY to decide which side of a failed reproduction test is wrong. It never produces an interval: the band still comes from the resampling estimator, and it is withheld whenever the estimator's own point value misses the published one. Not available: no independent witness was supplied for this block.",
+        "witness_tolerance": 1e-05
+      },
+      "relative_vs_nifty": {
+        "autocorrelation": {
+          "ar1": -0.067387,
+          "ar1_basis": "OLS slope of r_t on r_(t-1) over the measured window",
+          "ar1_decimals": 6,
+          "effective_n": 594.0018,
+          "effective_n_basis": "Quenouille/Bartlett AR(1) variance-inflation adjustment applied to the sample mean. It is the count of independent observations that carries the same information about the mean as the measured n; below n whenever the returns are positively autocorrelated.",
+          "effective_n_decimals": 4,
+          "effective_n_formula": "n * (1 - ar1) / (1 + ar1)",
+          "effective_n_reproducibility": {
+            "bound_basis": "effective_n is computed from the UNROUNDED ar1 and ar1 is published rounded, so substituting the published ar1 and the published n into the published formula does not return the published effective_n exactly. The difference is bounded by the half-ulp of effective_n's own last published place plus the ar1 rounding amplified through the formula's sensitivity d/dar1 = -2n / (1 + ar1)^2, which is the recomputation_deviation_bound published here. That bound is a statement about the rounding, not an error: neither figure was moved to make the other agree, and a reader who recomputes from the published inputs will land inside the bound rather than on the last digit",
+            "recomputation_deviation": 5.6075349675666075e-05,
+            "recomputation_deviation_bound": 0.000646712167586858,
+            "recomputes_from_published_ar1": false
+          },
+          "naive_n_would_assume": "independent observations, which the measured AR(1) does not support",
+          "observations": 519,
+          "reason": null,
+          "status": "computed"
+        },
+        "band_provenance_tolerance_basis": "a BAND-PROVENANCE test, not a truth test. An interval is published only after the resampling estimator's own point value reproduces the published value to within this tolerance, which is what makes the band belong to the statistic the reader can see. It says nothing about whether either number is CORRECT: on its own the test cannot tell which of the two is wrong. A disagreement is adjudicated against an independent witness - see estimates.<field>.point_status, which states which side failed, and witness_status / witness_tolerance on this block.",
+        "block_size": 8,
+        "block_size_basis": "Politis & White (2004) rule of thumb n ** (1/3) trading days",
+        "bootstrap_resamples": 1000,
+        "confidence_level": 0.95,
+        "dropped_non_finite_observations": 0,
+        "estimates": {
+          "alpha_annualized": {
+            "conf_int": [
+              -0.262676,
+              0.131419
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.0614,
+            "point_status": "verified_against_independent_witness",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.100438,
+            "status": "computed"
+          },
+          "beta_vs_nifty": {
+            "conf_int": [
+              -0.075975,
+              0.062717
+            ],
+            "conf_int_basis": "percentile interval at level 0.95 over 1000 circular moving-block resamples of block length 8, drawn from the 519 measured observations (effective_n 594.0018)",
+            "conf_int_level": 0.95,
+            "conf_int_method": "circular_moving_block_bootstrap_percentile",
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": -0.0048,
+            "point_status": "verified_against_independent_witness",
+            "point_within_conf_int": true,
+            "point_within_conf_int_note": null,
+            "reason": null,
+            "standard_error": 0.035685,
+            "status": "computed"
+          },
+          "measurement_windows": {
+            "conf_int": null,
+            "conf_int_basis": null,
+            "conf_int_level": null,
+            "conf_int_method": null,
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": null,
+            "point_status": "unverified",
+            "point_within_conf_int": null,
+            "point_within_conf_int_note": null,
+            "reason": "the point estimate itself is withheld (below the annualization gate, or unmeasurable on this window), so there is no number to put an interval around",
+            "standard_error": null,
+            "status": "not_computed"
+          },
+          "overlap_days": {
+            "conf_int": null,
+            "conf_int_basis": null,
+            "conf_int_level": null,
+            "conf_int_method": null,
+            "effective_n": 594.0018,
+            "observations": 519,
+            "point": 519.0,
+            "point_status": "unverified",
+            "point_within_conf_int": null,
+            "point_within_conf_int_note": null,
+            "reason": "no resampling estimator is registered for overlap_days (looked for 'overlap_days' among ['alpha_annualized', 'beta']), so no interval can belong to it",
+            "standard_error": null,
+            "status": "not_computed"
+          }
+        },
+        "estimator_withheld": null,
+        "estimator_withheld_basis": null,
+        "method": "circular_moving_block_bootstrap_percentile",
+        "method_basis": "Circular moving-block bootstrap (Politis & Romano 1994) of the measured return series, reported as a percentile interval at the stated level. Contiguous blocks are resampled rather than individual observations because daily equity returns are serially dependent: an iid bootstrap would destroy the dependence that makes the naive sqrt(n) interval too narrow. The standard error is the sample standard deviation (ddof=1) of the resampled statistic.",
+        "notes": {
+          "alignment_basis": "the two columns are paired on their shared DATE index and are never truncated to a common length, so a row of the frame is one session for both legs",
+          "annualization_periods": 252,
+          "estimator": "market_model_statistics: the tear sheet's own closed form, beta = cov(p, b) / var(b) and alpha = (p.mean() - beta * b.mean()) * 252, both on ddof=1, with the portfolio and the benchmark resampled as aligned pairs",
+          "resampling_basis": "the portfolio and benchmark are resampled on the SAME index draw, so the joint distribution the covariance is estimated from is preserved inside every block",
+          "witness": "market_model_witness: np.linalg.lstsq on the [1, b] design matrix, which shares no arithmetic with the estimator's closed form, evaluated on the same date-aligned frame. When the estimator's own point value misses the published one, this block names which side failed instead of asserting the published point is wrong; see estimates.<field>.point_status"
+        },
+        "observation_columns": 2,
+        "observation_filter": "complete_case_all_columns_finite",
+        "observation_filter_basis": "complete case: a row is measured only when every column is finite, which is the right reading for a statistic that is a function of the columns jointly. A pairwise statistic (a mean of pairwise Pearson correlations) is defined on a different population - the rows on which the PAIR is finite - and a caller with one passes row_filter so the band is measured on the sample its point value was measured on.",
+        "observations": 519,
+        "point_tolerance": 0.0001,
+        "reason": null,
+        "resample_seed": 20260925,
+        "resampling_basis": "For each draw, ceil(n / block_size) start offsets are drawn uniformly from 0..n-1 and concatenated circularly, then truncated to n. Indices wrap modulo n, so every observation enters every resample and none is dropped.",
+        "scope": "tear_sheet full_history relative_vs_nifty: beta and alpha over the full-depth portfolio/benchmark overlap",
+        "status": "computed",
+        "witness_status": "witness_ran",
+        "witness_status_basis": "an independent second derivation of the published point value, by a different code path over the sample the point was published from, used ONLY to decide which side of a failed reproduction test is wrong. It never produces an interval: the band still comes from the resampling estimator, and it is withheld whenever the estimator's own point value misses the published one. The witness was evaluated over 519 finite observation(s) and 2 column(s) - the sample the PUBLISHED value was measured on, which is not necessarily the frame the resampling estimator was handed (519 observation(s), 2 column(s), published above as observation_columns). A witness run over a mis-aligned frame would agree with a mis-aligned ESTIMATOR rather than with the published value and would withhold a correct point, which is why the two frame sizes are published side by side. Caller's basis: np.linalg.lstsq on the [1, b] design matrix, evaluated on the same date-aligned frame the resampling estimator was handed, which is the frame beta_vs_nifty and alpha_annualized were published from.",
+        "witness_tolerance": 0.0001
+      }
+    },
+    "first_observation": "2024-01-03",
+    "holding_context_note": "Holding context is ancillary: it never shortens, lengthens or annualizes this model window.",
+    "last_observation": "2025-12-29",
+    "latest_observation_date": "2025-12-29",
+    "measurable_return_rows": 519,
+    "measurement_frame_note": "`window`/`observation_count` describe the wide per-ticker return frame. `metrics_observation_count`/`metrics_window` describe the shorter portfolio return series the `metrics` block was measured on. The difference between the two counts is `partial_coverage_days`: dates on which the surviving positive-weight constituents did not cover 100% of gross weight, which were refused rather than renormalised into a partial-basket portfolio return.",
+    "metrics": {
+      "annualized": true,
+      "cagr": -0.072815,
+      "calmar": -0.349848,
+      "days": 519,
+      "max_drawdown": -0.208134,
+      "sharpe": -0.499711,
+      "sortino": -0.693118,
+      "total_return": -0.144189,
+      "volatility": 0.164032
+    },
+    "metrics_meet_minimum_observations": true,
+    "metrics_observation_count": 519,
+    "metrics_observation_count_basis": "the portfolio return series this block's `metrics` were measured on, which is a DIFFERENT and usually far shorter population than observation_count above: that counts every date ANY leg was measurable on, this counts the dates the whole positive-weight book cleared coverage on. CAGR, Sharpe, Sortino, Calmar and volatility are annualised on THIS count, so (1 + total_return) ** (252 / metrics_observation_count) - 1 reproduces `metrics.cagr` and the same expression on observation_count does not.",
+    "metrics_window": {
+      "days": 519,
+      "end": "2025-12-29",
+      "start": "2024-01-03"
+    },
+    "minimum_observations_required": 30,
+    "model_used_tickers": [
+      "ALPHA.NS",
+      "BETA.NS"
+    ],
+    "observation_count": 519,
+    "partial_coverage_days": 0,
+    "partial_coverage_days_reason": "dates where the surviving positive-weight constituents did not cover 100% of gross weight were refused rather than renormalised into a partial-basket portfolio return",
+    "per_ticker_return_observations": {
+      "ALPHA.NS": 519,
+      "BETA.NS": 519
+    },
+    "relative_vs_nifty": {
+      "alpha_annualized": -0.0614,
+      "beta_vs_nifty": -0.0048,
+      "measurement_windows": {
+        "comparison_note": "This block is not on a single window. Compare a field only with a field whose `window_ref` matches: `metrics` and this block's holding-window sample are like for like, and nothing else here is. In particular a `metrics` ratio and a `benchmark_*` value are measured over different periods and their difference is not a skill gap.",
+        "distinct_windows": 2,
+        "fields": {
+          "alpha_annualized": {
+            "observations": 519,
+            "observations_short_of_metrics_window": null,
+            "shares_metrics_window": true,
+            "window_ref": "portfolio_benchmark_overlap"
+          },
+          "beta_vs_nifty": {
+            "observations": 519,
+            "observations_short_of_metrics_window": null,
+            "shares_metrics_window": true,
+            "window_ref": "portfolio_benchmark_overlap"
+          }
+        },
+        "fields_not_on_the_metrics_window": [],
+        "fields_sharing_the_metrics_window": [
+          "alpha_annualized",
+          "beta_vs_nifty"
+        ],
+        "reason": null,
+        "status": "computed",
+        "windows": {
+          "holding_window_metrics": {
+            "basis": "full_exchange_history_current_weights",
+            "description": "the hypothetical-current-weights portfolio return series over the full cache depth, which is the same sample the full_history metrics block was measured from",
+            "observation_count": 519,
+            "observations": 519,
+            "published_also_at": "tear_sheet.full_history.metrics.days",
+            "same_sample_as": "tear_sheet.full_history.metrics",
+            "window": {
+              "days": 519,
+              "end": "2025-12-29",
+              "start": "2024-01-03"
+            }
+          },
+          "portfolio_benchmark_overlap": {
+            "basis": "portfolio_benchmark_overlap",
+            "below_minimum_observations_required": false,
+            "description": "the portfolio returns and the benchmark returns on their COMMON dates only; beta and alpha are a joint covariance fit, so each side contributes only on dates both were observed",
+            "gate_effect": "reported: the overlap clears the annualization policy minimum",
+            "minimum_observations_required": 30,
+            "observation_count": 519,
+            "observations": 519,
+            "relation_to_metrics_window_basis": "every holding-window portfolio return observation also has a benchmark return, so a field fitted here uses exactly the rows the metrics block was measured from",
+            "shares_metrics_sample": true,
+            "window": {
+              "days": 519,
+              "end": "2025-12-29",
+              "start": "2024-01-03"
+            }
+          }
+        },
+        "windows_fields_rest_on": 1
+      },
+      "overlap_days": 519
+    },
+    "requested_window": {
+      "end": "2026-01-02",
+      "start": "2024-01-02"
+    },
+    "scope": "full_exchange_history",
+    "start": "2024-01-03",
+    "tickers": {
+      "ALPHA.NS": {
+        "coverage_reason": null,
+        "limited_history": false,
+        "return_observations": 519,
+        "usable_observations": 519
+      },
+      "BETA.NS": {
+        "coverage_reason": null,
+        "limited_history": false,
+        "return_observations": 519,
+        "usable_observations": 519
+      }
+    },
+    "truncated_to_holding_window": false,
+    "universe_coverage": {
+      "available_count": 2,
+      "available_tickers": [
+        "ALPHA.NS",
+        "BETA.NS"
+      ],
+      "complete": true,
+      "coverage_ratio": 1.0,
+      "covered_tickers": [
+        "ALPHA.NS",
+        "BETA.NS"
+      ],
+      "missing_tickers": [],
+      "requested_count": 2,
+      "requested_tickers": [
+        "ALPHA.NS",
+        "BETA.NS"
+      ],
+      "status": "complete"
+    },
+    "window": {
+      "days": 519,
+      "end": "2025-12-29",
+      "start": "2024-01-03"
+    }
+  },
+  "history_coverage": {
+    "annualized": true,
+    "covered_days": 519,
+    "covered_days_scope": "holding_window_aligned_return_rows",
+    "effective_start": "2024-01-02",
+    "effective_start_source": "stored_added_on",
+    "inferred_start_tickers": [],
+    "intersection_start": "2024-01-02",
+    "intersection_start_source": "stored_added_on",
+    "model_used_tickers": [
+      "ALPHA.NS",
+      "BETA.NS"
+    ],
+    "oldest_holding": "2024-01-02",
+    "per_ticker_count_units": {
+      "counts_identity": "raw_days - masked_days = the price rows the holding window removed. return_observations is measured in RETURN rows, not price rows, so it is NOT raw_days - masked_days: a return needs two held prices, and the bar on the start date is the first held price and produces none. A gapless leg therefore has return_observations == raw_days - 1, while the block's covered_days counts the PORTFOLIO series inside the same window. No per-ticker holding-window return count is published here: these sections publish the held price rows instead.",
+      "masked_days": "delivered_price_rows_after_the_holding_window_mask",
+      "raw_days": "delivered_price_rows_before_the_holding_window_mask",
+      "return_observations": "aligned_return_rows_produced_by_those_price_rows"
+    },
+    "provenance_evidence_window": {
+      "days": 252,
+      "end": "2026-01-02",
+      "source": "canonical_window_price_frames",
+      "start": "2025-04-25"
+    },
+    "provenance_rule": "One window start per position for every section: the stored import date, or an earlier close within tolerance of the buy price found inside the canonical evidence window (252 calendar days ending at the section's requested end). A start that differs from the stored import date is always published as buy_price_inferred beside that stored date, and the evidence window used is published with it.",
+    "requested_end": "2026-01-02",
+    "requested_start": "2024-01-02",
+    "tickers": {
+      "ALPHA.NS": {
+        "analytics_start": "2024-01-02",
+        "analytics_start_source": "stored_added_on",
+        "buy_price_inferred": null,
+        "coverage_reason": null,
+        "effective_start": "2024-01-02",
+        "limited_history": false,
+        "masked_days": 520,
+        "raw_days": 520,
+        "return_observations": 519,
+        "stored_added_on": "2024-01-02"
+      },
+      "BETA.NS": {
+        "analytics_start": "2024-01-02",
+        "analytics_start_source": "stored_added_on",
+        "buy_price_inferred": null,
+        "coverage_reason": null,
+        "effective_start": "2024-01-02",
+        "limited_history": false,
+        "masked_days": 520,
+        "raw_days": 520,
+        "return_observations": 519,
+        "stored_added_on": "2024-01-02"
+      }
+    },
+    "truncated": false
+  },
+  "holdings": {
+    "ALPHA.NS": 0.5,
+    "BETA.NS": 0.5
+  },
+  "latest_observation_date": "2025-12-29",
+  "measured_window": {
+    "covered_days_scope": "holding_window_whole_book_complete_return_rows",
+    "days": 519,
+    "end": "2025-12-29",
+    "holding_window_start": "2024-01-02",
+    "holding_window_to_measured_start_gap_days": 1,
+    "measured_start_basis": "first date on which every held position had a measurable return; earlier holding-window sessions had at least one leg without a price and were refused rather than renormalised into a partial-basket portfolio return",
+    "observation_count": 519,
+    "start": "2024-01-03",
+    "truncated_to_holding_window": false
+  },
+  "methodology": "quantstats metric suite over cached OHLCV adj-close returns",
+  "metrics": {
+    "annualized": true,
+    "cagr": -0.072815,
+    "calmar": -0.349848,
+    "kurtosis": -0.13697,
+    "max_drawdown": -0.208134,
+    "omega": 0.942173,
+    "sharpe": -0.499711,
+    "skew": 0.066634,
+    "sortino": -0.693118,
+    "tail_ratio": 0.952347,
+    "total_return": -0.144189,
+    "volatility": 0.164032
+  },
+  "monthly_returns": {
+    "2024": {
+      "1": -0.027371,
+      "10": -0.041552,
+      "11": -0.021202,
+      "12": -0.069057,
+      "2": -0.03362,
+      "3": 0.079868,
+      "4": -0.038588,
+      "5": 0.002524,
+      "6": -0.03408,
+      "7": 0.038011,
+      "8": -0.032656,
+      "9": 0.081948
+    },
+    "2025": {
+      "1": -0.050841,
+      "10": -0.041185,
+      "11": -0.061793,
+      "12": 0.036186,
+      "2": 0.057356,
+      "3": -0.024692,
+      "4": -0.002756,
+      "5": 0.051438,
+      "6": 0.008829,
+      "7": -0.018804,
+      "8": 0.011736,
+      "9": -0.003692
+    }
+  },
+  "observation_count": 519,
+  "relative_vs_nifty": {
+    "alpha_annualized": -0.0614,
+    "benchmark_max_drawdown": -0.207332,
+    "benchmark_sharpe": 0.728381,
+    "benchmark_total_return": 0.319262,
+    "benchmark_volatility": 0.179236,
+    "beta_vs_nifty": -0.0048,
+    "measurement_windows": {
+      "comparison_note": "This block is not on a single window. Compare a field only with a field whose `window_ref` matches: `metrics` and this block's holding-window sample are like for like, and nothing else here is. In particular a `metrics` ratio and a `benchmark_*` value are measured over different periods and their difference is not a skill gap.",
+      "distinct_windows": 3,
+      "fields": {
+        "alpha_annualized": {
+          "observations": 519,
+          "observations_short_of_metrics_window": null,
+          "shares_metrics_window": true,
+          "window_ref": "portfolio_benchmark_overlap"
+        },
+        "benchmark_max_drawdown": {
+          "observations": 520,
+          "observations_short_of_metrics_window": 1,
+          "shares_metrics_window": false,
+          "window_ref": "requested_window_benchmark"
+        },
+        "benchmark_sharpe": {
+          "observations": 520,
+          "observations_short_of_metrics_window": 1,
+          "shares_metrics_window": false,
+          "window_ref": "requested_window_benchmark"
+        },
+        "benchmark_total_return": {
+          "observations": 520,
+          "observations_short_of_metrics_window": 1,
+          "shares_metrics_window": false,
+          "window_ref": "requested_window_benchmark"
+        },
+        "benchmark_volatility": {
+          "observations": 520,
+          "observations_short_of_metrics_window": 1,
+          "shares_metrics_window": false,
+          "window_ref": "requested_window_benchmark"
+        },
+        "beta_vs_nifty": {
+          "observations": 519,
+          "observations_short_of_metrics_window": null,
+          "shares_metrics_window": true,
+          "window_ref": "portfolio_benchmark_overlap"
+        }
+      },
+      "fields_not_on_the_metrics_window": [
+        "benchmark_max_drawdown",
+        "benchmark_sharpe",
+        "benchmark_total_return",
+        "benchmark_volatility"
+      ],
+      "fields_sharing_the_metrics_window": [
+        "alpha_annualized",
+        "beta_vs_nifty"
+      ],
+      "reason": null,
+      "status": "computed",
+      "windows": {
+        "holding_window_metrics": {
+          "basis": "holding_window_whole_book_complete_return_rows",
+          "description": "the holding-window portfolio return series, measured on the whole-book complete return rows; this is the same sample the tear sheet's `metrics` block was measured from",
+          "observation_count": 519,
+          "observations": 519,
+          "published_also_at": "tear_sheet.measured_window.observation_count",
+          "same_sample_as": "tear_sheet.metrics",
+          "window": {
+            "days": 519,
+            "end": "2025-12-29",
+            "start": "2024-01-03"
+          }
+        },
+        "portfolio_benchmark_overlap": {
+          "basis": "portfolio_benchmark_overlap",
+          "below_minimum_observations_required": false,
+          "description": "the portfolio returns and the benchmark returns on their COMMON dates only; beta and alpha are a joint covariance fit, so each side contributes only on dates both were observed",
+          "gate_effect": "reported: the overlap clears the annualization policy minimum",
+          "minimum_observations_required": 30,
+          "observation_count": 519,
+          "observations": 519,
+          "relation_to_metrics_window_basis": "every holding-window portfolio return observation also has a benchmark return, so a field fitted here uses exactly the rows the metrics block was measured from",
+          "shares_metrics_sample": true,
+          "window": {
+            "days": 519,
+            "end": "2025-12-29",
+            "start": "2024-01-03"
+          }
+        },
+        "requested_window_benchmark": {
+          "basis": "requested_window_benchmark",
+          "description": "the benchmark's own daily return series, from the requested window start to the requested end, bounded by the benchmark history actually cached",
+          "observation_count": 520,
+          "observations": 520,
+          "reason_not_recomputed": "The index itself has no holding period, so its standalone statistics have no holding window to be aligned to. This sample is the requested window sliced back to the requested start and bounded by the benchmark history actually cached, which is generally LONGER than the holding window. Slicing it to the holding window instead would answer a different question - how the index performed on the days this book was held - and on a short holding window it would annualise a handful of sessions. The values are therefore published on the window they are correct on, not recomputed onto the window of the metrics block beside them.",
+          "relation_to_metrics_window_basis": "the index series is a different, usually much longer, sample than the metrics block; a value measured here must not be compared with a `metrics` ratio as though it covered the holding window",
+          "requested_window": {
+            "end": "2026-01-02",
+            "start": "2024-01-02"
+          },
+          "shares_metrics_sample": false,
+          "truncated_by_cached_benchmark_depth": false,
+          "window": {
+            "days": 520,
+            "end": "2025-12-29",
+            "start": "2024-01-02"
+          }
+        }
+      },
+      "windows_fields_rest_on": 2
+    },
+    "overlap_days": 519
+  },
+  "requested_window": {
+    "end": "2026-01-02",
+    "start": "2024-01-02"
+  },
+  "underwater": [
+    {
+      "date": "2025-01-14",
+      "drawdown": -0.14907
+    },
+    {
+      "date": "2025-01-15",
+      "drawdown": -0.155965
+    },
+    {
+      "date": "2025-01-16",
+      "drawdown": -0.152364
+    },
+    {
+      "date": "2025-01-17",
+      "drawdown": -0.145628
+    },
+    {
+      "date": "2025-01-20",
+      "drawdown": -0.141775
+    },
+    {
+      "date": "2025-01-21",
+      "drawdown": -0.140065
+    },
+    {
+      "date": "2025-01-22",
+      "drawdown": -0.146597
+    },
+    {
+      "date": "2025-01-23",
+      "drawdown": -0.163287
+    },
+    {
+      "date": "2025-01-24",
+      "drawdown": -0.161338
+    },
+    {
+      "date": "2025-01-27",
+      "drawdown": -0.162774
+    },
+    {
+      "date": "2025-01-28",
+      "drawdown": -0.167391
+    },
+    {
+      "date": "2025-01-29",
+      "drawdown": -0.170879
+    },
+    {
+      "date": "2025-01-30",
+      "drawdown": -0.173543
+    },
+    {
+      "date": "2025-01-31",
+      "drawdown": -0.182086
+    },
+    {
+      "date": "2025-02-03",
+      "drawdown": -0.173588
+    },
+    {
+      "date": "2025-02-04",
+      "drawdown": -0.171903
+    },
+    {
+      "date": "2025-02-05",
+      "drawdown": -0.171239
+    },
+    {
+      "date": "2025-02-06",
+      "drawdown": -0.172292
+    },
+    {
+      "date": "2025-02-07",
+      "drawdown": -0.180688
+    },
+    {
+      "date": "2025-02-10",
+      "drawdown": -0.180448
+    },
+    {
+      "date": "2025-02-11",
+      "drawdown": -0.185871
+    },
+    {
+      "date": "2025-02-12",
+      "drawdown": -0.174204
+    },
+    {
+      "date": "2025-02-13",
+      "drawdown": -0.167328
+    },
+    {
+      "date": "2025-02-14",
+      "drawdown": -0.1571
+    },
+    {
+      "date": "2025-02-17",
+      "drawdown": -0.146654
+    },
+    {
+      "date": "2025-02-18",
+      "drawdown": -0.134523
+    },
+    {
+      "date": "2025-02-19",
+      "drawdown": -0.130065
+    },
+    {
+      "date": "2025-02-20",
+      "drawdown": -0.135373
+    },
+    {
+      "date": "2025-02-21",
+      "drawdown": -0.133526
+    },
+    {
+      "date": "2025-02-24",
+      "drawdown": -0.145599
+    },
+    {
+      "date": "2025-02-25",
+      "drawdown": -0.135325
+    },
+    {
+      "date": "2025-02-26",
+      "drawdown": -0.134445
+    },
+    {
+      "date": "2025-02-27",
+      "drawdown": -0.134813
+    },
+    {
+      "date": "2025-02-28",
+      "drawdown": -0.135174
+    },
+    {
+      "date": "2025-03-03",
+      "drawdown": -0.138743
+    },
+    {
+      "date": "2025-03-04",
+      "drawdown": -0.137326
+    },
+    {
+      "date": "2025-03-05",
+      "drawdown": -0.13612
+    },
+    {
+      "date": "2025-03-06",
+      "drawdown": -0.140613
+    },
+    {
+      "date": "2025-03-07",
+      "drawdown": -0.142722
+    },
+    {
+      "date": "2025-03-10",
+      "drawdown": -0.147211
+    },
+    {
+      "date": "2025-03-11",
+      "drawdown": -0.153499
+    },
+    {
+      "date": "2025-03-12",
+      "drawdown": -0.142954
+    },
+    {
+      "date": "2025-03-13",
+      "drawdown": -0.13673
+    },
+    {
+      "date": "2025-03-14",
+      "drawdown": -0.139657
+    },
+    {
+      "date": "2025-03-17",
+      "drawdown": -0.136054
+    },
+    {
+      "date": "2025-03-18",
+      "drawdown": -0.144546
+    },
+    {
+      "date": "2025-03-19",
+      "drawdown": -0.157807
+    },
+    {
+      "date": "2025-03-20",
+      "drawdown": -0.152859
+    },
+    {
+      "date": "2025-03-21",
+      "drawdown": -0.169029
+    },
+    {
+      "date": "2025-03-24",
+      "drawdown": -0.166327
+    },
+    {
+      "date": "2025-03-25",
+      "drawdown": -0.176391
+    },
+    {
+      "date": "2025-03-26",
+      "drawdown": -0.165351
+    },
+    {
+      "date": "2025-03-27",
+      "drawdown": -0.148155
+    },
+    {
+      "date": "2025-03-28",
+      "drawdown": -0.153816
+    },
+    {
+      "date": "2025-03-31",
+      "drawdown": -0.156528
+    },
+    {
+      "date": "2025-04-01",
+      "drawdown": -0.171228
+    },
+    {
+      "date": "2025-04-02",
+      "drawdown": -0.165621
+    },
+    {
+      "date": "2025-04-03",
+      "drawdown": -0.169297
+    },
+    {
+      "date": "2025-04-04",
+      "drawdown": -0.157762
+    },
+    {
+      "date": "2025-04-07",
+      "drawdown": -0.159351
+    },
+    {
+      "date": "2025-04-08",
+      "drawdown": -0.158474
+    },
+    {
+      "date": "2025-04-09",
+      "drawdown": -0.161674
+    },
+    {
+      "date": "2025-04-10",
+      "drawdown": -0.184005
+    },
+    {
+      "date": "2025-04-11",
+      "drawdown": -0.185975
+    },
+    {
+      "date": "2025-04-14",
+      "drawdown": -0.193721
+    },
+    {
+      "date": "2025-04-15",
+      "drawdown": -0.195186
+    },
+    {
+      "date": "2025-04-16",
+      "drawdown": -0.185912
+    },
+    {
+      "date": "2025-04-17",
+      "drawdown": -0.194258
+    },
+    {
+      "date": "2025-04-18",
+      "drawdown": -0.184681
+    },
+    {
+      "date": "2025-04-21",
+      "drawdown": -0.175622
+    },
+    {
+      "date": "2025-04-22",
+      "drawdown": -0.177726
+    },
+    {
+      "date": "2025-04-23",
+      "drawdown": -0.180254
+    },
+    {
+      "date": "2025-04-24",
+      "drawdown": -0.166861
+    },
+    {
+      "date": "2025-04-25",
+      "drawdown": -0.166811
+    },
+    {
+      "date": "2025-04-28",
+      "drawdown": -0.158533
+    },
+    {
+      "date": "2025-04-29",
+      "drawdown": -0.169531
+    },
+    {
+      "date": "2025-04-30",
+      "drawdown": -0.158853
+    },
+    {
+      "date": "2025-05-01",
+      "drawdown": -0.146887
+    },
+    {
+      "date": "2025-05-02",
+      "drawdown": -0.13278
+    },
+    {
+      "date": "2025-05-05",
+      "drawdown": -0.144402
+    },
+    {
+      "date": "2025-05-06",
+      "drawdown": -0.155118
+    },
+    {
+      "date": "2025-05-07",
+      "drawdown": -0.159938
+    },
+    {
+      "date": "2025-05-08",
+      "drawdown": -0.152091
+    },
+    {
+      "date": "2025-05-09",
+      "drawdown": -0.151952
+    },
+    {
+      "date": "2025-05-12",
+      "drawdown": -0.145442
+    },
+    {
+      "date": "2025-05-13",
+      "drawdown": -0.141163
+    },
+    {
+      "date": "2025-05-14",
+      "drawdown": -0.136069
+    },
+    {
+      "date": "2025-05-15",
+      "drawdown": -0.134705
+    },
+    {
+      "date": "2025-05-16",
+      "drawdown": -0.13642
+    },
+    {
+      "date": "2025-05-19",
+      "drawdown": -0.133275
+    },
+    {
+      "date": "2025-05-20",
+      "drawdown": -0.129055
+    },
+    {
+      "date": "2025-05-21",
+      "drawdown": -0.104732
+    },
+    {
+      "date": "2025-05-22",
+      "drawdown": -0.101451
+    },
+    {
+      "date": "2025-05-23",
+      "drawdown": -0.09998
+    },
+    {
+      "date": "2025-05-26",
+      "drawdown": -0.112928
+    },
+    {
+      "date": "2025-05-27",
+      "drawdown": -0.102221
+    },
+    {
+      "date": "2025-05-28",
+      "drawdown": -0.108855
+    },
+    {
+      "date": "2025-05-29",
+      "drawdown": -0.113446
+    },
+    {
+      "date": "2025-05-30",
+      "drawdown": -0.115586
+    },
+    {
+      "date": "2025-06-02",
+      "drawdown": -0.12047
+    },
+    {
+      "date": "2025-06-03",
+      "drawdown": -0.119355
+    },
+    {
+      "date": "2025-06-04",
+      "drawdown": -0.125361
+    },
+    {
+      "date": "2025-06-05",
+      "drawdown": -0.117626
+    },
+    {
+      "date": "2025-06-06",
+      "drawdown": -0.133473
+    },
+    {
+      "date": "2025-06-09",
+      "drawdown": -0.130072
+    },
+    {
+      "date": "2025-06-10",
+      "drawdown": -0.125631
+    },
+    {
+      "date": "2025-06-11",
+      "drawdown": -0.130113
+    },
+    {
+      "date": "2025-06-12",
+      "drawdown": -0.136262
+    },
+    {
+      "date": "2025-06-13",
+      "drawdown": -0.13715
+    },
+    {
+      "date": "2025-06-16",
+      "drawdown": -0.140564
+    },
+    {
+      "date": "2025-06-17",
+      "drawdown": -0.145965
+    },
+    {
+      "date": "2025-06-18",
+      "drawdown": -0.154983
+    },
+    {
+      "date": "2025-06-19",
+      "drawdown": -0.145857
+    },
+    {
+      "date": "2025-06-20",
+      "drawdown": -0.137061
+    },
+    {
+      "date": "2025-06-23",
+      "drawdown": -0.139324
+    },
+    {
+      "date": "2025-06-24",
+      "drawdown": -0.133825
+    },
+    {
+      "date": "2025-06-25",
+      "drawdown": -0.129159
+    },
+    {
+      "date": "2025-06-26",
+      "drawdown": -0.124193
+    },
+    {
+      "date": "2025-06-27",
+      "drawdown": -0.117576
+    },
+    {
+      "date": "2025-06-30",
+      "drawdown": -0.107777
+    },
+    {
+      "date": "2025-07-01",
+      "drawdown": -0.116739
+    },
+    {
+      "date": "2025-07-02",
+      "drawdown": -0.118537
+    },
+    {
+      "date": "2025-07-03",
+      "drawdown": -0.129699
+    },
+    {
+      "date": "2025-07-04",
+      "drawdown": -0.145779
+    },
+    {
+      "date": "2025-07-07",
+      "drawdown": -0.141327
+    },
+    {
+      "date": "2025-07-08",
+      "drawdown": -0.149778
+    },
+    {
+      "date": "2025-07-09",
+      "drawdown": -0.133967
+    },
+    {
+      "date": "2025-07-10",
+      "drawdown": -0.124342
+    },
+    {
+      "date": "2025-07-11",
+      "drawdown": -0.14186
+    },
+    {
+      "date": "2025-07-14",
+      "drawdown": -0.15042
+    },
+    {
+      "date": "2025-07-15",
+      "drawdown": -0.137772
+    },
+    {
+      "date": "2025-07-16",
+      "drawdown": -0.137965
+    },
+    {
+      "date": "2025-07-17",
+      "drawdown": -0.135539
+    },
+    {
+      "date": "2025-07-18",
+      "drawdown": -0.124664
+    },
+    {
+      "date": "2025-07-21",
+      "drawdown": -0.115694
+    },
+    {
+      "date": "2025-07-22",
+      "drawdown": -0.119086
+    },
+    {
+      "date": "2025-07-23",
+      "drawdown": -0.12623
+    },
+    {
+      "date": "2025-07-24",
+      "drawdown": -0.124428
+    },
+    {
+      "date": "2025-07-25",
+      "drawdown": -0.132532
+    },
+    {
+      "date": "2025-07-28",
+      "drawdown": -0.144681
+    },
+    {
+      "date": "2025-07-29",
+      "drawdown": -0.134711
+    },
+    {
+      "date": "2025-07-30",
+      "drawdown": -0.132797
+    },
+    {
+      "date": "2025-07-31",
+      "drawdown": -0.124554
+    },
+    {
+      "date": "2025-08-01",
+      "drawdown": -0.134618
+    },
+    {
+      "date": "2025-08-04",
+      "drawdown": -0.121859
+    },
+    {
+      "date": "2025-08-05",
+      "drawdown": -0.132155
+    },
+    {
+      "date": "2025-08-06",
+      "drawdown": -0.121661
+    },
+    {
+      "date": "2025-08-07",
+      "drawdown": -0.126381
+    },
+    {
+      "date": "2025-08-08",
+      "drawdown": -0.116603
+    },
+    {
+      "date": "2025-08-11",
+      "drawdown": -0.115575
+    },
+    {
+      "date": "2025-08-12",
+      "drawdown": -0.12995
+    },
+    {
+      "date": "2025-08-13",
+      "drawdown": -0.136997
+    },
+    {
+      "date": "2025-08-14",
+      "drawdown": -0.143093
+    },
+    {
+      "date": "2025-08-15",
+      "drawdown": -0.137529
+    },
+    {
+      "date": "2025-08-18",
+      "drawdown": -0.138574
+    },
+    {
+      "date": "2025-08-19",
+      "drawdown": -0.12626
+    },
+    {
+      "date": "2025-08-20",
+      "drawdown": -0.128117
+    },
+    {
+      "date": "2025-08-21",
+      "drawdown": -0.13515
+    },
+    {
+      "date": "2025-08-22",
+      "drawdown": -0.125714
+    },
+    {
+      "date": "2025-08-25",
+      "drawdown": -0.119332
+    },
+    {
+      "date": "2025-08-26",
+      "drawdown": -0.113515
+    },
+    {
+      "date": "2025-08-27",
+      "drawdown": -0.116635
+    },
+    {
+      "date": "2025-08-28",
+      "drawdown": -0.115283
+    },
+    {
+      "date": "2025-08-29",
+      "drawdown": -0.11428
+    },
+    {
+      "date": "2025-09-01",
+      "drawdown": -0.124306
+    },
+    {
+      "date": "2025-09-02",
+      "drawdown": -0.138849
+    },
+    {
+      "date": "2025-09-03",
+      "drawdown": -0.135397
+    },
+    {
+      "date": "2025-09-04",
+      "drawdown": -0.126771
+    },
+    {
+      "date": "2025-09-05",
+      "drawdown": -0.128317
+    },
+    {
+      "date": "2025-09-08",
+      "drawdown": -0.131067
+    },
+    {
+      "date": "2025-09-09",
+      "drawdown": -0.125667
+    },
+    {
+      "date": "2025-09-10",
+      "drawdown": -0.134043
+    },
+    {
+      "date": "2025-09-11",
+      "drawdown": -0.119848
+    },
+    {
+      "date": "2025-09-12",
+      "drawdown": -0.119253
+    },
+    {
+      "date": "2025-09-15",
+      "drawdown": -0.112656
+    },
+    {
+      "date": "2025-09-16",
+      "drawdown": -0.123697
+    },
+    {
+      "date": "2025-09-17",
+      "drawdown": -0.121563
+    },
+    {
+      "date": "2025-09-18",
+      "drawdown": -0.124418
+    },
+    {
+      "date": "2025-09-19",
+      "drawdown": -0.122746
+    },
+    {
+      "date": "2025-09-22",
+      "drawdown": -0.123013
+    },
+    {
+      "date": "2025-09-23",
+      "drawdown": -0.133275
+    },
+    {
+      "date": "2025-09-24",
+      "drawdown": -0.129084
+    },
+    {
+      "date": "2025-09-25",
+      "drawdown": -0.116272
+    },
+    {
+      "date": "2025-09-26",
+      "drawdown": -0.112036
+    },
+    {
+      "date": "2025-09-29",
+      "drawdown": -0.116459
+    },
+    {
+      "date": "2025-09-30",
+      "drawdown": -0.11755
+    },
+    {
+      "date": "2025-10-01",
+      "drawdown": -0.108664
+    },
+    {
+      "date": "2025-10-02",
+      "drawdown": -0.118716
+    },
+    {
+      "date": "2025-10-03",
+      "drawdown": -0.120218
+    },
+    {
+      "date": "2025-10-06",
+      "drawdown": -0.132877
+    },
+    {
+      "date": "2025-10-07",
+      "drawdown": -0.135027
+    },
+    {
+      "date": "2025-10-08",
+      "drawdown": -0.145615
+    },
+    {
+      "date": "2025-10-09",
+      "drawdown": -0.159773
+    },
+    {
+      "date": "2025-10-10",
+      "drawdown": -0.158305
+    },
+    {
+      "date": "2025-10-13",
+      "drawdown": -0.158312
+    },
+    {
+      "date": "2025-10-14",
+      "drawdown": -0.166807
+    },
+    {
+      "date": "2025-10-15",
+      "drawdown": -0.179296
+    },
+    {
+      "date": "2025-10-16",
+      "drawdown": -0.188451
+    },
+    {
+      "date": "2025-10-17",
+      "drawdown": -0.201715
+    },
+    {
+      "date": "2025-10-20",
+      "drawdown": -0.17433
+    },
+    {
+      "date": "2025-10-21",
+      "drawdown": -0.171091
+    },
+    {
+      "date": "2025-10-22",
+      "drawdown": -0.166752
+    },
+    {
+      "date": "2025-10-23",
+      "drawdown": -0.157621
+    },
+    {
+      "date": "2025-10-24",
+      "drawdown": -0.163497
+    },
+    {
+      "date": "2025-10-27",
+      "drawdown": -0.159994
+    },
+    {
+      "date": "2025-10-28",
+      "drawdown": -0.163889
+    },
+    {
+      "date": "2025-10-29",
+      "drawdown": -0.168255
+    },
+    {
+      "date": "2025-10-30",
+      "drawdown": -0.175473
+    },
+    {
+      "date": "2025-10-31",
+      "drawdown": -0.153894
+    },
+    {
+      "date": "2025-11-03",
+      "drawdown": -0.173947
+    },
+    {
+      "date": "2025-11-04",
+      "drawdown": -0.175511
+    },
+    {
+      "date": "2025-11-05",
+      "drawdown": -0.171144
+    },
+    {
+      "date": "2025-11-06",
+      "drawdown": -0.172021
+    },
+    {
+      "date": "2025-11-07",
+      "drawdown": -0.172337
+    },
+    {
+      "date": "2025-11-10",
+      "drawdown": -0.150605
+    },
+    {
+      "date": "2025-11-11",
+      "drawdown": -0.155596
+    },
+    {
+      "date": "2025-11-12",
+      "drawdown": -0.153549
+    },
+    {
+      "date": "2025-11-13",
+      "drawdown": -0.159852
+    },
+    {
+      "date": "2025-11-14",
+      "drawdown": -0.166333
+    },
+    {
+      "date": "2025-11-17",
+      "drawdown": -0.167907
+    },
+    {
+      "date": "2025-11-18",
+      "drawdown": -0.174635
+    },
+    {
+      "date": "2025-11-19",
+      "drawdown": -0.182787
+    },
+    {
+      "date": "2025-11-20",
+      "drawdown": -0.190508
+    },
+    {
+      "date": "2025-11-21",
+      "drawdown": -0.194417
+    },
+    {
+      "date": "2025-11-24",
+      "drawdown": -0.193656
+    },
+    {
+      "date": "2025-11-25",
+      "drawdown": -0.206032
+    },
+    {
+      "date": "2025-11-26",
+      "drawdown": -0.202131
+    },
+    {
+      "date": "2025-11-27",
+      "drawdown": -0.208134
+    },
+    {
+      "date": "2025-11-28",
+      "drawdown": -0.206178
+    },
+    {
+      "date": "2025-12-01",
+      "drawdown": -0.202277
+    },
+    {
+      "date": "2025-12-02",
+      "drawdown": -0.19471
+    },
+    {
+      "date": "2025-12-03",
+      "drawdown": -0.201514
+    },
+    {
+      "date": "2025-12-04",
+      "drawdown": -0.207693
+    },
+    {
+      "date": "2025-12-05",
+      "drawdown": -0.197537
+    },
+    {
+      "date": "2025-12-08",
+      "drawdown": -0.181891
+    },
+    {
+      "date": "2025-12-09",
+      "drawdown": -0.166393
+    },
+    {
+      "date": "2025-12-10",
+      "drawdown": -0.171384
+    },
+    {
+      "date": "2025-12-11",
+      "drawdown": -0.185299
+    },
+    {
+      "date": "2025-12-12",
+      "drawdown": -0.198297
+    },
+    {
+      "date": "2025-12-15",
+      "drawdown": -0.180966
+    },
+    {
+      "date": "2025-12-16",
+      "drawdown": -0.187881
+    },
+    {
+      "date": "2025-12-17",
+      "drawdown": -0.182764
+    },
+    {
+      "date": "2025-12-18",
+      "drawdown": -0.186171
+    },
+    {
+      "date": "2025-12-19",
+      "drawdown": -0.17801
+    },
+    {
+      "date": "2025-12-22",
+      "drawdown": -0.183187
+    },
+    {
+      "date": "2025-12-23",
+      "drawdown": -0.184684
+    },
+    {
+      "date": "2025-12-24",
+      "drawdown": -0.171855
+    },
+    {
+      "date": "2025-12-25",
+      "drawdown": -0.169802
+    },
+    {
+      "date": "2025-12-26",
+      "drawdown": -0.166981
+    },
+    {
+      "date": "2025-12-29",
+      "drawdown": -0.177453
+    }
+  ],
+  "universe_coverage": {
+    "available_count": 2,
+    "available_tickers": [
+      "ALPHA.NS",
+      "BETA.NS"
+    ],
+    "complete": true,
+    "coverage_ratio": 1.0,
+    "covered_tickers": [
+      "ALPHA.NS",
+      "BETA.NS"
+    ],
+    "missing_tickers": [],
+    "requested_count": 2,
+    "requested_tickers": [
+      "ALPHA.NS",
+      "BETA.NS"
+    ],
+    "status": "complete"
+  },
+  "window": {
+    "end": "2026-01-02",
+    "kind": "requested_analytics_window",
+    "start": "2024-01-02"
+  }
+}

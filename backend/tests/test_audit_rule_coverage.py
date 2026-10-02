@@ -47,9 +47,32 @@ set" rather than silently improving a number nobody reads.  That asymmetry is
 deliberate: a coverage harness that quietly reports better coverage after a
 rule is added has stopped measuring.
 
-Base document: a real, complete, schema-valid export of every section in the
-catalog under the temp directory, named :data:`BASE_EXPORT` below.  Navigate it
-with Python; never dump it.
+Base document: a complete, schema-valid export of every section in the catalog,
+committed next to this file as :data:`BASE_EXPORT`.  Navigate it with Python;
+never dump it.
+
+It is a SANITISED export, and the sanitisation is worth stating because this
+file is frozen against it.  Three transforms, none of which changes the
+document's shape -- every key, every nesting level, every value TYPE and every
+field the rules read is the one the live export published:
+
+  * every ticker becomes ``TKT01``..``TKT14``, in portfolio order, everywhere it
+    appears: dict keys, list values, the dotted ``inherits_precision_at``
+    pointers, and the prose inside warnings and basis strings;
+  * every absolute currency amount is multiplied by ONE factor, chosen so the
+    whole book reads as exactly 1,000,000 units.  A single factor is the only
+    thing that keeps ``total_value == sum(market_value)``, ``sum(weight) == 1``,
+    ``amount == shares * price`` and every percentile fan true simultaneously,
+    which is what keeps the base finding-free and the ledger below the one
+    measured against the live export;
+  * every position's ``quantity`` becomes the fixed integer 100, and its prices
+    are re-derived from the synthetic market value and cost, so
+    ``quantity * price == value`` still holds by construction.
+
+So the fixture's rupee figures are not real amounts and its share counts are
+not real holdings: what is under measurement is the RULES against a
+well-formed document, not a portfolio.  Every injected money value below is
+expressed in the fixture's own 1,000,000-unit book for the same reason.
 
 Read-only on purpose.  ``app/debugging/context_audit.py`` is parent-owned; when
 a mutation below is UNCOVERED the rule it wants is written up in the report that
@@ -72,9 +95,19 @@ import numpy as np
 from app.debugging import context_audit as ca
 from app.services.ai_context_service import SECTION_CATALOG
 
-#: The reference export this measurement is taken against: a real, complete,
-#: schema-valid export of every section in the catalog, 0 unavailable.
-BASE_EXPORT = Path(r"C:\Users\Sayanti\AppData\Local\Temp\opencode\v27.json")
+#: The reference export this measurement is taken against: a complete,
+#: schema-valid export of every section in the catalog, 0 unavailable,
+#: sanitised as the module docstring describes.
+#:
+#: Resolved from ``__file__`` so it travels with the repository: it used to be
+#: an absolute path into one developer's ``%TEMP%``, which made this gate
+#: ``pytest.fail`` on every other machine and so had never executed in CI.
+#: Nothing here reads the environment, and there is no Windows-specific path
+#: construction anywhere in this module, so the same expression resolves on a
+#: Linux runner as on Windows.
+BASE_EXPORT = (
+    Path(__file__).resolve().parent / "fixtures" / "audit_rule_coverage_base.json"
+)
 
 #: Sentinel for "remove this key".  A key REMOVED is as schema-valid as a key
 #: changed, and a dropped disclosure is a real defect class, so deletions are
@@ -123,10 +156,10 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ---- portfolio -------------------------------------------------------
     Mutation(
         "portfolio", "total_does_not_equal_sum_of_parts",
-        ((( "total_value",), 42598.20),),
+        ((( "total_value",), 999382.98),),
         ("NUM-001",),
-        "total_value 42598.2 against sum(market_value) 42624.5: a stale total "
-        "carried across a partial re-mark, off by one session's move.",
+        "total_value 999382.98 against sum(market_value) 1000000.0: a stale "
+        "total carried across a partial re-mark, off by one session's move.",
     ),
     Mutation(
         "portfolio", "weight_published_as_percentage",
@@ -250,7 +283,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         "realized_risk", "confidence_interval_is_a_fixed_band",
         (
-            (("positions", "CIPLA.NS", "estimate_uncertainty", "estimates",
+            (("positions", "TKT01", "estimate_uncertainty", "estimates",
               "var_95", "conf_int"),
              [_RR_VAR_CENTRE * 1.2, _RR_VAR_CENTRE * 0.8]),
         ),
@@ -268,10 +301,10 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         "realized_risk", "interval_broader_than_its_own_estimate",
         (
-            (("positions", "CIPLA.NS", "estimate_uncertainty", "estimates",
+            (("positions", "TKT01", "estimate_uncertainty", "estimates",
               "var_95", "conf_int"),
              [-0.015101, -0.010981]),
-            (("positions", "CIPLA.NS", "estimate_uncertainty", "estimates",
+            (("positions", "TKT01", "estimate_uncertainty", "estimates",
               "var_95", "point_estimate"), -0.0002),
         ),
         (),
@@ -303,9 +336,9 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "realized_risk", "start_contradicts_the_stored_date_it_claims",
-        ((("history_coverage", "tickers", "ARROWGREEN.NS", "analytics_start"), "2025-11-04"),),
+        ((("history_coverage", "tickers", "TKT04", "analytics_start"), "2025-11-04"),),
         ("XS-004",),
-        "ARROWGREEN.NS declares analytics_start_source 'stored_added_on' with "
+        "TKT04 declares analytics_start_source 'stored_added_on' with "
         "stored_added_on 2025-08-20 beside it, and now dates its own analytics "
         "start three months later than the date it says it came from.",
     ),
@@ -409,7 +442,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ---- liquidity --------------------------------------------------------
     Mutation(
         "liquidity", "band_contradicts_its_own_score",
-        ((("by_position", "CIPLA.NS", "score"), 5.4),),
+        ((("by_position", "TKT01", "score"), 5.4),),
         ("NUM-004",),
         "score 5.4 with category 'High' under the section's own band table.",
     ),
@@ -490,29 +523,29 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "volatility_sizing", "trade_amount_does_not_reconcile_to_its_legs",
-        ((("trades", "CIPLA.NS", "shares_delta"), 3),),
+        ((("trades", "TKT01", "shares_delta"), 3),),
         ("NUM-008",),
         "shares_delta 3 against an amount still priced off 2 shares.",
     ),
     Mutation(
         "volatility_sizing", "sub_lot_trade_rounded_to_zero_shares",
-        ((("trades", "CIPLA.NS", "shares_delta"), 0),),
+        ((("trades", "TKT01", "shares_delta"), 0),),
         ("NUM-009",),
-        "shares_delta 0 with the 2483.36 notional preserved and no "
+        "shares_delta 0 with the 58261.33 notional preserved and no "
         "sub-lot status.",
     ),
     Mutation(
         "volatility_sizing", "published_maximum_is_really_a_minimum",
-        ((("trade_reconciliation", "max_abs_rounding_residual"), 316.04),),
+        ((("trade_reconciliation", "max_abs_rounding_residual"), 7414.52),),
         ("NUM-010",),
-        "the min-in-a-max bug: 316.04 published as the maximum residual.",
+        "the min-in-a-max bug: 7414.52 published as the maximum residual.",
     ),
     Mutation(
         "volatility_sizing", "financing_requirement_contradicts_its_fraction",
-        ((("exposure", "financing_requirement"), 11250.0),),
+        ((("exposure", "financing_requirement"), 263932.71),),
         (),
-        "financing_requirement 11250.0 against financing_fraction 0.217796 of "
-        "portfolio_value 42624.5, which is 9283.45. NUM-012 reads the "
+        "financing_requirement 263932.71 against financing_fraction 0.217796 "
+        "of portfolio_value 1000000.0, which is 217796.0. NUM-012 reads the "
         "optimizer's weight_normalization, not this block.",
     ),
     Mutation(
@@ -526,8 +559,8 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         "volatility_sizing", "record_claims_executable_inside_a_gated_section",
         (
-            (("trades", "CIPLA.NS", "status"), "executable"),
-            (("trades", "CIPLA.NS", "execution_eligible"), DELETE),
+            (("trades", "TKT01", "status"), "executable"),
+            (("trades", "TKT01", "execution_eligible"), DELETE),
         ),
         ("ENV-019",),
         "the AD-5/G3 defect its own docstring calls the most dangerous kind of "
@@ -603,7 +636,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ---- risk_contribution ------------------------------------------------
     Mutation(
         "risk_contribution", "shares_do_not_sum_to_the_published_total",
-        ((("positions", "volatility", "ARROWGREEN.NS"), 0.128049),),
+        ((("positions", "volatility", "TKT04"), 0.128049),),
         ("NUM-003",),
         "one leg's risk contribution restated, so the fourteen published "
         "shares no longer sum to published_total.",
@@ -669,7 +702,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ---- optimization -----------------------------------------------------
     Mutation(
         "optimization", "weight_delta_does_not_close_against_its_legs",
-        ((("trades_required", "CIPLA.NS", "weight_delta"), 0.5),),
+        ((("trades_required", "TKT01", "weight_delta"), 0.5),),
         ("NUM-011",),
         "the trade record publishes two weights and a delta that is neither "
         "their difference nor anything close to it.",
@@ -684,7 +717,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "optimization", "recommended_weights_do_not_sum_to_their_published_total",
-        ((("weights", "CIPLA.NS"), 0.35),),
+        ((("weights", "TKT01"), 0.35),),
         (),
         "one recommended leg restated so the 14 weights no longer sum to the "
         "recommended_weights_published_total printed in trades_required_basis.",
@@ -734,7 +767,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ---- monte_carlo ------------------------------------------------------
     Mutation(
         "monte_carlo", "quantiles_not_monotone",
-        ((("terminal_percentiles", "p25"), 165000.0),),
+        ((("terminal_percentiles", "p25"), 3871013.15),),
         ("NUM-013",),
         "p25 above p50 in the terminal distribution.",
     ),
@@ -742,23 +775,24 @@ MUTATIONS: tuple[Mutation, ...] = (
         "monte_carlo", "success_probability_contradicts_its_own_distribution",
         ((("prob_success",), 0.42),),
         ("NUM-026",),
-        "prob_success 0.42 while p25 of the terminal distribution is 117447 "
-        "against a target of 85249: at least 75% of the mass is already above "
-        "target, so 0.42 is arithmetically impossible. The percentiles, the "
-        "target and the probability are all published in one block.",
+        "prob_success 0.42 while p25 of the terminal distribution is 2755390.21 "
+        "against a target of 2000000.0: at least 75% of the mass is already "
+        "above target, so 0.42 is arithmetically impossible. The percentiles, "
+        "the target and the probability are all published in one block.",
     ),
     Mutation(
         "monte_carlo", "fan_row_quantiles_not_monotone",
-        ((("fan", 1, "p25"), 62000.0),),
+        ((("fan", 1, "p25"), 1454562.52),),
         ("NUM-013",),
         "the year-0.5 fan row's p25 above its own p50.",
     ),
     Mutation(
         "monte_carlo", "initial_value_contradicts_the_fan_origin",
-        ((("initial_value",), 51200.0),),
+        ((("initial_value",), 1201187.11),),
         ("NUM-026",),
-        "initial_value 51200.0 while every fan row at year 0 reads 42624.5, "
-        "which is the portfolio total the whole simulation starts from.",
+        "initial_value 1201187.11 while every fan row at year 0 reads "
+        "1000000.0, which is the portfolio total the whole simulation starts "
+        "from.",
     ),
 
     # ---- pairs ------------------------------------------------------------
@@ -790,7 +824,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "pairs", "actionable_directive_with_no_published_basis",
-        ((("recommendation",), "LONG_SPREAD (Long JKIL.NS, Short NIFTYIETF.NS)"),),
+        ((("recommendation",), "LONG_SPREAD (Long TKT05, Short TKT10)"),),
         ("NUM-024",),
         "NUM-024 has nothing to check on the honest export: every signal string "
         "the exporter publishes says 'No direction is published', so the "
@@ -979,15 +1013,15 @@ KNOWN_COLLATERAL: frozenset[tuple[str, str]] = frozenset({
 #:
 #:   sections.monte_carlo.data.prob_success   (NUM-026)   -- RETIRED
 #:
-#: The note that accompanied the entry asserted that a p95 of 301465.64 clears
-#: ``target_value: 85249.0``, "so at most 5% of those paths finished below the
+#: The note that accompanied the entry asserted that a p95 of 7072590.65 clears
+#: ``target_value: 2000000.0``, "so at most 5% of those paths finished below the
 #: target, so prob_success must be at least 0.95".  That is the same mirrored
 #: derivation the rule itself was making, and it was wrong.  The share of paths
 #: that clear the target is the share AT OR ABOVE the clearing percentile, so
 #: the level enters COMPLEMENTED: p95 above the target puts a FLOOR of 0.05
-#: under the share, not a floor of 0.95, and p25 at 117447.13 -- the SMALLEST
+#: under the share, not a floor of 0.95, and p25 at 2755390.21 -- the SMALLEST
 #: published level above the target -- puts the tightest floor there is,
-#: 1 - 25/100 = 0.75.  p5 at 79001.08, below the target, puts a ceiling of
+#: 1 - 25/100 = 0.75.  p5 at 1853419.51, below the target, puts a ceiling of
 #: 1 - 5/100 = 0.95 on it.  So the bracket the published table requires is
 #: [0.75, 0.95] and the published 0.922 is inside it.  The export was never
 #: wrong; the note and the rule were, and they were wrong in the same way and
@@ -1056,9 +1090,9 @@ def _base_document() -> dict[str, Any]:
     if not BASE_EXPORT.is_file():
         pytest.fail(
             f"the reference export is missing: {BASE_EXPORT}. This harness "
-            f"measures rule coverage against a real export; skipping would "
-            f"leave the gate reporting nothing while exiting 0, which is the "
-            f"exact failure mode it exists to detect."
+            f"measures rule coverage against a committed export; skipping "
+            f"would leave the gate reporting nothing while exiting 0, which is "
+            f"the exact failure mode it exists to detect."
         )
     return json.loads(BASE_EXPORT.read_text(encoding="utf-8"))
 
