@@ -448,7 +448,21 @@ async def test_a13_zero_variance_excluded_leg_does_not_poison_sizing():
     # to be computed and discarded, which is how three different "current"
     # volatilities ended up circulating for one book.
     assert result["sizing_volatility"] is not None
-    assert result["current_volatility"] is not None
+    # `current_volatility` is the MODEL quantity, and it is deliberately
+    # refused here: FLAT has zero variance, so its correlation with VAR is
+    # UNKNOWN, not 0.0. Commit d2085fc made that field nullable for exactly
+    # this reason - a NaN pairwise correlation filled to 0.0 means "no
+    # relationship whatsoever", the opposite claim.
+    #
+    # This assertion was `is not None`, written before the refusal existed and
+    # left failing behind d2085fc. Demanding a number here would demand the
+    # fabrication that commit removed. What must hold instead is stronger:
+    # the refusal must be EXPLAINED, must name the offending pair, and the
+    # measurable alternative must still be published beside it.
+    assert result["current_volatility"] is None
+    assert result["current_volatility_unmeasurable_pairs"] == ["FLAT/VAR"]
+    assert "FLAT/VAR" in (result["current_volatility_reason"] or "")
+    assert result["current_volatility_sample_covariance"] is not None
     assert np.isfinite(result["scale_factor"])
     assert result["cash_weight"] > 0.0
 
