@@ -66,7 +66,19 @@ export interface PortfolioStore {
     selectedTickers: string[];
     isLoading: boolean;
     error: string | null;
-    totalValue: number;
+
+    /**
+     * The book's total value, or `null` when no payload has published one.
+     *
+     * Typed nullable on purpose: `totalValue || 0` turned "the payload said
+     * nothing" into a measured ₹0.00, which on screen is indistinguishable from
+     * an empty book that really is worth zero. `dashboard/page.tsx` is already
+     * hardened against this laundering ("NaN || 0 is 0, which turns a broken
+     * payload into a confident ₹0.00") but it can only harden what the store
+     * hands it — a `null` reaches that guard and renders N/A, a laundered 0 does
+     * not. A consumer that wants a number must measure, not default.
+     */
+    totalValue: number | null;
     totalWeight: number;
     positionCount: number;
 
@@ -74,9 +86,9 @@ export interface PortfolioStore {
     fetchPortfolio: () => Promise<boolean>;
     setPositionCount: (count: number) => void;
     setPortfolioSnapshot: (snapshot: {
-        positions: PortfolioPosition[];
-        total_value: number;
-        total_weight: number;
+        positions: PortfolioPosition[] | null;
+        total_value: number | null;
+        total_weight: number | null;
     }) => void;
     addPosition: (position: {
         ticker: string;
@@ -142,6 +154,17 @@ export interface AnalyticsStore {
 // Coalesce StrictMode/route refreshes for the same shared portfolio snapshot.
 let portfolioFetchInFlight: Promise<boolean> | null = null;
 
+/**
+ * A total value, or `null` when the payload published none.
+ *
+ * `?? null` is not enough: a `NaN` from an upstream computation is not absence,
+ * but it is equally not a measurement, and storing it would let the `number`
+ * half of `totalValue: number | null` vouch for a figure no engine produced.
+ * `0` is a real measurement and survives unchanged.
+ */
+const measuredTotal = (value: number | null | undefined): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+
 async function waitForPortfolioFetch(): Promise<void> {
     const pending = portfolioFetchInFlight;
     if (pending) await pending;
@@ -168,7 +191,11 @@ export const usePortfolioStore = create<PortfolioStore>()(
                         const data = await portfolioApi.getPortfolio();
                         set({
                             positions: data.positions || [],
-                            totalValue: data.total_value || 0,
+                            // Same contract as `setPortfolioSnapshot`: an absent
+                            // total is `null`, not a fabricated 0. `NaN || 0` is
+                            // 0, which is exactly the laundering the dashboard
+                            // page's guard exists to catch.
+                            totalValue: measuredTotal(data.total_value),
                             totalWeight: data.total_weight || 0,
                             positionCount: data.total_positions ?? data.positions?.length ?? 0,
                             isLoading: false,
@@ -199,11 +226,26 @@ export const usePortfolioStore = create<PortfolioStore>()(
             },
 
             setPortfolioSnapshot: (snapshot) => {
+                // One read of each raw field, then the whole object derives from
+                // it. The previous version substituted `[]` into `positions` on
+                // one line and read `snapshot.positions.length` off the RAW
+                // field on the next: the substitution did not protect the read
+                // below it, so an absent `positions` raised
+                // "Cannot read properties of undefined (reading 'length')".
+                const positions = snapshot.positions ?? [];
                 set({
-                    positions: snapshot.positions || [],
-                    totalValue: snapshot.total_value || 0,
-                    totalWeight: snapshot.total_weight || 0,
-                    positionCount: snapshot.positions.length,
+                    positions,
+                    // `|| 0` published ₹0.00 for a payload that carried no total.
+                    // `null` reaches the dashboard's existing guard and renders
+                    // N/A; a measured 0 stays a measured 0.
+                    //
+                    // Non-finite is absence too: `NaN` is a number the type would
+                    // then vouch for but no payload ever measured, which is the
+                    // same fabrication one layer down. `?? null` alone lets NaN
+                    // through, so the check is explicit.
+                    totalValue: measuredTotal(snapshot.total_value),
+                    totalWeight: snapshot.total_weight ?? 0,
+                    positionCount: positions.length,
                     error: null,
                 });
                 useUIStore.getState().updateLastUpdated();
@@ -325,6 +367,13 @@ export const usePortfolioStore = create<PortfolioStore>()(
                 selectedTickers: state.selectedTickers,
                 // Persist totals with positions so the hydration window never
                 // sees non-empty positions against totalValue === 0 (zero-state invariant)
+                //
+                // `totalValue` is `number | null`, and that survives the
+                // round-trip through storage as itself: a persisted `null`
+                // rehydrates to the ABSENT state and the dashboard's guard
+                // renders N/A, which is the whole point of the nullable type. It
+                // must NOT be coerced to 0 on the way in or out — that is the
+                // laundering this shape exists to prevent.
                 totalValue: state.totalValue,
                 totalWeight: state.totalWeight,
             }),

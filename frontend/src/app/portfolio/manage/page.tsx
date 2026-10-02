@@ -42,10 +42,31 @@ import { cn, formatCurrency as sharedFormatCurrency } from '@/lib/utils';
 // Payload already carries snake_case calculated fields (PortfolioPosition)
 type SimplePortfolioPosition = PortfolioPosition;
 
-const monetaryValue = (base: number | null | undefined, native: number | null | undefined): number => {
+/**
+ * A monetary value that PRESERVES absence.
+ *
+ * This helper used to be typed `(…): number` with a terminal `return 0`. Every
+ * N/A guard written over its result was therefore dead code — `Number.isFinite(
+ * monetaryValue(…))` is unconditionally true — so the `% Return` cell's N/A
+ * branch at its call site could not be reached, and a holding the engine could
+ * not cost rendered a green `+0.00%`.
+ *
+ * The two forms below differ only in the terminal case, and which one a call
+ * site needs follows from what it does with an absent value:
+ *   - a REDUCTION (`sum + …`) keeps the 0-absorbing form: an absent leg
+ *     contributes nothing to a total stated over the legs that were measured.
+ *   - anything rendering ONE holding's figure reads the nullable form, so the
+ *     render can say N/A instead of publishing a fabricated zero.
+ */
+const measuredValue = (base: number | null | undefined, native: number | null | undefined): number | null => {
     if (typeof base === 'number' && Number.isFinite(base)) return base;
     if (typeof native === 'number' && Number.isFinite(native)) return native;
-    return 0;
+    return null;
+};
+
+/** The reduction form: an absent leg adds nothing rather than voiding the sum. */
+const monetaryValue = (base: number | null | undefined, native: number | null | undefined): number => {
+    return measuredValue(base, native) ?? 0;
 };
 
 export default function PortfolioManagePage() {
@@ -197,7 +218,14 @@ export default function PortfolioManagePage() {
                         pos.unrealized_gain_loss_base,
                         baseCurrent - baseCost
                     ),
-                    unrealized_gain_loss_pct_base: monetaryValue(
+                    // A per-holding PERCENTAGE, so absence must survive to the
+                    // render. Routed through `monetaryValue` the derived NaN
+                    // (no usable cost basis) became a real 0 here, one step
+                    // BEFORE the cell's guard ever ran — so the cell saw a
+                    // measured 0.00% and had no way to tell it from a flat
+                    // holding. `measuredValue` keeps it null and the cell
+                    // renders N/A.
+                    unrealized_gain_loss_pct_base: measuredValue(
                         pos.unrealized_gain_loss_pct_base,
                         baseCost > 0 ? ((baseCurrent - baseCost) / baseCost) * 100 : NaN
                     ),
@@ -783,9 +811,22 @@ export default function PortfolioManagePage() {
                                                 "px-6 py-4 whitespace-nowrap text-sm font-medium",
                                                 monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? "text-green-600" : "text-red-600"
                                             )}>
-                                                {Number.isFinite(monetaryValue(position.unrealized_gain_loss_pct_base, position.unrealized_gain_loss_pct))
-                                                    ? `${monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? '+' : ''}${monetaryValue(position.unrealized_gain_loss_pct_base, position.unrealized_gain_loss_pct).toFixed(2)}%`
-                                                    : <span className="text-gray-500">N/A</span>}
+                                                {(() => {
+                                                    // The guard reads the RAW nullable field, not the
+                                                    // post-helper value: `monetaryValue` absorbed the
+                                                    // absent case as 0, so this N/A branch was
+                                                    // unreachable and every uncostable holding showed a
+                                                    // green +0.00%.
+                                                    const pct = measuredValue(
+                                                        position.unrealized_gain_loss_pct_base,
+                                                        position.unrealized_gain_loss_pct
+                                                    );
+                                                    return pct === null ? (
+                                                        <span className="text-gray-500">N/A</span>
+                                                    ) : (
+                                                        `${monetaryValue(position.unrealized_gain_loss_base, position.unrealized_gain_loss) >= 0 ? '+' : ''}${pct.toFixed(2)}%`
+                                                    );
+                                                })()}
                                             </td>
                                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
                                                 {isLoadingForecast ? (

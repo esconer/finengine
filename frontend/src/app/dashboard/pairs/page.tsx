@@ -14,12 +14,14 @@ const P_VALUE_THRESHOLD = 0.05;
 /**
  * The scan envelope, not just its rows.
  *
- * `/analytics/coint` publishes `as_of` AND `as_of_semantics` (default
- * `latest_available_observation`; `request_end_no_usable_price_data` when the
- * scan had no usable price), plus `missing_tickers` and `warnings`. Reading only
- * `res.data.pairs` threw all of that away, which is how a scan dated by its
- * REQUEST end became indistinguishable from one dated by its newest delivered
- * observation.
+ * `/analytics/coint` publishes `as_of` AND `as_of_semantics` (three tokens,
+ * not two: `latest_available_observation`,
+ * `request_end_no_usable_price_data`, and
+ * `request_end_universe_too_small_for_pairs` when the universe is too small
+ * to form a pair — see `COINT_NO_PAIR_UNIVERSE_AS_OF_SEMANTICS`), plus
+ * `missing_tickers` and `warnings`. Reading only `res.data.pairs` threw all of
+ * that away, which is how a scan dated by its REQUEST end became
+ * indistinguishable from one dated by its newest delivered observation.
  */
 interface CointScanEnvelope {
     pairs?: unknown[];
@@ -82,10 +84,13 @@ export default function PairsScannerPage() {
             </div>
 
             {/* Provenance: this is one of the few sections whose route publishes
-                `as_of_semantics`, and the two values it takes
-                (`latest_available_observation` vs
-                `request_end_no_usable_price_data`) mean very different things,
-                so the semantics are rendered with the date, never dropped. */}
+                `as_of_semantics`, and it is a free-form string rather than an
+                enum, so it is rendered verbatim and the three tokens it takes
+                — `latest_available_observation` (a real newest bar),
+                `request_end_no_usable_price_data` (prices asked for, none came
+                back) and `request_end_universe_too_small_for_pairs` (fewer than
+                two names, so no pair was ever tested) — mean very different
+                things. Rendered with the date, never dropped. */}
             <SectionProvenance
                 section="Cointegration & pairs"
                 asOf={scan?.as_of ?? scan?.latest_observation_date ?? null}

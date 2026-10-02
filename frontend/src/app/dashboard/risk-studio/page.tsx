@@ -127,6 +127,21 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   }
 };
 
+/**
+ * The engine's own reasons for withholding a lower-tail coefficient, in the
+ * reader's words. Same idiom as `MarginalImpactPanel`'s `STATE_LABEL`: a token
+ * with no entry here falls back to the raw token rather than to a blank, so a
+ * reason the backend adds later still names itself instead of vanishing. These
+ * strings are what makes an N/A cell accountable — the reason travels from
+ * `TailRiskService` with the payload precisely so it can be shown.
+ */
+const UNMEASURABLE_REASON_LABELS: Record<string, string> = {
+  zero_dispersion_leg:
+    'one leg has no dispersion (a frozen or single-row series), so its correlation is undefined',
+  marginal_t_fit_failed:
+    'the marginal Student-t fit failed, so λL has no degrees of freedom to use',
+};
+
 function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
@@ -325,11 +340,53 @@ export default function RiskStudioPage() {
     : Array.isArray(tailRisk?.tickers)
       ? tailRisk.tickers
       : [];
-  const copulaMatrix: number[][] = Array.isArray(tailRisk?.tail_dependence_matrix?.matrix)
+  // `null` is a MEANINGFUL cell value here, not an absent array: the endpoint
+  // withholds the λL of a pair it could not measure rather than publishing a
+  // number for it. Typing this as `number[][]` is what licensed the per-cell
+  // `?? 0.0` below to read a refusal as a measurement — and 0.0 is the
+  // STRONGEST claim this domain allows ("these two never crash together"),
+  // which is the opposite of unknown.
+  const copulaMatrix: (number | null)[][] = Array.isArray(tailRisk?.tail_dependence_matrix?.matrix)
     ? tailRisk.tail_dependence_matrix.matrix
     : Array.isArray(tailRisk?.matrix)
       ? tailRisk.matrix
       : [];
+
+  // Why each cell was withheld, as the endpoint states it. A withheld pair is
+  // (correctly) absent from `high_tail_risk_pairs`, which filters on
+  // `lower_tail_lambda >= 0.20` and has no lambda to compare — so this is the
+  // only place the cause is ever published, and an N/A the reader cannot
+  // account for is one they will read as a bug.
+  const unmeasurablePairs: { pair: string[]; reason: string | null }[] = (
+    (Array.isArray(tailRisk?.tail_dependence_matrix?.unmeasurable_pairs)
+      ? tailRisk.tail_dependence_matrix.unmeasurable_pairs
+      : Array.isArray(tailRisk?.unmeasurable_pairs)
+        ? tailRisk.unmeasurable_pairs
+        : []) as any[]
+  )
+    // The pair is what makes the cell accountable, so an entry without a
+    // 2-ticker pair is not a withheld pair at all. A missing REASON is kept:
+    // dropping it would silently under-count the withheld pairs, which is the
+    // same erasure the N/A exists to stop.
+    .filter((entry: any) => Array.isArray(entry?.pair) && entry.pair.length === 2)
+    .map((entry: any) => ({
+      pair: entry.pair as string[],
+      reason: typeof entry.reason === 'string' ? entry.reason : null,
+    }));
+
+  // `—` when the payload states no reason: this file's own absent-value marker
+  // (`fmtPct`, the fat-tail flag, the GPD shape), rather than a blank or a word
+  // this page invented.
+  const reasonLabel = (reason: string | null) =>
+    (reason ? UNMEASURABLE_REASON_LABELS[reason] ?? reason : '—');
+
+  /** The withheld reason for one CELL, or null when that pair was measured. */
+  const unmeasurableReasonFor = (a: string, b: string): string | null => {
+    const hit = unmeasurablePairs.find(
+      ({ pair }) => (pair[0] === a && pair[1] === b) || (pair[0] === b && pair[1] === a)
+    );
+    return hit?.reason ?? null;
+  };
 
   // Prepare Vol Cone Chart Data — null quantiles stay undefined (gaps), never 0
   const coneChartData = useMemo(() => {
@@ -374,9 +431,27 @@ export default function RiskStudioPage() {
     for (let r = 0; r < copulaTickers.length; r++) {
       const rowVals = [escapeCsvCell(copulaTickers[r])];
       for (let c = 0; c < copulaTickers.length; c++) {
-        rowVals.push((copulaMatrix[r]?.[c] ?? (r === c ? 1.0 : 0.0)).toFixed(4));
+        const measured = copulaMatrix[r]?.[c] ?? null;
+        // The same rule as the cell, in the same token. `(… ??
+        // (r === c ? 1.0 : 0.0)).toFixed(4)` published "0.0000" — a
+        // four-decimal, spreadsheet-grade endorsement of a claim the engine
+        // had explicitly refused to make, and a downloaded file outlives the
+        // page that would have explained it.
+        if (measured === null && r !== c) {
+          rowVals.push('N/A');
+        } else {
+          rowVals.push((measured ?? 1).toFixed(4));
+        }
       }
       rows.push(rowVals.join(','));
+    }
+    if (unmeasurablePairs.length > 0) {
+      // The matrix's N/A cells have to be accountable inside the export too.
+      rows.push('');
+      rows.push('Unmeasurable Pairs (lambda_L withheld - no measurement, NOT zero)');
+      for (const { pair, reason } of unmeasurablePairs) {
+        rows.push(`${pair.map(escapeCsvCell).join(' / ')},${escapeCsvCell(reasonLabel(reason))}`);
+      }
     }
 
     const csvContent = 'data:text/csv;charset=utf-8,' + rows.join('\n');
@@ -618,15 +693,58 @@ export default function RiskStudioPage() {
                       <tr key={rowTicker} className="border-t border-slate-800/60">
                         <td className="p-2 text-left font-mono font-medium text-slate-300 sticky left-0 bg-slate-950/90">{rowTicker.replace('.NS', '')}</td>
                         {copulaTickers.map((colTicker, colIdx) => {
-                          const num = copulaMatrix[rowIdx]?.[colIdx] ?? (rowIdx === colIdx ? 1.0 : 0.0);
                           const isSelf = rowIdx === colIdx;
+                          const measured = copulaMatrix[rowIdx]?.[colIdx] ?? null;
+                          // The diagonal is a DEFINITION, not a measurement: a
+                          // series always fully crashes with itself, so λL = 1
+                          // whether or not any fit succeeded. An em-dash there
+                          // would assert the opposite — that nobody knows
+                          // whether X crashes with itself — which is false. It
+                          // is read from the payload when the payload carries
+                          // it, and falls back to that definition (never to a
+                          // measurement) only when a ragged matrix leaves the
+                          // cell absent. Its band is deliberately neither rose
+                          // nor emerald for the same reason: 1.0 on the shared
+                          // scale is not a verdict about X against anything.
+                          //
+                          // Off the diagonal there is nothing to fall back to.
+                          // `?? (isSelf ? 1.0 : 0.0)` published the strongest
+                          // claim this domain allows — "these two never crash
+                          // together" — on the emerald band, for a pair the
+                          // engine had just refused to measure.
+                          const num = isSelf ? (measured ?? 1) : measured;
+                          const withheldReason = isSelf
+                            ? null
+                            : unmeasurableReasonFor(rowTicker, colTicker);
+                          if (num === null) {
+                            // NO band. Emerald asserts a verdict and rose
+                            // asserts the opposite one; an unmeasured cell
+                            // supports neither. Dim rather than slate, so it
+                            // never reads as a measured low.
+                            return (
+                              <td
+                                key={colTicker}
+                                data-role="unmeasured"
+                                className="p-1.5 font-mono text-slate-600"
+                                title={`${rowTicker} ↔ ${colTicker}: λL not measured${withheldReason ? ` — ${reasonLabel(withheldReason)}` : ''}`}
+                              >
+                                N/A
+                              </td>
+                            );
+                          }
                           const intensity = isSelf
                             ? 'bg-slate-800/80 text-slate-400'
                             : num > 0.25
                               ? 'bg-rose-500/20 text-rose-300 font-bold border border-rose-500/30'
                               : 'bg-emerald-500/10 text-emerald-300 font-medium';
                           return (
-                            <td key={colTicker} className={`p-1.5 font-mono ${intensity}`} title={`${rowTicker} ↔ ${colTicker}: λL = ${num.toFixed(3)}`}>
+                            <td
+                              key={colTicker}
+                              className={`p-1.5 font-mono ${intensity}`}
+                              title={isSelf
+                                ? `${rowTicker} ↔ ${colTicker}: λL = 1 by definition (self-pair), not a measurement`
+                                : `${rowTicker} ↔ ${colTicker}: λL = ${num.toFixed(3)}`}
+                            >
                               {num.toFixed(3)}
                             </td>
                           );
@@ -640,6 +758,19 @@ export default function RiskStudioPage() {
               <div className="h-48 flex items-center justify-center text-xs text-slate-500">
                 No copula matrix data available
               </div>
+            )}
+            {/* An N/A cell the reader cannot account for is one they will assume
+                is a bug. The engine withholds these pairs on purpose and
+                publishes why, so the cause is shown next to the matrix rather
+                than left for the reader to infer from a hole. */}
+            {unmeasurablePairs.length > 0 && (
+              <p data-testid="copula-unmeasurable-pairs" className="text-xs text-slate-500 mt-2">
+                λL withheld for {unmeasurablePairs.length} of the copula pairs —{' '}
+                {unmeasurablePairs
+                  .map(({ pair, reason }) => `${pair.join(' ↔ ')} (${reasonLabel(reason)})`)
+                  .join('; ')}
+                . Those cells are unmeasured, not zero.
+              </p>
             )}
           </div>
           <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">

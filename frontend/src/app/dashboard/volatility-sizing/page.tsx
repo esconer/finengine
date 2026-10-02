@@ -806,13 +806,25 @@ export default function VolatilitySizingPage() {
     }
   };
 
-  // Format metrics for display
+  /**
+   * FRACTION in, percent out. Every call site on this page passes a fraction —
+   * `current_weight`, `recommended_weight`, `weight_change`, `volatilities` and
+   * `target_volatility` are all fractions of NAV — so the scale is declared once
+   * here instead of sniffed from the magnitude. The old
+   * `Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value` multiplied the
+   * ordinary values and left the leveraged ones unscaled: a 130% recommended
+   * weight, which this page's own financing branch exists to render, printed as
+   * "1.3%".
+   *
+   * This is the same contract `formatWeight` (module scope, above) already
+   * applies unconditionally; it is kept separate only because this one defaults
+   * to one decimal and omits the sign.
+   */
   const formatPercentage = (value: number | undefined | null, decimals = 1) => {
     if (value === undefined || value === null || isNaN(value)) {
       return 'N/A';
     }
-    const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
-    return `${scaled.toFixed(decimals)}%`;
+    return `${(value * 100).toFixed(decimals)}%`;
   };
 
   const formatCurrency = (value: number | undefined | null) => {

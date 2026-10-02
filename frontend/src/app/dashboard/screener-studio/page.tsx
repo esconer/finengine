@@ -171,10 +171,22 @@ export default function ScreenerStudioPage() {
   };
 
   const handleAddToPortfolio = async (stock: ScreenerStock) => {
+    // A screened row with no price has no buy price to record. `stock.price || 0`
+    // wrote a fabricated 0, which the backend rejects —
+    // `schemas.py:17 buy_price: float = Field(..., gt=0)` — so nothing was
+    // persisted and the user saw "buy_price: Input should be greater than 0"
+    // beside a row rendering "Rs undefined", which names neither the row nor the
+    // cause. Refuse the add and say which row is missing its price instead.
+    if (typeof stock.price !== 'number' || !Number.isFinite(stock.price) || stock.price <= 0) {
+      setAddError(
+        `Cannot add ${stock.symbol}: the screen published no price for ${stock.ticker}, so there is no buy price to record.`
+      );
+      return;
+    }
     setAddingStock(stock.symbol);
     setAddError(null);
     try {
-      const price = stock.price || 0;
+      const price = stock.price;
       // Mirror AddPositionModalSimple weight math: first position in an empty
       // portfolio is 1.0 (zero-state invariant); otherwise value/(total+value).
       const portfolio = await portfolioApi.getPortfolio({ currency: 'INR' });

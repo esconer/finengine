@@ -279,9 +279,10 @@ const buildPayloads = (options: {
     },
     pairs: {
       as_of: asOf,
-      // This is the one route that publishes a real `as_of_semantics` by
-      // default, and the one that swaps it for `request_end_no_usable_price_data`
-      // when the scan had no usable price.
+      // The pairs scan publishes a real `as_of_semantics` by default (as does
+      // `/correlation-stability`, on both its branches), and it is the one that
+      // swaps it for `request_end_no_usable_price_data` when the scan had no
+      // usable price.
       as_of_semantics: options.semantics ?? 'latest_available_observation',
       pairs: [],
       missing_tickers: coverage.missing_tickers,
@@ -543,7 +544,7 @@ describe('SectionProvenance — a missing ticker is NAMED, not counted', () => {
     expect(coverage).toMatch(/incomplete/i);
   });
 
-  it('names a missing ticker on the pairs scan, the one route with real as_of_semantics', async () => {
+  it('names a missing ticker on the pairs scan, which publishes real as_of_semantics', async () => {
     wireMocks(buildPayloads({ withDate: true, withGap: true }));
     render(<PairsPage />);
     await waitFor(() => expect(screen.getByTestId('section-provenance')).toBeDefined());
@@ -606,15 +607,21 @@ describe('SectionProvenance — as_of_semantics renders wherever the backend pub
   });
 
   /**
-   * Only `/analytics/coint` publishes a non-null `as_of_semantics` among these
-   * routes — verified against `backend/app/api/analytics.py` (the sole
-   * `"as_of_semantics"` key between the realized-risk and vol-cone routes is
-   * concentration's always-null one, and `CointScannerResponse` declares
-   * `as_of_semantics: str = "latest_available_observation"`).
+   * `/analytics/coint` and `/correlation-stability` are the routes that publish
+   * a non-null `as_of_semantics` — verified against
+   * `backend/app/api/analytics.py` (the sole `"as_of_semantics"` key between the
+   * realized-risk and vol-cone routes is concentration's always-null one,
+   * `CointScannerResponse` declares
+   * `as_of_semantics: str = "latest_available_observation"`, and
+   * `CorrelationStabilityResponse` sets a token on BOTH its branches —
+   * `request_end_universe_too_small_for_pairwise_correlation` at
+   * analytics.py:11025 and `latest_available_observation` at
+   * correlation_service.py:263 — so it is no longer a sole publisher).
    *
-   * So the inverse is also pinned here: a route that publishes NO semantics must
-   * not be made to look as though it did. Fabricating a label in the frontend to
-   * fill the gap would be a second, drifting copy of the backend's vocabulary.
+   * None of the four routes exercised below is one of them, so the inverse is
+   * pinned here: a route that publishes NO semantics must not be made to look as
+   * though it did. Fabricating a label in the frontend to fill the gap would be a
+   * second, drifting copy of the backend's vocabulary.
    */
   it.each([
     ['realized-risk', RealizedRiskPage],

@@ -383,12 +383,19 @@ export default function LiquidityPage() {
     return value.toLocaleString('en-IN');
   };
 
+  /**
+   * FRACTION in, percent out. Both call sites pass fractions: `bid_ask_spread`
+   * is a fraction of price, and `highLiquidityShare` is `count / scoredCount`.
+   * The scale is therefore declared once here rather than sniffed per value —
+   * the old `Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value`
+   * multiplied exactly the legitimate values and left the ones a wide spread or
+   * a fully-covered book can produce (1.5 → "1.5%") unscaled.
+   */
   const formatPercentage = (value: number | undefined | null, decimals = 2) => {
     if (value === undefined || value === null || isNaN(value)) {
       return 'N/A';
     }
-    const scaled = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
-    return `${scaled.toFixed(decimals)}%`;
+    return `${(value * 100).toFixed(decimals)}%`;
   };
 
   const getScoreColor = (score: number | null): string => {

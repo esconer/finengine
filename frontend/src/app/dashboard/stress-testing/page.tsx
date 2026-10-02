@@ -550,17 +550,34 @@ export default function StressTestingPage() {
     };
   }, [positions]);
 
+  /**
+   * FRACTION in, percent out.
+   *
+   * The engine declares both impact fields as fractions:
+   *   `analytics_engine.py:4431` `"portfolio_impact": "fraction_of_portfolio_value"`
+   *   `analytics_engine.py:4432` `"position_impacts": "fraction_of_position_value"`
+   *
+   * Every one of the four places that used to sniff the scale
+   * (`Math.abs(v) <= 1.0 && v !== 0 ? v * 100 : v`) has the same contract, so
+   * the scale lives in ONE place now. The sniff multiplied exactly the
+   * legitimate in-window values and left the ones a leveraged book can actually
+   * produce unscaled — a -1.5 (a 150% loss) printed as "-1.5%". The `!== 0`
+   * clause shows the sniff was narrowed once and never removed; a measured 0
+   * renders as "0.0%" either way, so it bought nothing.
+   */
+  const impactPercent = (value: number | null | undefined): number | null => {
+    if (value === undefined || value === null || isNaN(value)) return null;
+    return value * 100;
+  };
+
   const formatPercentage = (value: number | undefined | null, decimals = 1) => {
-    if (value === undefined || value === null || isNaN(value)) {
-      return 'N/A';
-    }
-    const pct = Math.abs(value) <= 1.0 && value !== 0 ? value * 100 : value;
-    return `${pct >= 0 ? '+' : ''}${pct.toFixed(decimals)}%`;
+    const pct = impactPercent(value);
+    return pct === null ? 'N/A' : `${pct >= 0 ? '+' : ''}${pct.toFixed(decimals)}%`;
   };
 
   const getImpactColor = (impact: number | null | undefined): string => {
-    if (impact == null) return 'text-gray-400 dark:text-gray-500';
-    const pct = Math.abs(impact) <= 1.0 && impact !== 0 ? impact * 100 : impact;
+    const pct = impactPercent(impact);
+    if (pct === null) return 'text-gray-400 dark:text-gray-500';
     if (pct < -25) return 'text-red-600 dark:text-red-400';
     if (pct < -15) return 'text-orange-600 dark:text-orange-400';
     if (pct < -5) return 'text-yellow-600 dark:text-yellow-400';
@@ -568,8 +585,8 @@ export default function StressTestingPage() {
   };
 
   const getImpactBgColor = (impact: number | null | undefined): string => {
-    if (impact == null) return 'bg-gray-50 dark:bg-gray-800/40 border-gray-200 dark:border-gray-700';
-    const pct = Math.abs(impact) <= 1.0 && impact !== 0 ? impact * 100 : impact;
+    const pct = impactPercent(impact);
+    if (pct === null) return 'bg-gray-50 dark:bg-gray-800/40 border-gray-200 dark:border-gray-700';
     if (pct < -25) return 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800';
     if (pct < -15) return 'bg-orange-50 dark:bg-orange-950/20 border-orange-200 dark:border-orange-800';
     if (pct < -5) return 'bg-yellow-50 dark:bg-yellow-950/20 border-yellow-200 dark:border-yellow-800';
@@ -577,8 +594,8 @@ export default function StressTestingPage() {
   };
 
   const severityFor = (rawImpact: number | null | undefined): { label: string; className: string } | null => {
-    if (rawImpact == null) return null;
-    const impactVal = Math.abs(rawImpact) <= 1.0 && rawImpact !== 0 ? rawImpact * 100 : rawImpact;
+    const impactVal = impactPercent(rawImpact);
+    if (impactVal === null) return null;
     const severity = impactVal < -25 ? 'Critical' : impactVal < -15 ? 'High' : impactVal < -5 ? 'Medium' : 'Low';
     const colorClass = severity === 'Critical' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300 border-red-200 dark:border-red-800' :
                       severity === 'High' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300 border-orange-200 dark:border-orange-800' :
