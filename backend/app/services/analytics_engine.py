@@ -6010,17 +6010,42 @@ class AnalyticsEngine:
             # a STATED assumption, not a property of the fitted model.  The
             # disclosure says so rather than letting `model: EWMA` imply a
             # parametric tail it does not have.
-            return_space_vol = float(forecast_volatility * h_factor)
+            #
+            # The tail is built from the core's RAW sigma, not the clipped
+            # `volatility_forecast` this method used to multiply here.  On a
+            # low-volatility book that sigma is below `FORECAST_VOL_CLIP_LOW`,
+            # so the published VaR/CVaR were the 5 % floor's tail while the two
+            # branches beside it published the raw sigma's tail -- the same
+            # input yielding two different risk numbers depending on which
+            # model was selected.  `volatility_forecast` itself stays clipped:
+            # the term structure above and the public field keep their UI
+            # bounds, and only the DERIVED risk measure moves to the raw sigma.
+            #
+            # THE MULTIPLICATION ORDER IS UNCHANGED, deliberately.  The defect
+            # was the sigma, not the association; rewriting this as
+            # `(raw * h_factor) * multiplier` reassociates the product and
+            # moves a published value by one ULP on inputs where the clip was
+            # already inert -- which
+            # `test_forecast_precision_disclosure.py::test_every_model_series_and_horizon_is_bit_identical`
+            # correctly catches.  Keeping `raw_sigma * M * h_factor` leaves every
+            # already-correct input bit-identical and moves only the inputs the
+            # clip was actually corrupting.
+            raw_sigma = point["raw_volatility_forecast"]
+            if raw_sigma is None or not np.isfinite(float(raw_sigma)):
+                # Refuse, never substitute the clipped sigma for a missing one.
+                raise ValueError("EWMA core published no finite raw sigma")
+            raw_sigma = float(raw_sigma)
+            return_space_vol = float(raw_sigma * h_factor)
             var_forecast = float(
                 np.clip(
-                    -forecast_volatility * TAIL_Z_MULTIPLIER * h_factor,
+                    -raw_sigma * TAIL_Z_MULTIPLIER * h_factor,
                     TAIL_CLIP_LOW,
                     TAIL_CLIP_HIGH,
                 )
             )
             cvar_forecast = float(
                 np.clip(
-                    -forecast_volatility * TAIL_ES_MULTIPLIER * h_factor,
+                    -raw_sigma * TAIL_ES_MULTIPLIER * h_factor,
                     TAIL_CLIP_LOW,
                     TAIL_CLIP_HIGH,
                 )
@@ -6209,7 +6234,28 @@ class AnalyticsEngine:
                             port_alpha_se = self._finite_param(port_model.bse, 0)
                             port_beta_se = self._finite_param(port_model.bse, 1)
                             r_squared = round(float(port_model.rsquared), 4)
-                            adj_r_squared = round(float(max(0.0, port_model.rsquared_adj)), 4)
+                            # Published UNCLIPPED, negatives included.
+                            # `rsquared_adj` is 1-(1-R^2)(n-1)/(n-2), so it is
+                            # negative whenever R^2 < 1/(n-1).  The fit is
+                            # gated by `len(common_dates) > 10` above, so 11 is
+                            # the smallest sample this section can publish and
+                            # the sign boundary sits at 1/(n-1) = 0.100 there --
+                            # a threshold an ordinary 4-name book against a
+                            # benchmark clears by nothing.  The `max(0.0, ...)`
+                            # that stood here published 0.0 for every such fit: a
+                            # model explaining 5% of variance reported the same
+                            # number as a model explaining none, and 0.0 is also
+                            # what a fit explaining NONE would publish on its
+                            # own terms, so no threshold reading the field could
+                            # tell the three apart.  The negative value carries
+                            # the real information -- the model is worse than
+                            # the sample mean -- and the identity the rest of the
+                            # repo checks the pair against
+                            # (`tests/test_model_sample_and_aggregation_disclosure.py`)
+                            # only holds for the unclipped value.  `r_squared`
+                            # itself is never negative, so the pair's own
+                            # invariant `adjusted <= raw` is preserved.
+                            adj_r_squared = round(float(port_model.rsquared_adj), 4)
                             return {
                                 'portfolio': {
                                     'alpha': round(port_alpha, 6) if port_alpha is not None else None,
@@ -6555,6 +6601,23 @@ def volatility_forecast_point(
         for x in window:
             var = EWMA_LAMBDA * var + (1.0 - EWMA_LAMBDA) * x * x
         raw = float(np.sqrt(max(0.0, var) * 252))
+        if not np.isfinite(raw):
+            # Refuse rather than fall back to the clipped path below.  Every
+            # other consumer of this raw value (`_volatility_sizing`'s
+            # inverse-volatility parity) reads `raw_volatility_forecast`
+            # directly, so a non-finite raw that quietly became the 5% floor
+            # here would put a fabricated risk measure on the wire while the
+            # sizing leg read the same field as though it were measured.  This
+            # is the same contract the GARCH/EGARCH branch applies to its
+            # variance path (:6640).  Both enclosing handlers treat a refusal
+            # as an absent measurement rather than a number:
+            # `volatility_forecast_statistics` counts the draw NaN and
+            # `_ewma_forecast`'s `except` returns the empty-forecast contract,
+            # where `var_forecast`, `cvar_forecast` and `tail_measure` are all
+            # None.  (That handler's published `error` string is
+            # `_empty_forecast`'s default -- pre-existing, and not this
+            # function's to relabel.)
+            raise ValueError("EWMA recursion produced a non-finite sigma")
         annualized = np.array([float(np.clip(raw, FORECAST_VOL_CLIP_LOW,
                                             FORECAST_VOL_CLIP_HIGH))] * h)
         return {
@@ -6562,7 +6625,18 @@ def volatility_forecast_point(
             "horizon": h,
             "volatility_forecast": float(annualized[-1]),
             "raw_volatility_forecast": raw,
-            "return_space_volatility": float(annualized[-1] * np.sqrt(h / 252.0)),
+            # The RAW sigma, not `annualized[-1]`.  This is the convention the
+            # GARCH/EGARCH branch already follows (:6652, built from the
+            # un-clipped `return_space_path`), and `return_space_volatility` is
+            # what VaR and CVaR are derived from -- so reading the clipped path
+            # here published a 3%-volatility book at a VaR computed from the
+            # 5% floor, 73% high, while the public `volatility_forecast`
+            # beside it stayed correctly clipped for UI bounds.  The sizing leg
+            # made the same distinction at :4628-4631 for the same reason: a
+            # clip is a display bound, not a measurement.  `np.isfinite` rather
+            # than the builtin `min`, which returns 5.9 for `min(5.9, nan)`
+            # and would let a NaN through as the clipped value.
+            "return_space_volatility": float(raw * np.sqrt(h / 252.0)),
             "annualized_volatility_path": annualized,
             "forecast_method": "riskmetrics_recursion",
             "simulated": False,
