@@ -424,6 +424,38 @@ def _pvalue_of(value: Any) -> Optional[float]:
     return float(min(1.0, max(0.0, float(value))))
 
 
+def _carries_non_finite(value: Any) -> bool:
+    """True when any number anywhere inside `value` is NaN or an infinity.
+
+    The published payload NESTS, so a check over a model's own top-level fields
+    would pass while the figure that actually reaches the wire is the degenerate
+    one: the per-leg stationarity records are dicts of p-values and
+    `spread_series` is a list of dicts. So this walks both, rather than trusting
+    the caller to have flattened first.
+
+    The sibling of `_is_real`, and deliberately not a re-implementation of it:
+    `_is_real` answers "is this one thing a finite real number", which is False
+    for `None`, a string, a dict and `nan` alike, so it cannot be the predicate
+    here - every non-numeric leaf would read as a failure. This one asks only
+    about finiteness, and leaves everything else alone.
+
+    Non-numeric leaves (`None`, `str`, `bool`, dates) are not measurements and
+    cannot be non-finite, so they pass through. Bools are excluded explicitly
+    because `isinstance(True, int)` is True and `np.isfinite(True)` is
+    harmless, but `bool` is a declaration and should never be read as one of
+    these figures.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return not bool(np.isfinite(float(value)))
+    if isinstance(value, dict):
+        return any(_carries_non_finite(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_carries_non_finite(item) for item in value)
+    return False
+
+
 def bonferroni_threshold(family_alpha: float, comparisons: int) -> Optional[float]:
     """`alpha / comparisons`, or None when the family is empty.
 
@@ -1407,6 +1439,53 @@ def analyze_pair_cointegration(
         logger.debug(f"Engle-Granger error for {ticker_a}-{ticker_b}: {e}")
         return None
 
+    # 1a. A verdict the test itself declines to stand behind.
+    #
+    # `coint` does not raise on collinear legs - it WARNS
+    # (`CollinearityWarning`, "y0 and y1 are (almost) perfectly colinear.
+    # Cointegration test is not reliable in this case") and returns, on that
+    # same branch, a t-statistic that is hardcoded there:
+    #
+    #     if res_co.rsquared < 1 - 100 * SQRTEPS:
+    #         res_adf = adfuller(...)
+    #     else:
+    #         warnings.warn(..., CollinearityWarning)
+    #         res_adf = (-np.inf,)
+    #
+    # so the warning and a non-finite statistic are not two symptoms of one
+    # condition - they are one condition read off two channels, and reading it
+    # off the return value is how you avoid touching the warning at all. The
+    # `except` above can never see it, because a warning is not an exception.
+    #
+    # What it cost when it was published: `p` is `cdf(-inf)` = 0.0, which is
+    # the strongest possible reading of "strongly cointegrated" and the exact
+    # opposite of the truth. The regression residual is identically zero, so
+    # there is no sampling distribution to compare against and the test has no
+    # answer. `bool(0.0 < p_value_threshold)` then published the pair as
+    # cointegrated on a statistic its own author called unreliable.
+    #
+    # Refused, never repaired. Clipping `-inf` to a large finite number
+    # publishes a statistic the test never computed; writing `0.0` publishes a
+    # finite one that reads as an ordinary measurement. Both are the same
+    # defect in different clothes, and a refusal is the answer this module
+    # already gives when it cannot measure something (`MIN_PAIR_OBSERVATIONS`
+    # above). `CointPairResult.is_cointegrated` is a required `bool`, so a pair
+    # with no valid verdict has no representable payload at all - which is why
+    # this is a `None` rather than a new signal head.
+    #
+    # The warning is NOT suppressed: it still reaches the caller, because a
+    # silent refusal is how a reader cannot tell a vanished pair from one that
+    # was never scanned.
+    if not (_is_real(engle_granger_tstat) and _is_real(engle_granger_pvalue)):
+        logger.debug(
+            f"Engle-Granger declined to answer for {ticker_a}-{ticker_b}: "
+            f"tstat={engle_granger_tstat!r} pvalue={engle_granger_pvalue!r} is not "
+            f"a finite measurement (collinear legs make statsmodels return -inf "
+            f"with p=0.0, and warn that the result is not reliable). Refusing "
+            f"rather than publishing a statistic the test disowns."
+        )
+        return None
+
     is_coint = bool(engle_granger_pvalue < p_value_threshold)
 
     # 1b. The precondition the verdict above is read against. Measured on
@@ -1428,6 +1507,19 @@ def analyze_pair_cointegration(
         alpha = float(alpha)
     except Exception as e:
         logger.debug(f"OLS hedge ratio error for {ticker_a}-{ticker_b}: {e}")
+        return None
+
+    # The hedge ratio is the one figure that SIZES a directive, so it is the
+    # last one that may not be a fabrication. `np.polyfit` does not raise on a
+    # degenerate fit - it warns and returns `nan` - and the float() casts above
+    # would carry that straight into the payload and into the f-strings that
+    # render `hedge_ratio_beta` into `signal`. Same rule, same refusal: not
+    # measurable means not published.
+    if not (_is_real(beta) and _is_real(alpha)):
+        logger.debug(
+            f"OLS hedge ratio is not finite for {ticker_a}-{ticker_b}: "
+            f"beta={beta!r} alpha={alpha!r}. Refusing."
+        )
         return None
 
     # 2b. Standard errors for that regression. The slope drives a TRADE: a
@@ -1583,7 +1675,7 @@ def analyze_pair_cointegration(
 
     overlap_start = _date_text(df.index[0])
     overlap_end = _date_text(df.index[-1])
-    return CointPairResult(
+    result = CointPairResult(
         ticker_a=ticker_a,
         ticker_b=ticker_b,
         engle_granger_pvalue=round(engle_granger_pvalue, 6),
@@ -1630,6 +1722,32 @@ def analyze_pair_cointegration(
         stationarity_leg_b=stationarity_leg_b,
         stationarity_gate=stationarity_gate,
     )
+
+    # 9. Nothing non-finite is published, whatever produced it.
+    #
+    # The specific guards above - the Engle-Granger statistic at 1a, the hedge
+    # ratio at 2 - each cover the one field whose failure they were written for,
+    # and this covers the rest: the OU parameters, the z-score, the spread
+    # points, and any nested per-leg p-value. `_carries_non_finite` walks the
+    # built payload rather than a hand-listed tuple of locals, so a field added
+    # later is covered by construction instead of by remembering to list it.
+    #
+    # Why this is a refusal and not a scrub: `-inf` and `nan` are not JSON.
+    # `json.dumps` emits them as bare `-Infinity` / `NaN` by default, which RFC
+    # 8259 does not allow, so a strict parser (`JSON.parse`) throws on the whole
+    # response rather than skipping one field - one pair's statistic takes down
+    # every pair's data. Substituting a finite stand-in would hide that behind a
+    # number that looks measured. The module's rule stands: a refusal is a valid
+    # answer, a fabricated number is the defect.
+    if _carries_non_finite(result.model_dump()):
+        logger.debug(
+            f"Refusing to publish {ticker_a}-{ticker_b}: the payload carries a "
+            f"non-finite figure. A NaN or infinity cannot cross the wire as JSON, "
+            f"so this pair is dropped rather than published unparseable."
+        )
+        return None
+
+    return result
 
 
 class CointegrationService:
@@ -1760,6 +1878,23 @@ class CointegrationService:
                 STATIONARITY_UNDETERMINED,
             ):
                 return False
+        # A non-finite figure is the same class of defect as a missing
+        # measurement, and this row shape is exactly what a build BEFORE the
+        # collinearity refusal wrote: `engle_granger_tstat = -inf` with
+        # `is_cointegrated = True`, cached and then re-served. Serving it would
+        # republish the precise verdict `analyze_pair_cointegration` now refuses
+        # to produce - for up to CACHE_TTL_HOURS in memory, and until
+        # `last_date` rolls over in the DB, which for a same-day rescan is
+        # never. Recomputing it now yields no row at all, so a miss here costs
+        # nothing and a hit would cost a wrong answer.
+        #
+        # Checked on the row rather than by bumping `COINT_CONTRACT_VERSION`,
+        # deliberately: a bump invalidates every cached pair in the book and
+        # forces a full rescan, whereas the rows that are actually wrong are
+        # exactly the ones carrying a non-finite figure, and those are the ones
+        # this drops.
+        if _carries_non_finite(pair_data):
+            return False
         try:
             return int(pair_data.get("hedge_regression_observations") or 0) > 2
         except (TypeError, ValueError):
