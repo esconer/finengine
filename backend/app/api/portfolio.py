@@ -2264,23 +2264,48 @@ async def _update_portfolio_prices(
 
     sem = asyncio.Semaphore(5)
 
-    async def update_one(position: PortfolioPosition):
+    async def fetch_one(position: PortfolioPosition):
+        """Fetch one quote. Returns plain data; touches no ORM attribute.
+
+        `fetch_quote` runs `db.execute()` on the request's one AsyncSession,
+        and autoflush is on, so a mapped attribute assigned here lands inside a
+        sibling worker's flush -- after its dirty snapshot
+        (sqlalchemy/orm/session.py:4373) and before its post-flush
+        `_commit_all_states` (session.py:4457-4474), which resets the history
+        without emitting an UPDATE. The write is lost; only the SAWarning
+        hints at it. `DataService._db_lock` gates its own DB work for the same
+        reason (data_service.py:238-243); the assignments are hoisted out of
+        the gather rather than gated, because they need no await at all.
+
+        `updated_on` is stamped HERE, when this leg's quote actually arrives,
+        and applied after the gather. Stamping it during the serial apply
+        instead would collapse the per-leg spread that `_mark_clock_block`
+        publishes (portfolio.py:313-323).
+        """
         async with sem:
             try:
                 quote_data = await data_service.fetch_quote(position.ticker)
-                if quote_data and quote_data.get("current_price"):
-                    position.last_price = quote_data["current_price"]
-                    position.market_value = (position.quantity or 0) * position.last_price
-                    if quote_data.get("sector") and not position.sector:
-                        position.sector = quote_data["sector"]
-                    if quote_data.get("industry") and not position.industry:
-                        position.industry = quote_data["industry"]
-                    if quote_data.get("currency"):
-                        # Transient request metadata; persistence belongs to the
-                        # D-owned position migration, not this API shim.
-                        position._quote_currency = quote_data["currency"]
-                    position.updated_on = datetime.now(timezone.utc).replace(tzinfo=None)
+                return position, quote_data, datetime.now(timezone.utc).replace(tzinfo=None)
             except Exception:
                 logger.error("Portfolio price refresh failed")
+                return position, None, None
 
-    await asyncio.gather(*[update_one(p) for p in positions_to_update])
+    fetched = await asyncio.gather(*[fetch_one(p) for p in positions_to_update])
+
+    # One serial pass: no worker is in flight, so nothing can be mid-flush.
+    for position, quote_data, updated_on in fetched:
+        try:
+            if quote_data and quote_data.get("current_price"):
+                position.last_price = quote_data["current_price"]
+                position.market_value = (position.quantity or 0) * position.last_price
+                if quote_data.get("sector") and not position.sector:
+                    position.sector = quote_data["sector"]
+                if quote_data.get("industry") and not position.industry:
+                    position.industry = quote_data["industry"]
+                if quote_data.get("currency"):
+                    # Transient request metadata; persistence belongs to the
+                    # D-owned position migration, not this API shim.
+                    position._quote_currency = quote_data["currency"]
+                position.updated_on = updated_on
+        except Exception:
+            logger.error("Portfolio price refresh failed")
