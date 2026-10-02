@@ -67,6 +67,7 @@ from app.models.schemas import CointPairResult
 from app.services import cointegration_service as coint
 from app.services.cointegration_service import (
     MULTIPLICITY_CORRECTION,
+    SIGNAL_DIAGNOSTIC_UNAVAILABLE,
     SIGNAL_SPURIOUS,
     SIGNAL_STATIONARITY_UNDETERMINED,
     STATIONARITY_ALPHA,
@@ -661,6 +662,9 @@ class TestTheWithholdingCountsArePublished:
         assert payload["spurious_regression_rejected_count"] == 0
         assert payload["stationarity_undetermined_count"] == 0
         assert payload["directive_withheld_count"] == 0
+        # The negative half of the THIRD count too. A counter that only exists
+        # when it fires is a counter nobody can read the absence of.
+        assert payload["diagnostic_unavailable_count"] == 0
 
     async def test_a_measured_spurious_pair_is_counted_on_the_wire(self):
         """The counts are not a fixture artefact: a real scan of two stationary
@@ -1230,3 +1234,170 @@ class TestTheVerdictTotalAndTheWithholdingCountAreTwoFacts:
         by_key = {f"{r.ticker_a}/{r.ticker_b}": r for r in rows}
         for row in payload["pairs"]:
             assert set(row) == set(by_key[f"{row['ticker_a']}/{row['ticker_b']}"].model_dump())
+
+
+# ---------------------------------------------------------------------------
+# 3b. The THIRD withholding: a diagnostic that produced no verdict
+# ---------------------------------------------------------------------------
+# `build_pair_signal` emits `JOHANSEN_DIAGNOSTIC_UNAVAILABLE` for a pair whose
+# Johansen statistic was not computable, and that head is in none of the counts
+# above. `contested_pair_count` counts the contested head and must keep counting
+# only pairs where two tests RAN and returned opposite verdicts; the two
+# stationarity counts are about legs. So the refusal was withheld from every
+# counter on the wire while still counting towards `directive_withheld_count`, and
+# a reader reconciling those four numbers had no field that held it.
+
+
+def _refusal(a: str, b: str, **overrides) -> CointPairResult:
+    """A decision-positive, gate-passed pair whose diagnostic produced no verdict.
+
+    `johansen_agrees_with_decision` is None, not False: `None == False` is True in
+    Python, so the naive comparison would publish "the two tests agree" for a pair
+    whose second test never ran.
+    """
+    fields = dict(
+        ticker_a=a,
+        ticker_b=b,
+        engle_granger_pvalue=1e-9,
+        engle_granger_tstat=-3.5,
+        is_cointegrated=True,
+        hedge_ratio_beta=1.0,
+        intercept_alpha=0.0,
+        ou_half_life_days=10.0,
+        ou_reversion_speed_theta=0.07,
+        current_spread_zscore=-2.0,
+        hedge_ratio_beta_std_error=0.04,
+        intercept_alpha_std_error=1.2,
+        hedge_regression_observations=N,
+        hedge_regression_std_error_basis=(
+            "ols_standard_error_from_polyfit_covariance_df_n_minus_2"
+        ),
+        johansen_cointegrated=None,
+        last_price_a=100.0,
+        last_price_b=200.0,
+        observation_date_a="2026-01-01",
+        observation_date_b="2026-01-01",
+        overlap_start="2026-01-01",
+        overlap_end="2026-08-31",
+        overlap_observations=N,
+        signal="NEUTRAL",
+        decision_test="engle_granger",
+        johansen_role="diagnostic_only",
+        johansen_agrees_with_decision=None,
+        stationarity_leg_a=_leg(a, "i1"),
+        stationarity_leg_b=_leg(b, "i1"),
+        stationarity_gate={
+            "verdict": STATIONARITY_GATE_PASSED,
+            "leg_a_verdict": "i1",
+            "leg_b_verdict": "i1",
+            "reason": "fixture gate passed",
+        },
+    )
+    fields.update(overrides)
+    return CointPairResult(**fields)
+
+
+def _mixed_rows() -> List[CointPairResult]:
+    """Six rows: one refusal, one measured conflict, one directive, one negative,
+    and two that fail the family correction.
+
+    Each withholding head this section counts has its own row, so no count can be
+    satisfied by another head's total, and the scan carries a `LONG_SPREAD`
+    alongside the withheld rows so `directive_withheld_count` is not the whole
+    delivered set.
+    """
+    return [
+        _refusal("A.NS", "B.NS"),
+        _pair("A.NS", "C.NS", 1e-9, johansen=False, zscore=2.0),
+        _pair("B.NS", "C.NS", 1e-9, zscore=-1.5),
+        _pair("A.NS", "D.NS", 0.5, is_coint=False, johansen=False, zscore=0.1),
+        _pair("B.NS", "D.NS", 0.042007, zscore=0.2),
+        _pair("C.NS", "D.NS", 0.042007, zscore=-0.2),
+    ]
+
+
+class TestTheDiagnosticRefusalIsCountedOnTheWire:
+    async def test_the_refusal_is_counted_and_not_as_a_contested_pair(self):
+        payload = await _scan(DIVERGENCE_TICKERS, _mixed_rows())
+
+        assert _head(payload["pairs"][0]["signal"]) == SIGNAL_DIAGNOSTIC_UNAVAILABLE
+        assert payload["diagnostic_unavailable_count"] == 1
+        # The sharp half: a refusal is NOT a conflict. One pair here ran both
+        # tests and they opposed each other, so this counter stays at 1 and
+        # cannot be doing the refusal's job.
+        assert payload["contested_pair_count"] == 1
+        assert payload["spurious_regression_rejected_count"] == 0
+        assert payload["stationarity_undetermined_count"] == 0
+
+    async def test_the_count_is_read_off_the_published_signal_heads(self):
+        payload = await _scan(DIVERGENCE_TICKERS, _mixed_rows())
+        heads = [_head(row["signal"]) for row in payload["pairs"]]
+
+        assert heads.count(SIGNAL_DIAGNOSTIC_UNAVAILABLE) == payload[
+            "diagnostic_unavailable_count"
+        ]
+        # And it accounts for the withheld row the other three counters do not,
+        # so the four of them still close over `directive_withheld_count`. The
+        # two remaining heads are `LONG_SPREAD` (a directive, not withheld) and
+        # `NOT_COINTEGRATED`, which is withheld but is not a gate withholding.
+        assert (
+            payload["contested_pair_count"]
+            + payload["spurious_regression_rejected_count"]
+            + payload["stationarity_undetermined_count"]
+            + payload["diagnostic_unavailable_count"]
+            + heads.count("UNCONFIRMED_AFTER_MULTIPLE_TESTING_CORRECTION")
+            + heads.count("NOT_COINTEGRATED")
+        ) == payload["directive_withheld_count"]
+
+    async def test_it_agrees_with_the_test_agreement_block_on_the_same_rows(self):
+        """Two counters over the same population, derived from two different
+        fields (the signal head and the diagnostic itself), so a mismatch means
+        one of them is lying about the book."""
+        payload = await _scan(DIVERGENCE_TICKERS, _mixed_rows())
+
+        assert payload["test_agreement"]["unavailable_count"] == 1
+        assert payload["diagnostic_unavailable_count"] == 1
+        assert payload["test_agreement"]["unavailable_pairs"] == [
+            f"{payload['pairs'][0]['ticker_a']}/{payload['pairs'][0]['ticker_b']}"
+        ]
+
+    async def test_the_basis_does_not_read_as_a_data_conflict(self):
+        """The wording matters as much as the number: a basis sentence that says
+        "conflict" or "disagree" next to this count restates a refused
+        computation as a finding about the pair, whatever the count is called."""
+        payload = await _scan(DIVERGENCE_TICKERS, _mixed_rows())
+        basis = payload["diagnostic_unavailable_count_basis"]
+
+        assert SIGNAL_DIAGNOSTIC_UNAVAILABLE in basis
+        assert "NOT a subset of contested_pair_count" in basis
+        assert "claim about the computation" in basis
+        for forbidden in ("the two tests disagree", "tests conflict"):
+            assert forbidden not in basis, forbidden
+
+    async def test_the_warning_names_the_refusal_without_reading_as_a_conflict(self):
+        payload = await _scan(DIVERGENCE_TICKERS, _mixed_rows())
+        warnings = [w for w in payload["warnings"] if w.startswith("Diagnostic unavailable:")]
+
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert "1 pair is cointegrated under engle_granger" in warning
+        assert "not computable" in warning
+        # The distinction is stated in the sentence a consumer reads first, and
+        # the line is separate from the contested one so the two cannot merge.
+        assert "This is a statement about the computation, not about the pair" in warning
+        assert "the two tests did not conflict, because only one of them answered" in warning
+        for forbidden in ("the two tests disagree", "tests conflict"):
+            assert forbidden not in warning, forbidden
+        contested = [w for w in payload["warnings"] if w.startswith("Contested pairs:")]
+        assert len(contested) == 1
+        assert warning is not contested[0]
+
+    async def test_a_scan_with_no_refusal_publishes_no_such_warning(self):
+        """The half nobody writes. A warning that fires on clean scans is noise,
+        and noise is how a real degradation goes unread."""
+        payload = await _scan(CLEAN_TICKERS, _clean_rows())
+
+        assert payload["diagnostic_unavailable_count"] == 0
+        assert not [
+            w for w in payload["warnings"] if w.startswith("Diagnostic unavailable:")
+        ]

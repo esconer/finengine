@@ -2959,11 +2959,30 @@ def num_014_pairs_counting(export: Export) -> list[Finding]:
                 )
             )
             continue
+        # Three buckets, not two. `johansen_cointegrated` is a tri-state:
+        # `null` means the statistic was not computable, so no verdict exists to
+        # compare against the decision. Such a pair is neither agreement nor
+        # disagreement -- it is a refusal -- and the two-bucket identity below
+        # fired on every honest export carrying one, because the aggregate was
+        # forced to publish the refusal as a conflict. `unavailable_count` is
+        # therefore read beside the other two. It is DEFAULTED to 0, not
+        # required: an export generated before the tri-state had no refused
+        # diagnostic to count, so 0 is the true value of that field for one, and
+        # requiring the key would fail every pre-tri-state artifact on a
+        # disclosure rather than on an inconsistency.
+        unavailable = agreement.get("unavailable_count", 0)
         counts = [
             agreement.get("agreement_count"),
             agreement.get("disagreement_count"),
+            unavailable,
             agreement.get("counted_pairs"),
         ]
+        published = (
+            "agreement_count",
+            "disagreement_count",
+            "unavailable_count",
+            "counted_pairs",
+        )
         if not all(_is_number(count) for count in counts):
             findings.append(
                 Finding(
@@ -2971,17 +2990,22 @@ def num_014_pairs_counting(export: Export) -> list[Finding]:
                     _section_of(path),
                     f"{path}.test_agreement",
                     f"agreement counts are not published: "
-                    f"{ {k: agreement.get(k) for k in ('agreement_count', 'disagreement_count', 'counted_pairs')} }",
+                    f"{ {k: agreement.get(k) for k in published} }",
                 )
             )
-        elif int(counts[0]) + int(counts[1]) != int(counts[2]):
+        elif int(counts[0]) + int(counts[1]) + int(counts[2]) != int(counts[3]):
             findings.append(
                 Finding(
                     "NUM-014",
                     _section_of(path),
                     f"{path}.test_agreement",
-                    f"agreement ({counts[0]}) + disagreement ({counts[1]}) != "
-                    f"counted_pairs ({counts[2]})",
+                    f"agreement ({counts[0]}) + disagreement ({counts[1]})"
+                    + (
+                        f" + unavailable ({counts[2]})"
+                        if "unavailable_count" in agreement
+                        else ""
+                    )
+                    + f" != counted_pairs ({counts[3]})",
                 )
             )
     return findings
@@ -4736,7 +4760,9 @@ RULES: tuple[Rule, ...] = (
          "success_definition is present", num_013_monte_carlo_quantiles),
     Rule("NUM-014", CATEGORY_NUMERIC,
          "pairs: n*(n-1)/2 == scanned_pairs_count, a shallow leg forces partial, "
-         "EG/Johansen agreement counts are published", num_014_pairs_counting),
+         "EG/Johansen agreement counts are published and close against "
+         "counted_pairs over all three buckets (a refused diagnostic is "
+         "unavailable, not a disagreement)", num_014_pairs_counting),
     Rule("NUM-015", CATEGORY_NUMERIC,
          "regime probabilities and transition rows sum to ~100 with a published "
          "residual; stability_pct declares its rule", num_015_regime_percentages),

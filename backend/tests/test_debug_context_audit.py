@@ -2091,6 +2091,95 @@ class TestNumericRules:
     def test_num014_consistent_pairs_passes(self) -> None:
         assert rule_ids(self._pairs()) == set()
 
+    # ------------------------------------------------------------------
+    # The third bucket. `johansen_cointegrated` is a tri-state: `null`
+    # means the statistic was not computable, so there is no second
+    # verdict to compare the decision against and the pair is neither
+    # agreement nor disagreement. The identity below used to be a two-bucket
+    # one, so it fired on every honest export carrying a refusal - the pair of
+    # changes that would have left the gate permanently red.
+    # ------------------------------------------------------------------
+
+    def test_num014_a_refused_diagnostic_is_a_third_bucket(self) -> None:
+        """The case the two-bucket identity could not express: 4 + 1 + 1 == 6.
+
+        Before the relaxation this fired, which is the red proof that the rule
+        was reading a refusal as a missing count.
+        """
+        assert rule_ids(
+            self._pairs(
+                test_agreement={
+                    "agreement_count": 4,
+                    "disagreement_count": 1,
+                    "unavailable_count": 1,
+                    "counted_pairs": 6,
+                }
+            )
+        ) == set()
+
+    def test_num014_an_unavailable_count_that_does_not_close_still_fires(self) -> None:
+        """The negative half, and the reason the relaxation is not decoration.
+
+        Relaxing an identity is only sound if it can still fail. Here the three
+        buckets do not account for every counted pair: a refused pair was
+        dropped from all three and `counted_pairs` still says 6.
+        """
+        assert_only(
+            self._pairs(
+                test_agreement={
+                    "agreement_count": 4,
+                    "disagreement_count": 1,
+                    "unavailable_count": 0,
+                    "counted_pairs": 6,
+                }
+            ),
+            "NUM-014",
+        )
+
+    def test_num014_an_overstated_unavailable_count_still_fires(self) -> None:
+        """The mirror of the previous case, because a relaxation that only
+        catches under-counting is half a rule: claiming three refusals on a
+        six-pair book whose buckets sum to seven is as wrong as losing one."""
+        assert_only(
+            self._pairs(
+                test_agreement={
+                    "agreement_count": 4,
+                    "disagreement_count": 1,
+                    "unavailable_count": 3,
+                    "counted_pairs": 6,
+                }
+            ),
+            "NUM-014",
+        )
+
+    def test_num014_an_unpublished_unavailable_count_still_fires(self) -> None:
+        """`unavailable_count` is defaulted to 0 when the key is ABSENT, so a
+        pre-tri-state export still passes. It is not defaulted when the key is
+        present and null: that is a count the exporter claimed to publish and
+        did not."""
+        assert_only(
+            self._pairs(
+                test_agreement={
+                    "agreement_count": 4,
+                    "disagreement_count": 1,
+                    "unavailable_count": None,
+                    "counted_pairs": 6,
+                }
+            ),
+            "NUM-014",
+        )
+
+    def test_num014_a_pre_tristate_export_still_passes(self) -> None:
+        """The compatibility half. An artifact generated before the tri-state
+        had no refused diagnostic to count, so 0 is the TRUE value of the field
+        for one; requiring the key would fail every such export on a disclosure
+        rather than on an inconsistency."""
+        export = self._pairs()
+        assert "unavailable_count" not in export["sections"]["pairs"]["data"][
+            "test_agreement"
+        ]
+        assert rule_ids(export) == set()
+
     def _regime(self, **overrides: Any) -> dict[str, Any]:
         data: dict[str, Any] = {
             "data_status": "available",

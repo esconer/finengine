@@ -1113,6 +1113,171 @@ async def test_pairs_route_publishes_the_agreement_block():
 
 
 # ---------------------------------------------------------------------------
+# 9b. a diagnostic that produced NO verdict is not a disagreement
+# ---------------------------------------------------------------------------
+# `johansen_cointegrated` is a tri-state: `None` says the statistic was not
+# computable, so no second verdict exists to compare the decision against. The
+# aggregate folded it into the disagreement bucket, and both halves of that fold
+# are silent: `bool(None)` is `False`, and `None == False` is `True` in Python,
+# so the coercion and the equality each publish a refused computation as a
+# measured negative. The whole block then closed over two buckets and read as
+# though every pair had been compared.
+
+
+def _tri_state_pairs() -> list:
+    """Two pairs whose diagnostic refused, among pairs that measured cleanly."""
+    return [
+        _Pair("A", "B", True, True),     # measured agreement
+        _Pair("C", "D", True, False),    # measured disagreement
+        _Pair("E", "F", False, False),   # measured agreement
+        _Pair("G", "H", True, None),     # REFUSED
+        _Pair("I", "J", False, None),    # REFUSED
+    ]
+
+
+def test_a_refused_diagnostic_is_counted_as_unavailable_not_as_a_disagreement():
+    block = _pairs_test_agreement(_tri_state_pairs())
+
+    assert block["unavailable_count"] == 2
+    assert block["unavailable_pairs"] == ["G/H", "I/J"]
+    # Only the ONE pair where two tests ran and opposed each other.
+    assert block["disagreement_count"] == 1
+    assert block["agreement_count"] == 2
+    # And the three buckets close over every delivered row, exactly once.
+    assert (
+        block["agreement_count"]
+        + block["disagreement_count"]
+        + block["unavailable_count"]
+        == block["counted_pairs"]
+    )
+
+
+def test_a_refused_diagnostic_is_still_a_decision_measurement():
+    """G/H is decision-positive and the decision test DID run on it. Recording it
+    only in `unavailable` would drop it out of the positive counts and make the
+    summed-count note under-report the decision test's own hits."""
+    block = _pairs_test_agreement(_tri_state_pairs())
+
+    assert block["decision_positive_count"] == 3  # A/B, C/D and G/H
+    assert block["diagnostic_positive_count"] == 1  # A/B only
+    assert "G/H" in block["decision_positive_pairs"]
+    assert "G/H" not in block["diagnostic_positive_pairs"]
+    # Exactly one pair is both decision-positive and refused: G/H. I/J is
+    # refused too, but Engle-Granger never declared it cointegrated, so nothing
+    # was withheld from it.
+    assert set(block["decision_positive_pairs"]) & set(block["unavailable_pairs"]) == {
+        "G/H"
+    }
+
+
+def test_the_note_states_that_a_refusal_exists_and_how_many():
+    """`summed_count_note` is where a reader learns what the counts mean. A
+    refusal in neither positive list makes the note's arithmetic quietly
+    incomplete, so the note has to name the third bucket itself."""
+    block = _pairs_test_agreement(_tri_state_pairs())
+    note = block["summed_count_note"]
+
+    assert "must NOT be added" in note
+    assert "9 are flagged by at least one test" not in note  # 4 are, here
+    assert "3 are flagged by at least one test" in note
+    assert "2 of the 5 counted pairs published NO johansen verdict" in note
+    assert "unavailable_count" in note
+    assert "not a disagreement between two verdicts" in note
+
+
+def test_a_fully_measured_book_publishes_the_same_note_it_always_did():
+    """The negative half. A note that grew a sentence on every clean scan would
+    be noise, and noise is how a real degradation goes unread."""
+    block = _pairs_test_agreement([_Pair("A", "B", True, True)])
+    note = block["summed_count_note"]
+
+    assert "unavailable_count" not in note
+    assert "NO johansen verdict" not in note
+    assert block["unavailable_count"] == 0
+    assert block["unavailable_pairs"] == []
+
+
+def test_a_fully_measured_book_is_byte_identical_to_the_two_bucket_block():
+    """No published figure may move when every pair computed.
+
+    The regression this guards is the quiet one: a fix that routes `None` to a
+    third bucket has no reason to touch a book with no `None` in it, but
+    "has no reason to" is not a measurement. The reference below is the
+    pre-fix two-bucket aggregate, transcribed, and every key it publishes is
+    compared for EQUALITY - not for approximate equality, not for the keys
+    this file happens to assert on.
+    """
+    # The audited book's real geometry: 5 decision-positive, 5 diagnostic-
+    # positive, one overlap, every pair computed.
+    decision = {
+        "ARROWGREEN.NS/MOTHERSON.NS", "ELECTCAST.NS/MCX.NS", "JKIL.NS/NIFTYIETF.NS",
+        "JUNIORBEES.NS/MOTILALOFS.NS", "MOTHERSON.NS/NTPC.NS",
+    }
+    diagnostic = {
+        "CIPLA.NS/JUNIORBEES.NS", "ELECTCAST.NS/JKIL.NS", "CIPLA.NS/MIDCAPIETF.NS",
+        "CIPLA.NS/NTPC.NS", "JKIL.NS/NIFTYIETF.NS",
+    }
+    pairs = [
+        _Pair(*key.split("/"), key in decision, key in diagnostic)
+        for key in decision | diagnostic
+    ]
+    block = _pairs_test_agreement(pairs)
+
+    before = {
+        "decision_test": "engle_granger",
+        "diagnostic_test": "johansen",
+        "test_roles": {
+            "engle_granger": "published_decision",
+            "johansen": "diagnostic_only",
+        },
+        "counted_pairs": 9,
+        "decision_positive_count": 5,
+        "diagnostic_positive_count": 5,
+        "agreement_count": 1,
+        "disagreement_count": 8,
+        "decision_positive_only_count": 4,
+        "diagnostic_positive_only_count": 4,
+        "decision_positive_pairs": sorted(decision),
+        "diagnostic_positive_pairs": sorted(diagnostic),
+        "summed_count_note": (
+            "is_cointegrated and johansen_cointegrated are different tests and "
+            "must NOT be added: a pair can carry both. is_cointegrated "
+            "(engle_granger) is the published decision; johansen_cointegrated "
+            "is diagnostic_only. Summing the two positive counts would report "
+            "10 pairs where only 9 are flagged by at least one test."
+        ),
+    }
+
+    assert block.keys() - before.keys() == {"unavailable_count", "unavailable_pairs"}
+    assert before.keys() - block.keys() == set()
+    for key, value in before.items():
+        assert block[key] == value, key
+
+
+def test_a_refused_pair_is_never_published_as_a_data_conflict():
+    """The defect class, stated as the invariant it violates: a computation that
+    could not run is not evidence about a pair, so it may not appear in any
+    count that names a comparison between the two tests."""
+    block = _pairs_test_agreement(_tri_state_pairs())
+    refused = set(block["unavailable_pairs"])
+    decision_positive = set(block["decision_positive_pairs"])
+
+    # G/H is decision-positive and refused. It is the one pair where the old
+    # aggregate asserted a conflict between two verdicts that were never both
+    # produced, so it is the pair this invariant is about.
+    assert (refused & decision_positive) == {"G/H"}
+    # The refusal reached neither bucket. agreement_count is 2 (A/B, E/F) and
+    # disagreement_count is 1 (C/D): one measured conflict on the whole book,
+    # not three.
+    assert block["disagreement_count"] == 1
+    assert block["agreement_count"] == 2
+    # And the positive lists, which are the only place a consumer rebuilds the
+    # comparison from, name no refusal as a diagnostic measurement.
+    assert not set(block["diagnostic_positive_pairs"]) & refused
+    assert refused.isdisjoint({"A/B", "C/D", "E/F"})
+
+
+# ---------------------------------------------------------------------------
 # 10/11. the routes: sizing price freshness, portfolio value, per-ticker units
 # ---------------------------------------------------------------------------
 def _sizing_engine_result(portfolio_value: float) -> Dict[str, Any]:

@@ -801,3 +801,273 @@ class TestNoRegression:
             assert entry["johansen_agrees_with_decision"] is True
             assert entry["correction_applied"] == MULTIPLICITY_CORRECTION
             assert entry["comparisons_made"] == family_size
+
+
+# ---------------------------------------------------------------------------
+# A diagnostic that did not answer is not a diagnostic that disagreed
+# ---------------------------------------------------------------------------
+
+
+def _unavailable_pair(**overrides) -> CointPairResult:
+    """A decision-positive pair whose Johansen diagnostic returned nothing."""
+    fields = dict(
+        ticker_a="AAA.NS",
+        ticker_b="BBB.NS",
+        engle_granger_pvalue=0.01,
+        engle_granger_tstat=-3.5,
+        is_cointegrated=True,
+        hedge_ratio_beta=1.0,
+        intercept_alpha=0.0,
+        ou_half_life_days=10.0,
+        ou_reversion_speed_theta=0.07,
+        current_spread_zscore=0.1,
+        johansen_cointegrated=None,
+        last_price_a=100.0,
+        last_price_b=200.0,
+        signal="NEUTRAL",
+        decision_test="engle_granger",
+        johansen_role="diagnostic_only",
+        johansen_agrees_with_decision=None,
+    )
+    fields.update(overrides)
+    return CointPairResult(**fields)
+
+
+class TestDiagnosticRefusalIsNotADisagreement:
+    """`None` and `False` are different claims and must not share a rung.
+
+    `False` says the diagnostic ran and did not reject cointegration.
+    `None` says the diagnostic produced no verdict at all. Both withhold a
+    directive - the gate needs agreement and a refusal is not agreement - but
+    a consumer reading the string must be able to tell which happened. Before
+    this, a failed computation was published as `False` and therefore as
+    "the two tests conflict", reporting a measurement failure as an
+    empirical finding about the pair.
+    """
+
+    def test_a_refused_diagnostic_blocks_but_does_not_claim_a_conflict(self):
+        pair = _unavailable_pair()
+        signal = build_pair_signal(pair, comparisons_made=1)
+
+        assert not _names_an_action(signal), signal
+        assert _head(signal) == "JOHANSEN_DIAGNOSTIC_UNAVAILABLE"
+        assert _head(signal) != "CONTESTED_TESTS_DISAGREE"
+        # The string must not assert a disagreement that never happened.
+        assert "two tests conflict" not in signal
+        assert "not computable" in signal
+        assert "no direction is published" in signal.lower()
+
+    def test_a_real_conflict_still_says_so(self):
+        """The new head must not swallow the existing conflict claim."""
+        pair = _unavailable_pair(johansen_cointegrated=False)
+        signal = build_pair_signal(pair, comparisons_made=1)
+        assert _head(signal) == "CONTESTED_TESTS_DISAGREE"
+        assert "two tests conflict" in signal
+
+    def test_a_refusal_is_gated_before_the_z_threshold(self):
+        """A 6-sigma spread on a pair with no second verdict is still no trade,
+        and the z-score must not change the reason it was withheld."""
+        wide = _unavailable_pair(current_spread_zscore=-6.0)
+        narrow = _unavailable_pair(current_spread_zscore=-0.01)
+        assert build_pair_signal(wide, comparisons_made=1) == build_pair_signal(
+            narrow, comparisons_made=1
+        )
+
+    def test_a_refusal_survives_the_family_correction_stage(self):
+        """`apply_signal_directives` re-derives the string for the scan; it must
+        not resurrect a directive from a pair whose diagnostic never answered."""
+        rows = [apply_signal_directives([_unavailable_pair()], comparisons_made=1)[0]]
+        assert _head(rows[0].signal) == "JOHANSEN_DIAGNOSTIC_UNAVAILABLE"
+        assert not _names_an_action(rows[0].signal)
+
+    def test_cached_row_metadata_does_not_invent_agreement(self):
+        """`with_test_role_metadata` back-fills role fields onto cached rows. For
+        a row with no diagnostic it must leave the agreement flag None: Python
+        evaluates `None == False` as True, so the naive comparison publishes
+        "the two tests agree" for a pair whose second test never ran."""
+        from app.services.cointegration_service import with_test_role_metadata
+
+        pair = _unavailable_pair(decision_test=None, johansen_role=None)
+        upgraded = with_test_role_metadata(pair)
+        assert upgraded.decision_test == "engle_granger"
+        assert upgraded.johansen_role == "diagnostic_only"
+        assert upgraded.johansen_agrees_with_decision is None
+
+    def test_a_measured_diagnostic_still_gets_a_boolean(self):
+        """The refusal must not leak into pairs that computed cleanly."""
+        for verdict in (True, False):
+            pair = _unavailable_pair(
+                johansen_cointegrated=verdict,
+                johansen_agrees_with_decision=verdict,
+            )
+            assert pair.johansen_agrees_with_decision is verdict
+
+    def test_the_rung_refuses_on_a_degraded_statistic_end_to_end(self):
+        """No mocked verdict: the real service, on an input that drives a
+        canonical correlation outside the unit circle."""
+        rng = np.random.default_rng(5)
+        n = 35
+        base = np.cumsum(rng.normal(size=n)) + 100.0
+        near = base + 1e-6 * rng.normal(size=n)
+
+        assert coint.test_johansen_cointegration(near, base) is None
+
+    def test_the_rung_refuses_on_a_non_finite_statistic(self):
+        """A non-finite trace statistic is not a comparison. The module already
+        guards finite values elsewhere (`_is_real`, `_pvalue_of`, the OLS
+        covariance diagonal at :1282); the Johansen call was the one place
+        whose `float()` was unguarded."""
+        from unittest.mock import patch
+
+        class _Result:
+            eig = np.array([0.4 + 0j, 0.1 + 0j])
+            lr1 = np.array([np.inf, 1.0])
+            cvt = np.array([[1.0, 15.4943, 20.0], [1.0, 3.0, 5.0]])
+
+        with patch.object(coint, "coint_johansen", lambda *_a, **_k: _Result()):
+            assert coint.test_johansen_cointegration(
+                np.arange(50.0), np.arange(50.0) + 1.0
+            ) is None
+
+    def test_the_rung_refuses_a_complex_statistic_even_with_clean_eigenvalues(self):
+        """The finite guard must run BEFORE the `float()` cast, not after.
+
+        `float()` on a numpy complex scalar does not raise the way it does on
+        a Python complex - it discards the imaginary part and emits a
+        ComplexWarning. So `float(res.lr1[0])` followed by `_is_real(...)` tests
+        an already-truncated number and passes on a fabricated value. The
+        eigenvalues here are clean on purpose: this isolates the cast, which is
+        the one step the eigenvalue check cannot cover.
+        """
+        from unittest.mock import patch
+
+        class _Result:
+            eig = np.array([0.4 + 0j, 0.1 + 0j])  # passes the eigenvalue check
+            lr1 = np.array([5.0 + 99.0j, 1.0])     # but the statistic is complex
+            cvt = np.array([[1.0, 15.4943, 20.0], [1.0, 3.0, 5.0]])
+
+        with patch.object(coint, "coint_johansen", lambda *_a, **_k: _Result()):
+            res = coint.test_johansen_cointegration(
+                np.arange(50.0), np.arange(50.0) + 1.0
+            )
+        assert res is None, (
+            f"a complex trace statistic must be refused, not truncated to "
+            f"{res!r} by float()"
+        )
+
+    def test_the_rung_refuses_on_non_finite_eigenvalues(self):
+        from unittest.mock import patch
+
+        class _Result:
+            eig = np.array([np.nan + 0j, 0.1 + 0j])
+            lr1 = np.array([5.0, 1.0])
+            cvt = np.array([[1.0, 15.4943, 20.0], [1.0, 3.0, 5.0]])
+
+        with patch.object(coint, "coint_johansen", lambda *_a, **_k: _Result()):
+            assert coint.test_johansen_cointegration(
+                np.arange(50.0), np.arange(50.0) + 1.0
+            ) is None
+
+    def test_a_raised_error_is_a_refusal_not_a_negative_verdict(self):
+        """The bare `except` used to return False, which is indistinguishable
+        from a measured 'no'."""
+        from unittest.mock import patch
+
+        def _boom(*_a, **_k):
+            raise ValueError("statsmodels exploded")
+
+        with patch.object(coint, "coint_johansen", _boom):
+            assert coint.test_johansen_cointegration(
+                np.arange(50.0), np.arange(50.0) + 1.0
+            ) is None
+
+    def test_a_clean_pair_still_returns_a_boolean(self):
+        """The refusal is a degradation report, not a maths change: a
+        well-conditioned pair must keep the verdict it always had."""
+        rng = np.random.default_rng(2024)
+        n = 300
+        e1 = np.cumsum(rng.normal(size=n))
+        e2 = np.cumsum(rng.normal(size=n))
+        a = 100.0 + np.cumsum(0.8 * e1 + 0.2 * e2)
+        b = 100.0 + np.cumsum(0.8 * e1 + 0.2 * e2 + 0.05 * rng.normal(size=n))
+        assert coint.test_johansen_cointegration(a, b) is False
+
+
+class TestCachedRowsCannotSmuggleAFabricatedDiagnostic:
+    """A row written by the old rung can hold a `johansen_cointegrated` that
+    was carved out of a complex statistic. Once it is a bool in a dict it is
+    indistinguishable from a measured one, so the only thing that can stop it
+    being served is the key itself."""
+
+    _PARAMS = dict(
+        ticker_a="AAA.NS",
+        ticker_b="BBB.NS",
+        engle_granger_pvalue=0.01,
+        engle_granger_tstat=-3.5,
+        is_cointegrated=True,
+        hedge_ratio_beta=1.0,
+        intercept_alpha=0.0,
+        ou_half_life_days=10.0,
+        ou_reversion_speed_theta=0.07,
+        current_spread_zscore=0.1,
+        last_price_a=100.0,
+        last_price_b=200.0,
+        signal="CONTESTED_TESTS_DISAGREE",
+    )
+
+    def _old_row(self) -> dict:
+        """A row in the shape the pre-fix build wrote."""
+        return dict(
+            self._PARAMS,
+            johansen_cointegrated=False,
+            hedge_ratio_beta_std_error=0.1,
+            intercept_alpha_std_error=0.1,
+            hedge_regression_observations=300,
+            hedge_regression_std_error_basis="ols_standard_error_from_polyfit_covariance_df_n_minus_2",
+            stationarity_gate={"verdict": "both_legs_i1", "reason": "ok"},
+            stationarity_leg_a={"verdict": "i1", "reason": "ok"},
+            stationarity_leg_b={"verdict": "i1", "reason": "ok"},
+        )
+
+    def test_the_contract_gate_cannot_see_the_corruption(self):
+        """Documents WHY the key has to carry the version: the row looks
+        complete and well-formed to every existing check, so a green gate here
+        is not evidence that the diagnostic is real."""
+        assert coint.CointegrationService._cached_pair_satisfies_contract(
+            self._old_row()
+        ) is True
+
+    def test_the_row_is_never_misread_as_agreement(self):
+        """Rehydration must not turn a `False` diagnostic into an agreeing
+        one, and the signal it produces must be the conflict claim it really
+        is - the corruption here is historical and lives in the row."""
+        row = coint.with_test_role_metadata(CointPairResult(**self._old_row()))
+        assert row.johansen_cointegrated is False
+        assert row.johansen_agrees_with_decision is False
+        assert _head(build_pair_signal(row, comparisons_made=1)) == "CONTESTED_TESTS_DISAGREE"
+
+    def test_the_cache_key_carries_the_contract_version(self):
+        """The actual invalidation. Both keys must move when the computation
+        contract changes, or a pre-fix row stays reachable until its
+        `last_date` rolls over - and the DB read path has no TTL at all."""
+        kwargs = dict(
+            ticker_a="AAA.NS",
+            ticker_b="BBB.NS",
+            last_date="2026-10-01",
+            p_value_threshold=0.05,
+            include_spread_series=False,
+            lookback_days=252,
+            history_coverage="300:2025-01-01:2026-01-01:abc123",
+        )
+        assert coint.COINT_CONTRACT_VERSION
+        assert "_c" + coint.COINT_CONTRACT_VERSION in coint._mem_cache_key(**kwargs)
+        # The pre-fix digest, recomputed from the pre-fix raw string.
+        from hashlib import sha1
+
+        old_raw = (
+            "AAA.NS|BBB.NS|0.05|0|lookback:252|"
+            "coverage:300:2025-01-01:2026-01-01:abc123"
+        )
+        old_metric = f"coint_{sha1(old_raw.encode('utf-8')).hexdigest()[:8]}_2026-10-01"
+        assert coint._db_cache_keys(**kwargs)[1] != old_metric
+        assert not coint._mem_cache_key(**kwargs).endswith("abc123")

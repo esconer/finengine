@@ -2,10 +2,13 @@
 Comprehensive test suite for TailRiskService, VolatilityService, CointegrationService, and CorrelationService.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 from app.services.tail_risk_service import TailRiskService
 from app.services.volatility_service import VolatilityService
@@ -121,9 +124,77 @@ class TestCointegrationService:
         assert compute_ou_parameters(np.cumsum(np.ones(100))) == (None, None)
 
     def test_johansen_method(self):
+        """The rung returns a REAL verdict on a well-conditioned pair.
+
+        The previous assertion here was `isinstance(res, bool)`, which is
+        satisfied by True, by False, AND by the exception fallback's False
+        alike - it could not tell a measurement from a refusal, so it passed
+        no matter what the function did. `res is True or res is False` uses
+        identity, so `None` (a refusal) now fails it.
+        """
         df = _sample_prices(200)
         res = _run_johansen(df["STOCK_A"].values, df["STOCK_B"].values)
-        assert isinstance(res, bool)
+        assert res is True or res is False, (
+            f"a well-conditioned pair must yield a measured verdict, not a "
+            f"refusal: {res!r}"
+        )
+
+    def test_johansen_refuses_when_the_statistic_is_degraded(self):
+        """A dropped imaginary part is a refusal, not a number.
+
+        statsmodels allocates `lr1` as float64 (vecm.py:709) and then assigns
+        `-t * sum(log(1 - a))` into it (vecm.py:717). When an eigenvalue sits
+        at or outside the unit circle, `1 - a` is non-positive and numpy's log
+        of it - taken in complex dtype - carries an imaginary part of
+        `-pi` per offending eigenvalue. The float64 store discards it, so the
+        published statistic is the real part of a complex number that has no
+        real value: it is fabricated, and the ComplexWarning is the only
+        trace of it.
+
+        Before the fix this returned `False`, a boolean indistinguishable
+        from a measurement. It must return `None`.
+        """
+        # A near-collinear short pair: the residual covariance `skk` is close
+        # to singular, which drives an eigenvalue outside the unit circle.
+        rng = np.random.default_rng(5)
+        n = 35
+        base = np.cumsum(rng.normal(size=n)) + 100.0
+        near = base + 1e-6 * rng.normal(size=n)
+
+        # Prove the fixture really does hit the degraded branch, so this test
+        # cannot silently stop testing anything if statsmodels changes.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            probe = coint_johansen(
+                np.column_stack([near, base]), det_order=0, k_ar_diff=1
+            )
+        eigenvalues = np.asarray(probe.eig)
+        assert np.any(np.real(eigenvalues) >= 1.0), (
+            f"fixture no longer exercises the degraded branch: "
+            f"eig={eigenvalues!r}"
+        )
+
+        res = _run_johansen(near, base)
+        assert res is None, (
+            f"a degraded Johansen computation must be a refusal (None), not the "
+            f"boolean {res!r} carved out of a complex statistic"
+        )
+
+    def test_johansen_agrees_with_the_raw_statsmodels_verdict_when_clean(self):
+        """The refusal is a degradation report, not a maths change.
+
+        A clean pair must produce exactly the boolean the unguarded `float()`
+        read produced - same input, same verdict - or the fix has silently
+        altered a published figure.
+        """
+        df = _sample_prices(200)
+        a, b = df["STOCK_A"].values, df["STOCK_B"].values
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            probe = coint_johansen(np.column_stack([a, b]), det_order=0, k_ar_diff=1)
+        assert np.all(np.real(np.asarray(probe.eig)) < 1.0), "fixture must be clean"
+        expected = bool(float(probe.lr1[0]) > float(probe.cvt[0, 1]))
+        assert _run_johansen(a, b) is expected
 
     def test_analyze_pair_cointegration(self):
         df = _sample_prices(250)

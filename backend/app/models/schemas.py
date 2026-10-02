@@ -502,7 +502,14 @@ class CointPairResult(BaseModel):
     intercept_alpha_std_error: Optional[float] = None
     hedge_regression_observations: Optional[int] = None
     hedge_regression_std_error_basis: Optional[str] = None
-    johansen_cointegrated: bool
+    # The Johansen diagnostic's verdict, or None when the test could not be
+    # computed. Not a defaulted bool: a required `bool` makes a degraded or
+    # failed computation indistinguishable from a measured one, and a
+    # `bool = False` default fabricates a measurement the row never made.
+    # None means "no verdict" - the test did not answer - which is a
+    # different claim from False, which means "the test answered: no".
+    # `build_pair_signal` blocks on both, but publishes a different reason.
+    johansen_cointegrated: Optional[bool] = None
     last_price_a: float
     last_price_b: float
     observation_date_a: Optional[str] = None

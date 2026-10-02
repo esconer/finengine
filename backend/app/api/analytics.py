@@ -10963,16 +10963,43 @@ def _pairs_test_agreement(
     `johansen_agrees_with_decision` flag answers the question one row at a time;
     this answers it for the whole scan, so the headline count and the diagnostic
     cannot be added together by accident.
+
+    Three buckets, not two: `johansen_cointegrated` is a tri-state, and the
+    third state is `null` - the statistic was not computable, so there is no
+    second verdict to compare the decision against. A row in that bucket is
+    counted in NEITHER `agreement_count` nor `disagreement_count`, because one
+    test answered and the other produced no answer, and a computation that
+    could not run is not evidence about the pair. `agreement_count +
+    disagreement_count + unavailable_count` therefore equals `counted_pairs`,
+    with each row in exactly one bucket.
     """
     rows = list(pairs or [])
     decision_positive: List[str] = []
     diagnostic_positive: List[str] = []
     agree: List[str] = []
     disagree: List[str] = []
+    # The third bucket. `johansen_cointegrated` is Optional: `None` says the
+    # statistic was not computable, which is a claim about the COMPUTATION and
+    # not about the pair. `bool(None)` is `False` and `None == False` is `True`
+    # in Python, so both the coercion and the equality below would publish a
+    # refusal as a measured negative - and then as a conflict between two
+    # tests, which is an empirical claim about data that was never compared.
+    unavailable: List[str] = []
     for pair in rows:
         key = f"{getattr(pair, 'ticker_a', None)}/{getattr(pair, 'ticker_b', None)}"
         decision = bool(getattr(pair, "is_cointegrated", False))
-        diagnostic = bool(getattr(pair, "johansen_cointegrated", False))
+        # Read the diagnostic RAW. `is None` is the only test that separates a
+        # refusal from a measurement; `bool()` cannot.
+        raw = getattr(pair, "johansen_cointegrated", None)
+        if raw is None:
+            # Still a decision measurement, so it stays in the positive list;
+            # only the COMPARISON is missing, and a missing comparison is not
+            # an agreement.
+            if decision:
+                decision_positive.append(key)
+            unavailable.append(key)
+            continue
+        diagnostic = bool(raw)
         if decision:
             decision_positive.append(key)
         if diagnostic:
@@ -10990,10 +11017,17 @@ def _pairs_test_agreement(
         "diagnostic_positive_count": len(diagnostic_positive),
         "agreement_count": len(agree),
         "disagreement_count": len(disagree),
+        # The third bucket, published as its own count rather than absorbed.
+        # A refused diagnostic is neither agreement nor disagreement: only one
+        # of the two tests answered, so there is nothing to compare. Reading
+        # `unavailable_count` as part of the disagreement count is the exact
+        # conflation this block exists to prevent.
+        "unavailable_count": len(unavailable),
         "decision_positive_only_count": len(set(decision_positive) - set(diagnostic_positive)),
         "diagnostic_positive_only_count": len(set(diagnostic_positive) - set(decision_positive)),
         "decision_positive_pairs": sorted(decision_positive),
         "diagnostic_positive_pairs": sorted(diagnostic_positive),
+        "unavailable_pairs": sorted(unavailable),
         "summed_count_note": (
             "is_cointegrated and johansen_cointegrated are different tests and must "
             "NOT be added: a pair can carry both. is_cointegrated (engle_granger) is "
@@ -11001,6 +11035,17 @@ def _pairs_test_agreement(
             "Summing the two positive counts would report "
             f"{len(decision_positive) + len(diagnostic_positive)} pairs where only "
             f"{len(flagged)} are flagged by at least one test."
+            + (
+                f" {len(unavailable)} of the {len(rows)} counted pairs published NO "
+                "johansen verdict at all (johansen_cointegrated is null because the "
+                "statistic was not computable), so they are counted in "
+                "unavailable_count and in NEITHER agreement_count nor "
+                "disagreement_count: one test answered and the other produced no "
+                "answer, which is a statement about the computation and not a "
+                "disagreement between two verdicts."
+                if unavailable
+                else ""
+            )
         ),
     }
 
@@ -11261,6 +11306,7 @@ async def get_cointegration_pairs(
         SIGNAL_DIRECTIVE_HEADS,
         SIGNAL_NOT_COINTEGRATED,
         SIGNAL_NOTIONAL_CONVENTION,
+        SIGNAL_DIAGNOSTIC_UNAVAILABLE,
         SIGNAL_SPURIOUS,
         SIGNAL_STATIONARITY_UNDETERMINED,
         SIGNAL_ZSCORE_THRESHOLD,
@@ -11391,18 +11437,24 @@ async def get_cointegration_pairs(
         return text.split(" ", 1)[0] if text else ""
 
     def _withholding_counts(pairs: Iterable[Any]) -> Dict[str, int]:
-        """How many delivered rows the stationarity gate withheld, and under which head.
+        """How many delivered rows the gate withheld, and under which head.
 
         Counted off the published signal heads, exactly as `contested_pair_count`
         counts the contested head: the gate decision was already made once, by
         `build_pair_signal`, and re-deriving it here could disagree with the
-        verdict the row already carries. The two heads are the two distinct
-        withholdings - a leg measured stationary (a finding) and a leg whose
-        I(1) was never established (an absent measurement) - and they are kept
+        verdict the row already carries. The three heads are three distinct
+        withholdings - a leg measured stationary (a finding), a leg whose I(1)
+        was never established (an absent measurement), and a diagnostic that
+        produced no verdict at all (an absent COMPARISON) - and they are kept
         apart because collapsing them would say a quarter of the book was
-        spurious when part of it was simply not measured.
+        spurious when part of it was simply not measured, and would report a
+        computation that could not run as a conflict between two tests.
         """
-        counts = {SIGNAL_SPURIOUS: 0, SIGNAL_STATIONARITY_UNDETERMINED: 0}
+        counts = {
+            SIGNAL_SPURIOUS: 0,
+            SIGNAL_STATIONARITY_UNDETERMINED: 0,
+            SIGNAL_DIAGNOSTIC_UNAVAILABLE: 0,
+        }
         for pair in pairs:
             head = _signal_head(getattr(pair, "signal", None))
             if head in counts:
@@ -11693,11 +11745,39 @@ async def get_cointegration_pairs(
         # because that set is a p-value measurement - so without these two
         # counts a reader has no way to learn that a quarter of the declared
         # cointegrations were rejected on the precondition the test assumes.
+        # `_withholding_counts` keys all THREE withholding heads; only the two
+        # stationarity ones are read into the gate counts below.
         withholding = _withholding_counts(pairs)
         extras["spurious_regression_rejected_count"] = withholding[SIGNAL_SPURIOUS]
         extras["stationarity_undetermined_count"] = withholding[
             SIGNAL_STATIONARITY_UNDETERMINED
         ]
+        # The third withholding, and the one that is not about the DATA at all.
+        # `build_pair_signal` now emits `JOHANSEN_DIAGNOSTIC_UNAVAILABLE` for a
+        # pair whose Johansen statistic was not computable, and that head is in
+        # none of the counts above: not `contested_pair_count`, which counts the
+        # contested head and must keep counting only pairs where two tests ran
+        # and returned opposite verdicts, and not the two stationarity counts,
+        # which are about legs. So a refusal was withheld from every counter on
+        # the wire while still counting towards `directive_withheld_count`, and
+        # a reader reconciling those numbers had no field that held it.
+        extras["diagnostic_unavailable_count"] = withholding[
+            SIGNAL_DIAGNOSTIC_UNAVAILABLE
+        ]
+        extras["diagnostic_unavailable_count_basis"] = (
+            f"Rows whose published signal head is {SIGNAL_DIAGNOSTIC_UNAVAILABLE}: "
+            f"pairs Engle-Granger declared cointegrated whose johansen diagnostic "
+            f"produced no verdict, because the statistic was not computable. This "
+            f"is a count of CANDIDATES WITHHELD FOR A MISSING MEASUREMENT, and it "
+            f"is NOT a subset of contested_pair_count and NOT a disagreement: two "
+            f"tests that returned opposite verdicts is a claim about the data, while "
+            f"this is a claim about the computation - only one of the two tests "
+            f"answered. A pair here is withheld on conservative grounds (the gate "
+            f"requires agreement and there is nothing to agree with), and no "
+            f"direction is published for it. See test_agreement.unavailable_count "
+            f"for the same count over every delivered row, which also counts pairs "
+            f"Engle-Granger never declared cointegrated."
+        )
         # The two withholdings and the two verdict totals are four numbers
         # about one gate, and only three of them used to be published. The
         # missing one is the one a reader can count off the rows, which is
@@ -11794,6 +11874,27 @@ async def get_cointegration_pairs(
                 f"engle_granger but not under the johansen diagnostic, so the "
                 f"two tests disagree. A contested pair is not a trade and "
                 f"publishes no direction; see test_agreement."
+            )
+        if withholding[SIGNAL_DIAGNOSTIC_UNAVAILABLE]:
+            # Deliberately NOT worded as a data conflict and deliberately a
+            # separate line from the contested one: `contested_pair_count` is
+            # the count of pairs where two tests ran and opposed each other,
+            # and folding this into that sentence would restate a refused
+            # computation as a finding about the pair.
+            unavailable = withholding[SIGNAL_DIAGNOSTIC_UNAVAILABLE]
+            warnings.append(
+                f"Diagnostic unavailable: {unavailable} pair"
+                f"{'' if unavailable == 1 else 's'} "
+                f"{'is' if unavailable == 1 else 'are'} cointegrated under "
+                f"engle_granger and the johansen diagnostic produced no verdict "
+                f"for {'it' if unavailable == 1 else 'them'}, because the "
+                f"statistic was not computable. This is a statement about the "
+                f"computation, not about the pair: the two tests did not "
+                f"conflict, because only one of them answered. "
+                f"{'That pair' if unavailable == 1 else 'Those pairs'} withheld "
+                f"no direction and {'is' if unavailable == 1 else 'are'} counted "
+                f"in diagnostic_unavailable_count, separately from "
+                f"contested_pair_count; see test_agreement."
             )
         if warnings:
             extras["warnings"] = warnings

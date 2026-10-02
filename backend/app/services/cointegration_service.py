@@ -5,6 +5,7 @@ Ornstein-Uhlenbeck (OU) mean-reversion speed/half-life, spread z-scores, and cac
 """
 
 import asyncio
+import warnings
 from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from itertools import combinations
@@ -37,6 +38,29 @@ CACHE_TTL_HOURS = 24
 # (e.g. RELIANCE/RELCAP) and metric coint_{date} was shared by every pair,
 # so each write evicted all other pairs of the day (last-write-wins).
 COINT_DB_TICKER = "COINT"
+
+# A cached row is only as good as the computation that produced it, and the
+# Johansen rung changed its ANSWER: it used to return a bare `bool`, casting a
+# complex trace statistic to real and publishing the carved-out real part as a
+# measurement. Rows written before that fix can hold such a value, and
+# `_cached_pair_satisfies_contract` cannot detect it - a corrupted `False` is
+# indistinguishable from a legitimately measured `False` once it is a bool in
+# a dict, and the contract gate does not (and cannot) re-derive the test.
+#
+# The DB read path has no TTL at all (CACHE_TTL_HOURS guards only the
+# in-memory dict), and both keys are built from pair identity, date, threshold
+# and coverage - nothing about the code that wrote them. So a row written by
+# the old rung stays reachable until the pair's `last_date` rolls over, which
+# for a same-day re-scan is never.
+#
+# Folding this token into both keys is the same invalidation the history
+# coverage already performs: rows written under a different contract are
+# addressed by a different key, so they are misses rather than stale answers.
+# Bump it whenever a change to this module alters a MEASUREMENT a cached row
+# carries. Bump only on such a change - a change to a display string or a
+# signal head does not invalidate a measurement and should not force a
+# rescan of the whole book.
+COINT_CONTRACT_VERSION = "johansen-tristate-1"
 
 # ---------------------------------------------------------------------------
 # Pairs depth + dual-test contract (V3-14)
@@ -134,6 +158,14 @@ SIGNAL_DIRECTIVE_HEADS = ("LONG_SPREAD", "SHORT_SPREAD")
 # reach a pair these two describe.
 SIGNAL_SPURIOUS = "SPURIOUS_REGRESSION_REJECTED"
 SIGNAL_STATIONARITY_UNDETERMINED = "STATIONARITY_UNDETERMINED"
+
+# The diagnostic did not answer. Deliberately NOT `CONTESTED_TESTS_DISAGREE`:
+# that head claims two tests ran and returned opposite verdicts, which is a
+# claim about the DATA. This one claims a test produced no verdict at all,
+# which is a claim about the COMPUTATION. Collapsing them would report a
+# measurement failure as an empirical finding - and would, for a `None` that
+# arrived as `False`, have asserted a disagreement that never happened.
+SIGNAL_DIAGNOSTIC_UNAVAILABLE = "JOHANSEN_DIAGNOSTIC_UNAVAILABLE"
 
 # ---------------------------------------------------------------------------
 # Stationarity gate: the precondition cointegration is DEFINED on
@@ -352,11 +384,18 @@ def with_test_role_metadata(pair: CointPairResult) -> CointPairResult:
         and pair.johansen_agrees_with_decision is not None
     ):
         return pair
+    diagnostic = pair.johansen_cointegrated
     return pair.model_copy(
         update={
             "decision_test": DECISION_TEST,
             "johansen_role": JOHANSEN_ROLE,
-            "johansen_agrees_with_decision": pair.johansen_cointegrated == pair.is_cointegrated,
+            # None in, None out. `None == False` is True in Python, so
+            # comparing a missing diagnostic against a False decision would
+            # back-fill a row that never ran its second test with a claim
+            # that the two tests agree - a measurement the row does not carry.
+            "johansen_agrees_with_decision": (
+                None if diagnostic is None else diagnostic == pair.is_cointegrated
+            ),
         }
     )
 
@@ -705,11 +744,27 @@ def build_pair_signal(
             f"direction is published.)"
         )
 
-    johansen = bool(getattr(pair, "johansen_cointegrated", False))
+    # A None here means the diagnostic produced no verdict, which is a
+    # different claim from a False, and it gets its own head. Both block: a
+    # pair whose second test could not be computed is not one this function
+    # has the evidence to call a trade. It is refused on CONSERVATIVE grounds
+    # (the gate requires agreement and there is nothing to agree with), not
+    # because the two tests were weighed and found to conflict.
+    johansen = getattr(pair, "johansen_cointegrated", None)
+    if johansen is None:
+        return (
+            f"{SIGNAL_DIAGNOSTIC_UNAVAILABLE} (engle_granger p={p_text} < "
+            f"{alpha:g} declared this pair cointegrated, but the johansen "
+            f"diagnostic produced no verdict for it - the statistic was not "
+            f"computable, so there is no second test to agree or disagree "
+            f"with. This is a statement about the computation, not about the "
+            f"pair: the two tests did not conflict, because only one of them "
+            f"answered. No direction is published.)"
+        )
     if not johansen:
         return (
             f"{SIGNAL_CONTESTED} (engle_granger p={p_text} < {alpha:g} declared "
-            f"this pair cointegrated, johansen_cointegrated={johansen}, so the "
+            f"this pair cointegrated, johansen_cointegrated=False, so the "
             f"two tests conflict; a contested pair is not a trade and no "
             f"direction is published. See test_agreement.)"
         )
@@ -820,12 +875,15 @@ def _db_cache_keys(
 
     Pair/date/threshold/spread flags alone are insufficient: the same pair
     requested over 60 versus 2,520 observations has different p-values,
-    spread points, and OU diagnostics.
+    spread points, and OU diagnostics. The contract version is in the digest
+    for the reason on `COINT_CONTRACT_VERSION`: a row written by a build whose
+    computation changed is a miss, not a stale answer.
     """
     coverage = history_coverage or ("lookback:unknown" if lookback_days is None else f"lookback:{int(lookback_days)}")
     raw = (
         f"{ticker_a}|{ticker_b}|{p_value_threshold}|"
         f"{int(include_spread_series)}|lookback:{lookback_days}|coverage:{coverage}"
+        f"|contract:{COINT_CONTRACT_VERSION}"
     )
     digest = sha1(raw.encode("utf-8")).hexdigest()[:8]
     return COINT_DB_TICKER, f"coint_{digest}_{last_date}"
@@ -846,6 +904,10 @@ def _mem_cache_key(
         f"coint_{ticker_a}_{ticker_b}_{last_date}"
         f"_{p_value_threshold}_{int(include_spread_series)}"
         f"_{lookback_days}_{coverage}"
+        # A build whose computation changed addresses its rows by a different
+        # key, so a memo entry written under the old contract is a miss
+        # rather than a stale answer. See `COINT_CONTRACT_VERSION`.
+        f"_c{COINT_CONTRACT_VERSION}"
     )
 
 
@@ -926,23 +988,127 @@ def compute_ou_parameters(spread: np.ndarray) -> Tuple[Optional[float], Optional
         return None, None
 
 
-def test_johansen_cointegration(series_a: np.ndarray, series_b: np.ndarray) -> bool:
-    """
-    Perform Johansen cointegration rank test on a bivariate system.
-    Returns True if trace statistic for r=0 exceeds 95% critical value.
+# Resolved once at import, outside the rung's try block on purpose: an
+# AttributeError raised while filtering would be swallowed by that handler and
+# would refuse EVERY pair in the scan, turning a typo into a silent
+# whole-scan outage. `np.exceptions` is the numpy >= 1.25 home; the top-level
+# alias covers older builds; RuntimeWarning is the last resort and is
+# strictly broader than intended.
+_COMPLEX_WARNING = getattr(np, "ComplexWarning", None) or getattr(
+    np.exceptions, "ComplexWarning", RuntimeWarning
+)
+
+
+def test_johansen_cointegration(
+    series_a: np.ndarray, series_b: np.ndarray
+) -> Optional[bool]:
+    """Perform the Johansen rank test; True if the trace statistic for r=0
+    exceeds its 95% critical value.
+
+    Returns None when the test could not be computed, which is a THIRD answer
+    and not `False`. `False` means "the diagnostic ran and did not reject coin
+    integration"; None means "there is no diagnostic verdict for this pair".
+    Publishing the first as the second tells a reader the two tests conflict
+    when in fact one of them never answered.
+
+    Why None is reachable, and why it is detected where it is:
+
+    statsmodels builds the trace statistic as
+        lr1[i] = -t * sum(log(1 - a[i:]))            (vecm.py:717)
+    where `a` is the VECM's canonical-correlation eigenvalues. `lr1` is
+    allocated float64 (vecm.py:709) while `a` is a complex array (numpy's
+    `linalg.eig` always returns complex128, and the matrix it is given,
+    `inv(skk) @ sig`, is a product of two symmetric positive-definite matrices
+    whose spectrum is therefore real but is not forced to be stored as such).
+    A canonical correlation is a correlation, so it belongs in [0, 1) - but on
+    a near-singular residual covariance `skk` (short samples, collinear legs,
+    near-constant series) it can come out at or above 1. Then `1 - a` is
+    non-positive, numpy's log of it is complex, and the float64 assignment
+    silently discards the imaginary part: the stored statistic is the real
+    part of a number that has no real value, and a `ComplexWarning` is the
+    only trace that anything went wrong.
+
+    The check therefore runs on `res.eig` - the eigenvalue array, which
+    statsmodels returns intact and never writes through the float64 `lr1` -
+    BEFORE those statistics are read. Taking `.real` of the statistic, or
+    `np.real_if_close`, would convert that visible warning into an invisible
+    fabricated number, which is strictly worse than publishing nothing: a
+    refusal is a claim the reader can check, a salvaged real part is a claim
+    they cannot. The dropped imaginary part is exactly `-pi` per offending
+    eigenvalue, so it is large (`-t*pi`, about -104 on a 33-observation
+    sample) rather than a rounding crumb - the published statistic is off by
+    a term of that order, not in its last digit.
+
+    A genuinely complex eigenvalue (a conjugate pair, real and imaginary parts
+    both non-zero) is refused on the same grounds: the statistic built from it
+    is not a real quantity at all. Measured, that case does not arise here -
+    `inv(skk) @ sig` is a product of two symmetric positive-definite matrices,
+    which is similar to a symmetric matrix and so has an all-real spectrum, and
+    50,000 sampled 2x2 SPD products produced no complex eigenvalue. The check
+    is kept because the argument is a property of the construction, not a
+    guarantee about the input, and it costs one array comparison.
     """
     try:
         data = np.column_stack([series_a, series_b])
-        # det_order=0 (constant term), k_ar_diff=1 (lag order)
-        res = coint_johansen(data, det_order=0, k_ar_diff=1)
+        with warnings.catch_warnings():
+            # The ComplexWarning is not the signal - it fires on EVERY call
+            # (numpy warns on the complex-to-float cast even when the
+            # imaginary part is exactly 0.0, which is the healthy case), so
+            # treating it as one would refuse every pair in the scan. It is
+            # silenced here only because the eigenvalue check below has
+            # already turned the degradation into a refusal; without that
+            # check this would be hiding a defect.
+            warnings.simplefilter("ignore", _COMPLEX_WARNING)
+            # det_order=0 (constant term), k_ar_diff=1 (lag order)
+            res = coint_johansen(data, det_order=0, k_ar_diff=1)
+
+        eigenvalues = np.asarray(res.eig)
+        if not np.all(np.isfinite(eigenvalues)):
+            logger.debug("Johansen eigenvalues are not finite; refusing")
+            return None
+        if np.any(np.abs(np.imag(eigenvalues)) > 0.0):
+            logger.debug(
+                "Johansen eigenvalues are a complex conjugate pair; the trace "
+                "statistic would be complex and statsmodels would discard its "
+                "imaginary part into a float64 array. Refusing."
+            )
+            return None
+        canonical = np.real(eigenvalues)
+        if np.any(canonical >= 1.0):
+            logger.debug(
+                "Johansen canonical correlation at or outside the unit circle "
+                f"({np.round(canonical, 6).tolist()}): 1-a is non-positive, so "
+                "log(1-a) is complex and the imaginary part statsmodels drops "
+                "into the float64 trace statistic is not zero. Refusing."
+            )
+            return None
+
         # Trace statistic for rank 0: res.lr1[0]
         # 95% critical value for rank 0: res.cvt[0, 1]
-        trace_stat_r0 = float(res.lr1[0])
-        crit_val_95_r0 = float(res.cvt[0, 1])
+        #
+        # Guarded BEFORE the cast, not after. `_is_real` rejects a complex by
+        # type, so it is only useful on the raw value: `float()` on a numpy
+        # complex scalar does NOT raise the way `float()` on a Python complex
+        # does - it discards the imaginary part and emits a ComplexWarning, so
+        # a `float()` first would hand `_is_real` an already-truncated real
+        # number and the guard would pass on a fabricated value. The real
+        # `lr1` is float64 today, so this is defence against a statsmodels
+        # that widens the array rather than a live defect - but it is the
+        # difference between a guard and a decoration.
+        raw_trace = res.lr1[0]
+        raw_crit = res.cvt[0, 1]
+        if not _is_real(raw_trace) or not _is_real(raw_crit):
+            logger.debug(
+                f"Johansen statistic is not a finite real number "
+                f"(trace={raw_trace!r}, crit={raw_crit!r}); refusing"
+            )
+            return None
+        trace_stat_r0 = float(raw_trace)
+        crit_val_95_r0 = float(raw_crit)
         return bool(trace_stat_r0 > crit_val_95_r0)
     except Exception as e:
         logger.debug(f"Johansen test error: {e}")
-        return False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1343,6 +1509,21 @@ def analyze_pair_cointegration(
             family_alpha=p_value_threshold,
             comparisons_made=1,
         )
+    elif johansen_coint is None:
+        # The diagnostic did not answer. It blocks like a conflict does, but
+        # it is not one: no second verdict exists to conflict with the
+        # decision, and saying "the two tests conflict" here would report a
+        # computation failure as an empirical disagreement.
+        signal = (
+            f"{SIGNAL_DIAGNOSTIC_UNAVAILABLE} (engle_granger p="
+            f"{engle_granger_pvalue:.6f} < {p_value_threshold:g} declared this "
+            f"pair cointegrated, but the johansen diagnostic produced no "
+            f"verdict - the statistic was not computable, so there is no "
+            f"second test to agree or disagree with. This is a statement "
+            f"about the computation, not about the pair: the two tests did "
+            f"not conflict, because only one of them answered. No direction "
+            f"is published.)"
+        )
     elif not johansen_coint:
         # The diagnostic contradicts the decision. Publishing a direction here
         # is the SI-1 defect: two tests of different nulls disagreeing is a
@@ -1351,7 +1532,7 @@ def analyze_pair_cointegration(
         signal = (
             f"{SIGNAL_CONTESTED} (engle_granger p="
             f"{engle_granger_pvalue:.6f} < {p_value_threshold:g} declared this "
-            f"pair cointegrated, johansen_cointegrated={johansen_coint}, so the "
+            f"pair cointegrated, johansen_cointegrated=False, so the "
             f"two tests conflict; a contested pair is not a trade and no "
             f"direction is published.)"
         )
@@ -1436,7 +1617,11 @@ def analyze_pair_cointegration(
         # so a disagreement is reported rather than acted on.
         decision_test=DECISION_TEST,
         johansen_role=JOHANSEN_ROLE,
-        johansen_agrees_with_decision=bool(johansen_coint == is_coint),
+        # None in, None out. `bool(None == False)` would be True, publishing
+        # agreement for a diagnostic that produced no verdict at all.
+        johansen_agrees_with_decision=(
+            None if johansen_coint is None else bool(johansen_coint == is_coint)
+        ),
         # `is_cointegrated` above is unchanged: the p-value the test returned is
         # still the p-value it returned. What the legs are made of travels
         # beside it, because that is what decides whether the number is
