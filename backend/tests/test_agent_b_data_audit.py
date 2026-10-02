@@ -76,21 +76,6 @@ def _lower(frame, ticker="B.NS"):
     return out
 
 
-@pytest.fixture(autouse=True)
-def _clear_agent_b_memos():
-    DataService._in_memory_df_cache.clear()
-    DataService._quote_memo.clear()
-    DataService._l1_sources.clear()
-    DataService._l1_preferences.clear()
-    DataService._quote_sources.clear()
-    yield
-    DataService._in_memory_df_cache.clear()
-    DataService._quote_memo.clear()
-    DataService._l1_sources.clear()
-    DataService._quote_sources.clear()
-    cointegration_service._IN_MEMORY_COINT_CACHE.clear()
-
-
 @pytest.mark.asyncio
 async def test_b01_runtime_controls_bypass_and_ttl(test_db):
     test_db.add(AppSetting(key="enable_cache", value="false"))

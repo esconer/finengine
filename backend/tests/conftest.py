@@ -18,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.pool import StaticPool
 
 # Application imports
-from main import app
+# NOTE: `app` is resolved lazily via `_current_app()`, never bound at import
+# time -- see that helper. Importing the module keeps the reference live.
+import main as main_module
 from app.db.database import get_db_session, Base
 from app.services.data_service import DataService
 from app.services.analytics_engine import AnalyticsEngine
@@ -214,6 +216,27 @@ async def mock_cache_service(test_db: AsyncSession):
 
 
 # Application fixtures
+def _current_app():
+    """Return the *live* FastAPI app, re-read from `main` on every call.
+
+    `main.app` is rebuilt from scratch by `importlib.reload(main)`, which
+    test_agent_d_deployment_contract does to exercise the production-only
+    middleware gate. The reload rebinds `main.app` to a new FastAPI instance
+    carrying a brand-new `dependency_overrides` dict, and the previously
+    captured instance is orphaned forever.
+
+    `from main import app` in this conftest bound that orphaned object, so
+    `async_client`/`client` kept driving it while every test -- which resolves
+    `from main import app` at call time -- installed its dependency overrides
+    on the *new* dict. The overrides silently became no-ops: three mocked API
+    tests in test_bugfix_api_layer fell through to the real DataService and
+    issued live yfinance requests, so they passed alone and failed in suite
+    order. Reading `main.app` per call keeps the driven app and the configured
+    app the same object no matter how many reloads happen.
+    """
+    return main_module.app
+
+
 def _override_get_db(session: AsyncSession):
     async def _gen():
         yield session
@@ -223,6 +246,7 @@ def _override_get_db(session: AsyncSession):
 @pytest_asyncio.fixture
 async def async_client(test_db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     """Async test client bound to the ISOLATED test database (never daisy.db)."""
+    app = _current_app()
     app.dependency_overrides[get_db_session] = _override_get_db(test_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -255,7 +279,7 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
     )
     monkeypatch.setattr(ws_mod, "SessionLocal", db_mod.SessionLocal)
     monkeypatch.setattr(db_mod.settings, "database_url", url)
-    with TestClient(app) as client:
+    with TestClient(_current_app()) as client:
         yield client
 
 
@@ -417,6 +441,53 @@ def error_simulation_config():
 
 
 # Cleanup fixtures
+def _clear_service_memos():
+    """Drop every process-global service memo and snapshot.
+
+    These are class-level / module-level dicts on singletons, so they are
+    shared by every test in the session and outlive any test that fills them.
+    Entries are keyed by ticker (or pair) and hold values derived from
+    whichever `test_db` happened to be open when they were written, so a
+    survivor lets the next test read another test's rows, source labels or
+    generations -- order-dependent results with no visible cause.
+
+    The runtime-cache snapshot/fingerprint pair belongs here for the same
+    reason and is the sharper case: it records the `enable_cache` /
+    `cache_ttl_minutes` rows of whichever database was last consulted. A test
+    that sets `enable_cache=false` in its own test_db is then overruled by a
+    snapshot published earlier from the real one, and its cache-bypass
+    assertion fails with a vendor that provably *was* called. `None` is the
+    module's own initial state and the value every reader defaults to, so
+    resetting to it can only remove pollution, never introduce it.
+    """
+    from app.services import cache_service, cointegration_service
+
+    DataService._in_memory_df_cache.clear()
+    DataService._quote_memo.clear()
+    DataService._l1_sources.clear()
+    DataService._l1_preferences.clear()
+    DataService._quote_sources.clear()
+    cointegration_service._IN_MEMORY_COINT_CACHE.clear()
+    cache_service._RUNTIME_CONFIG_SNAPSHOT = None
+    cache_service._RUNTIME_CONFIG_FINGERPRINT = None
+
+
+@pytest.fixture(autouse=True)
+def reset_service_memos():
+    """Give every test a clean set of service memos, before and after.
+
+    Framework-level on purpose. This was previously a file-local autouse
+    fixture in test_agent_b_data_audit only, which cleared the memos for that
+    one file and left every other file free to poison -- and be poisoned by --
+    them. `test_reset_service_memos_actually_clears` /
+    `test_reset_service_memos_leaves_nothing_for_the_next_test` in
+    test_test_isolation_invariants.py fail if this reset stops happening.
+    """
+    _clear_service_memos()
+    yield
+    _clear_service_memos()
+
+
 @pytest.fixture(autouse=True)
 def cleanup_test_data():
     """Automatically clean up test data after each test"""
