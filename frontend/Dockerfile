@@ -1,5 +1,6 @@
 # Multi-stage build for Next.js production optimization
-FROM node:18-alpine AS base
+# Node 22 LTS: next@16.3.6 declares engines.node >=20.9.0
+FROM node:22-alpine AS base
 
 # Install dependencies only when needed
 FROM base AS deps
@@ -54,9 +55,9 @@ EXPOSE 3000
 ENV PORT 3000
 ENV HOSTNAME "0.0.0.0"
 
-# Health check
+# Health check: node ships in the base image; alpine has no curl
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000 || exit 1
+    CMD ["node", "-e", "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
 
 # Start the application
 CMD ["node", "server.js"]

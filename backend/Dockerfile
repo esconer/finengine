@@ -49,6 +49,6 @@ EXPOSE 8000
 # Readiness combines the published HTTP liveness endpoint with SQLite
 # quick_check. Python is already present, so no curl/wget runtime is required.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import os,sqlite3,urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).close(); p=os.environ['DATABASE_URL'].rsplit('///',1)[1]; c=sqlite3.connect(p,timeout=3); ok=c.execute('PRAGMA quick_check').fetchone()[0]; c.close(); assert ok == 'ok', ok"]
+    CMD ["python", "-c", "import os,sqlite3,urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).close(); p=os.environ['DATABASE_URL'].split('///',1)[1]; c=sqlite3.connect(p,timeout=3); ok=c.execute('PRAGMA quick_check').fetchone()[0]; c.close(); assert ok == 'ok', ok"]
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

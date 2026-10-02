@@ -41,7 +41,7 @@ services:
           import os, sqlite3, urllib.request;
           urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close();
           url = os.environ['DATABASE_URL'];
-          path = url.rsplit('///', 1)[1];
+          path = url.split('///', 1)[1];
           conn = sqlite3.connect(path, timeout=3);
           ok = conn.execute('PRAGMA quick_check').fetchone()[0];
           conn.close();

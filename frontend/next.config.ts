@@ -3,6 +3,8 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   /* config options here */
   reactCompiler: false, // Disabled for stability
+  // Emit .next/standalone — frontend/Dockerfile copies it to run the app.
+  output: 'standalone',
   compress: true,
   poweredByHeader: false,
   productionBrowserSourceMaps: false,
