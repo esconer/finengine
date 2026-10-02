@@ -10,6 +10,14 @@ from __future__ import annotations
 import json
 import urllib.request
 
+import pytest
+
+# This check only passes against an already-published stack on 127.0.0.1:8000
+# and :3000, which the `integration` CI job brings up before invoking this
+# module directly. Unit runs select the complement with -m "not integration",
+# so the marker is what keeps the two invocations distinct.
+pytestmark = pytest.mark.integration
+
 
 def _read(url: str) -> tuple[int, bytes]:
     with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - fixed localhost URLs

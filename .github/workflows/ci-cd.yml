@@ -18,6 +18,13 @@ jobs:
       matrix:
         python-version: ["3.12"]
 
+    # Pin the uv cache to a constant location so the cached path below is
+    # authoritative. Left to its own devices uv picks $XDG_CACHE_HOME/uv, so a
+    # runner image that sets XDG_CACHE_HOME elsewhere would make the cache
+    # unreadable and silently pay the full download on every run.
+    env:
+      UV_CACHE_DIR: /tmp/.uv-cache
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -32,11 +39,18 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-    - name: Cache dependencies
-      uses: actions/cache@v3
+    # `uv` is the installer above, so `~/.cache/pip` was never read by anything
+    # and every run re-downloaded and re-linked the whole scientific stack.
+    # Caching uv's own cache instead, keyed on the lockfile, is where the
+    # backend job's wall clock actually goes. actions/cache v3 is retired
+    # (Node 16); v4 is SHA-pinned below with the version in a trailing comment.
+    - name: Cache uv dependencies
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
+        path: /tmp/.uv-cache
+        key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-
 
     - name: Install dependencies
       working-directory: backend
@@ -48,10 +62,15 @@ jobs:
       run: |
         uv run ruff check --no-cache .
 
+    # -m "not integration" excludes tests/integration/test_compose_services.py.
+    # It probes 127.0.0.1:8000 and :3000, which nothing is listening on at this
+    # point in the job, so collecting it here failed the build on every push. It
+    # is still marked (not deleted) and still runs, standalone, in the
+    # `integration` job once Compose is up.
     - name: Run backend tests with 80% coverage gate
       working-directory: backend
       run: |
-        uv run pytest -p no:cacheprovider tests/ --cov=app --cov-fail-under=80 --cov-report=xml --cov-report=term
+        uv run pytest -p no:cacheprovider tests/ -m "not integration" --cov=app --cov-fail-under=80 --cov-report=xml --cov-report=term
 
     - name: Build backend Docker image
       run: |
@@ -121,8 +140,11 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    # Pinned to the v0.36.0 release commit. This was the only mutable
+    # ref in the file (`@master`), which is a supply-chain hazard: whatever
+    # is on master at run time is what executes here.
     - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       with:
         scan-type: 'fs'
         scan-ref: '.'
@@ -130,7 +152,7 @@ jobs:
         output: 'trivy-results.sarif'
 
     - name: Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3.38.2
       with:
         sarif_file: 'trivy-results.sarif'
 
@@ -184,7 +206,7 @@ jobs:
 
     - name: Login to Amazon ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
     - name: Build, tag, and push backend image to Amazon ECR
       env:
