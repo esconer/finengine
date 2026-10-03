@@ -103,12 +103,22 @@ export interface FactorExposureResponse {
 }
 
 // Concentration Metrics Type
+//
+// `herfindahl_index` is `number | null`, NOT `number`: the route's empty-book
+// branch and the engine's `_empty_concentration()` both publish
+// `herfindahl_index: None`, and the route's MEASURED branch forwards that shape
+// through `.get("herfindahl_index", 0.0)` — `.get` hands back the stored `None`
+// because the key is present, so the `0.0` default is dead. `0.0` was never a
+// reachable measurement (HHI = Σw² ≥ 1/n > 0 for every non-empty book), and
+// `risk_scoring` was feeding this field into `min(30, herfindahl_index * 100)`,
+// scoring the refusal as the safest book there is. The key is always present, so
+// `?:` is not needed — it is published `null`, not omitted.
 export interface ConcentrationMetrics {
   largest_position: number;
   top_3: number;
   top_5: number;
   top_10: number;
-  herfindahl_index: number;
+  herfindahl_index: number | null;
   effective_positions: number;
   diversification_ratio: number;
   diversification_score?: number | null;
@@ -977,7 +987,8 @@ export interface EquityResearchProfile {
   industry?: string;
   sub_industry?: string;
   indices: string[];
-  current_price: number;
+  /** `Optional[float] = None` upstream: absent in some serialisations, null in others. Never a fabricated 0. */
+  current_price?: number | null;
   market_cap_cr?: number;
   high_52w?: number;
   low_52w?: number;
@@ -1058,7 +1069,8 @@ export interface CustomRatiosDataResponse {
   ev_to_ebitda?: number;
   interest_coverage?: number;
   cfo_to_pat_ratio?: number;
-  current_price: number;
+  /** `Optional[float] = None` upstream: absent in some serialisations, null in others. Never a fabricated 0. */
+  current_price?: number | null;
   ratios_history: {
     periods: string[];
     rows: Record<string, number[]>;

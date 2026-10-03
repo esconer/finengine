@@ -51,7 +51,14 @@ interface ConcentrationData {
   top_3: number;
   top_5: number;
   top_10: number;
-  herfindahl_index: number;
+  /**
+   * `null`, not absent and not `0`. HHI = Σw² ≥ 1/n > 0 for every non-empty
+   * book, so the route cannot publish a measured `0.0` here — the engine's
+   * no-book shape publishes `None`, and a reader who sees `0.00` reads it as the
+   * one book HHI does describe. Guarded with `!= null` everywhere below; never
+   * `!== undefined`, and never truthiness (`0` is a value, not an absence).
+   */
+  herfindahl_index: number | null;
   effective_positions: number;
   diversification_score?: number | null;
   error?: string;
@@ -103,7 +110,14 @@ function finiteOrNull(value: unknown): number | null {
 interface ConcentrationMetric {
   name: string;
   key: string;
-  value: number | undefined;
+  /**
+   * `null` is part of the wire, not an accident of it: `herfindahl_index` is
+   * published `None` when the engine refused to measure it. `status` is the only
+   * thing this row is read for — every threshold comparison happens behind a
+   * `== null` guard that yields `'N/A'` — so the figure itself is carried here
+   * exactly as it arrived rather than coerced into a number to satisfy a type.
+   */
+  value: number | null | undefined;
   threshold: number;
   status: 'Good' | 'Warning' | 'Risk' | 'N/A';
   color_class: string;
@@ -768,7 +782,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Largest Position"
-            value={concentrationData?.largest_position !== undefined ? formatPercentage(concentrationData.largest_position) : 'N/A'}
+            value={concentrationData?.largest_position != null ? formatPercentage(concentrationData.largest_position) : 'N/A'}
             icon={Target}
             loading={loading}
           />
@@ -780,7 +794,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Top 3 Holdings"
-            value={concentrationData?.top_3 !== undefined ? formatPercentage(concentrationData.top_3) : 'N/A'}
+            value={concentrationData?.top_3 != null ? formatPercentage(concentrationData.top_3) : 'N/A'}
             icon={BarChart3}
             loading={loading}
           />
@@ -792,7 +806,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Herfindahl Index"
-            value={concentrationData?.herfindahl_index !== undefined ? formatRatio(concentrationData.herfindahl_index) : 'N/A'}
+            value={concentrationData?.herfindahl_index != null ? formatRatio(concentrationData.herfindahl_index) : 'N/A'}
             icon={AlertTriangle}
             loading={loading}
           />
@@ -804,7 +818,7 @@ export default function ConcentrationPage() {
         <div className="relative">
           <MetricCard
             title="Effective Positions"
-            value={concentrationData?.effective_positions !== undefined ? formatRatio(concentrationData.effective_positions) : 'N/A'}
+            value={concentrationData?.effective_positions != null ? formatRatio(concentrationData.effective_positions) : 'N/A'}
             icon={TrendingUp}
             loading={loading}
           />
@@ -1045,7 +1059,10 @@ export default function ConcentrationPage() {
             </div>
           )}
 
-          {concentrationData?.herfindahl_index && concentrationData.herfindahl_index < 0.20 && (
+          {/* `!= null`, not truthiness and not `!== undefined`: this field is published
+              as `null` when the engine refused it, and `0` is a value the falsy half
+              of that question would throw away rather than read. */}
+          {concentrationData?.herfindahl_index != null && concentrationData.herfindahl_index < 0.20 && (
             <div className="flex items-start space-x-3 bg-purple-50/50 dark:bg-purple-950/20 p-3.5 rounded-xl border border-purple-200/50 dark:border-purple-900/30">
               <Target className="w-5 h-5 text-purple-600 dark:text-purple-400 shrink-0 mt-0.5" />
               <div>

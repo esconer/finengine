@@ -12,6 +12,35 @@ const LOOKBACK_DAYS = 252;
 const P_VALUE_THRESHOLD = 0.05;
 
 /**
+ * One row of `/analytics/coint`'s `pairs` array, shaped from
+ * `backend/app/models/schemas.py:496 CointPairResult`.
+ *
+ * The two nullable fields are not defensive typing — they are the schema's own:
+ * `ou_half_life_days` and `current_spread_zscore` are `Optional[float] = None`
+ * because `_get_cached_pair` reconstructs the model from DB cache rows written by
+ * older builds, and the schema's docstring says "Absent means 'not recorded',
+ * not 'zero'" (`schemas.py:499-503`). Every other field the table reads is a
+ * REQUIRED `float` on that model, so it is typed `number` here rather than
+ * widened to `number | null` out of caution: a column that cannot be absent
+ * should not look as though it can.
+ *
+ * This interface is what makes the defect visible to the compiler. `pairs` was
+ * `useState<any[]>`, so every element was `any`, `x.toFixed(2)` on an `any` is
+ * legal, and a clean `tsc --noEmit` said nothing at all about the null that the
+ * next row render dereferences. Typing the array is the fix for the blind spot;
+ * the guard at the call site is the fix for the crash.
+ */
+interface CointPairRow {
+    ticker_a: string;
+    ticker_b: string;
+    engle_granger_pvalue: number;
+    hedge_ratio_beta: number;
+    ou_half_life_days: number | null;
+    current_spread_zscore: number | null;
+    signal: string;
+}
+
+/**
  * The scan envelope, not just its rows.
  *
  * `/analytics/coint` publishes `as_of` AND `as_of_semantics` (three tokens,
@@ -24,7 +53,7 @@ const P_VALUE_THRESHOLD = 0.05;
  * indistinguishable from one dated by its newest delivered observation.
  */
 interface CointScanEnvelope {
-    pairs?: unknown[];
+    pairs?: CointPairRow[] | null;
     as_of?: string | null;
     as_of_semantics?: string | null;
     latest_observation_date?: string | null;
@@ -38,7 +67,7 @@ interface CointScanEnvelope {
 export default function PairsScannerPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [pairs, setPairs] = useState<any[]>([]);
+    const [pairs, setPairs] = useState<CointPairRow[]>([]);
     const [scan, setScan] = useState<CointScanEnvelope | null>(null);
 
     const fetchPairs = async () => {
@@ -146,8 +175,16 @@ export default function PairsScannerPage() {
                                         <td className="px-4 py-3">
                                             {p.ou_half_life_days ? `${p.ou_half_life_days.toFixed(1)} days` : 'N/A'}
                                         </td>
-                                        <td className={`px-4 py-3 font-mono ${Math.abs(p.current_spread_zscore) > 2 ? 'text-amber-600 dark:text-amber-400 font-bold' : ''}`}>
-                                            {p.current_spread_zscore.toFixed(2)}σ
+                                        {/* `current_spread_zscore` is `Optional[float] =
+                                            None`, so `.toFixed(2)` on it THREW and one
+                                            unrecorded pair took the whole table down
+                                            with it. The half-life cell above already
+                                            guards its own optional and renders 'N/A' —
+                                            this cell now matches its sibling, and the
+                                            amber "wide spread" highlight is applied only
+                                            to a z-score that actually exists. */}
+                                        <td className={`px-4 py-3 font-mono ${p.current_spread_zscore != null && Math.abs(p.current_spread_zscore) > 2 ? 'text-amber-600 dark:text-amber-400 font-bold' : ''}`}>
+                                            {p.current_spread_zscore == null ? 'N/A' : `${p.current_spread_zscore.toFixed(2)}σ`}
                                         </td>
                                         <td className="px-4 py-3">
                                             <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${p.signal === 'NEUTRAL' || p.signal === 'NOT_COINTEGRATED' ? 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'}`}>

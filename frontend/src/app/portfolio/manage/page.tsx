@@ -38,6 +38,11 @@ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { analyticsApi, portfolioApi } from '@/lib/api';
 import { usePortfolioStore } from '@/lib/store';
 import { cn, formatCurrency as sharedFormatCurrency } from '@/lib/utils';
+import {
+    forecastRiskLevel,
+    formatForecastPercent,
+    formatForecastSignedPercent,
+} from '@/lib/forecast-risk-format';
 
 // Payload already carries snake_case calculated fields (PortfolioPosition)
 type SimplePortfolioPosition = PortfolioPosition;
@@ -68,6 +73,33 @@ const measuredValue = (base: number | null | undefined, native: number | null | 
 const monetaryValue = (base: number | null | undefined, native: number | null | undefined): number => {
     return measuredValue(base, native) ?? 0;
 };
+
+/**
+ * The three forecast columns, as TEXT, with absence preserved.
+ *
+ * `volatility_forecast` and `var_forecast` arrive as DECIMALS —
+ * `analytics_engine.py:5937` `"volatility_forecast_units": "annualized"` and
+ * `:5921` `"var_units": "1_day_cumulative_return_decimal"` — so the columns
+ * have to multiply by 100. They did not, and printed `0.42%` for a 42% forecast
+ * and `-0.03%` for a -3.1% VaR.
+ *
+ * The scale and the banding both come from `@/lib/forecast-risk-format`, the
+ * one module `dashboard/forecast-risk` also goes through. Each helper returns
+ * `null` — never a formatted string — when the engine published nothing, so a
+ * caller cannot format an absence by accident, and each cell renders N/A on
+ * `null`. A MEASURED zero still formats: 0 → `0.00%`, and a band.
+ *
+ * The risk band is read off the SAME `volatility_forecast` the volatility cell
+ * above publishes, so the badge cannot contradict the number beside it.
+ */
+const forecastVolatilityText = (position: SimplePortfolioPosition) =>
+    formatForecastPercent(position.volatility_forecast);
+
+const forecastVarText = (position: SimplePortfolioPosition) =>
+    formatForecastSignedPercent(position.var_forecast);
+
+const forecastRisk = (position: SimplePortfolioPosition) =>
+    forecastRiskLevel(position.volatility_forecast);
 
 export default function PortfolioManagePage() {
     // State management
@@ -137,29 +169,28 @@ export default function PortfolioManagePage() {
             }
             if (data && data.positions) {
                 // Update positions with forecast risk data
+                //
+                // The RISK BAND is deliberately not stored here. It used to be
+                // (`risk_level: getRiskLevel(vol)`) and read back by the badge,
+                // which put a second copy of the banding rule on this page —
+                // the copy that drifted into percent-space thresholds and made
+                // every row green "Low". It is now derived at the render from
+                // the same `volatility_forecast` the cell above publishes, via
+                // the one shared helper, so there is nothing left to drift.
                 const updatedPositions = positions.map(position => {
                     const tickerData = data.positions?.[position.ticker];
-                    if (tickerData) {
-                        const vol =
-                            typeof tickerData.volatility_forecast === 'number'
-                                ? tickerData.volatility_forecast
-                                : undefined;
-                        const varFc =
-                            typeof tickerData.var_forecast === 'number'
-                                ? tickerData.var_forecast
-                                : undefined;
-                        return {
-                            ...position,
-                            volatility_forecast: vol,
-                            var_forecast: varFc,
-                            risk_level: vol !== undefined ? getRiskLevel(vol) : undefined
-                        };
-                    }
+                    const vol =
+                        tickerData && typeof tickerData.volatility_forecast === 'number'
+                            ? tickerData.volatility_forecast
+                            : undefined;
+                    const varFc =
+                        tickerData && typeof tickerData.var_forecast === 'number'
+                            ? tickerData.var_forecast
+                            : undefined;
                     return {
                         ...position,
-                        volatility_forecast: undefined,
-                        var_forecast: undefined,
-                        risk_level: undefined
+                        volatility_forecast: vol,
+                        var_forecast: varFc,
                     };
                 });
 
@@ -172,20 +203,12 @@ export default function PortfolioManagePage() {
             const updatedPositions = positions.map(position => ({
                 ...position,
                 volatility_forecast: undefined,
-                var_forecast: undefined,
-                risk_level: undefined
+                var_forecast: undefined
             }));
             setPositions(updatedPositions);
         } finally {
             setIsLoadingForecast(false);
         }
-    };
-
-    // Determine risk level based on volatility forecast
-    const getRiskLevel = (volatility: number): 'Low' | 'Medium' | 'High' => {
-        if (volatility < 20) return 'Low';
-        if (volatility < 40) return 'Medium';
-        return 'High';
     };
 
     // Fetch portfolio data
@@ -444,7 +467,18 @@ export default function PortfolioManagePage() {
         (sum, pos) => sum + monetaryValue(pos.total_cost_base, pos.total_cost),
         0
     );
-    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : 0;
+    // The two SUMS above are reductions over the legs that were measured, so an
+    // absent leg contributes nothing and they stay numbers. The RATIO is a
+    // different kind of quantity: its fallback fires on a zero DENOMINATOR, not
+    // on a missing summand. `totalCost > 0 ? … : 0` therefore published 0.00%
+    // for a book it could not compute a return for — and because `totalGainLoss`
+    // was also 0 on such a book, `0 >= 0` painted that withheld 0 green, so the
+    // card read as a measured "no change" on a book that was never weighed.
+    //
+    // `null` states the third possibility: the cost basis is zero or absent, so
+    // there is no return to report. This is the same shape the sibling card in
+    // `PortfolioStats.tsx` already carries (`stats.avgGainLoss == null`).
+    const totalGainLossPct = totalCost > 0 ? (totalGainLoss / totalCost) * 100 : null;
 
     const formatCurrency = (amount: number) =>
         sharedFormatCurrency(amount, currency);
@@ -589,9 +623,16 @@ export default function PortfolioManagePage() {
                                     </p>
                                     <p className={cn(
                                         'text-sm',
-                                        totalGainLoss >= 0 ? 'text-green-600' : 'text-red-600'
+                                        // No colour on the withheld state: green
+                                        // reads as "no change" and red as "a loss",
+                                        // and the data supports neither claim.
+                                        totalGainLossPct === null
+                                            ? ''
+                                            : totalGainLoss >= 0 ? 'text-green-600' : 'text-red-600'
                                     )}>
-                                        {totalGainLoss >= 0 ? '+' : ''}{totalGainLossPct.toFixed(2)}%
+                                        {totalGainLossPct === null
+                                            ? 'N/A'
+                                            : `${totalGainLoss >= 0 ? '+' : ''}${totalGainLossPct.toFixed(2)}%`}
                                     </p>
                                 </div>
                             </div>
@@ -834,10 +875,10 @@ export default function PortfolioManagePage() {
                                                         <Activity className="w-3 h-3 animate-pulse" />
                                                         <span>Loading...</span>
                                                     </div>
-                                                ) : position.volatility_forecast != null ? (
+                                                ) : forecastVolatilityText(position) !== null ? (
                                                     <div className="flex items-center space-x-1">
                                                         <Activity className="w-4 h-4 text-blue-500" />
-                                                        <span>{position.volatility_forecast.toFixed(2)}%</span>
+                                                        <span>{forecastVolatilityText(position)}</span>
                                                     </div>
                                                 ) : (
                                                     <span className="text-gray-500">N/A</span>
@@ -849,14 +890,14 @@ export default function PortfolioManagePage() {
                                                         <Activity className="w-3 h-3 animate-pulse" />
                                                         <span>Loading...</span>
                                                     </div>
-                                                ) : position.var_forecast != null ? (
+                                                ) : forecastVarText(position) !== null ? (
                                                     <div className="flex items-center space-x-1">
                                                         <AlertTriangle className="w-4 h-4 text-orange-500" />
                                                         <span className={cn(
                                                             "font-medium",
-                                                            position.var_forecast >= 0 ? "text-green-600" : "text-red-600"
+                                                            position.var_forecast != null && position.var_forecast >= 0 ? "text-green-600" : "text-red-600"
                                                         )}>
-                                                            {position.var_forecast >= 0 ? '+' : ''}{position.var_forecast.toFixed(2)}%
+                                                            {forecastVarText(position)}
                                                         </span>
                                                     </div>
                                                 ) : (
@@ -869,15 +910,15 @@ export default function PortfolioManagePage() {
                                                         <Activity className="w-3 h-3 animate-pulse" />
                                                         <span>Loading...</span>
                                                     </div>
-                                                ) : position.risk_level ? (
+                                                ) : forecastRisk(position) !== null ? (
                                                     <span className={cn(
                                                         "inline-flex items-center px-2 py-1 rounded-full text-xs font-medium",
-                                                        position.risk_level === 'Low' ? "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400" :
-                                                        position.risk_level === 'Medium' ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400" :
+                                                        forecastRisk(position) === 'Low' ? "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400" :
+                                                        forecastRisk(position) === 'Medium' ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400" :
                                                         "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400"
                                                     )}>
                                                         <Shield className="w-3 h-3 mr-1" />
-                                                        {position.risk_level}
+                                                        {forecastRisk(position)}
                                                     </span>
                                                 ) : (
                                                     <span className="text-gray-500">N/A</span>

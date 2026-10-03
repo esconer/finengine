@@ -32,7 +32,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
+  // `number | null`, not `number`. `data.total_value || 0` was FE-7 at a FOURTH
+  // site: the store now types its own `totalValue` as `number | null` for exactly
+  // this reason, but this is LOCAL state fed by a field declared `number`
+  // (types/index.ts:58), so the store's nullable type protects nothing here and
+  // `tsc` sees a `number` throughout. `null` means the payload published no
+  // total, which is a different fact from a total of zero.
+  const [totalPortfolioValue, setTotalPortfolioValue] = useState<number | null>(null);
   const [existingCount, setExistingCount] = useState(0);
   const [portfolioLoaded, setPortfolioLoaded] = useState(false);
   const [fetchError, setFetchError] = useState(false);
@@ -42,7 +48,10 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       const data = await portfolioApi.getPortfolio({ currency });
       const posList = data.positions || [];
       setExistingCount(posList.length);
-      setTotalPortfolioValue(data.total_value || 0);
+      const total = data.total_value;
+      setTotalPortfolioValue(
+        typeof total === 'number' && Number.isFinite(total) ? total : null
+      );
       setPortfolioLoaded(true);
       setFetchError(false);
     } catch (error) {
@@ -73,8 +82,27 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       setErrors({});
       setPortfolioLoaded(false);
       setFetchError(false);
+      // Never carry the previous book's total into a newly opened modal: the
+      // weight effect early-returns until `portfolioLoaded`, but a lingering
+      // value is a measurement about a book this modal never asked about.
+      setTotalPortfolioValue(null);
     }
   }, [isOpen, currency]);
+
+  // An EMPTY book is a measurement, an UNKNOWN total is not.
+  //
+  // `existingCount === 0` means the engine reported no holdings at all, so the
+  // position being added IS the whole portfolio — a real 1.0, and the
+  // zero-state invariant in AGENTS.md. That holds whether the payload also
+  // published a total or not: a missing total is irrelevant to a book with
+  // nothing in it.
+  //
+  // `existingCount > 0` with a null total is the opposite case. The book holds
+  // holdings whose value was never published, so `value / (0 + value)` came out
+  // as exactly 1.0 — a fabricated "this new position is your entire portfolio".
+  // There is no honest weight to compute, so none is published.
+  const weightUnavailable =
+    portfolioLoaded && existingCount > 0 && totalPortfolioValue === null;
 
   // Auto-calculate weight when quantity or buy price changes (only after a successful fetch)
   useEffect(() => {
@@ -84,11 +112,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
       if (existingCount === 0) {
         // First position in an empty portfolio is always 100% (1.0)
         setFormData(prev => ({ ...prev, weight: 1.0 }));
-      } else {
+      } else if (totalPortfolioValue !== null) {
         const newTotalValue = totalPortfolioValue + positionValue;
         const estimatedWeight = positionValue / newTotalValue;
         setFormData(prev => ({ ...prev, weight: estimatedWeight }));
       }
+      // else: the total is unmeasured, so no weight is written. The weight field
+      // is read-only, so there is no value the user could supply instead.
     }
   }, [formData.quantity, formData.buy_price, totalPortfolioValue, existingCount, portfolioLoaded]);
 
@@ -111,7 +141,11 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
     }
 
     // Validate weight is properly set
-    if (formData.weight <= 0 || formData.weight > 1) {
+    if (weightUnavailable) {
+      // Not a validation failure: the ratio has no denominator. Saying "between
+      // 0 and 1" would blame the user for the engine not publishing a total.
+      newErrors.weight = 'Portfolio total unavailable — weight cannot be calculated. Retry.';
+    } else if (formData.weight <= 0 || formData.weight > 1) {
       newErrors.weight = 'Weight must be between 0 and 1';
     }
 
@@ -131,6 +165,12 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
     e.preventDefault();
 
     if (fetchError) {
+      return;
+    }
+
+    // Refuse the write rather than record a weight nobody measured. The weight
+    // field is read-only, so this is not a field the user can fill in.
+    if (weightUnavailable) {
       return;
     }
 
@@ -291,7 +331,13 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
               <input
                 id="add-weight"
                 type="text"
-                value={formData.weight > 0 ? `${(formData.weight * 100).toFixed(2)}%` : 'Auto-calculated'}
+                value={
+                  weightUnavailable
+                    ? 'N/A'
+                    : formData.weight > 0
+                      ? `${(formData.weight * 100).toFixed(2)}%`
+                      : 'Auto-calculated'
+                }
                 readOnly
                 className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-400 cursor-not-allowed"
               />
@@ -299,6 +345,19 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
                 <span className="text-sm text-gray-500 dark:text-gray-400">%</span>
               </div>
             </div>
+            {weightUnavailable && (
+              <p className="mt-2 text-sm text-amber-700 dark:text-amber-300">
+                Portfolio total unavailable — this position&apos;s share of a book whose value was
+                never published cannot be calculated, so nothing will be recorded.
+                <button
+                  type="button"
+                  onClick={fetchTotalPortfolioValue}
+                  className="ml-2 font-semibold underline shrink-0"
+                >
+                  Retry
+                </button>
+              </p>
+            )}
             {errors.weight && (
               <p className="mt-2 text-sm text-red-600 dark:text-red-400">{errors.weight}</p>
             )}
@@ -361,7 +420,7 @@ export function AddPositionModalSimple({ isOpen, onClose, onAdd, currency }: Add
             </button>
             <button
               type="submit"
-              disabled={isSubmitting || fetchError}
+              disabled={isSubmitting || fetchError || weightUnavailable}
               className="flex-1 flex items-center justify-center space-x-2 px-4 py-3 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {isSubmitting ? (

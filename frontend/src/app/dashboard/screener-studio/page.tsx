@@ -39,6 +39,24 @@ const STRATEGY_ICONS: Record<string, React.ReactNode> = {
   undervalued_growth: <BarChart3 className="w-4 h-4 text-purple-400" />,
 };
 
+/**
+ * A screened row's price, or `null` when the screen published none.
+ *
+ * `ScreenerStock.price` is declared `number` (types/index.ts:1072) but the
+ * endpoint can omit it — a fundamental-only screen run has no quote to attach.
+ * The cell used to read `₹{data.price?.toLocaleString(…)}`, and because React
+ * DROPS an `undefined` child rather than stringifying it, the string on screen
+ * was a bare `₹`: a currency with no amount, which reads as a price that
+ * exists. `null` here is what lets the cell say the row has no price.
+ *
+ * The same predicate gates the add (`hasPrice` in the row action), so the
+ * control and the cell can never disagree about whether a price exists.
+ */
+const measuredPrice = (stock: { price?: number | null }): number | null => {
+  const { price } = stock;
+  return typeof price === 'number' && Number.isFinite(price) && price > 0 ? price : null;
+};
+
 export default function ScreenerStudioPage() {
   const [strategies, setStrategies] = useState<ScreenerStrategyMeta[]>([]);
   const [strategiesError, setStrategiesError] = useState<string | null>(null);
@@ -174,19 +192,19 @@ export default function ScreenerStudioPage() {
     // A screened row with no price has no buy price to record. `stock.price || 0`
     // wrote a fabricated 0, which the backend rejects —
     // `schemas.py:17 buy_price: float = Field(..., gt=0)` — so nothing was
-    // persisted and the user saw "buy_price: Input should be greater than 0"
-    // beside a row rendering "Rs undefined", which names neither the row nor the
-    // cause. Refuse the add and say which row is missing its price instead.
-    if (typeof stock.price !== 'number' || !Number.isFinite(stock.price) || stock.price <= 0) {
-      setAddError(
-        `Cannot add ${stock.symbol}: the screen published no price for ${stock.ticker}, so there is no buy price to record.`
-      );
-      return;
-    }
+    // persisted and the user saw "buy_price: Input should be greater than 0",
+    // which names neither the row nor the cause.
+    //
+    // Defence in depth, not the live path: the Portfolio control is DISABLED for
+    // an unpriced row, and the reason is stated on the row's Price cell. It
+    // cannot live here instead — a control that cannot be clicked is the only
+    // place a click-time message could ever have come from, so a message kept
+    // here would be unreachable for a real user.
+    const price = measuredPrice(stock);
+    if (price === null) return;
     setAddingStock(stock.symbol);
     setAddError(null);
     try {
-      const price = stock.price;
       // Mirror AddPositionModalSimple weight math: first position in an empty
       // portfolio is 1.0 (zero-state invariant); otherwise value/(total+value).
       const portfolio = await portfolioApi.getPortfolio({ currency: 'INR' });
@@ -276,9 +294,23 @@ export default function ScreenerStudioPage() {
         ),
         cell: ({ row }) => {
           const data = row.original;
+          const price = measuredPrice(data);
           return (
             <div className="text-right font-mono font-semibold text-white">
-              ₹{data.price?.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+              {price === null ? (
+                <>
+                  {/* The dash is this file's own absent marker for a numeric
+                      cell (market cap, P/E, ROCE, ROE, div. yield all use it).
+                      The note underneath is what makes the disabled Portfolio
+                      control self-explanatory: a `disabled` button cannot be
+                      clicked, so a reason that only appeared on click would be
+                      unreachable for a real user. */}
+                  <span className="text-slate-500">-</span>
+                  <div className="text-[10px] font-normal text-slate-500">No price published</div>
+                </>
+              ) : (
+                `₹${price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+              )}
             </div>
           );
         },
@@ -392,6 +424,10 @@ export default function ScreenerStudioPage() {
           const data = row.original;
           const isAdded = addedStocks[data.symbol];
           const isAdding = addingStock === data.symbol;
+          // An unpriced row has no buy price to record, so the control that
+          // records one is unavailable. The reason is on the row's Price cell,
+          // not behind the click.
+          const hasPrice = measuredPrice(data) !== null;
           return (
             <div className="flex items-center gap-2">
               <Link
@@ -416,8 +452,13 @@ export default function ScreenerStudioPage() {
               </button>
               <button
                 onClick={() => handleAddToPortfolio(data)}
-                disabled={isAdding || isAdded}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold transition-all ${
+                disabled={isAdding || isAdded || !hasPrice}
+                title={
+                  hasPrice
+                    ? `Add ${data.ticker} to your portfolio`
+                    : `The screen published no price for ${data.ticker}, so there is no buy price to record`
+                }
+                className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
                   isAdded
                     ? 'bg-emerald-600 text-white'
                     : 'bg-blue-600/30 hover:bg-blue-600 text-blue-200 hover:text-white border border-blue-500/40'
