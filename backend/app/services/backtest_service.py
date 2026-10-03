@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from app.services.optimization_service import STRATEGIES, optimize
+from app.utils.holdings import MIN_ANNUALIZE_DAYS
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -62,9 +63,19 @@ def run_walk_forward_backtest(
     if not np.isfinite(returns.to_numpy(dtype=float)).all():
         raise ValueError("returns must contain only finite values")
 
+    # A frame shorter than the requested window cannot answer the request, so
+    # the window is reduced -- but the reduction is a DIFFERENT quantity from
+    # the one that was asked for and is published as such. Both windows are
+    # recorded before the rewrite so the payload can name the ask beside the
+    # answer; without them a 756-day request silently received a 20-day
+    # backtest under the same key, on the same curve, with nothing saying so.
+    requested_lookback_days = int(lookback_days)
+    requested_rebalance_freq_days = int(rebalance_freq_days)
+    requested_windows_honoured = True
     if len(returns) < lookback_days + rebalance_freq_days:
         lookback_days = max(20, int(len(returns) * 0.4))
         rebalance_freq_days = max(5, int(len(returns) * 0.1))
+        requested_windows_honoured = False
 
     assets = list(returns.columns)
     cost_factor = transaction_cost_bps / 10000.0
@@ -184,9 +195,31 @@ def run_walk_forward_backtest(
 
     n_days = len(strat_rets)
     years = n_days / TRADING_DAYS
-    
-    strat_cagr = float((strat_cum[-1]) ** (1.0 / years) - 1.0) if years > 0 else 0.0
-    bench_cagr = float((bench_cum[-1]) ** (1.0 / years) - 1.0) if years > 0 else 0.0
+
+    # MIN_ANNUALIZE_DAYS (app/utils/holdings.py) is the codebase's own gate:
+    # below it, annualizing "fabricates triple-digit percentages", and its own
+    # docstring names "CAGR, Sharpe, Sortino, Calmar, annualized vol". It is
+    # applied to the days the curve was actually SIMULATED, not to the input
+    # frame -- the frame's length includes the lookback burn, and it is the
+    # curve that every annualized figure below describes. A caller whose window
+    # was honoured can still land under the gate (40 rows, a 20-day lookback and
+    # a 20-day rebalance simulate 20 days), so the route's own input-frame check
+    # cannot stand in for it. The estimators are untouched where the gate
+    # applies: this is a missing gate, not bad arithmetic. Below the gate the
+    # figure is withheld (None), the shape this function already uses for an
+    # unusable Sharpe denominator and an unusable Calmar.
+    #
+    # ONE predicate covers all seven published figures -- cagr,
+    # benchmark_cagr, calmar_ratio, annualized_volatility,
+    # benchmark_volatility, sharpe_ratio, benchmark_sharpe -- because they are
+    # one measurement family: every one of them extrapolates the simulated
+    # window to a year. Gating three of them left a 10-day run publishing
+    # `annualized_volatility = 0.102` and `sharpe_ratio = 3.0169`, which is the
+    # same fabrication as the CAGR the gate had just removed.
+    annualizable = n_days >= MIN_ANNUALIZE_DAYS and years > 0
+
+    strat_cagr = float((strat_cum[-1]) ** (1.0 / years) - 1.0) if annualizable else None
+    bench_cagr = float((bench_cum[-1]) ** (1.0 / years) - 1.0) if annualizable else None
 
     # Sharpe (1966) / Lo (2002): mean-based excess return over ddof=1 sample
     # volatility — not geometric CAGR over population std.
@@ -195,16 +228,36 @@ def run_walk_forward_backtest(
     bench_mu_d = float(np.mean(bench_rets))
     bench_sd_d = float(np.std(bench_rets, ddof=1)) if n_days > 1 else 0.0
 
-    strat_vol = float(strat_sd_d * np.sqrt(TRADING_DAYS))
-    bench_vol = float(bench_sd_d * np.sqrt(TRADING_DAYS))
+    strat_vol = float(strat_sd_d * np.sqrt(TRADING_DAYS)) if annualizable else None
+    bench_vol = float(bench_sd_d * np.sqrt(TRADING_DAYS)) if annualizable else None
 
-    strat_sharpe = float((strat_mu_d * TRADING_DAYS - risk_free_rate) / strat_vol) if strat_vol > 0 else None
-    bench_sharpe = float((bench_mu_d * TRADING_DAYS - risk_free_rate) / bench_vol) if bench_vol > 0 else None
+    # The Sharpe consumes the volatility, so it inherits the gate through it:
+    # without the `is not None` half this raises TypeError on a short run, the
+    # same cascade the Calmar below already guards. A Sharpe over a window too
+    # short to annualize is not a conservative Sharpe, it is a wrong one -- the
+    # denominator is a standard deviation of ten days scaled by sqrt(252).
+    strat_sharpe = (
+        float((strat_mu_d * TRADING_DAYS - risk_free_rate) / strat_vol)
+        if strat_vol is not None and strat_vol > 0
+        else None
+    )
+    bench_sharpe = (
+        float((bench_mu_d * TRADING_DAYS - risk_free_rate) / bench_vol)
+        if bench_vol is not None and bench_vol > 0
+        else None
+    )
 
     strat_mdd = float(np.min(strat_dd_all))
     bench_mdd = float(np.min(bench_dd_all))
 
-    strat_calmar = float(strat_cagr / abs(strat_mdd)) if abs(strat_mdd) > 0 else None
+    # Calmar consumes the CAGR, so it inherits the gate: without the `is not
+    # None` half this raises TypeError on a short run and the caller gets a 500
+    # instead of the refusal the CAGR just published.
+    strat_calmar = (
+        float(strat_cagr / abs(strat_mdd))
+        if strat_cagr is not None and abs(strat_mdd) > 0
+        else None
+    )
 
     equity_curve = [
         {"date": d, "strategy": round(float(s), 4), "benchmark": round(float(b), 4)}
@@ -218,8 +271,28 @@ def run_walk_forward_backtest(
 
     return {
         "strategy": strategy,
-        "cagr": round(strat_cagr, 4),
-        "annualized_volatility": round(strat_vol, 4),
+        # Which window produced the curve. `*_requested` is what the caller
+        # asked for; the unsuffixed keys are what ran. `requested_windows_honoured`
+        # is the one-line answer to "did I get what I asked for", and
+        # `simulated_days` / `input_days` keep the days analysed distinct from
+        # the rows supplied -- conflating the two is how a 48-day backtest was
+        # published under a 120-day history.
+        "lookback_days": int(lookback_days),
+        "lookback_days_requested": requested_lookback_days,
+        "rebalance_freq_days": int(rebalance_freq_days),
+        "rebalance_freq_days_requested": requested_rebalance_freq_days,
+        "requested_windows_honoured": bool(requested_windows_honoured),
+        "simulated_days": int(n_days),
+        "input_days": int(len(returns)),
+        # The gate that withholds the annualized figures, published with its
+        # own day count so a null cagr is readable without the source. Every
+        # key below that extrapolates the simulated window to a year is null
+        # when `annualized` is False; the drawdowns, the curve and the turnover
+        # are measured on the window itself and are published either way.
+        "annualized": bool(annualizable),
+        "minimum_observations_required": MIN_ANNUALIZE_DAYS,
+        "cagr": round(strat_cagr, 4) if strat_cagr is not None else None,
+        "annualized_volatility": round(strat_vol, 4) if strat_vol is not None else None,
         "sharpe_ratio": round(strat_sharpe, 4) if strat_sharpe is not None else None,
         "max_drawdown": round(strat_mdd, 4),
         "calmar_ratio": round(strat_calmar, 4) if strat_calmar is not None else None,
@@ -227,8 +300,8 @@ def run_walk_forward_backtest(
         "total_rebalances": len(rebalance_events),
         "benchmark_method": "equal_weight_buy_and_hold",
         "strategy_accounting": "self_financing_weight_drift",
-        "benchmark_cagr": round(bench_cagr, 4),
-        "benchmark_volatility": round(bench_vol, 4),
+        "benchmark_cagr": round(bench_cagr, 4) if bench_cagr is not None else None,
+        "benchmark_volatility": round(bench_vol, 4) if bench_vol is not None else None,
         "benchmark_sharpe": round(bench_sharpe, 4) if bench_sharpe is not None else None,
         "benchmark_max_drawdown": round(bench_mdd, 4),
         "equity_curve": equity_curve,

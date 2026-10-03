@@ -11,6 +11,13 @@ RUN pip install uv==0.12.17
 
 # Only dependency metadata enters the dependency layer. No .env, database,
 # logs, tests, coverage output, or generated caches are in this allowlist.
+#
+# `--frozen`, not `--locked`, and deliberately so. `--locked` asserts the
+# lockfile still matches pyproject.toml and fails when it does not; CI uses
+# `--locked` for exactly that reason. A container build must not fail on a lock
+# check: an image has to build from whatever context it was handed, and turning
+# a stale lock into a failed deploy is a worse outcome than installing it. Drift
+# is caught upstream in CI, once, not again on every image build.
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 

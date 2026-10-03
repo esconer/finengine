@@ -182,14 +182,88 @@ async def test_rebalance_allows_full_exit(async_client: AsyncClient, test_db: As
 # B6 + B7: truthful empty concentration
 # ---------------------------------------------------------------------------
 
+#: `herfindahl_index` was on the 0.0 loop below until 2026-10-03, and the sweep
+#: it belongs to is what put it there: item 5 of this file's header is
+#: "`_empty_concentration` returned fabricated HHI/N_eff instead of zeros", so
+#: 0.0 was itself the FIX for an earlier wave - it replaced values that had no
+#: defensible provenance at all.
+#:
+#: It is the wrong fix for `herfindahl_index`, and provably so rather than by
+#: preference.  HHI = sum(w_i^2) >= 1/n > 0 for every NON-EMPTY book, so 0.0 is
+#: not a reachable measurement - it is a third value that no book can produce,
+#: sitting in the same field as the two that can (1.0 for one holding, 0.25 for
+#: four equal holdings).  A reader who sees 0.0 has to check `n_holdings` to
+#: learn which of the three it is, and the payload's own scale note already
+#: exists to make exactly that check necessary.
+#:
+#: It was not cosmetic.  `risk_scoring` fed this field straight into
+#: `min(30, herfindahl_index * 100)`, so the refusal scored the concentration
+#: leg at 0 - the BEST possible value on a 0-30 scale where 30 is the most
+#: concentrated book there is - and, because the leg was not in `excluded`, kept
+#: its 0.20 nominal weight and dragged `overall_score` down by up to 6 points.
+#: An unmeasured measurement was reported as the safest book there is.
+#:
+#: `None` is the answer, and it is scoped to `n == 0` exactly: the measured
+#: branch of `concentration_analysis` is untouched, so the AGENTS.md invariant
+#: ("a single-holding portfolio must strictly render 0% diversification score")
+#: still holds at `n == 1` and is pinned below.
+ZERO_VALUED_ON_AN_EMPTY_BOOK = (
+    "largest_position",
+    "top_3",
+    "top_5",
+    "top_10",
+    "effective_positions",
+    "diversification_score",
+    "gini_coefficient",
+)
+
+
 def test_empty_concentration_truthful():
     result = AnalyticsEngine()._empty_concentration()
     assert result["error"]
-    for key in ("largest_position", "top_3", "top_5", "top_10",
-                "herfindahl_index", "effective_positions",
-                "diversification_score", "gini_coefficient"):
+    for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
         assert key in result, f"missing key: {key}"
         assert result[key] == 0.0, f"{key} must be 0.0, got {result[key]}"
+    # The one key that moved.  See ZERO_VALUED_ON_AN_EMPTY_BOOK above for why
+    # 0.0 was the wrong fix and None is the right one; the measured branch at
+    # n == 1 is unaffected and is pinned by the test below.
+    assert "herfindahl_index" in result
+    assert result["herfindahl_index"] is None
+    # `n_holdings` is what separates this shape from a measured one-holding
+    # book, and it is a true statement about an absent book rather than a
+    # stand-in for one.
+    assert result["n_holdings"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_single_holding_book_is_still_measured_and_still_renders_zero_diversification():
+    """The `n == 1` counterpart, pinned so the `n == 0` change cannot erode into it.
+
+    The repo carries "A single-holding portfolio must strictly render 0%
+    diversification score" as a hard invariant, and it is the reason WM-6 was
+    scoped to `n == 0` rather than applied to `diversification_score` as well.
+    On ONE holding the scale genuinely reads 0 - the book is maximally
+    concentrated - so 0.0 there is a measurement and must stay one.  On ZERO
+    holdings there is no scale to read.
+    """
+    single = await AnalyticsEngine().concentration_analysis({"ONLY.NS": 1.0})
+    assert single["n_holdings"] == 1
+    # Measured, not refused: this is the value the refused shape must not be
+    # mistaken for.
+    assert single["herfindahl_index"] == 1.0
+    assert single["effective_positions"] == 1.0
+    assert single["diversification_score"] == 0.0
+    assert single["diversification_ratio"] == 1.0
+    assert "error" not in single
+
+    empty = AnalyticsEngine()._empty_concentration()
+    # The two are distinguishable on every axis a consumer reads.
+    assert empty["n_holdings"] == 0
+    assert empty["herfindahl_index"] is None
+    assert empty["herfindahl_index"] != single["herfindahl_index"]
+    # And the scale documentation reaches both shapes, so a consumer reads one
+    # vocabulary whichever it lands on.
+    assert empty["scale"] == single["scale"]
 
 
 @pytest.mark.asyncio
@@ -202,7 +276,15 @@ async def test_concentration_endpoint_empty_state_keys(async_client: AsyncClient
     data = resp.json()
     assert data["diversification_score"] == 0.0
     assert data["gini_coefficient"] == 0.0
-    assert data["herfindahl_index"] == 0.0
+    # The ROUTE's no-book branch, which never calls the engine, had kept the
+    # 0.0 that WM-6 removed from `_empty_concentration`. It is now aligned with
+    # the engine shape - see ZERO_VALUED_ON_AN_EMPTY_BOOK above for why 0.0 is
+    # not a reachable Herfindahl index for any book - and asserted with `is
+    # None` rather than a comparison, so a future 0.0 here fails instead of
+    # passing.
+    assert "herfindahl_index" in data
+    assert data["herfindahl_index"] is None
+    assert data["n_holdings"] == 0
 
 
 # ---------------------------------------------------------------------------

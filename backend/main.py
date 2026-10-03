@@ -102,9 +102,13 @@ app = FastAPI(
 if settings.environment == "production":
     # Security middleware for production
     app.add_middleware(_HealthExemptHTTPSRedirectMiddleware)
+    # Hosts come from Settings (env ALLOWED_HOSTS), the same source as the CORS
+    # origins below. This list used to be a literal here, which made the host
+    # gate the one security control no env var could reach -- setting
+    # ALLOWED_ORIGINS to add a domain did not add it here.
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["daisy-risk-engine.com", "*.daisy-risk-engine.com", "localhost", "127.0.0.1"]
+        allowed_hosts=settings.allowed_hosts
     )
 
 # CORS middleware

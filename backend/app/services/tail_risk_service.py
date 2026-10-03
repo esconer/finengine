@@ -212,12 +212,34 @@ def _fat_tail_verdict(
 #    stand-in was indistinguishable from a fit and was published as
 #    degrees_of_freedom: 4.0 with nothing marking it.
 #
+# 3. A NON-FINITE leg. This one was only half-fixed: the dispersion guard moved
+#    from `np.std(...) > 0` to `np.ptp(...) > 0` (above) but the missing
+#    `np.isfinite(rho)` half never landed. A +/-inf passes `ptp > 0` with
+#    ptp == inf -- and such a leg is real: `dropna()` drops NaN, not -inf, and
+#    `prices.pct_change(fill_method=None)` emits inf from a zero denominator.
+#    Pearson over it is NaN, `np.clip` propagates NaN unchanged, and every
+#    comparison against NaN is False -- so the band chain fell through to LOW
+#    and the pair was never named in `unmeasurable_pairs`. A pair nobody could
+#    measure was published under a risk band. The computation is now contained
+#    in `np.errstate` too, so the arithmetic runs to completion and the
+#    finiteness tests below are the decision point. The suite does NOT promote
+#    RuntimeWarning to an error -- that was tried and reverted (see
+#    pyproject.toml) -- so this is not here to satisfy a filter. It is here so
+#    that a caller which DOES elevate RuntimeWarning still gets the refusal
+#    rather than a 500, which is the same substitution by way of an exception
+#    instead of a LOW band.
+#    It is withheld under its OWN reason, `non_finite_leg`, because the whole
+#    point of `unmeasurable_pairs` is to say WHICH pair and WHY: told
+#    `zero_dispersion_leg`, a reader goes looking for a frozen series that is
+#    not there while the actual defect is a non-finite number upstream.
+#
 # The idiom is the GPD fit's own, in `calculate_evt_pot_var_es`: withhold the
 # value, and publish why. A `0.0` or a `4.0` standing where no measurement
 # exists is worse than an absence, because a reader cannot tell it apart from
 # one.
 TAIL_DEPENDENCE_ZERO_DISPERSION = "zero_dispersion_leg"
 TAIL_DEPENDENCE_T_FIT_FAILED = "marginal_t_fit_failed"
+TAIL_DEPENDENCE_NON_FINITE_LEG = "non_finite_leg"
 
 TAIL_DEPENDENCE_RULE = (
     "linear_correlation is Pearson rho of the paired raw legs and "
@@ -230,7 +252,23 @@ TAIL_DEPENDENCE_RULE = (
     "'no relationship whatsoever', and it is the opposite of unknown - and "
     "lambda_L is null with it. A failed or non-finite marginal Student-t fit "
     "leaves nu null rather than a stand-in inside the [2.1, 30.0] clip range, "
-    "and lambda_L is null with it because the formula needs nu. "
+    "and lambda_L is null with it because the formula needs nu. A leg carrying "
+    "a non-finite observation also leaves rho null, under its OWN reason: the "
+    "dispersion guard only tests the peak-to-peak range, which such a leg "
+    "satisfies with an infinite range, and Pearson correlation over it is NaN "
+    "rather than a number - NaN is not a measurement and every comparison "
+    "against it is False. That pair is named non_finite_leg, never "
+    "zero_dispersion_leg: the two are different defects with different fixes, "
+    "and a reader told to look for a frozen series would not find one. Where a "
+    "pair fails both tests, non_finite_leg is published, because it names the "
+    "input defect that has to be fixed before anything else is measurable. "
+    "unmeasurable_pairs[].reason is one of exactly three tokens, named here so "
+    "a reader holding a payload can match it to its cause: "
+    "'zero_dispersion_leg' (a leg with no dispersion), "
+    "'marginal_t_fit_failed' (the marginal Student-t fit produced no usable df), "
+    "'non_finite_leg' (a leg carried a non-finite observation, or the pair's "
+    "correlation arithmetic did not produce a finite number). A reason outside "
+    "that set is a bug in the service, not a new cause. "
     "unmeasurable_pairs names every pair that was withheld and why; the "
     "corresponding matrix cell is null, which cannot be confused with a "
     "measured 0.0. Withheld pairs are excluded from high_tail_risk_pairs "
@@ -522,10 +560,10 @@ class TailRiskService:
 
             Any of the first three is ``None`` when it was not measured, and
             ``unmeasurable_reason`` then names which input was missing -
-            ``"zero_dispersion_leg"`` or ``"marginal_t_fit_failed"`` - or is
-            ``None`` when everything was measured. This is the tuple form of
-            the same contract the GPD fit publishes as ``model_fitted=False``
-            plus a ``constraint_reason``.
+            ``"zero_dispersion_leg"``, ``"marginal_t_fit_failed"`` or
+            ``"non_finite_leg"`` - or is ``None`` when everything was measured.
+            This is the tuple form of the same contract the GPD fit publishes
+            as ``model_fitted=False`` plus a ``constraint_reason``.
 
         Notes
         -----
@@ -536,7 +574,10 @@ class TailRiskService:
         the raw pair, used directly in the copula formula. A failed t fit
         publishes ``nu = None``, not a stand-in df: lambda_L is a function of
         nu, so it is withheld with it. A constant leg publishes ``rho = None``,
-        not 0.0, for the reason set out in :data:`TAIL_DEPENDENCE_RULE`.
+        not 0.0, for the reason set out in :data:`TAIL_DEPENDENCE_RULE`, and so
+        does a leg carrying a non-finite observation: Pearson correlation over
+        such a leg is NaN, which is not a measurement and which every
+        comparison would silently pass as "no relationship".
         """
         df_paired = pd.DataFrame({"a": returns_a, "b": returns_b}).dropna()
         if len(df_paired) < 10:
@@ -548,14 +589,54 @@ class TailRiskService:
         r_a = df_paired["a"].values
         r_b = df_paired["b"].values
 
-        # Linear correlation rho. Peak-to-peak range, not std: see the module
-        # note on TAIL_DEPENDENCE_RULE.
-        if np.ptp(r_a) > 0 and np.ptp(r_b) > 0:
-            rho: Optional[float] = float(np.corrcoef(r_a, r_b)[0, 1])
-        else:
-            rho = None
-        if rho is not None:
-            rho = float(np.clip(rho, -0.9999, 0.9999))
+        # Linear correlation rho, and WHICH failure withheld it if it did.
+        #
+        # The two causes are named separately because they are different defects
+        # with different fixes, and `unmeasurable_pairs` exists to say which:
+        # `zero_dispersion_leg` sends a reader looking for a frozen series, and
+        # `non_finite_leg` sends them looking for a zero denominator upstream in
+        # `pct_change`. Collapsing them would publish a cause the code never
+        # checked for. Where both apply, the non-finite label wins: it names the
+        # input defect that has to be fixed before anything else is measurable.
+        #
+        # The measurement is wrapped in np.errstate because a leg carrying a
+        # non-finite or an overflowing observation makes numpy warn
+        # mid-computation. The suite does NOT promote RuntimeWarning to an
+        # error -- that was tried and reverted (see pyproject.toml) -- so this
+        # is not here to satisfy a filter. It is here so the arithmetic runs to
+        # completion and the finiteness tests BELOW get to be the decision
+        # point: for these inputs the warning is the expected outcome rather
+        # than news, and it would otherwise be emitted for a pair the function
+        # is built to refuse. It also holds for any caller that does elevate
+        # RuntimeWarning, so a legitimately REFUSABLE pair stays a refusal
+        # there instead of becoming a 500. The finiteness tests below are the
+        # decision point; the warning is not.
+        rho: Optional[float] = None
+        rho_withheld_reason: Optional[str] = None
+        with np.errstate(invalid="ignore", over="ignore"):
+            if not (np.isfinite(r_a).all() and np.isfinite(r_b).all()):
+                # A leg carrying a +/-inf -- which `dropna()` keeps, and which
+                # `prices.pct_change(fill_method=None)` really does emit from a
+                # zero denominator -- has no measurable correlation. It is not
+                # caught by the dispersion guard either: `np.ptp` of such a leg
+                # is `inf`, which passes `> 0`.
+                rho_withheld_reason = TAIL_DEPENDENCE_NON_FINITE_LEG
+            elif np.ptp(r_a) > 0 and np.ptp(r_b) > 0:
+                # Peak-to-peak range, not std: see the module note on
+                # TAIL_DEPENDENCE_RULE.
+                measured = float(np.clip(np.corrcoef(r_a, r_b)[0, 1], -0.9999, 0.9999))
+                if np.isfinite(measured):
+                    rho = measured
+                else:
+                    # Finite legs whose correlation arithmetic still overflowed:
+                    # np.clip propagates NaN, so a non-finite result arrives here
+                    # as NaN rather than as the clip bound, and the clip is not a
+                    # repair. NaN is not a measurement -- every comparison against
+                    # it is False, so it used to fall through the band chain into
+                    # LOW and out of `unmeasurable_pairs`.
+                    rho_withheld_reason = TAIL_DEPENDENCE_NON_FINITE_LEG
+            else:
+                rho_withheld_reason = TAIL_DEPENDENCE_ZERO_DISPERSION
 
         # Degrees of freedom: caller-cached marginal fits, else fit here.
         nu: Optional[float]
@@ -581,7 +662,9 @@ class TailRiskService:
         unmeasurable_reason: Optional[str]
         if rho is None:
             lambda_l = None
-            unmeasurable_reason = TAIL_DEPENDENCE_ZERO_DISPERSION
+            # Whatever the rho block above found, not a single answer for every
+            # way the correlation can fail to exist.
+            unmeasurable_reason = rho_withheld_reason
         elif nu is None:
             lambda_l = None
             unmeasurable_reason = TAIL_DEPENDENCE_T_FIT_FAILED

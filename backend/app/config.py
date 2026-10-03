@@ -87,6 +87,38 @@ class Settings(BaseSettings):
                 return json.loads(v)
             return [part.strip() for part in v.split(",") if part.strip()]
         return v
+
+    # TrustedHostMiddleware hosts, parsed exactly like ALLOWED_ORIGINS: JSON
+    # array or comma-separated string, via the same NoDecode + before-validator.
+    #
+    # This used to be a literal list inside main.py's middleware call, which
+    # made the host allowlist the one security control in the app that `env`
+    # could not reach: an operator who set ALLOWED_ORIGINS to add a domain still
+    # had the host gate reject it, with nothing in config to show why. Two
+    # sources of truth, one invisible in the settings object.
+    #
+    # Default is byte-for-byte the list that was hardcoded, so an operator who
+    # set only ALLOWED_ORIGINS sees no behaviour change. Note it is a
+    # *hostname* list, not a URL list -- no scheme, no port -- because that is
+    # what Starlette matches `Host` against.
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default=[
+            "daisy-risk-engine.com",
+            "*.daisy-risk-engine.com",
+            "localhost",
+            "127.0.0.1",
+        ],
+    )
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def parse_allowed_hosts(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
+            return [part.strip() for part in v.split(",") if part.strip()]
+        return v
     
     # Environment
     environment: str = Field(default="development")

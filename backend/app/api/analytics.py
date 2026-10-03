@@ -16,9 +16,16 @@ from sqlalchemy import select
 import numpy as np
 import pandas as pd
 
+from app.config import settings
 from app.db.database import get_db_session
 from app.models.database import PortfolioPosition
-from app.services.benchmark_service import BenchmarkService
+from app.services.benchmark_service import (
+    BENCHMARK_NAME,
+    BENCHMARK_PRICE_COLUMN_ATTR,
+    BENCHMARK_RETURN_BASIS_ATTR,
+    BENCHMARK_SYMBOL,
+    BenchmarkService,
+)
 from app.services.optimization_service import (
     no_estimate_uncertainty,
     optimizer_estimate_uncertainty,
@@ -129,7 +136,16 @@ class OptimizeRequest(BaseModel):
     """Bounded API-local contract; schemas.py remains foundation-owned."""
 
     strategy: str = "hrp"
-    risk_free_rate: float = Field(default=0.02, ge=-1.0, le=1.0, allow_inf_nan=False)
+    #: Read through a factory, so the default is the CONFIGURED rate at
+    #: validation time and not a literal captured at import.  `0.02` was
+    #: written here as well as in `app/config.py`, which means `RISK_FREE_RATE`
+    #: in the environment moved the engine, the tear sheet and every service
+    #: that reads settings while these two request bodies kept deducting the
+    #: built-in default - an operator who set the rate got two books.
+    risk_free_rate: float = Field(
+        default_factory=lambda: settings.risk_free_rate,
+        ge=-1.0, le=1.0, allow_inf_nan=False,
+    )
     tickers: Optional[List[str]] = Field(default=None, max_length=_MAX_TICKERS)
     views: Optional[Dict[str, float]] = None
     relative_views: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=_MAX_TICKERS)
@@ -163,7 +179,11 @@ class BacktestRequest(BaseModel):
     rebalance_freq_days: int = Field(default=21, ge=1, le=2520)
     lookback_days: int = Field(default=252, ge=20, le=2520)
     transaction_cost_bps: float = Field(default=10.0, ge=0.0, le=1000.0, allow_inf_nan=False)
-    risk_free_rate: float = Field(default=0.02, ge=-1.0, le=1.0, allow_inf_nan=False)
+    #: Same factory, same reason as `OptimizeRequest.risk_free_rate`.
+    risk_free_rate: float = Field(
+        default_factory=lambda: settings.risk_free_rate,
+        ge=-1.0, le=1.0, allow_inf_nan=False,
+    )
     history_days: int = Field(default=750, ge=30, le=_MAX_HISTORY_DAYS)
     tickers: Optional[List[str]] = Field(default=None, max_length=_MAX_TICKERS)
 
@@ -552,7 +572,6 @@ def _q(metric_fn, *args, **kwargs):
 # `measure_estimate_uncertainty` refuses to publish a band unless its own point
 # value reproduces the published one.  The two things a Sharpe's interval has to
 # say - how it was measured, and on how many observations - travel with it.
-TEAR_SHEET_RISK_FREE_RATE = 0.02
 #: The two shape statistics.  No honest interval, and a stated reason.
 _SHAPE_STATISTIC_REASON = (
     "not computed: quantstats' skew and kurtosis are pandas bias-corrected "
@@ -614,7 +633,7 @@ def _tear_sheet_uncertainty(
     return measure_estimate_uncertainty(
         np.zeros((0, 1)) if quantstats_returns_look_like_prices(values) else values,
         statistics if statistics is not None else quantstats_ratio_statistics(
-            TEAR_SHEET_RISK_FREE_RATE
+            settings.risk_free_rate
         ),
         published,
         scope=scope,
@@ -630,7 +649,7 @@ def _tear_sheet_uncertainty(
                 "quantstats functions this route already calls, verified to "
                 "reproduce each published metric before the band is attached"
             ),
-            "risk_free_rate": TEAR_SHEET_RISK_FREE_RATE,
+            "risk_free_rate": settings.risk_free_rate,
             "risk_free_rate_basis": (
                 "the annualized rf this route passes to quantstats; quantstats "
                 "deannualises it COMPOUNDED as (1 + rf) ** (1/252) - 1 and the "
@@ -6796,17 +6815,38 @@ async def get_forecast_risk(
         # section publishes is one of three kinds of thing and admits a different
         # disclosure; see FORECAST_PRECISION_BASIS.  Built AFTER the response
         # skeleton so it can only read published values, never influence them,
-        # and each measured block runs on its own thread because a re-fit
-        # bootstrap is CPU-bound and would otherwise hold the event loop for the
-        # better part of a minute.
+        # and each measured block is offloaded because a re-fit bootstrap is
+        # CPU-bound and would otherwise hold the event loop for the better part
+        # of a minute: the portfolio block is FORECAST_PORTFOLIO_REFIT_RESAMPLES
+        # (1000) GARCH/EGARCH re-fits, measured at 17.3 s for 1001 of them on the
+        # real 14-position book (analytics_engine.py:6863).
+        #
+        # `_run_cpu`, not a bare `asyncio.to_thread`, and the difference is the
+        # whole point of this line.  A bare offload is off the loop but
+        # UNBOUNDED: it takes no permit, so N concurrent forecast-risk requests
+        # each started their own thousand-refit storm, and they competed with
+        # `/optimize` and `/backtest` for the same cores instead of queueing
+        # behind the per-loop `asyncio.Semaphore(2)` those routes already
+        # respect.  This was the last heavy quant section in the module holding
+        # its CPU work outside that budget.
+        #
+        # Offloading is safe here for the same reason it is safe on the tear
+        # sheet, and the seed is the reason: `measure_estimate_uncertainty`
+        # draws its indices from a FRESH `np.random.default_rng(seed)`, there is
+        # no global RNG anywhere on this path, and the one stochastic branch -
+        # the multi-step EGARCH simulation - rebuilds its distribution at
+        # EGARCH_SIMULATION_SEED on every call rather than advancing a stream.
+        # So the worker thread computes the same numbers the loop did;
+        # `tests/test_forecast_risk_cpu_offload.py` proves it by hashing the
+        # block off the loop against the same block computed inline.
         estimated_statistics: Dict[str, Any] = {}
-        estimated_statistics["portfolio"] = await asyncio.to_thread(
+        estimated_statistics["portfolio"] = await _run_cpu(
             _forecast_portfolio_uncertainty,
             portfolio_returns, model, horizon, forecast_result,
         )
         estimated_statistics["positions"] = {}
         for ticker, leg in positions.items():
-            leg_block = await asyncio.to_thread(
+            leg_block = await _run_cpu(
                 _forecast_leg_uncertainty,
                 leg, leg_returns.get(ticker), model, horizon,
             )
@@ -6925,6 +6965,47 @@ async def get_forecast_risk(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+#: Which benchmark a regression on this route was measured against, read off
+#: the leg the benchmark service itself stamped.
+#:
+#: `services/benchmark_service.py` owns this disclosure. It resolves the price
+#: column ONCE (`resolve_close_column`, candidates ordered adjusted-first),
+#: stamps the resolution and `BENCHMARK_RETURN_BASIS` onto every object it
+#: returns - `get_returns` included - and publishes the block's canonical shape
+#: through `benchmark_basis_disclosure(df)`. Every alpha, beta and R-squared on
+#: `/factor-exposure` is a regression against this leg, and `price_index` is the
+#: half that matters: a beta fitted against a price index and one fitted against
+#: a total-return index are different numbers, and before this the payload said
+#: neither. The data half is deferred for a stated reason - there is no `^NSEI`
+#: TRI on the available feed, and an ETF proxy is a different index rather than
+#: the same one with dividends - so naming the basis is the whole disclosure.
+#:
+#: WHY NOT `benchmark_basis_disclosure(df)` DIRECTLY: that function takes the
+#: FRAME, and this route holds the RETURNS LEG. Fetching the frame as well means
+#: `get_benchmark_df()`, which re-reads `fetch_historical_data` over a different
+#: window (1100 days against this route's `lookback_days`) and is therefore a
+#: SECOND vendor request for the same index on a cold cache. So the block is
+#: assembled from the service's own stamped attrs and its own key constants, and
+#: `tests/test_factor_exposure_benchmark_basis.py` pins it against
+#: `benchmark_basis_disclosure(frame)` on a real `get_returns` call, so the two
+#: cannot drift.
+#:
+#: A leg with NO attrs - a bare Series from a test double, or a fetch that
+#: failed - publishes nulls rather than the constants. A basis is a property of
+#: a leg that exists; filling one in for a leg that does not is a claim nothing
+#: measured. And `price_column` is published even when the service stamped it
+#: `None`, because "no close column was present" is the answer a reader needs and
+#: a missing key reads as an unrecorded disclosure.
+def _benchmark_basis_block(benchmark_returns: Any) -> Dict[str, Any]:
+    attrs = getattr(benchmark_returns, "attrs", None) or {}
+    return {
+        "symbol": BENCHMARK_SYMBOL,
+        "name": BENCHMARK_NAME,
+        "price_column": attrs.get(BENCHMARK_PRICE_COLUMN_ATTR),
+        "return_basis": attrs.get(BENCHMARK_RETURN_BASIS_ATTR),
+    }
+
+
 @router.get("/factor-exposure")
 async def get_factor_exposure(
     tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
@@ -6950,6 +7031,11 @@ async def get_factor_exposure(
                 "positions": {},
                 "r_squared": None,
                 "adjusted_r_squared": None,
+                # No book means no regression, so there is no benchmark leg to
+                # describe. Published as an explicit null rather than omitted,
+                # so a consumer reading this key cannot mistake a section that
+                # declined to measure for one that forgot to say.
+                "benchmark": None,
                 "universe_coverage": _universe_coverage([], []),
                 "data_status": "unavailable",
                 "error": "No portfolio positions found"
@@ -6962,6 +7048,7 @@ async def get_factor_exposure(
                 "positions": {},
                 "r_squared": None,
                 "adjusted_r_squared": None,
+                "benchmark": None,
                 "universe_coverage": _universe_coverage(ticker_list, []),
                 "data_status": "unavailable",
                 "error": "No active portfolio weights available for factor analysis",
@@ -6984,6 +7071,7 @@ async def get_factor_exposure(
                 "positions": {},
                 "r_squared": None,
                 "adjusted_r_squared": None,
+                "benchmark": None,
                 "universe_coverage": _universe_coverage(ticker_list, []),
                 "data_status": "unavailable",
                 "error": "No price data available for factor analysis"
@@ -7178,6 +7266,10 @@ async def get_factor_exposure(
         return {
             "portfolio": factor_result.get("portfolio", {}),
             "positions": factor_result.get("positions", {}),
+            # Which index every alpha and beta above was fitted against, and on
+            # which price leg. Read off the leg the benchmark service stamped, so
+            # the payload cannot name a basis the service did not serve.
+            "benchmark": _benchmark_basis_block(benchmark_returns),
             "universe_coverage": coverage,
             "data_status": data_status,
             "warnings": warnings_list,
@@ -7298,15 +7390,33 @@ async def get_concentration_metrics(
                 "top_3": 0.0,
                 "top_5": 0.0,
                 "top_10": 0.0,
-                "herfindahl_index": 0.0,
+                # The same refusal the engine's own no-book shape publishes, and
+                # for the same reason: HHI = sum(w_i^2) >= 1/n is strictly
+                # positive for every NON-EMPTY book, so 0.0 is not a value any
+                # book can produce. It is a THIRD value in a field whose only two
+                # real values are 1.0 (one holding) and 0.25 (four equal
+                # holdings), so a reader has to consult `n_holdings` to learn
+                # which of the three they are looking at - and every consumer
+                # reads the number, not the count beside it.
+                #
+                # It was never cosmetic. `risk_scoring` fed this field straight
+                # into `min(30, herfindahl_index * 100)`, so on this branch the
+                # concentration leg scored 0 - the BEST possible value on a 0-30
+                # scale where 30 is the most concentrated book there is - while
+                # not being excluded, dragging `overall_score` down by up to six
+                # points. An unmeasured measurement, reported as the safest book
+                # in the product.
+                #
+                # Scoped to `n == 0` exactly. The measured branch below is the
+                # engine's and is untouched, so a single-holding book still
+                # measures 1.0 and still renders 0% diversification.
+                "herfindahl_index": None,
                 "effective_positions": 0.0,
                 "diversification_score": 0.0,
-                # `n_holdings: 0` beside the 0.0 is what disambiguates this state:
-                # the index is undefined with no holdings, so the 0.0 marks an
-                # ABSENT book rather than a measured single-holding one. The scale
-                # itself is the engine's declaration and is deliberately NOT
-                # restated here - this branch never calls the engine, and a second
-                # copy of that text is the defect a single implementation avoids.
+                # The scale itself is the engine's declaration and is
+                # deliberately NOT restated here - this branch never calls the
+                # engine, and a second copy of that text is the defect a single
+                # implementation avoids.
                 **_concentration_diversification_disclosure({"by_weight": {}}),
                 "diversification_ratio": 1.0,
                 "gini_coefficient": 0.0,
@@ -9357,11 +9467,12 @@ def _tear_sheet_holding_metrics(
     """
     import quantstats as qs
 
+    rf = settings.risk_free_rate
     metrics = {
         "total_return": _q(qs.stats.comp, port_ret),
         "cagr": _q(qs.stats.cagr, port_ret),
-        "sharpe": _q(qs.stats.sharpe, port_ret, rf=0.02),
-        "sortino": _q(qs.stats.sortino, port_ret, rf=0.02),
+        "sharpe": _q(qs.stats.sharpe, port_ret, rf=rf),
+        "sortino": _q(qs.stats.sortino, port_ret, rf=rf),
         "calmar": _q(qs.stats.calmar, port_ret),
         "omega": _q(qs.stats.omega, port_ret),
         "tail_ratio": _q(qs.stats.tail_ratio, port_ret),
@@ -9431,11 +9542,12 @@ def _tear_sheet_payload(
     """
     import quantstats as qs
 
+    rf = settings.risk_free_rate
     full_metrics = {
         "total_return": _q(qs.stats.comp, full_port_ret),
         "cagr": _q(qs.stats.cagr, full_port_ret),
-        "sharpe": _q(qs.stats.sharpe, full_port_ret, rf=0.02),
-        "sortino": _q(qs.stats.sortino, full_port_ret, rf=0.02),
+        "sharpe": _q(qs.stats.sharpe, full_port_ret, rf=rf),
+        "sortino": _q(qs.stats.sortino, full_port_ret, rf=rf),
         "calmar": _q(qs.stats.calmar, full_port_ret),
         "volatility": _q(qs.stats.volatility, full_port_ret),
         "max_drawdown": _q(qs.stats.max_drawdown, full_port_ret),
@@ -9602,10 +9714,11 @@ def _tear_sheet_payload(
             bench_window = bench_ret[bench_ret.index >= start]
         except Exception:
             bench_window = bench_ret
+        rf = settings.risk_free_rate
         relative = {
             "beta_vs_nifty": None,
             "alpha_annualized": None,
-            "benchmark_sharpe": _q(qs.stats.sharpe, bench_window, rf=0.02),
+            "benchmark_sharpe": _q(qs.stats.sharpe, bench_window, rf=rf),
             "benchmark_volatility": _q(qs.stats.volatility, bench_window),
             "benchmark_max_drawdown": _q(qs.stats.max_drawdown, bench_window),
             "benchmark_total_return": _q(qs.stats.comp, bench_window),
@@ -11054,11 +11167,39 @@ async def get_correlation_stability(
                 detail="At least 2 assets with valid price history are required",
             )
 
-        result = await _run_cpu(
-            analyze_correlation_stability,
-            returns_df=returns_df,
-            window_days=window_days,
-        )
+        # The service REFUSES a book whose newest measurable date is short of
+        # all C = N(N-1)/2 pairs, and it says exactly what is missing: the date,
+        # the measured shortfall, the floor and the window. That message is the
+        # only thing a caller learns about a floor that is otherwise invisible,
+        # and this used to discard every character of it in favour of
+        # "Invalid analytics request" - which is not a softer message but a
+        # FALSE one. Nothing about the request was invalid; the service declined
+        # to publish a number it could not compute.
+        #
+        # It is not a rare shape either: the floor is `min(window_days, 30)`
+        # pairwise-complete observations per pair, so any book holding a name
+        # listed within roughly the last 30 trading days fails it. One newly
+        # added position was enough to answer a live book with a client-bug
+        # message.
+        #
+        # Scoped to THIS call rather than to the route's blanket `except
+        # ValueError` on purpose. `str(exc)` on an arbitrary ValueError is not
+        # provably safe to return: this body also builds frames, intersects
+        # indexes and copies response models, and a third-party ValueError from
+        # pandas or numpy can carry a repr, a column name or a path. The five
+        # messages reachable from here have all been read in
+        # `services/correlation_service.py` - a date label, integer counts,
+        # `min_periods`, `window_days`, nothing else - so this is the narrow
+        # surface, and the blanket arm below keeps its generic text for
+        # everything that is not the service declining to publish.
+        try:
+            result = await _run_cpu(
+                analyze_correlation_stability,
+                returns_df=returns_df,
+                window_days=window_days,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         coverage = _universe_coverage(
             ticker_list,
             history_coverage.get("model_used_tickers", returns_df.columns),

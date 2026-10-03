@@ -678,13 +678,83 @@ def _current_portfolio_block(
     }
 
 
-def _solve(prob: cp.Problem) -> None:
-    """Solve in place; map cvxpy SolverError to ValueError so API routes
-    map solver failures to 400, not 500 (SolverError is not a ValueError)."""
+#: The ONLY cvxpy status this service will publish weights from.
+#:
+#: This is a tolerance policy, not a formula, and it was decided on measurement
+#: rather than on the audit's recommendation alone.
+#:
+#: `optimal_inaccurate` is REFUSED rather than published with a caveat. The
+#: reason it is not "publish and label": `optimal_inaccurate` is the solver
+#: saying it could not satisfy its OWN convergence check. Labelling that answer
+#: and shipping it as a recommended allocation repeats this module's recurring
+#: defect - a stand-in published where a measurement was not secured - only with
+#: an extra string attached. A refusal is a valid answer here, and the refusal
+#: carries the status in its message.
+#:
+#: What that costs was measured before deciding: across 52 solves on this
+#: module's own problem class - well-posed books of 2..20 legs and 60..500
+#: days, plus deliberately ill-posed probes (duplicate return streams,
+#: variance scales of 1e-8 and 1e6, near-degenerate 40-leg covariances, CVaR LPs
+#: with -90% shock days) - the census was 51 `optimal`, 1 `infeasible`, and
+#: ZERO `optimal_inaccurate`. So the policy refuses a status this service was
+#: never observed to produce, and the one it does hit in production is caught
+#: (the `infeasible` probe previously reached the Black-Litterman path and was
+#: caught only by accident, by its `y.value is None` guard).
+#:
+#: THE IMPLICIT TOLERANCE, stated because it is the whole content of the policy:
+#: nothing here tightens or overrides Clarabel's defaults, so "optimal" means
+#: "optimal to Clarabel's default tolerances" and this service accepts whatever
+#: accuracy those certify and nothing more. A problem needing a tighter solve is
+#: refused rather than served at the default. The default residuals are
+#: themselves BLAS-thread sensitive - the same tangency QP reports a clipped
+#: magnitude of 3.9e-11 at default threads and 2.4e-12 at
+#: `OPENBLAS_NUM_THREADS=1` - so no test here asserts an exact magnitude across
+#: thread settings; the tests assert the DECISION (refuse vs. publish), which is
+#: thread-stable.
+SOLVER_STATUS_ACCEPTED = (cp.OPTIMAL,)
+
+
+def _solve(prob: cp.Problem, log: Optional[list[str]] = None) -> str:
+    """Solve in place and CHECK the outcome; return the status cvxpy reported.
+
+    Two failures used to leave this function unnoticed. `cp.error.SolverError`
+    is not a `ValueError`, so it escaped to the API as a 500 while every other
+    solver failure mapped to 400. And nothing read `prob.status`, so a problem
+    cvxpy could not solve - `infeasible`, `unbounded`, `optimal_inaccurate` -
+    published whatever `var.value` happened to hold, under a `solver` key that
+    claimed `cvxpy/clarabel` as though the solve had succeeded. A status check
+    is the only thing that distinguishes those: a diverged or infeasible answer
+    can still be finite, so `w.value is None` (the guard at each call site) is
+    not a substitute.
+
+    `log`, when given, receives every status in the order the solves were run,
+    INCLUDING one that is about to be refused, so a caller can publish which
+    solve produced the weights it went on to publish. Every fallback in this
+    module solves AFTER the answer it replaces, so the LAST entry is the one
+    whose answer was published.
+
+    Raises:
+        ValueError: on a `SolverError` (so API routes map it to 400, not 500),
+            or on any status outside `SOLVER_STATUS_ACCEPTED`.
+    """
     try:
         prob.solve(solver=cp.CLARABEL)
     except cp.error.SolverError as e:
         raise ValueError(f"Optimization solver failed: {e}") from e
+
+    status = prob.status
+    if log is not None:
+        log.append(status)
+    if status not in SOLVER_STATUS_ACCEPTED:
+        raise ValueError(
+            f"Optimization solver returned status {status!r}, which is not one "
+            f"of {list(SOLVER_STATUS_ACCEPTED)}. No weights are published from "
+            f"it: the solver did not certify this problem to its own "
+            f"tolerances, so the vector it returned is not a solution this "
+            f"service will stand behind. This service does not loosen the "
+            f"solver's tolerances to avoid the refusal."
+        )
+    return status
 
 
 def _cluster_var(cov_ord: np.ndarray, items: list[int]) -> float:
@@ -872,20 +942,26 @@ def _hrp_weights(returns: pd.DataFrame) -> pd.Series:
     return weights / weights.sum()
 
 
-def _min_vol(cov: np.ndarray) -> np.ndarray:
+def _min_vol(cov: np.ndarray, *, log: Optional[list[str]] = None) -> np.ndarray:
     n = cov.shape[0]
     w = cp.Variable(n)
     prob = cp.Problem(
         cp.Minimize(cp.quad_form(w, cp.psd_wrap(cov))),
         [cp.sum(w) == 1, w >= 0],
     )
-    _solve(prob)
+    _solve(prob, log)
     if w.value is None:
         raise ValueError("min_vol optimization failed to converge")
     return np.asarray(w.value).flatten()
 
 
-def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
+def _max_sharpe(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf: float,
+    *,
+    log: Optional[list[str]] = None,
+) -> np.ndarray:
     """Tangency portfolio: min y'Σy s.t. (mu-rf)'y = 1, y>=0; then normalize."""
     n = len(mu)
     excess = mu - rf
@@ -896,7 +972,7 @@ def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
         cp.Minimize(cp.quad_form(y, cp.psd_wrap(cov))),
         [excess @ y == 1, y >= 0],
     )
-    _solve(prob)
+    _solve(prob, log)
     if y.value is None:
         raise ValueError("max_sharpe optimization failed to converge")
     raw = np.asarray(y.value).flatten()
@@ -905,7 +981,12 @@ def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
     return raw / raw.sum()
 
 
-def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
+def _min_cvar(
+    returns: pd.DataFrame,
+    beta: float = 0.95,
+    *,
+    log: Optional[list[str]] = None,
+) -> np.ndarray:
     """Rockafellar-Uryasev scenario LP."""
     scenarios = returns.values          # (T, N)
     t_len, n = scenarios.shape
@@ -917,7 +998,7 @@ def _min_cvar(returns: pd.DataFrame, beta: float = 0.95) -> np.ndarray:
         cp.Minimize(alpha + (1.0 / ((1 - beta) * t_len)) * cp.sum(z)),
         [z >= loss - alpha, cp.sum(w) == 1, w >= 0],
     )
-    _solve(prob)
+    _solve(prob, log)
     if w.value is None:
         raise ValueError("min_cvar optimization failed to converge")
     return np.asarray(w.value).flatten()
@@ -960,6 +1041,8 @@ def _black_litterman_solved(
     risk_free_rate: float = 0.02,
     tau: float = 0.05,
     delta: float = 2.5,
+    *,
+    log: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Black-Litterman Bayesian Portfolio Optimization.
 
@@ -998,6 +1081,16 @@ def _black_litterman_solved(
     larger in magnitude and the long-only constraint binds on books where it
     previously did not -- a bound leg is exactly where a solver can return a
     few 1e-11 of tolerance dust, which the clip then removed with no marker.
+
+    The tangency solve goes through `_solve`, like every other one in this
+    module. It used to call `prob.solve` directly, which meant it checked NEITHER
+    `SolverError` (so this one strategy's solver crash escaped as a 500 while
+    the other three returned 400) NOR `Problem.status`. A refused status is not
+    an exception here: this function already owns a labelled fallback for a
+    tangency answer it cannot use, and refusing the weights of the tangency
+    portfolio and publishing the `_min_vol` answer under
+    `min_vol_fallback_solver_failure` is the same refusal this module already
+    speaks, rather than a new one invented for a new failure mode.
     """
     mu_ann, cov_ann, assets = _as_matrices(returns)
     n = len(assets)
@@ -1046,7 +1139,7 @@ def _black_litterman_solved(
     # published weights are y/sum(y), so the scale never reaches the output.
     excess = mu_bl
     if (excess <= 0).all():
-        return _min_vol(cov_bl), _clip_record(
+        return _min_vol(cov_bl, log=log), _clip_record(
             BL_PATH_NO_POSITIVE_EXCESS, None, assets
         )
 
@@ -1055,13 +1148,25 @@ def _black_litterman_solved(
         cp.Minimize(cp.quad_form(y, cp.psd_wrap(cov_bl))),
         [excess @ y == 1, y >= 0],
     )
-    prob.solve(solver=cp.CLARABEL)
+    # The checked helper, not `prob.solve`. A status it refuses - including
+    # `optimal_inaccurate`, see `SOLVER_STATUS_ACCEPTED` - is a tangency answer
+    # this service will not publish, and the labelled `_min_vol` fallback is how
+    # it says so.
+    try:
+        _solve(prob, log)
+    except ValueError:
+        # The refused status itself stays in `log`; what the record publishes
+        # about it is `solution_path` below plus `problem_status` from the
+        # fallback solve that produced these weights.
+        return _min_vol(cov_bl, log=log), _clip_record(
+            BL_PATH_SOLVER_FAILURE, None, assets
+        )
     # `np.isnan` alone let a `-inf` through, and `np.clip(-inf, 0, None)` is
     # 0.0 -- so a diverged solver would have had its answer quietly turned into
     # a zero weight here. `isfinite` keeps the NaN behaviour identical and adds
     # the infinities, which fall back to `_min_vol` and are reported as such.
     if y.value is None or not np.isfinite(y.value).all():
-        return _min_vol(cov_bl), _clip_record(
+        return _min_vol(cov_bl, log=log), _clip_record(
             BL_PATH_SOLVER_FAILURE, None, assets
         )
 
@@ -1072,7 +1177,7 @@ def _black_litterman_solved(
     clip = _clip_record(BL_PATH_TANGENCY, raw, assets)
     total_raw = float(np.clip(raw, 0.0, None).sum())
     if total_raw <= 0:
-        return _min_vol(cov_bl), _clip_record(
+        return _min_vol(cov_bl, log=log), _clip_record(
             BL_PATH_NONPOSITIVE_GROSS, raw, assets
         )
     # Unchanged arithmetic: the long-only bound is already a constraint of the
@@ -1177,6 +1282,13 @@ def optimize(
     two legs that share fewer than two return rows, so rather than invent one
     it declines to cluster them. The declined legs are published here, at a
     weight of zero, because a holding may not leave the user's book silently.
+
+    `problem_status`: the cvxpy status of the solve whose answer these weights
+    ARE. Every solve this call performs is appended to one local log by the
+    checked `_solve`, and every fallback here solves after the answer it
+    replaces, so the last entry is the one that was published. It is `None` for
+    `hrp`, which runs no cvxpy solve - so `None` means "no solver ran", never
+    "the solver did fine".
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy '{strategy}'. Choose from {list(STRATEGIES)}")
@@ -1184,6 +1296,9 @@ def optimize(
     mu, cov, assets = _as_matrices(returns)
     excluded: list[str] = []
     excluded_reasons: Dict[str, str] = {}
+    # Per-call, not module state: `optimize` runs in a threadpool, so a
+    # module-level log would interleave statuses between concurrent books.
+    solve_log: list[str] = []
     # EL-2: only `black_litterman` rewrites a solver answer after the solve, so
     # only it produces clip evidence. `None` means "this strategy has no
     # post-solve clip", which `_long_only_clip_block` states rather than hides.
@@ -1207,9 +1322,11 @@ def optimize(
             solved = solved.reindex(assets).fillna(0.0)
     else:
         if strategy == "min_vol":
-            solved = pd.Series(_min_vol(cov), index=assets)
+            solved = pd.Series(_min_vol(cov, log=solve_log), index=assets)
         elif strategy == "max_sharpe":
-            solved = pd.Series(_max_sharpe(mu, cov, risk_free_rate), index=assets)
+            solved = pd.Series(
+                _max_sharpe(mu, cov, risk_free_rate, log=solve_log), index=assets
+            )
         elif strategy == "black_litterman":
             # `_black_litterman_solved` also hands back the pre-clip solver
             # evidence, so the payload below can say whether these weights are
@@ -1220,10 +1337,11 @@ def optimize(
                 views=views,
                 relative_views=relative_views,
                 risk_free_rate=risk_free_rate,
+                log=solve_log,
             )
             solved = pd.Series(bl_weights, index=assets)
         else:
-            solved = pd.Series(_min_cvar(returns, beta=beta), index=assets)
+            solved = pd.Series(_min_cvar(returns, beta=beta, log=solve_log), index=assets)
 
     w_vec = _weight_vector(solved, assets)
     w_vec = np.clip(w_vec, 0.0, None)
@@ -1241,6 +1359,14 @@ def optimize(
         "expected_annual_volatility": _round_or_none(moments["expected_annual_volatility"], MOMENT_DECIMALS),
         "expected_sharpe": _round_or_none(moments["expected_sharpe"], MOMENT_DECIMALS),
         "solver": "cvxpy/clarabel" if strategy != "hrp" else "hierarchical-bisection",
+        # The cvxpy status of the solve these weights ARE, so a reader can see
+        # which it was instead of inferring it from `solver`. `None` means no
+        # cvxpy solve ran at all (`hrp`), never "the solve went well" - and the
+        # only status that can appear here is one `_solve` accepted, so a
+        # refused `optimal_inaccurate` can never be reported under this key.
+        # Published on EVERY record, including `hrp`, so a consumer never has to
+        # infer "no solver ran" from an absent key.
+        "problem_status": solve_log[-1] if solve_log else None,
         "objective": _objective_block(strategy),
         # Which legs this strategy declined to reason about, and why. Empty for
         # every strategy but `hrp` today; published unconditionally so a

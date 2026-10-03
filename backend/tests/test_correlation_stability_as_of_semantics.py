@@ -229,6 +229,16 @@ class TestNothingElseMoved:
         assert set(golden) - set(dumped) == set()
         assert dumped.pop("alert_direction") == arm
         assert dumped.pop("as_of_semantics") == "latest_available_observation"
+        # The golden's `series` entries predate the pair-denominator disclosure,
+        # which is additive on the POINT (two labels beside each figure). Same
+        # closed-set discipline as the response-level pops above: pop exactly
+        # those two from every point, then compare the whole payload.
+        for point in dumped["series"]:
+            assert set(point) - set(
+                golden["series"][0]
+            ) == {"pairs_contributing", "measurement_status"}
+            point.pop("pairs_contributing")
+            point.pop("measurement_status")
         assert dumped == golden
 
     @staticmethod

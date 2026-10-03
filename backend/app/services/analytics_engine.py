@@ -345,6 +345,43 @@ LIQUIDITY_SCORE_BAND_RULE = {
     ],
     "volume_stats_basis": "positions per published-score band, as a share of measured positions",
     "risk_level_rule": "inverted band: High->Low, Medium->Medium, Low->High",
+    # WM-1. A leg whose daily turnover is not a FINITE measurement has no
+    # score to band, and the ladder cannot say so: the tier predicates are all
+    # `daily_turnover >= X`, and `NaN >= X` is False for every one of them, so
+    # an unusable turnover fell through to the tier-4 branch and was then
+    # collapsed onto its bounds by `max(2.5, min(5.9, ...))` - where Python's
+    # builtin `min` returns 5.9 for `min(5.9, nan)`.  That published the
+    # CEILING of the weakest band as a measurement, and `risk_level` inverts the
+    # band, so the result was "Low" liquidity at "High" risk on a book nobody
+    # measured.  The rule, published here so it is discoverable:
+    "unscored_position_rule": {
+        "applies_when": "daily_turnover is not a finite measurement (no volume "
+                        "or no close column, or every turnover row missing)",
+        "published_score": None,
+        "published_score_raw": None,
+        "category": None,
+        "spread": None,
+        "liquidation_days": None,
+        "reason_key": "score_unavailable_reason",
+        "excluded_from": [
+            "overall_score and overall_score_raw (their mean)",
+            "high/medium/low volume split, whose denominator is the count of "
+            "SCORED positions",
+            "volume_stats.avg_volume and volume_stats.total_portfolio_volume, "
+            "which sum the per-leg mean volumes",
+        ],
+        "overall_when_nothing_is_scored": (
+            "overall_score / overall_score_raw / overall_band / "
+            "liquidation_time_days / risk_level are all null, and the "
+            "volume split is all zeros because no position was measured - the "
+            "same shape `_empty_liquidity` publishes"
+        ),
+        "why_not_a_floor": (
+            "no score is substituted for an unmeasured one. A clamp cannot "
+            "even express the refusal: np.minimum(5.9, nan) returns nan, and "
+            "the builtin min(5.9, nan) returns 5.9"
+        ),
+    },
 }
 
 # Market cap provenance (V3-09).  The only market-cap input is the quote the
@@ -511,6 +548,18 @@ MIN_SHARED_ROWS_FOR_CORRELATION = 2
 UNMEASURABLE_CORRELATION_REASON = (
     "fewer than two shared return rows, so the pairwise correlation is not "
     "measurable; it is unknown, not zero"
+)
+
+#: Why a HELD leg is refused out of a covariance rather than dropped from it.
+#: A distinct sentence because the cause is distinct: this is not a pair with
+#: too little overlap, it is a leg the book is carrying a positive weight on
+#: whose volatility could not be estimated at all (a constant return series, or
+#: a single observation). Dropping it and publishing the survivors' sigma is not
+#: a conservative restatement of the book -- the survivors keep their own
+#: weights, so the figure describes a portfolio the caller did not hold.
+UNMEASURABLE_LEG_VOLATILITY_REASON = (
+    "the book holds these legs at positive weight and no volatility could be "
+    "estimated for them, so the covariance has a hole no number can fill"
 )
 
 #: Lower bound of the 0-30 sub-score scale, and the reason a leg can publish
@@ -871,6 +920,20 @@ EWMA_LAMBDA = 0.94
 #: publishing no seed at all.
 FORECAST_SIMULATIONS = 2000
 EGARCH_SIMULATION_SEED = 100
+
+#: The +/-20 % winsorisation every volatility fit in this section is run on.
+#: The engine censors the RETURN SERIES at both tails before it is handed to
+#: arch, to the EWMA recursion, and to the sample-covariance fallback, so a
+#: fitted conditional sigma describes a censored series and not the delivered
+#: one.  That is a legitimate estimator choice and nothing moves here; it was
+#: simply invisible.  The sibling path already declared the same clip on
+#: `volatility_adjustment.return_clip` (see `stress_test`), and a clip written
+#: twice is a drift waiting to happen - so this is the one named constant, and
+#: it is PUBLISHED on every forecast payload as `input_return_clip`.
+#:
+#: This is a DISCLOSURE.  No value changes: the bounds here are exactly the two
+#: literals that were inline at the clip call sites.
+FORECAST_INPUT_RETURN_CLIP = (-0.20, 0.20)
 
 #: Why `confidence_interval` is null.  Published rather than left implicit so
 #: a consumer reading the absence learns the reason instead of assuming a bug.
@@ -2563,10 +2626,63 @@ def _fit_window(labels: Any, count: int) -> Dict[str, Any]:
     }
 
 
+def _measures_dispersion(values: Any) -> bool:
+    """Does this series carry more than ONE distinct finite value?
+
+    THE STRUCTURAL TEST, and the reason it is structural.  Three sites in this
+    module divide by a dispersion estimated from the same window they report on
+    - the Sharpe denominator, the Sortino denominator, and the EWMA recursion's
+    seed variance - and on a window whose every observation is the same number
+    each of those denominators is FLOAT ROUND-OFF rather than a measurement:
+
+        std([0.0007] * 60, ddof=1) == 1.0934e-19      # not a 1e-19 volatility
+        (0.0007*252 - 0.02) / 1.7356e-18 == 9.011e16 # not a Sharpe of 9e16
+
+    `nunique() < 2` is EXACTLY equivalent to `max == min`, so this needs no
+    tolerance, no epsilon and no threshold: it asks whether two observations
+    differ at all, in the only sense that can be asked without inventing a
+    boundary.  A series with two distinct values - even two `1e-18` apart - does
+    carry variation, and this returns True for it; see the note on
+    `VOLATILITY_FORECAST_NO_DISPERSION_REASON` for what that costs.
+
+    Non-finite values are not counted: an `inf` or a `NaN` is a missing
+    observation, and a series of missing observations measures nothing either
+    way.  Callers drop them with the same
+    `.replace([inf, -inf], nan).dropna()` every other estimator in this file
+    uses, so this only has to answer "did anything vary".
+    """
+    try:
+        series = pd.Series(np.asarray(values, dtype=float).ravel())
+    except (TypeError, ValueError):
+        return False
+    series = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if series.empty:
+        return False
+    return int(series.nunique()) >= 2
+
+
 def _liquidity_band(published_score: float) -> tuple[str, str]:
-    """Band label and liquidation window for an ALREADY-ROUNDED published score."""
+    """Band label and liquidation window for an ALREADY-ROUNDED published score.
+
+    Requires a FINITE score, and refuses anything else.  The builtin comparison
+    is what makes this worth guarding: `_liquidity_band(None)` used to reach
+    `published_score >= floor` and raise `TypeError`, and `min(5.9, nan)`
+    returns `5.9`, so a NaN reached the ladder and came back as the CEILING of
+    the weakest band - the weakest-liquidity-looking score carrying the WORST
+    risk level.  `liquidity_analysis` therefore withholds the score of a leg
+    whose turnover is not a finite measurement rather than handing this function
+    a value it cannot band; raising here makes that invariant structural instead
+    of a property of three call sites, and the enclosing handler turns it into
+    the same refusal shape the empty result publishes.
+    """
+    score = float(published_score)
+    if not np.isfinite(score):
+        raise ValueError(
+            "a liquidity band cannot be derived from a score that was never "
+            "measured; publish score=None with a reason instead"
+        )
     for band, floor, window in LIQUIDITY_SCORE_BANDS:
-        if floor is None or published_score >= floor:
+        if floor is None or score >= floor:
             return band, window
     last_band, _floor, last_window = LIQUIDITY_SCORE_BANDS[-1]
     return last_band, last_window
@@ -3917,6 +4033,19 @@ class AnalyticsEngine:
         that was annualised from turnover or floored at INR 1bn is reported with
         its provenance and `is_estimate=True` instead of passing as measured.
 
+        `daily_turnover` is the MEAN OF PRODUCTS, `mean(Volume_t * Close_t)` -
+        the turnover convention - not `mean(Volume_t) * Close[-1]`.  The two
+        differ by `cov(Volume, Close)`, and the old form also substituted a
+        TERMINAL price for an average one, so it scored a book off its last
+        close.  Every tier predicate, both spreads and the published
+        `avg_turnover` read this one number.
+
+        A leg whose turnover is not a FINITE measurement publishes `score: None`
+        with `score_unavailable_reason`, and is excluded from the overall
+        average, the band counts and the volume split.  See
+        `LIQUIDITY_SCORE_BAND_RULE["unscored_position_rule"]`, which is
+        published with the result.
+
         Args:
             price_data: Dictionary mapping tickers to price DataFrames
             market_caps: Optional mapping of tickers to market cap in INR
@@ -3940,11 +4069,29 @@ class AnalyticsEngine:
                 
                 if not vol_col:
                     continue
-                
-                # Calculate liquidity score based on volume, price, and daily turnover
+
+                # WM-8. The turnover convention is a MEAN OF PRODUCTS.
+                # `mean(Volume_t) * Close[-1]` is a product of means and dropped
+                # the covariance term outright - it is largest exactly when
+                # volume and price move together, which is the normal case for a
+                # book that rallied - and it substituted the TERMINAL close for an
+                # average price, so one day's price decided the whole score.
+                # Measured on the fixture pinned in
+                # `test_wm8_turnover_estimator.py`: old 316 429 809.85, new
+                # 341 336 884.36, +7.87 %.  Rows where either factor is missing
+                # contribute nothing to the mean rather than a zero row, which is
+                # why this cannot be assembled from the two means the old
+                # expression used.
                 volume = float(df[vol_col].mean())
-                price = float(df[close_col].iloc[-1]) if close_col and not df.empty else 0.0
-                daily_turnover = volume * price
+                if close_col:
+                    daily_turnover = float((df[vol_col] * df[close_col]).mean())
+                else:
+                    # No price series means no turnover to measure.  The old
+                    # expression reached the same place by substituting `0.0`
+                    # for a missing close and scoring `3.0` off it, so this is
+                    # the WM-1 refusal applied to the same line rather than a
+                    # new shape.
+                    daily_turnover = float("nan")
 
                 # Market cap / AUM dynamic resolution, with its provenance.  A
                 # missing or unusable cap is never allowed to look measured: the
@@ -3953,6 +4100,46 @@ class AnalyticsEngine:
                 mc, mc_provenance, mc_source = _market_cap_provenance(
                     (market_caps or {}).get(ticker), daily_turnover
                 )
+
+                # WM-1. The refusal has to come BEFORE the ladder, not after.
+                # Every tier predicate is `daily_turnover >= X`, and `NaN >= X`
+                # is False for all of them, so an unusable turnover fell
+                # through to the tier-4 branch - where `min(5.9, nan)` returns
+                # 5.9, because `nan < 5.9` is False.  The result was the
+                # CEILING of the weakest band published as a measurement, and
+                # `risk_level` INVERTS the band, so a book with no measurable
+                # volume came back "Low" liquidity at "High" risk.  A clamp
+                # cannot express the refusal either: `np.minimum(5.9, nan)` is
+                # nan.  So the check is `np.isfinite`, and an unmeasured
+                # turnover publishes no score at all.
+                if not np.isfinite(daily_turnover):
+                    liquidity_scores[ticker] = {
+                        'score': None,
+                        'score_raw': None,
+                        'avg_volume': volume if np.isfinite(volume) else None,
+                        'avg_turnover': None,
+                        'market_cap': mc,
+                        'market_cap_provenance': mc_provenance,
+                        'market_cap_source': mc_source,
+                        'is_estimate': mc_provenance in ('estimated', 'fallback'),
+                        'category': None,
+                        'spread': None,
+                        'liquidation_days': None,
+                        'score_unavailable_reason': (
+                            "no finite daily turnover was measured: this leg's "
+                            "mean of (Volume x Close) is "
+                            + ("not computable (no close column)"
+                               if not close_col
+                               else f"{daily_turnover!r}")
+                            + ", so no tier score, band, spread or liquidation "
+                            "window can be derived from it"
+                        ),
+                    }
+                    # Deliberately NOT accumulated into volume_stats: a NaN
+                    # added to `total_volume` published
+                    # `total_portfolio_volume: nan`, which is not a measurement
+                    # of anything, and the mean it fed was equally unusable.
+                    continue
 
                 # Institutional Turnover & Market Cap Liquidity Scoring (0 - 10)
                 # Tier 1: Mega / Large Turnover (> 50 Cr/day) or Mega Cap (> 50,000 Cr)
@@ -3980,7 +4167,7 @@ class AnalyticsEngine:
                 liquidity_scores[ticker] = {
                     'score': score,
                     'score_raw': round(float(score_raw), 6),
-                    'avg_volume': volume,
+                    'avg_volume': volume if np.isfinite(volume) else None,
                     'avg_turnover': daily_turnover,
                     'market_cap': mc,
                     'market_cap_provenance': mc_provenance,
@@ -3996,34 +4183,69 @@ class AnalyticsEngine:
             
             # Calculate overall metrics
             if liquidity_scores:
-                published_scores = [data['score'] for data in liquidity_scores.values()]
-                overall_score_raw = float(np.mean(published_scores))
-                overall_score = round(overall_score_raw, LIQUIDITY_SCORE_PRECISION)
+                # WM-1.  The scored legs only.  A `None` in this list is not an
+                # edge case to absorb: `np.mean([8.4, None])` raises TypeError
+                # inside the generator, and reading it as 0.0 would put a
+                # fabricated bottom-of-scale score into the portfolio average.
+                published_scores = [
+                    data['score'] for data in liquidity_scores.values()
+                    if data['score'] is not None
+                ]
+                scored_count = len(published_scores)
+                unscored_count = len(liquidity_scores) - scored_count
                 avg_volume = float(np.mean(volume_stats['volumes'])) if volume_stats['volumes'] else 0.0
 
                 # Volume & Score distribution: buckets follow the same published
                 # score band as `category`, so a position cannot be "High" here
-                # and "Medium" there.
+                # and "Medium" there.  The denominator is the count of SCORED
+                # positions, which is what `volume_stats_basis` already claimed;
+                # an unscored leg is in neither the numerator nor the
+                # denominator, so it cannot be published as a worst-case band
+                # either.
                 bands = [_liquidity_band(value)[0] for value in published_scores]
                 high_count = bands.count("High")
                 medium_count = bands.count("Medium")
                 low_count = bands.count("Low")
-                total_positions = len(liquidity_scores)
+                total_positions = scored_count
                 
                 volume_pct = lambda x: (x / total_positions * 100.0) if total_positions > 0 else 0.0
-                
-                # Liquidation time and risk level come from the same band rule
-                overall_band, liquidation_time = _liquidity_band(overall_score)
-                risk_level = LIQUIDITY_BAND_RISK_LEVEL[overall_band]
+
+                # Liquidation time and risk level come from the same band rule.
+                # No scored leg means there is no band, and every field derived
+                # from one is null rather than defaulting to the weakest band's
+                # inversion.
+                if scored_count:
+                    overall_score_raw = float(np.mean(published_scores))
+                    overall_score = round(overall_score_raw, LIQUIDITY_SCORE_PRECISION)
+                    overall_band, liquidation_time = _liquidity_band(overall_score)
+                    risk_level = LIQUIDITY_BAND_RISK_LEVEL[overall_band]
+                    overall_score_raw_published = round(overall_score_raw, 6)
+                else:
+                    overall_score = None
+                    overall_score_raw_published = None
+                    overall_band = None
+                    liquidation_time = None
+                    risk_level = None
                 
                 return {
                     "overall_score": overall_score,
-                    "overall_score_raw": round(overall_score_raw, 6),
+                    "overall_score_raw": overall_score_raw_published,
                     "liquidation_time_days": liquidation_time,
                     "risk_level": risk_level,
                     "overall_band": overall_band,
                     "score_band_rule": dict(LIQUIDITY_SCORE_BAND_RULE),
                     "by_position": liquidity_scores,
+                    # WM-1.  How much of the book the average above is the
+                    # average OF.  `overall_score` is the mean of
+                    # `scored_positions` legs only, so without these a book of
+                    # one measured leg and one unmeasured leg looked exactly
+                    # like a book of two measured ones.
+                    "scored_positions": scored_count,
+                    "unscored_positions": unscored_count,
+                    "unscored_tickers": sorted(
+                        ticker for ticker, data in liquidity_scores.items()
+                        if data['score'] is None
+                    ),
                     "volume_stats": {
                         "avg_volume": avg_volume,
                         "total_portfolio_volume": volume_stats['total_volume'],
@@ -4055,6 +4277,17 @@ class AnalyticsEngine:
         figure therefore ships with a `*_basis` tag, the `shock_inputs` it was
         built from, and its `units`, so a reader cannot read a proxy as a
         simulated statistic (V3-10).
+
+        The delivered weights are NORMALISED here, at the top, and the total
+        they arrived with is published as `weights_total_used`.  Every sibling
+        entry point already does this - `calculate_portfolio_metrics`,
+        `factor_exposure_analysis`, `concentration_analysis` and `risk_scoring`
+        all renormalise before they weight anything - and this one did not:
+        `weighted_impact += ticker_impact * weight` consumed whatever arrived,
+        so a caller sending weights that summed to 0.6 published an impact 40 %
+        below the same book sent as 1.0.  That is a latent invariant rather than
+        a live wrong number, because the only caller normalises before it gets
+        here, but it is exactly the kind of drift the published total stops.
 
         Args:
             price_data: Historical price data
@@ -4173,6 +4406,33 @@ class AnalyticsEngine:
             description = sc_cfg["description"]
             sector_table = sc_cfg.get("sectors", {})
 
+            # WM-7.  Normalise the delivered weights before anything is
+            # weighted by them.  Non-finite entries are dropped because they
+            # cannot be renormalised against each other; a SIGN is preserved,
+            # because dropping a negative weight would change the published
+            # impact and this is a normalisation, not a filter - `concentration_
+            # analysis` is the one that also drops non-positive rows, and it
+            # does so for a different measurement (active holdings, not a
+            # shock weighting).  A book whose weights do not sum to a positive
+            # finite total has no normalised book to shock, so it is refused
+            # with the same empty shape the short-history branch returns rather
+            # than scored off whatever arrived.
+            deliverable_weights: Dict[str, float] = {}
+            for key, value in weights.items():
+                try:
+                    candidate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(candidate):
+                    deliverable_weights[key] = candidate
+            weights_total_used = float(sum(deliverable_weights.values()))
+            if not np.isfinite(weights_total_used) or weights_total_used <= 0.0:
+                return self._empty_stress_test()
+            weights = {
+                key: value / weights_total_used
+                for key, value in deliverable_weights.items()
+            }
+
             # Keep the active observation mask; missing prices are not economic
             # zero returns and must not influence the volatility adjustment.
             cleaned_prices = price_data.replace([np.inf, -np.inf], np.nan).sort_index()
@@ -4260,7 +4520,14 @@ class AnalyticsEngine:
                 vol_basis = "unavailable_no_price_window"
                 if ticker in returns.columns:
                     s = returns[ticker]
-                    non_zero = s[s != 0.0].clip(lower=-0.20, upper=0.20)
+                    # Same named clip as the forecast section, for the reason
+                    # documented there: it is published on
+                    # `volatility_adjustment.return_clip` below, and two written
+                    # literals are two things that can drift apart.
+                    non_zero = s[s != 0.0].clip(
+                        lower=FORECAST_INPUT_RETURN_CLIP[0],
+                        upper=FORECAST_INPUT_RETURN_CLIP[1],
+                    )
                     if len(non_zero) >= STRESS_VOL_MIN_OBSERVATIONS:
                         ticker_vol = float(non_zero.std() * np.sqrt(252))
                         vol_adj = (
@@ -4421,7 +4688,7 @@ class AnalyticsEngine:
                     "reference_annualized_volatility": STRESS_VOL_REFERENCE,
                     "bounds": [STRESS_VOL_ADJ_MIN, STRESS_VOL_ADJ_MAX],
                     "min_observations": STRESS_VOL_MIN_OBSERVATIONS,
-                    "return_clip": [-0.20, 0.20],
+                    "return_clip": list(FORECAST_INPUT_RETURN_CLIP),
                     "annualization_trading_days": 252,
                     "by_ticker": volatility_adjustment,
                 },
@@ -4477,6 +4744,10 @@ class AnalyticsEngine:
                 "confidence_basis": "nominal_label_not_simulated",
                 "shock_inputs": shock_inputs,
                 "units": units,
+                # WM-7.  What the delivered weights summed to BEFORE they were
+                # normalised onto the book, so `portfolio_impact` above can be
+                # read for the book that was delivered rather than assumed.
+                "weights_total_used": weights_total_used,
                 "methodology": methodology
             }
             
@@ -4616,6 +4887,20 @@ class AnalyticsEngine:
                 )
                 if sample_vol is not None and (not np.isfinite(sample_vol) or sample_vol < 0):
                     sample_vol = None
+                # WM-3, on the FALLBACK leg rather than the model leg.  This is
+                # the coupling that had to be handled rather than discovered
+                # later: the EWMA seed above now refuses a window that measures
+                # no dispersion, so on such a leg `res` is `_empty_forecast`,
+                # `raw_value` is None, and control reaches the `sample_vol`
+                # branch.  On a constant series `series.std(ddof=1)` is the same
+                # float round-off (1.0934e-19 for returns of exactly 0.0007),
+                # so accepting it would hand `inv_vols` a sigma of ~1.7e-18 and
+                # the leg would take 100 % of the book - strictly worse than
+                # the defect the model-leg refusal fixes.  Same structural test,
+                # no tolerance: a window whose every observation is the same
+                # number has no sample dispersion to annualise.
+                if sample_vol is not None and not _measures_dispersion(series):
+                    sample_vol = None
                 vol_ann = None
                 source = model_type
                 try:
@@ -4652,22 +4937,71 @@ class AnalyticsEngine:
             current_tickers = []
             current_weight_values = []
             current_vol_values = []
+            # The legs the book HOLDS, against the legs of those the book holds
+            # that could be measured.  These are different sets and conflating
+            # them is how a refusal became a number: a positive-weight leg with
+            # no estimable volatility used to be dropped here, and the
+            # quadratic form below then ran on the SURVIVORS while still
+            # carrying the full weight vector, so it published a sigma for a book
+            # that no longer existed.  On {FLAT 0.1, VAR 0.9} that published
+            # `0.9 * sigma(VAR)` = 0.10132154564719102 -- labelled
+            # `correlation_x_ewma_volatility`, with an empty reason and an
+            # empty unmeasurable-pair list, so a reader could not tell it apart
+            # from a fully measured book.  Nothing here substitutes: the leg is
+            # still unmeasured, and a marginal that does not exist cannot enter a
+            # covariance, so the measurement is refused below and the pair is
+            # NAMED, which is what the comment under `current_corr` always said
+            # should happen for a leg with "no variation in either leg".
+            current_book_tickers: list[str] = []
+            current_unmeasured_tickers: list[str] = []
             for ticker in available_tickers:
                 try:
                     weight = float(weights.get(ticker, 0.0))
-                    vol = float(annualized_vols.get(ticker, np.nan))
                 except (TypeError, ValueError):
                     continue
-                if weight > 0.0 and np.isfinite(weight) and np.isfinite(vol) and vol >= 0.0:
+                # A leg the book does not hold carries no weight and therefore no
+                # book risk, so its absence from the measurement is not a defect
+                # and must not refuse one.  `weights.get` returning a stored
+                # `None` lands here too: there is no weight to hold.
+                if not (weight > 0.0 and np.isfinite(weight)):
+                    continue
+                current_book_tickers.append(ticker)
+                try:
+                    vol = float(annualized_vols.get(ticker, np.nan))
+                except (TypeError, ValueError):
+                    vol = np.nan
+                if np.isfinite(vol) and vol >= 0.0:
                     current_tickers.append(ticker)
                     current_weight_values.append(weight)
                     current_vol_values.append(vol / np.sqrt(252))
+                else:
+                    current_unmeasured_tickers.append(ticker)
             current_volatility = None
             current_volatility_reason: Optional[str] = None
             current_unmeasurable: list[str] = []
+            # One rule for every pair the book holds: a pair is unmeasurable if
+            # EITHER leg has no estimable marginal OR their correlation is not
+            # finite.  Enumerated over the book rather than over the measured
+            # legs, so a pair the missing leg removed from the matrix is still
+            # reported instead of disappearing from the payload with it.
+            measured_position = {t: i for i, t in enumerate(current_tickers)}
+            current_corr = None
             if current_tickers:
                 current_corr = returns[current_tickers].corr()
                 current_corr = current_corr.replace([np.inf, -np.inf], np.nan)
+            current_unmeasurable = []
+            for i, left in enumerate(current_book_tickers):
+                for right in current_book_tickers[i + 1:]:
+                    left_measured = left in measured_position
+                    right_measured = right in measured_position
+                    if left_measured and right_measured:
+                        rho = current_corr.iat[
+                            measured_position[left], measured_position[right]
+                        ]
+                        if np.isfinite(rho):
+                            continue
+                    current_unmeasurable.append(f"{left}/{right}")
+            if current_unmeasurable:
                 # A pair with fewer than two shared return rows -- or with no
                 # variation in either leg -- is NaN here, and NaN means NOT
                 # MEASURABLE. The old `.fillna(0.0)` asserted the strongest
@@ -4680,31 +5014,38 @@ class AnalyticsEngine:
                 # `excluded`); so does this one. The quadratic form needs a
                 # full matrix to be a measurement at all, so the figure is
                 # absent rather than approximated.
-                columns = list(current_corr.columns)
-                current_unmeasurable = [
-                    f"{columns[i]}/{columns[j]}"
-                    for i in range(len(columns))
-                    for j in range(i + 1, len(columns))
-                    if not np.isfinite(current_corr.iat[i, j])
-                ]
-                if current_unmeasurable:
-                    current_volatility_reason = (
-                        f"{UNMEASURABLE_CORRELATION_REASON}: "
-                        f"{', '.join(current_unmeasurable)}"
+                # `current_corr` holds only the legs with an estimable marginal,
+                # so a pair this loop had to reject for a missing leg never
+                # reaches the matrix -- which is the whole point: the pair is
+                # reported as unmeasurable here instead of being computed from
+                # whatever the survivors happen to be.
+                if current_unmeasured_tickers:
+                    reason = (
+                        f"{UNMEASURABLE_LEG_VOLATILITY_REASON} "
+                        f"({', '.join(current_unmeasured_tickers)}), so their "
+                        "pairwise correlations are not measurable either; they "
+                        "are unknown, not zero"
                     )
                 else:
-                    current_corr_values = current_corr.to_numpy(dtype=float).copy()
-                    np.fill_diagonal(current_corr_values, 1.0)
-                    current_cov = current_corr_values * np.outer(current_vol_values, current_vol_values)
-                    current_vec = np.asarray(current_weight_values, dtype=float)
-                    variance = float(current_vec @ current_cov @ current_vec)
-                    if np.isfinite(variance):
-                        current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
-                    else:
-                        current_volatility_reason = (
-                            "the correlation quadratic form did not evaluate to a "
-                            "finite variance on the measured legs"
-                        )
+                    # Textually the pre-existing sentence, so a book refused
+                    # purely for overlap reads exactly as it did before.
+                    reason = UNMEASURABLE_CORRELATION_REASON
+                current_volatility_reason = (
+                    f"{reason}: {', '.join(current_unmeasurable)}"
+                )
+            if current_tickers and not current_unmeasurable:
+                current_corr_values = current_corr.to_numpy(dtype=float).copy()
+                np.fill_diagonal(current_corr_values, 1.0)
+                current_cov = current_corr_values * np.outer(current_vol_values, current_vol_values)
+                current_vec = np.asarray(current_weight_values, dtype=float)
+                variance = float(current_vec @ current_cov @ current_vec)
+                if np.isfinite(variance):
+                    current_volatility = float(np.sqrt(max(0.0, variance)) * np.sqrt(252))
+                else:
+                    current_volatility_reason = (
+                        "the correlation quadratic form did not evaluate to a "
+                        "finite variance on the measured legs"
+                    )
             # The same book measured on the sample covariance.  Published
             # because `current_volatility` above is a MODEL quantity
             # (correlation x EWMA marginals) and the artifact used to carry it
@@ -4900,10 +5241,13 @@ class AnalyticsEngine:
                     if current_tickers and current_volatility is not None
                     else None
                 ),
-                # Why the figure above is absent, and which pairs had no
-                # correlation to measure. Published so that a null here is
+                # Why the figure above is absent, and which pairs of the book
+                # could not be measured. Published so that a null here is
                 # distinguishable from a payload that predates the key, and so
                 # the reader can see the book was refused rather than guessed.
+                # The list enumerates pairs the book HOLDS, so a leg excluded for
+                # having no volatility appears here instead of vanishing from
+                # the payload along with the matrix entry it removed.
                 "current_volatility_reason": current_volatility_reason,
                 "current_volatility_unmeasurable_pairs": current_unmeasurable,
                 "current_volatility_sample_covariance": (
@@ -5018,17 +5362,54 @@ class AnalyticsEngine:
             # Concentration risk (20% weight in overall score)
             concentration_result = await self.concentration_analysis(weights)
             # `herfindahl_index` is the whole input of this leg, and the analysis
-            # publishes 0.0 with an `error` when it measured nothing -- a 0.0
+            # publishes it with an `error` when it measured nothing -- a 0.0
             # Herfindahl is impossible for a non-empty book (sum(w^2) >=
             # 1/n > 0), so a 0.0 here is an absence wearing a measurement's
-            # clothes. The sub-score below is the original expression, untouched;
-            # only the PROVENANCE of its input is published, because a reader
-            # cannot otherwise tell a real 0.0 from an unmeasured one.
-            concentration_unavailable = bool(concentration_result.get("error"))
-            hhi = concentration_result.get('herfindahl_index', 0.1)
-            concentration_score = min(30, hhi * 100)
+            # clothes.
+            #
+            # WM-4 and WM-5, and they are one change.  The refusal path used to
+            # publish `herfindahl_index: 0.0`, so `min(30, 0.0 * 100)` handed
+            # this leg its BEST POSSIBLE sub-score -- 0 on a 0-30 scale where 30
+            # is the most concentrated possible book -- while `excluded` did not
+            # contain 'concentration', so the leg also KEPT its 0.20 nominal
+            # weight and dragged `overall_score` down by up to 6 points on a
+            # book whose concentration was never measured.  A missing
+            # measurement was reported as the safest book there is.
+            #
+            # `_empty_concentration` now publishes `herfindahl_index: None`, and
+            # `.get(key, default)` returns a stored `None` when the key is
+            # PRESENT - so the two halves have to land together: without the
+            # `None` guard below, `float(None)` raises and
+            # `min(30, None * 100)` is a TypeError.
+            #
+            # The pattern is the one the volatility, correlation and factor legs
+            # in THIS SAME function already use, and the one its own header
+            # comment states: a leg that could not be measured is `None` AND is
+            # listed in `excluded`, so the weight below is dropped and the rest
+            # renormalised.  The sub-score EXPRESSION below is untouched, so
+            # every measured book publishes exactly the number it did before.
+            hhi_raw = concentration_result.get('herfindahl_index')
+            try:
+                hhi = float(hhi_raw)
+            except (TypeError, ValueError):
+                hhi = None
+            concentration_unavailable = bool(
+                concentration_result.get("error")
+            ) or hhi is None or not np.isfinite(hhi)
+            if concentration_unavailable:
+                # WM-5: 0.20 of the weight released, not scored as zero.
+                concentration_score = None
+                excluded.append('concentration')
+                excluded_reasons['concentration'] = (
+                    "concentration analysis published no measured Herfindahl "
+                    f"index ({concentration_result.get('error') or 'no finite value'})"
+                )
+            else:
+                concentration_score = min(30, hhi * 100)
             scores['concentration'] = concentration_score
-            inputs['concentration'] = None if concentration_unavailable else float(hhi)
+            inputs['concentration'] = (
+                None if concentration_unavailable else hhi
+            )
             input_reasons['concentration'] = (
                 "concentration analysis published no measured Herfindahl index "
                 f"({concentration_result.get('error')})"
@@ -5330,8 +5711,16 @@ class AnalyticsEngine:
             
             # Generate alerts
             alerts = []
-            if concentration_score > 20:
-                alerts.append(f"High concentration risk (HHI: {concentration_result.get('herfindahl_index', 0):.3f})")
+            # WM-4 coupling: the `is not None` guard the three legs below already
+            # carry, applied to the one above it.  With the concentration leg now
+            # publishing `None` instead of a fabricated 0.0, `None > 20` raised
+            # and the whole score fell out to `_empty_risk_score` - so refusing
+            # the leg would have cost the reader every OTHER leg's measurement as
+            # well.  The published message is also corrected: it said "the
+            # sub-score was scored from an unmeasured Herfindahl index", which is
+            # exactly what WM-4 stopped happening.  The leg is now NOT SCORED.
+            if concentration_score is not None and concentration_score > 20:
+                alerts.append(f"High concentration risk (HHI: {hhi:.3f})")
             if volatility_score is not None and volatility_score > 20:
                 alerts.append(f"High volatility risk ({portfolio_vol:.1%} annualized)")
             if correlation_score is not None and correlation_score > 15:
@@ -5349,9 +5738,10 @@ class AnalyticsEngine:
                 )
             if concentration_unavailable:
                 alerts.append(
-                    "Concentration leg input unavailable: the sub-score was "
-                    "scored from an unmeasured Herfindahl index, not a measured "
-                    "one (see score_audit.components.concentration)"
+                    "Concentration leg not scored: no Herfindahl index was "
+                    "measured, so the leg was excluded and its weight released "
+                    "rather than scored zero (see "
+                    "score_audit.components.concentration)"
                 )
             alerts.extend(_risk_score_composition_alerts(score_audit))
             
@@ -5444,6 +5834,24 @@ class AnalyticsEngine:
         `_zero_dispersion_reason`.  `annual_return` and `annual_volatility` are
         NOT withheld on that window: a zero mean and a zero dispersion over a
         flat series are real measurements over the observations that exist.
+
+        WM-2, and the case this second guard never reached.  `> 0` on the
+        denominator is not the same question as "did this window measure a
+        dispersion", and on a window whose every return is the same number the
+        two disagree: `std(ddof=1)` of 60 returns of exactly 0.0007 is
+        1.0934e-19, not 0.0.  Annualized that is 1.7356e-18, which is `> 0`,
+        so the guard passed and the payload published `sharpe_ratio = 9.011e16`.
+        The ratio is real arithmetic over a denominator that is real
+        arithmetic - which is exactly the problem: nothing measured a
+        volatility, and a 9e16 Sharpe with a confidence interval attached reads
+        as the best Sharpe ever measured.  The guard is now
+        `_measures_dispersion(returns)` - `nunique() >= 2`, equivalently
+        `max != min` - with no tolerance and no threshold, and the Sortino
+        guard runs the same predicate on the downside series it divides by.
+        `annual_volatility` above is deliberately untouched and still publishes
+        the round-off, because that IS the measurement of this window and the
+        reader is owed it; the ratio that cannot be formed is the thing that is
+        withheld.
         """
         try:
             if returns.empty:
@@ -5491,9 +5899,30 @@ class AnalyticsEngine:
                 # method did not measure.  `annual_volatility > 0` is False for
                 # a non-finite dispersion as well as a zero one, which is the
                 # same absence - a NaN denominator has no ratio either.
+                #
+                # WM-2.  But `> 0` is the wrong QUESTION, and on this shape it
+                # answers yes.  A window whose every return is the same number
+                # has `std(ddof=1) == 0.0` only to within the arithmetic: 60
+                # returns of exactly 0.0007 measure 1.0934e-19, which annualizes
+                # to 1.7356e-18, which is `> 0`.  The published point was
+                # `sharpe_ratio = 9.011e16` WITH a confidence interval on it -
+                # because `_estimate_uncertainty_block` gates the band on the
+                # observation COUNT, and a moving-block resample of a constant
+                # series is that same constant series, so every draw reproduced
+                # the round-off and the interval was [9.011e16, 9.011e16].  A
+                # reader saw a 9e16 Sharpe and a band that agreed with it.
+                #
+                # The predicate is therefore structural, not a magnitude test:
+                # `_measures_dispersion` asks whether two observations differ at
+                # all (`nunique() >= 2`, exactly `max != min`), so no tolerance
+                # and no threshold is invented to separate "round-off" from
+                # "measured".  `annual_volatility` STAYS: it is what the window
+                # measured, and withholding it would hide a real reading of
+                # this window - the same line the branch above draws.
                 sharpe_ratio = (
                     float((annual_return - self.risk_free_rate) / annual_volatility)
-                    if annual_volatility > 0
+                    if np.isfinite(annual_volatility) and annual_volatility > 0
+                    and _measures_dispersion(returns)
                     else None
                 )
                 
@@ -5506,9 +5935,18 @@ class AnalyticsEngine:
                 # Same contract as the Sharpe above, on its own denominator: a
                 # window that never undershot the target has no downside to
                 # divide by, so the ratio has no value rather than a zero one.
+                # The predicate runs on the DOWNSIDE series this denominator is
+                # built from, for the same reason the Sharpe's runs on the
+                # returns: what has to be established is that the thing being
+                # divided by varies.  On a window whose every return is the same
+                # number the downside series is that one number repeated, and
+                # its RMS is the constant, not a spread of the book - which is
+                # why a book that never moved published exactly `-sqrt(252)`
+                # and called it a measured Sortino.
                 sortino_ratio = (
                     float((annual_return - self.risk_free_rate) / downside_deviation)
-                    if downside_deviation > 0
+                    if np.isfinite(downside_deviation) and downside_deviation > 0
+                    and _measures_dispersion(downside)
                     else None
                 )
             
@@ -5654,38 +6092,75 @@ class AnalyticsEngine:
     #: `annual_volatility` beside them are real measurements over a flat
     #: window, which is why the sibling reason withholds three fields and this
     #: one withholds two.
+    #:
+    #: WM-2 added a THIRD shape to this reason, and it is not "zero".  On a
+    #: window whose every return is the same NON-ZERO number the sample standard
+    #: deviation is not 0.0 but the round-off of the subtraction that produced it
+    #: (1.0934e-19 for 60 returns of 0.0007), so the old wording - "not a
+    #: positive finite dispersion" / "measured zero" - described a condition that
+    #: was never reached.  The reasons below say what is actually true: the
+    #: window does not MEASURE A DISPERSION, whatever the arithmetic produced.
     _ZERO_VOLATILITY_SHARPE_REASON = (
         "withheld: sharpe_ratio divides by this window's own annualized "
-        "volatility, which measured {volatility} - not a positive finite "
-        "dispersion - so the ratio has no value rather than a low one. No zero "
-        "is published in its place, because a Sharpe published as 0.0 cannot "
-        "be told apart from a portfolio that was measured and produced none, "
-        "and a window with no dispersion is exactly the case where a reader "
-        "would most want to know which of the two happened. Such a window is "
-        "consistent with EVERY performance level, including an excellent one, "
-        "so this absence says nothing about whether performance was good or "
-        "bad. annual_return and annual_volatility beside it are still "
-        "measurements over the observations that exist. This is a missing "
-        "measurement, not a low one: it is a zero-dispersion window (a flat or "
-        "stale price series, where every return is the same number), not a "
-        "portfolio with no risk."
+        "volatility, which measured {volatility}, and this window does not "
+        "measure a dispersion - every return observation is the same value, so "
+        "the sample standard deviation is the round-off of the subtraction "
+        "rather than a spread. {volatility} is a real number and not a "
+        "volatility: on a window of 60 returns of exactly 0.0007 it reads "
+        "1.7356e-18, and the ratio that guard used to admit was 9.011e16. The "
+        "ratio therefore has no value rather than a low one, and no zero or any "
+        "other substitute is published in its place, because a Sharpe published "
+        "as 0.0 cannot be told apart from a portfolio that was measured and "
+        "produced none - and 9.011e16 is the strongest possible claim of skill "
+        "resting on nothing at all. Such a window is consistent with EVERY "
+        "performance level, including an excellent one, so this absence says "
+        "nothing about whether performance was good or bad. annual_return and "
+        "annual_volatility beside it are still measurements over the "
+        "observations that exist, and are deliberately NOT withheld - including "
+        "annual_volatility, which on this window IS that round-off. This is a "
+        "missing measurement, not a low one: it is a flat or stale price series "
+        "where every return is the same number, not a portfolio with no risk."
     )
 
     _ZERO_DOWNSIDE_SORTINO_REASON = (
         "withheld: sortino_ratio divides by this window's downside deviation "
-        "below the risk-free target, which measured zero: the window never "
-        "undershot the target, so there is no downside to divide by and the "
-        "ratio has no value rather than a low one. No zero is published in its "
-        "place, because a Sortino published as 0.0 cannot be told apart from a "
-        "portfolio that was measured and suffered no downside. A window with "
-        "no downside deviation is consistent with EVERY performance level, "
-        "including an excellent one, so this absence says nothing about whether "
-        "performance was good or bad. This is a missing measurement, not a low "
-        "one."
+        "below the risk-free target, and that denominator does not measure a "
+        "dispersion. Either the window never undershot the target, so the "
+        "downside series is zero throughout, or every return is the same value "
+        "and the downside series is that one value repeated - in which case its "
+        "RMS is a constant, not a spread of the book, and a book that never "
+        "moved divided its risk-free target by itself and published exactly "
+        "-sqrt(252) as a measured Sortino. No zero and no other substitute is "
+        "published in its place, because a Sortino published as 0.0 cannot be "
+        "told apart from a portfolio that was measured and suffered no "
+        "downside. A window with no downside deviation is consistent with "
+        "EVERY performance level, including an excellent one, so this absence "
+        "says nothing about whether performance was good or bad. This is a "
+        "missing measurement, not a low one."
+    )
+
+    #: WM-2, residual judgement, recorded because it is a judgement.  A window
+    #: with exactly TWO distinct return values `1e-18` apart DOES measure a
+    #: dispersion - `_measures_dispersion` returns True for it, and the Sharpe
+    #: publishes, at roughly 8e13, together with a resampling band that is
+    #: correspondingly enormous.  That is the correct outcome of a structural
+    #: test and the alternative would be worse: separating 1e-18 of genuine
+    #: variation from 1e-19 of round-off needs a threshold, and any threshold
+    #: here is a number this method did not measure, sitting exactly where the
+    #: engine's own `num_018_no_hard_zero_sub_scores` audit says a floor is
+    #: "strictly worse than the ambiguity this rule was written to catch".  So
+    #: the near-constant case is published honestly - a very large ratio, with a
+    #: very wide band - and this note exists so the choice is on the record
+    #: rather than looking like an oversight.
+    _NEAR_ZERO_DISPERSION_NOTE = (
+        "a window whose returns differ by amounts this small does carry "
+        "variation, so the ratio is published as measured and its band is "
+        "attached; the band is correspondingly wide, which is the honest "
+        "statement of how little the window pins the ratio down"
     )
 
     def _zero_dispersion_reason(
-        self, declared: Mapping[str, Any]
+        self, declared: Mapping[str, Any], observations: Any = None
     ) -> Dict[str, str]:
         """Per-field reason published when a ratio's own denominator is nothing.
 
@@ -5694,6 +6169,17 @@ class AnalyticsEngine:
         earned instead of losing it to its sibling's absence.  Read off
         `declared` - the values the payload publishes - so the reason cannot
         describe a different window than the point it is attached to.
+
+        WM-2.  `observations` is the sample the block was measured on, and it
+        is a SECOND, independent gate on the same two fields.  Filtering on
+        `declared[field] is None` alone was enough while the point guard and
+        the reason read the same condition; after the guard moved to the
+        structural predicate the two could disagree, and a moving-block
+        resample of a constant series is that same constant series - so a band
+        would attach to a ratio whose every draw was the same number.  Checking
+        the sample itself makes "there is no dispersion here to resample" a
+        statement about the data rather than about whatever the point guard
+        happened to publish today.
         """
         reasons = {
             "sharpe_ratio": self._ZERO_VOLATILITY_SHARPE_REASON.format(
@@ -5705,6 +6191,17 @@ class AnalyticsEngine:
             field: reason
             for field, reason in reasons.items()
             if declared.get(field) is None
+            or (
+                # WM-2: the second gate.  `declared[field] is None` says the point
+                # guard fired; this says the SAMPLE cannot support the ratio at
+                # all, so there is nothing for a resampler to resample and no
+                # interval may attach even if a future change lets the point
+                # through.  `observations=None` keeps the historical
+                # declared-only behaviour for a caller with no sample to judge.
+                field in ("sharpe_ratio", "sortino_ratio")
+                and observations is not None
+                and not _measures_dispersion(observations)
+            )
         }
 
     def _estimate_uncertainty_block(
@@ -5745,7 +6242,17 @@ class AnalyticsEngine:
             # which would send a reader off to widen a window that is already
             # wide enough.  `_zero_dispersion_reason` filters to the fields
             # that are actually absent, so a measured sibling keeps its band.
-            not_computed.update(self._zero_dispersion_reason(declared))
+            #
+            # WM-2.  `values` is the sample, and it is now also handed to that
+            # filter.  This gate is the third site of the structural predicate:
+            # `measure_estimate_uncertainty` itself gates only on
+            # `size >= 10`, and a moving-block resample of a constant series
+            # IS that constant series - so before this, a window measuring no
+            # dispersion reproduced its own round-off on every draw and the
+            # interval came back as a DEGENERATE BAND on a ratio that should not
+            # have had one at all.  `values` rather than `returns` so the reason
+            # is judged on exactly the observations the resampler sees.
+            not_computed.update(self._zero_dispersion_reason(declared, values))
         return measure_estimate_uncertainty(
             values,
             engine_risk_statistics(self.risk_free_rate),
@@ -5983,6 +6490,13 @@ class AnalyticsEngine:
                 "horizon": h,
                 "volatility_forecast": vol_final,
                 "raw_volatility_forecast": raw_vol_final,
+                # WM-9.  What the fit was actually run on.  The +/-20 % clip on
+                # the delivered return series is published here rather than
+                # living only as two literals inside the core, because a
+                # conditional sigma fitted to a censored series describes the
+                # censored series.  Disclosure only; nothing here is clipped by
+                # it - these are the INPUT bounds.
+                "input_return_clip": list(FORECAST_INPUT_RETURN_CLIP),
                 "var_forecast": var_forecast,
                 "cvar_forecast": cvar_forecast,
                 # No interval.  The previous value was `vol * [0.8, 1.2]` --
@@ -6063,6 +6577,9 @@ class AnalyticsEngine:
                 "horizon": h,
                 "volatility_forecast": vol_final,
                 "raw_volatility_forecast": raw_vol_final,
+                # WM-9, as on the GARCH payload: the fit ran on the clipped
+                # return series, so the clip is published with the number.
+                "input_return_clip": list(FORECAST_INPUT_RETURN_CLIP),
                 "var_forecast": var_forecast,
                 "cvar_forecast": cvar_forecast,
                 # See `_garch_forecast`: null + reason, never a fabricated band.
@@ -6173,6 +6690,10 @@ class AnalyticsEngine:
                 "horizon": h,
                 "volatility_forecast": forecast_volatility,
                 "raw_volatility_forecast": raw_forecast_volatility,
+                # WM-9, as on the other two payloads.  It matters most here:
+                # the EWMA recursion is the branch with no model at all, so the
+                # clip is the ONLY censoring applied to its input.
+                "input_return_clip": list(FORECAST_INPUT_RETURN_CLIP),
                 "var_forecast": var_forecast,
                 "cvar_forecast": cvar_forecast,
                 # See `_garch_forecast`: null + reason, never a fabricated band.
@@ -6305,12 +6826,33 @@ class AnalyticsEngine:
                                 **({'error': 'insufficient history for factor regression'} if alpha is None else {})
                             }
                         except Exception:
+                            # WM-10.  These two keys were hard-coded on the
+                            # failure path, and both were false statements about
+                            # the window.  `data_pts` and `is_limited` are the
+                            # MEASURED row count and the measured short-history
+                            # flag for this ticker, and they are already in scope
+                            # and already published three keys above on the
+                            # success path - so a ticker with 180 usable rows
+                            # that failed on the HAC fit published
+                            # `data_points: 0` and `is_limited_history: False`,
+                            # which points a reader who is diagnosing the null
+                            # `alpha` at "there is no data here" instead of "the
+                            # regression failed on a window that had plenty".
+                            # No published figure was wrong; the diagnostic
+                            # surface misdirected, which is the same defect class
+                            # as publishing a substituted number - a reader
+                            # reaches the same false conclusion either way.
+                            # `history_warning` is the window's, not the fit's,
+                            # so it is published here on the same condition the
+                            # success path uses.
                             positions_exp[ticker] = {
                                 'alpha': None, 'annualized_alpha': None, 'market': None,
                                 'alpha_std_error': None, 'market_std_error': None,
                                 'std_error_basis': None, 'std_error_robust': None,
-                                'is_limited_history': False, 'history_warning': None,
-                                'data_points': 0, 'error': 'factor regression failed'
+                                'is_limited_history': is_limited,
+                                'history_warning': f"Only {data_pts} active trading days in the analyzed window" if is_limited else None,
+                                'data_points': data_pts,
+                                'error': 'factor regression failed'
                             }
 
                     port_returns = self._calculate_portfolio_returns(aligned_returns, weights).dropna()
@@ -6440,6 +6982,11 @@ class AnalyticsEngine:
             "model": model,
             "horizon": h,
             "volatility_forecast": None,
+            "raw_volatility_forecast": None,
+            # WM-9: the empty shape carries the input clip too, because the
+            # refusal is about the model fitting nothing - not about a
+            # different input.  Mirrored so a consumer reads one shape.
+            "input_return_clip": list(FORECAST_INPUT_RETURN_CLIP),
             "var_forecast": None,
             "cvar_forecast": None,
             # An unavailable forecast has no point estimate, so it has no band
@@ -6472,20 +7019,36 @@ class AnalyticsEngine:
             "top_3": 0.0,
             "top_5": 0.0,
             "top_10": 0.0,
-            "herfindahl_index": 0.0,
+            # WM-6.  `None`, not 0.0.  HHI = sum(w_i^2) >= 1/n > 0 for every
+            # non-empty book, so 0.0 is not a reachable MEASUREMENT - it is a
+            # third value, the one this refusal used to publish, and it is
+            # indistinguishable from a measured single-holding book (which
+            # measures exactly 1.0) to any reader who does not also read
+            # `n_holdings`.  That mattered downstream, not just here:
+            # `risk_scoring` fed this field straight into `min(30, hhi * 100)`,
+            # so the refusal scored the leg at its BEST possible value and kept
+            # its 0.20 nominal weight (see the concentration leg there).
+            #
+            # SCOPE.  This is the `n == 0` / error path ONLY.
+            # `diversification_score == 0.0` below is CORRECT for `n == 1` and
+            # is not touched: the repo's own invariant is that a single-holding
+            # portfolio must strictly render 0% diversification, because that
+            # IS what the scale reads at one holding.  A test pins both cases
+            # side by side so the two cannot erode into each other.
+            "herfindahl_index": None,
             "effective_positions": 0.0,
             "diversification_score": 0.0,
             "diversification_ratio": 1.0,
             "gini_coefficient": 0.0,
             # The disclosure keys are published here too, so a consumer sees one
             # shape rather than two. `n_holdings` is 0 because no holding was
-            # measured -- that is a true statement about an absent book. The
-            # three numbers above are NOT: diversification_score 0.0 on an empty
-            # book is indistinguishable from a measured single-holding book, the
-            # same class of defect the liquidity `_empty_liquidity` comment
-            # records (V3-09). Left exactly as they were -- changing them is
-            # outside this disclosure, and a consumer that needs the difference
-            # has `error` and `n_holdings` == 0 to read it from.
+            # measured -- that is a true statement about an absent book, and it
+            # is what distinguishes this shape from the `n == 1` book that
+            # legitimately measures `herfindahl_index: 1.0` and
+            # `diversification_score: 0.0`.  `diversification_score` and
+            # `diversification_ratio` on this shape are still left exactly as
+            # they were: they are the same class of ambiguity, but they are a
+            # SEPARATE disclosure and `risk_scoring` does not read either.
             "n_holdings": 0,
             "scale": dict(CONCENTRATION_DIVERSIFICATION_SCALE),
             "diversification_score_formula": (
@@ -6543,6 +7106,7 @@ class AnalyticsEngine:
             "confidence_basis": None,
             "shock_inputs": None,
             "units": None,
+            "weights_total_used": None,
             "methodology": None,
             "error": "Insufficient data for stress testing"
         }
@@ -6678,7 +7242,11 @@ def volatility_forecast_point(
     # a non-pandas input raises here exactly as it raised there, rather than
     # being quietly accepted and producing a number where there used to be none.
     clean = returns.replace([np.inf, -np.inf], np.nan).dropna()
-    clean = clean.clip(lower=-0.20, upper=0.20)
+    # WM-9.  Disclosure only: the bounds are the two literals that were inline
+    # here, now named so they can be PUBLISHED rather than hidden.  Every fit in
+    # this section runs on this censored series and nothing used to say so.
+    clean = clean.clip(lower=FORECAST_INPUT_RETURN_CLIP[0],
+                       upper=FORECAST_INPUT_RETURN_CLIP[1])
 
     if name == "EWMA":
         # Single-pass recursion:
@@ -6714,8 +7282,52 @@ def volatility_forecast_point(
         # measurable volatility is not cheap.  The two paths were previously
         # documented as sharing one contract; they do not, and closing that
         # difference here is a separate decision from this comment.
+        #
+        # WM-3.  `0.0` was published for the seed on BOTH of the conditions this
+        # line then had to invent, and neither of them is an absence of
+        # measurement that can carry a number:
+        #
+        #   * `len(window) < 2`.  A sample variance is undefined below two
+        #     observations.  The old comment claimed this arm was unreachable,
+        #     and that claim is WRONG: `forecast_volatility` gates on the RAW
+        #     series length (`len(returns) < 30`, :3739) while the seed is
+        #     computed from the FINITE count, so 30 rows carrying one finite
+        #     observation reach this line with `len(window) == 1`.  Measured
+        #     before this fix: `volatility_forecast` 0.05 - the clip floor -
+        #     off a single return.  `volatility_forecast_statistics`, the
+        #     resampling restatement, calls this function with no length gate at
+        #     all.
+        #
+        #   * `len(window) >= 2` but CONSTANT.  Measured on 60 returns of
+        #     exactly 0.0007: `np.var(window, ddof=1) == 1.1954e-38`, which is
+        #     float round-off in the subtraction, not a variance.  The recursion
+        #     then converged to `raw == 0.010976`, `np.isfinite(raw)` was True,
+        #     and the clip published `volatility_forecast: 0.05` - a book
+        #     "displayed" as 5 % annualized - beside `return_space_volatility`
+        #     6.914e-4 and a VaR of -1.14e-3 computed from the raw sigma.  The
+        #     display and the tail were two orders of magnitude apart because
+        #     one of them was the clip floor and the other was round-off.
+        #
+        # Both conditions are the same statement - THE WINDOW MEASURES NO
+        # DISPERSION - and `_measures_dispersion` answers it with no tolerance
+        # at all: `nunique() < 2` is exactly `max == min`, so no boundary is
+        # invented.  `_InsufficientForecast` is the refusal this section already
+        # documents for "too little to fit", and both enclosing handlers treat
+        # it as an absent measurement rather than a number:
+        # `volatility_forecast_statistics` counts the draw NaN (a
+        # moving-block resample of a constant series IS that constant series,
+        # so withholding here withholds on every draw rather than banding a
+        # round-off), and `_ewma_forecast`'s `except` returns
+        # `_empty_forecast`, where `volatility_forecast`, `var_forecast`,
+        # `cvar_forecast` and `tail_measure` are all None.
         window = r[-min(len(r), 60):]
-        var = float(np.var(window, ddof=1)) if len(window) > 1 else 0.0
+        if window.size < 2 or not _measures_dispersion(window):
+            raise _InsufficientForecast(
+                f"the EWMA seed is a sample variance of the "
+                f"{int(window.size)}-observation window and measures no "
+                f"dispersion: {'fewer than two observations' if window.size < 2 else 'every observation is the same value'}"
+            )
+        var = float(np.var(window, ddof=1))
         for x in window:
             var = EWMA_LAMBDA * var + (1.0 - EWMA_LAMBDA) * x * x
         raw = float(np.sqrt(max(0.0, var) * 252))

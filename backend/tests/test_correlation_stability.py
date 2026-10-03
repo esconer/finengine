@@ -57,6 +57,16 @@ GOLDEN_PATH = (
 #     observation (see `analyze_correlation_stability`).
 ADDITIVE_KEYS_SINCE_GOLDEN = frozenset({"alert_direction", "as_of_semantics"})
 
+# The same idea one level down, for `CorrelationDataPoint`. The golden's `series`
+# entries were captured when a point carried four fields; a point now also
+# carries the DENOMINATOR its figure was taken over and the token naming the
+# condition that admitted the date. Both are additive labels beside the figure,
+# never a changed figure, and the set is closed for the same reason: a third
+# entry means a published point moved without a label saying so.
+ADDITIVE_POINT_KEYS_SINCE_GOLDEN = frozenset(
+    {"pairs_contributing", "measurement_status"}
+)
+
 # Each shape is chosen so a DIFFERENT comparison decides the alert, which is what
 # makes the direction observable. `test_the_arm_each_shape_reaches` re-derives the
 # arm from the published percentiles, so a drifted shape fails loudly instead of
@@ -191,6 +201,24 @@ class TestTheArmEachShapeReaches:
         }
 
 
+def _without_additive_point_keys(payload: dict) -> dict:
+    """A shallow copy of a dumped payload with the two additive POINT labels off
+    every series entry.
+
+    The golden's `series` entries were captured when a `CorrelationDataPoint`
+    carried four fields, so any comparison of the WHOLE payload has to strip
+    them - once, here, for every caller. The closed set is what keeps the strip
+    from hiding a moved figure: a third key fails the key-set assertions rather
+    than being popped silently.
+    """
+    out = dict(payload)
+    out["series"] = [
+        {k: v for k, v in point.items() if k not in ADDITIVE_POINT_KEYS_SINCE_GOLDEN}
+        for point in payload.get("series", [])
+    ]
+    return out
+
+
 # ===========================================================================
 # 2. Nothing published moved
 # ===========================================================================
@@ -199,28 +227,36 @@ class TestNothingPublishedMoved:
     def test_payload_is_byte_identical_to_the_pre_field_service(
         self, monkeypatch, golden, arm
     ):
-        """The whole payload, minus the two additive labels, equals the payload
+        """The whole payload, minus the additive labels, equals the payload
         the unmodified service produced for the same book.
 
         The fixture was captured by running this same function before
         `alert_direction` existed, and before `as_of_semantics` was declared in
         schemas.py. A comparison of the full dumped dict (not a selection of
         fields) means a changed percentile, threshold, median, message or series
-        row fails here. The key-set assertion above is what keeps the two pops
-        honest: it fails on an UNEXPECTED addition, so the comparison below can
-        only be reached with exactly the two known labels removed.
+        row fails here. The key-set assertions are what keep the pops honest:
+        they fail on an UNEXPECTED addition, so the comparison below can only be
+        reached with exactly the known labels removed - at the response level
+        (`ADDITIVE_KEYS_SINCE_GOLDEN`) and inside every series point
+        (`ADDITIVE_POINT_KEYS_SINCE_GOLDEN`).
         """
         res = _analyze(monkeypatch, BOOKS[arm])
         dumped = res.model_dump()
 
         assert set(dumped) - set(golden[arm]) == ADDITIVE_KEYS_SINCE_GOLDEN
         assert set(golden[arm]) - set(dumped) == set()
+        for point, golden_point in zip(dumped["series"], golden[arm]["series"]):
+            assert set(point) - set(golden_point) == ADDITIVE_POINT_KEYS_SINCE_GOLDEN
+            assert set(golden_point) - set(point) == set()
         for additive in ADDITIVE_KEYS_SINCE_GOLDEN:
             dumped.pop(additive)
-        assert dumped == golden[arm], (
+        assert _without_additive_point_keys(dumped) == (
+            _without_additive_point_keys(golden[arm])
+        ), (
             "a published figure moved: once the additive labels "
-            f"{sorted(ADDITIVE_KEYS_SINCE_GOLDEN)} are removed, the payload "
-            "must equal the pre-field golden exactly"
+            f"{sorted(ADDITIVE_KEYS_SINCE_GOLDEN)} and "
+            f"{sorted(ADDITIVE_POINT_KEYS_SINCE_GOLDEN)} are removed, the "
+            "payload must equal the pre-field golden exactly"
         )
 
     @pytest.mark.parametrize("arm", sorted(BOOKS))
@@ -247,9 +283,14 @@ class TestNothingPublishedMoved:
             assert _analyze(monkeypatch, book).message == golden[arm]["message"]
 
     def test_the_series_shape_is_untouched(self, monkeypatch, golden):
+        """Each POINT is compared whole, minus the two additive point-level
+        labels (see `ADDITIVE_POINT_KEYS_SINCE_GOLDEN` and
+        `_without_additive_point_keys`), so a moved date, threshold or rounding
+        fails here rather than hiding behind a selection of fields."""
         for arm, book in BOOKS.items():
             series = _analyze(monkeypatch, book).series
-            assert [p.model_dump() for p in series] == golden[arm]["series"]
+            points = _without_additive_point_keys({"series": [p.model_dump() for p in series]})
+            assert points["series"] == golden[arm]["series"]
 
     def test_the_live_books_published_numbers_are_untouched(self, golden):
         """The artifact values themselves, so a regression in the live shape

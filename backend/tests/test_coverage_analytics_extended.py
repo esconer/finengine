@@ -179,7 +179,11 @@ class TestAnalyticsEmptyPortfolioRoutes:
         # 4. Concentration
         res = await async_client.get("/api/v1/analytics/concentration")
         assert res.status_code in [200, 404]
-        assert res.json()["herfindahl_index"] == 0.0
+        # An empty book publishes NO Herfindahl index: HHI = sum(w_i^2) >= 1/n is
+        # strictly positive for every non-empty book, so 0.0 is not a value this
+        # field can hold. It used to be asserted at 0.0 here, which pinned the
+        # fabricated value the engine's own no-book shape had already dropped.
+        assert res.json()["herfindahl_index"] is None
 
         # 5. Liquidity
         res = await async_client.get("/api/v1/analytics/liquidity")

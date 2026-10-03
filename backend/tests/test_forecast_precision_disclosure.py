@@ -105,6 +105,7 @@ from app.services.analytics_engine import (
     FORECAST_LEG_REFIT_RESAMPLES_WITHHELD,
     FORECAST_SIMULATIONS,
     FORECAST_VOL_CLIP_HIGH,
+    FORECAST_VOL_CLIP_LOW,
     TAIL_CLIP_HIGH,
     TAIL_CLIP_LOW,
     TAIL_ES_MULTIPLIER,
@@ -2213,20 +2214,104 @@ class TestTheEwmaSeedIsComputedOverTheWindowItRecursesOver:
         # Both are material. If either ever rounds to zero the defect argument
         # weakens, and this test should be revisited rather than left passing.
 
-    def test_short_and_degenerate_windows_still_produce_a_number(self):
-        """EWMA has no minimum-sample gate and must not acquire one.
+    def test_a_two_observation_window_is_still_fitted(self):
+        """EWMA has no minimum-sample gate ABOVE TWO observations, and must
+        not acquire one.
 
-        One observation has no sample variance, so the seed is the explicit
-        zero-assumption contract - never a crash, and never a value borrowed
-        from a window that does not exist.
+        This is the load-bearing half of the retired
+        `test_short_and_degenerate_windows_still_produce_a_number`, which
+        looped over `(1, 2, 3)` and required all three to publish a number.  The
+        `n = 1` case is retired with the assertion that pinned it - see the
+        test below - and what survives it is this: `n = 2` and `n = 3` are real
+        windows with a real sample variance, the recursion is a closed form over
+        whatever it is handed, and both must keep publishing.
+
+        Two is the floor now, and it is the floor because a sample variance is
+        undefined below it - not because a minimum-sample policy was invented
+        here.  A gate the estimator cannot satisfy is a refusal; a gate it can
+        satisfy is a rule, and no rule was added.
         """
-        for n in (1, 2, 3):
+        for n in (2, 3):
             series = _returns(observations=n, seed=2, rho=0.0)
             point = volatility_forecast_point(series, "EWMA", 1)
-            assert point["simulated"] is False
-            assert point["forecast_method"] == "riskmetrics_recursion"
-            assert np.isfinite(point["volatility_forecast"])
-            assert point["volatility_forecast"] > 0.0
+            assert point["simulated"] is False, n
+            assert point["forecast_method"] == "riskmetrics_recursion", n
+            assert np.isfinite(point["volatility_forecast"]), n
+            assert point["volatility_forecast"] > 0.0, n
+
+    def test_a_single_observation_window_withholds_instead_of_publishing_the_clip_floor(
+        self,
+    ):
+        """`n = 1` is refused by the core, and the refusal reaches the payload
+        as an absence rather than as a number.
+
+        THE RETIRED VALUE, because "still produced a number" was the assertion
+        and the number was THE CLIP FLOOR - not a measurement.  `_returns` at
+        `n = 1` is a single `0.0` (the AR(1) loop has no first step), so with a
+        seed of `0.0` the recursion was a no-op:
+
+            var = 0.0
+            var = 0.94 * var + 0.06 * 0.0**2      -> 0.0
+            raw = sqrt(var * 252)                  -> 0.0
+            np.clip(raw, FORECAST_VOL_CLIP_LOW, ..) -> FORECAST_VOL_CLIP_LOW
+
+        so one day on which the price did not move published a 5 % annualized
+        volatility forecast.  The sibling record for the other reach of this arm
+        - 30 rows carrying one finite observation of 0.01 - published raw
+        0.0389, which the same clip turned into the same 0.05.  Both were
+        `FORECAST_VOL_CLIP_LOW`, the display bound, wearing the field name of a
+        measurement; nothing on the payload said so.
+
+        WHY A REFUSAL AND NOT A LOWER FLOOR.  `0.0` is not a missing
+        measurement - it is the strongest claim the field can make, "this book
+        does not move" - and it stays RANKABLE: `calculate_volatility_cone`
+        compares the forecast level against the realized-volatility
+        distribution, where any non-negative p25 puts `0.0` in the CHEAP band,
+        so a book with no measurable volatility would be priced as the cheapest
+        one available.  `volatility_service.calculate_ewma_volatility` already
+        WITHHELDS at `n = 1` for exactly that reason, and this function's own
+        seed comment said so; two lines above it, the same comment called `0.0`
+        "the explicit zero-assumption contract".  Two comments in one function
+        disagreed about the same number, and this test now sides with the first:
+        `_InsufficientForecast` is the refusal this section already documents
+        for "too little to fit at all".
+
+        The retired docstring's OTHER promise - "never a crash" - survives, and
+        survives at the caller rather than at the core: the refusal is typed, so
+        the resampling restatement can count it per draw, and `_ewma_forecast`
+        turns it into `_empty_forecast`.
+        """
+        series = _returns(observations=1, seed=2, rho=0.0)
+        window = series.to_numpy(dtype=float)
+        assert window.size == 1 and window[0] == 0.0
+
+        # THE RETIRED NUMBER, recomputed so the refusal below is falsifiable
+        # rather than merely absent.
+        var = 0.0
+        for x in window:
+            var = 0.94 * var + (1.0 - 0.94) * x * x
+        raw = float(np.sqrt(max(0.0, var) * 252))
+        assert raw == 0.0, raw
+        assert float(np.clip(raw, FORECAST_VOL_CLIP_LOW, 1.20)) == FORECAST_VOL_CLIP_LOW
+
+        # 1. The core refuses, and says which of its two arms fired.
+        with pytest.raises(_InsufficientForecast, match="fewer than two observations"):
+            volatility_forecast_point(series, "EWMA", 1)
+
+        # 2. ...and the caller publishes the absence, not the floor.  The field
+        # list is `_empty_forecast`'s own: `return_space_volatility` is absent
+        # from the empty shape entirely, which is why the equality below - not
+        # this loop - is the statement of the contract.
+        engine = AnalyticsEngine()
+        forecast = engine._ewma_forecast(series, 1)
+        for field in ("volatility_forecast", "raw_volatility_forecast",
+                      "var_forecast", "cvar_forecast", "tail_measure",
+                      "term_structure", "model_params"):
+            assert forecast[field] is None, field
+        assert forecast == engine._empty_forecast(1, "EWMA")
+        # The model is still named, so a reader knows which fit declined.
+        assert forecast["model"] == "EWMA"
+        assert forecast["error"]
 
     def test_the_two_live_ewma_estimators_are_not_the_same_estimator(self):
         """Why the seed fix stops short of a de-duplication, with numbers.

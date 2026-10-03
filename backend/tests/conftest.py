@@ -9,7 +9,7 @@ from typing import Generator, AsyncGenerator
 from datetime import datetime
 import pandas as pd
 import numpy as np
-import os
+import zlib
 import asyncio
 from types import SimpleNamespace
 
@@ -425,31 +425,6 @@ def mock_websocket_messages():
     }
 
 
-# Environment fixtures
-@pytest.fixture
-def test_env_vars():
-    """Set up test environment variables"""
-    test_vars = {
-        "DATABASE_URL": TEST_DATABASE_URL,
-        "TESTING": "True",
-        "LOG_LEVEL": "DEBUG"
-    }
-    
-    original_vars = {}
-    for key, value in test_vars.items():
-        original_vars[key] = os.environ.get(key)
-        os.environ[key] = value
-    
-    yield test_vars
-    
-    # Restore original values
-    for key, original_value in original_vars.items():
-        if original_value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = original_value
-
-
 # Performance testing fixtures
 @pytest.fixture
 def performance_test_data():
@@ -523,27 +498,17 @@ def reset_service_memos():
     them. `test_reset_service_memos_actually_clears` /
     `test_reset_service_memos_leaves_nothing_for_the_next_test` in
     test_test_isolation_invariants.py fail if this reset stops happening.
+
+    This is the isolation mechanism that actually runs. A second autouse fixture
+    named `cleanup_test_data` used to sit directly below this one: it cleaned
+    nothing, and its docstring ("Automatically clean up test data after each
+    test") claimed otherwise. It was deleted rather than fixed -- every real
+    leak it gestured at is addressed either here or by the per-fixture teardown
+    that owns the resource (`test_db`, `isolated_database`, `seeded_positions`).
     """
     _clear_service_memos()
     yield
     _clear_service_memos()
-
-
-@pytest.fixture(autouse=True)
-def cleanup_test_data():
-    """Automatically clean up test data after each test"""
-    yield
-    
-    # Clean up any temporary files, database records, etc.
-    # This runs after each test
-    pass
-
-
-# Test markers and categories
-pytestmark = [
-    pytest.mark.unit,
-    pytest.mark.asyncio
-]
 
 
 # Utility functions for tests
@@ -555,9 +520,19 @@ def create_test_portfolio_data(num_positions: int = 10) -> dict:
 
 
 def create_test_price_data(ticker: str, num_days: int = 252) -> pd.DataFrame:
-    """Create test price data for a single ticker"""
+    """Create test price data for a single ticker.
+
+    Seeded from the ticker with `zlib.crc32`, NOT `hash()`. `str.__hash__` is
+    salted by PYTHONHASHSEED, so `hash(ticker) % 2**32` yields a different
+    seed -- and therefore a different price series -- on every interpreter
+    start. crc32 is a fixed CRC over the UTF-8 bytes: same ticker, same series,
+    in this process and the next one. Pinned by
+    test_seed_determinism_invariants.py, which compares series across two
+    subprocesses run under different PYTHONHASHSEED values; an in-process
+    check cannot see the salt at all.
+    """
     dates = pd.date_range(start="2023-01-01", periods=num_days, freq="B")
-    np.random.seed(hash(ticker) % 2**32)  # Seed based on ticker for consistency
+    np.random.seed(zlib.crc32(ticker.encode()) % 2**32)  # stable across processes
     
     returns = np.random.randn(num_days) * 0.02
     price = 100 * (1 + returns).cumprod()
@@ -604,7 +579,6 @@ __all__ = [
     "portfolio_position_factory",
     "stock_timeseries_factory",
     "performance_test_data",
-    "test_env_vars",
     "create_test_portfolio_data",
     "create_test_price_data"
 ]

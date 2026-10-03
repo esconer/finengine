@@ -92,6 +92,21 @@ markers = [
     "database: Database tests",
     "slow: Slow running tests",
 ]
+# RuntimeWarning is deliberately NOT elevated to an error. It was tried here on
+# 2026-10-03 and reverted, and the reason is worth not rediscovering.
+#
+# The gap is real: ComplexWarning and SAWarning both subclass RuntimeWarning, so
+# a numerically-invalid operation (a sqrt of a negative, an overflowing divide,
+# statsmodels fitting a degenerate sample) can leave a NaN in a returned payload
+# with the suite still green. But a global `error::RuntimeWarning` costs 5 tests,
+# and in every one of the 5 the warning IS the symptom under test: the input is
+# deliberately degenerate -- a collinear leg, a constant leg, a -100% day -- and
+# the assertion is that the service refuses it. The raise happens inside
+# statsmodels/pandas, on the test's own raw cross-check probe. So the filter
+# punished precisely the tests that prove nothing is fabricated, and two of the
+# five only failed in full-suite order, which makes the signal worse rather than
+# better. A future policy has to be scoped per call site (or the refusal tests
+# have to expect the warning), not re-enabled globally.
 filterwarnings = [
     "ignore::UserWarning",
     "ignore::DeprecationWarning",

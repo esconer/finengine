@@ -39,8 +39,8 @@ from app.api.analytics import (
     _pairs_estimate_uncertainty,
     _tear_sheet_relative_uncertainty,
     _tear_sheet_uncertainty,
-    TEAR_SHEET_RISK_FREE_RATE,
 )
+from app.config import settings
 from app.debugging.context_audit import (
     ESTIMATE_KEY_TOKENS,
     UNCERTAINTY_KEY_TOKENS,
@@ -307,7 +307,7 @@ def test_tear_sheet_ratio_restatements_reproduce_quantstats_exactly():
     or the block degrades for the wrong reason.
     """
     series = _series()
-    suite = quantstats_ratio_statistics(TEAR_SHEET_RISK_FREE_RATE)
+    suite = quantstats_ratio_statistics(settings.risk_free_rate)
     block_input = series.to_numpy().reshape(-1, 1, 1)
     expected = {
         "sharpe": qs.stats.sharpe(series, rf=0.02),

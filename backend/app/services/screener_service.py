@@ -6,6 +6,7 @@ High Dividend Yield, and Undervalued Growth.
 
 import asyncio
 import hashlib
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -308,30 +309,73 @@ class ScreenerService:
     ) -> Dict[str, Any]:
         """
         Execute dynamic custom screen based on ratio criteria.
+
+        Absence is not a value. A fundamental the provider did not return
+        cannot satisfy a constraint on that fundamental, so it is excluded and
+        reported under `unscored` rather than being replaced by a stand-in:
+        `or 0.0` made an unscored name fail every min_roce while `or 999.0`
+        let the same name pass every max_pe -- one absence, two opposite
+        verdicts, both invented. Only the constraints the caller actually set
+        gate the verdict; an unscreened field is not a question, so its
+        absence leaves the row standing and is merely recorded.
         """
+        # (provider field, side-channel key) in declaration order.
+        scored_fields = (
+            ("returnOnCapitalEmployed", "roce"),
+            ("returnOnEquity", "roe"),
+            ("trailingPE", "pe"),
+            ("marketCapInCr", "market_cap"),
+            ("dividendYield", "dividend_yield"),
+        )
+
+        # `_filter` is handed to bf.Screen and invoked off the event loop
+        # (_to_thread below), so the missing-field map is mutated on a worker
+        # thread. Locked rather than leaning on the GIL: filter_fn is a plain
+        # sync Callable with no stated concurrency contract, and a
+        # read-modify-write counter would lose updates if bfinance ever drives
+        # the predicate from a pool instead of one thread. Correct either way.
+        missing_lock = threading.Lock()
+        unscored: Dict[str, List[str]] = {}
+
+        def _record(symbol: str, missing: List[str]) -> None:
+            if not missing:
+                return
+            with missing_lock:
+                unscored[symbol] = list(missing)
+
         def _filter(t: bf.Ticker) -> bool:
             info = t.info
+            symbol = str(getattr(t, "symbol", "") or "")
             if not info:
+                _record(symbol, [key for _, key in scored_fields])
                 return False
 
-            roce = info.get("returnOnCapitalEmployed") or 0.0
-            roe = (info.get("returnOnEquity") or 0.0) * 100
-            pe = info.get("trailingPE") or 999.0
-            mcap = info.get("marketCapInCr") or 0.0
+            # `is None`, never truthiness: a measured 0.0 (dividendYield is 0.0
+            # for every non-payer, 7 of 75 symbols in a 2026-10-03 sweep) is a
+            # real reading and must not be confused with an absent one.
+            roce = info.get("returnOnCapitalEmployed")
+            roe = info.get("returnOnEquity")
+            pe = info.get("trailingPE")
+            mcap = info.get("marketCapInCr")
             # bfinance sets info["dividendYield"] = r.dividend_yield raw
             # PERCENT (models/company.py:19 "Dividend Yield %", quotes.py:241
             # no conversion) — *100 here admitted nearly every payer (B-13).
-            div_yield = info.get("dividendYield") or 0.0
+            div_yield = info.get("dividendYield")
 
-            if min_roce is not None and roce < min_roce:
+            _record(
+                symbol,
+                [key for field, key in scored_fields if info.get(field) is None],
+            )
+
+            if min_roce is not None and (roce is None or roce < min_roce):
                 return False
-            if min_roe is not None and roe < min_roe:
+            if min_roe is not None and (roe is None or roe * 100 < min_roe):
                 return False
-            if max_pe is not None and (pe <= 0 or pe > max_pe):
+            if max_pe is not None and (pe is None or pe <= 0 or pe > max_pe):
                 return False
-            if min_mcap_cr is not None and mcap < min_mcap_cr:
+            if min_mcap_cr is not None and (mcap is None or mcap < min_mcap_cr):
                 return False
-            if min_div_yield is not None and div_yield < min_div_yield:
+            if min_div_yield is not None and (div_yield is None or div_yield < min_div_yield):
                 return False
 
             return True
@@ -363,6 +407,11 @@ class ScreenerService:
         try:
             results = await _to_thread(_execute)
             results = results[: max_stocks or 50]
+            with missing_lock:
+                # Snapshot after the worker joined: counts the whole scanned
+                # universe, not just the capped slice, so a dropped name is
+                # never hidden by a small max_stocks.
+                dropped = {sym: list(fields) for sym, fields in unscored.items()}
             return {
                 "strategy": "custom",
                 "name": "Custom Filter",
@@ -370,6 +419,13 @@ class ScreenerService:
                 "source": "bfinance",
                 "count": len(results),
                 "stocks": results,
+                # Side channel naming every ticker the provider could not
+                # score and the fields it was missing, so an empty or short
+                # result is explainable instead of silent. ScreenerResponse has
+                # no field for it, so pydantic's default extra='ignore' drops
+                # it on the wire; this is observable at the service layer and
+                # needs schemas.py to reach the client.
+                "unscored": {"count": len(dropped), "symbols": dropped},
             }
         except Exception as exc:
             logger.error("Error running custom screener: %s", type(exc).__name__)

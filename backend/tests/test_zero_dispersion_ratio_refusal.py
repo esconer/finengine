@@ -38,6 +38,15 @@ windows - over a flat series a zero mean, a zero dispersion and a zero hit rate
 are genuine measurements over the observations that exist. The tests pin that,
 so the refusal cannot drift into nulling a real measurement or into stealing the
 interval a measured window earned.
+
+SUPERSEDED IN PART, and the pointer matters for the DIRECTION of the asymmetric
+case.  A later wave replaced the Sortino guard's `downside_deviation > 0` with
+the same structural predicate the Sharpe guard uses, so a book that never moved
+no longer publishes `-sqrt(252)` - see
+`test_zero_dispersion_ratio_refusal_roundoff.py`, which also owns the round-off
+window this file predates.  What this file still owns is the refusal itself and
+its reason strings; the two have to be read together to know which leg of the
+asymmetry - one ratio absent, the other measured and banded - is reachable.
 """
 
 import asyncio
@@ -79,6 +88,31 @@ def _never_undershoots_frame(days: int = DAYS, rate: float = 0.001) -> pd.DataFr
     """
     idx = pd.bdate_range("2024-01-02", periods=days)
     return pd.DataFrame({"AAA.NS": 100.0 * np.exp(np.arange(days) * rate)}, index=idx)
+
+
+def _never_undershoots_varying_frame(days: int = DAYS, seed: int = 5) -> pd.DataFrame:
+    """A window with a REAL dispersion that still never undershoots the target.
+
+    Deliberately distinct from `_never_undershoots_frame` above.  That ramp
+    produces returns which differ only in their last bits - it carries variation
+    by accident of the `cumprod`, and its Sharpe is a ~1e14 round-off artefact
+    rather than anything measured about the book.  This one varies on purpose,
+    so the Sharpe it publishes is a measurement and the band it earns is a real
+    one, which is what makes it able to DISCRIMINATE: on a fixture where the
+    sibling ratio is absent for a trivial reason, "the measured one kept its
+    band" would be satisfied by a block that withheld everything.
+
+    Every return sits at four times the Sortino target or more, so
+    `np.minimum(0, r - target)` is exactly `0.0` on every row and the downside
+    series is a constant - the ratio that divides by it has no value, while the
+    ratio that divides by the dispersion has one.
+    """
+    target = AnalyticsEngine().risk_free_rate / 252
+    rng = np.random.default_rng(seed)
+    daily = target * 4.0 + rng.uniform(0.0, 0.001, days)
+    idx = pd.bdate_range("2024-01-02", periods=days + 1)
+    prices = np.concatenate([[100.0], 100.0 * np.cumprod(1.0 + daily)])
+    return pd.DataFrame({"AAA.NS": prices}, index=idx)
 
 
 def _measured_frame(days: int = 120, seed: int = SEED) -> pd.DataFrame:
@@ -210,21 +244,100 @@ def test_the_real_measurements_beside_the_absent_ratio_still_ship():
     assert estimates["annual_volatility"]["status"] == "computed"
 
 
-def test_a_withheld_ratio_does_not_suppress_its_measured_sibling():
+def test_a_withheld_sortino_does_not_suppress_the_sharpe_band_it_earned():
     """One absence must not cost the other ratio the band it earned.
 
-    A flat window has no dispersion, so Sharpe has no value - but its downside
-    deviation against the risk-free target is real and Sortino is computable.
-    The reason map is filtered to the fields that are actually absent, so the
-    Sortino interval still ships.
-    """
-    metrics = _metrics(_flat_frame())
-    assert metrics["sharpe_ratio"] is None
-    assert isinstance(metrics["sortino_ratio"], float)
+    `_zero_dispersion_reason` filters the reason map to the fields that are
+    ACTUALLY absent, so a measured sibling keeps the interval it earned instead
+    of losing it to its sibling's absence.  Exercised here through
+    `calculate_portfolio_metrics` - the route this file is about - on a window
+    whose returns VARY and never undershoot the Sortino target: the Sharpe
+    denominator is a real dispersion, so the Sharpe is measured and banded,
+    while the downside series is identically 0.0 and the Sortino has nothing to
+    divide by.  (The same asymmetry on the core pair, without a price frame,
+    is `test_zero_dispersion_ratio_refusal_roundoff.py::
+    test_a_window_with_variation_but_no_downside_still_keeps_its_sharpe_band`.)
 
-    entry = metrics["estimate_uncertainty"]["estimates"]["sortino_ratio"]
+    WHY THIS DIRECTION, which is not the one the retired test used.  It
+    asserted that a flat book publishes a MEASURED Sortino.  It did - and the
+    number was exactly `-sqrt(252)`:
+
+        annual_return    0.0
+        downside series  -target on every row, where target = risk_free_rate/252
+        downside_dev     target * sqrt(252)
+        ratio            (0 - rf) / ((rf/252) * sqrt(252))  ==  -sqrt(252)
+
+    The rate CANCELS, and the window is not an argument to the expression at
+    all, so that one float came out of every book on earth sitting at 0 %
+    return, at every length, under every `risk_free_rate`.  It reported the
+    annualisation convention, not the book being measured - which is why the
+    Sortino guard now runs the same `_measures_dispersion` predicate as the
+    Sharpe guard.  Reproduced at the foot of this test so the refusal stays
+    falsifiable rather than merely absent.
+
+    WHY THE OTHER DIRECTION IS NOT RE-ADDED.  "Sharpe absent, Sortino present"
+    is now unreachable rather than merely untested, and that is arithmetic
+    rather than a policy choice: the Sharpe is withheld exactly when
+    `_measures_dispersion(returns)` is False, i.e. when every finite return is
+    one number - and `np.minimum(0, r - target)` maps one number to one number,
+    so the downside series is constant on that window too and the Sortino is
+    withheld with it.  The two guards co-refuse on a book that never moved; the
+    only way to separate them is a book that moved and never lost, which is the
+    fixture below.
+    """
+    prices = _never_undershoots_varying_frame()
+    realised = prices["AAA.NS"].pct_change().dropna()
+    target = AnalyticsEngine().risk_free_rate / 252
+    downside = np.minimum(0.0, realised.to_numpy(dtype=float) - target)
+    # The fixture has to be discriminating in BOTH directions or the assertions
+    # below prove nothing: a real dispersion for the Sharpe to divide by, and a
+    # downside series that is constant because the book never lost.
+    assert realised.nunique() > 1, "the fixture must carry a real dispersion"
+    assert np.unique(downside).size == 1 and downside[0] == 0.0, (
+        "the fixture must never undershoot the Sortino target, or the Sortino "
+        "is absent for a reason that has nothing to do with this test"
+    )
+
+    metrics = _metrics(prices)
+    estimates = metrics["estimate_uncertainty"]["estimates"]
+    # Guard, for the same reason `test_the_window_is_long_enough_to_annualize`
+    # exists: below the sample floor BOTH ratios are withheld for the short
+    # window, which would satisfy half of this test for the wrong reason.
+    assert metrics["observations"] >= SHORT_SAMPLE_MIN_OBSERVATIONS
+
+    # The withheld leg, on the payload and on the disclosure entry that
+    # restates it.
+    assert metrics["sortino_ratio"] is None
+    assert estimates["sortino_ratio"]["point"] is None
+    assert estimates["sortino_ratio"]["status"] == "not_computed"
+    assert estimates["sortino_ratio"]["conf_int"] is None
+
+    # The measured sibling keeps the number AND the band, and carries no reason
+    # belonging to a field that is not the one it is attached to.
+    assert isinstance(metrics["sharpe_ratio"], float)
+    entry = estimates["sharpe_ratio"]
     assert entry["status"] == "computed"
+    assert entry["reason"] is None
+    assert entry["point"] == metrics["sharpe_ratio"]
     assert entry["conf_int"] is not None
+    assert entry["conf_int"][0] < entry["conf_int"][1], (
+        "a band with no width is satisfied by a block that publishes a "
+        "degenerate interval, which is not what this test is about"
+    )
+    assert entry["conf_int"][0] <= entry["point"] <= entry["conf_int"][1]
+
+    # THE RETIRED NUMBER, recomputed so the refusal above is falsifiable rather
+    # than merely absent.  Every zero-return book produced exactly this, which
+    # is the whole argument for withholding it.
+    risk_free_rate = AnalyticsEngine().risk_free_rate
+    retired = (252 * 0.0 - risk_free_rate) / ((risk_free_rate / 252) * np.sqrt(252))
+    assert retired == pytest.approx(-np.sqrt(252), rel=1e-12)
+    # ...and halving the rate leaves it unchanged, which is the cancellation
+    # that makes it a statement about the convention instead of the book.
+    half = risk_free_rate / 2
+    assert (252 * 0.0 - half) / ((half / 252) * np.sqrt(252)) == pytest.approx(
+        retired, rel=1e-12
+    )
 
 
 def test_a_measured_window_keeps_both_ratios_and_both_intervals():

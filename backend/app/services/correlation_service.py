@@ -8,7 +8,11 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from app.models.schemas import CorrelationDataPoint, CorrelationStabilityResponse
+from app.models.schemas import (
+    CORRELATION_ALL_PAIRS_MEASURABLE,
+    CorrelationDataPoint,
+    CorrelationStabilityResponse,
+)
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -38,7 +42,10 @@ def compute_rolling_avg_correlation(
 
     Returns:
         pd.Series indexed by Date with rolling average pairwise correlation values,
-        carrying only the dates on which all N*(N-1)/2 pairs were measurable
+        carrying only the dates on which all N*(N-1)/2 pairs were measurable.
+        The DENOMINATOR travels with it in `Series.attrs["pairs_expected"]` so a
+        caller can publish how many pairs the figure was taken over instead of
+        re-deriving C and hoping it agrees.
 
     Raises:
         ValueError: If no date clears the floor, or if the newest measurable date
@@ -113,6 +120,20 @@ def compute_rolling_avg_correlation(
             f"pairwise-complete observations in a {window_days}-day window)"
         )
 
+    # The denominator rides with the series, so `analyze_correlation_stability`
+    # publishes it without re-deriving C from the column count - a second
+    # derivation of the same number is a second thing that can disagree with the
+    # floor this series was actually gated by.
+    #
+    # A per-date measured count is deliberately NOT carried: on the published
+    # index every count equals `expected_pairs` by construction, so it would be
+    # a second copy of one number on every row.
+    #
+    # `attrs` is SET here rather than relied on to propagate: `mean(axis=1)`,
+    # `where` and `dropna` do not all pass it through unchanged, so a silent
+    # propagation loss would leave the disclosure null on every point.
+    avg_corr_series.attrs["pairs_expected"] = int(expected_pairs)
+
     return avg_corr_series
 
 
@@ -135,6 +156,11 @@ def analyze_correlation_stability(
     also carries ``alert_direction``: which of the four arms fired, in words as
     well as in token, so the reader is not left inferring sign from a severity.
 
+    Every published point also carries ``pairs_contributing`` - the denominator
+    the figure was taken over - and ``measurement_status`` naming the condition
+    that admitted the date. Without them the floor is invisible in the payload:
+    a reader sees a number and has to assume it was the book-wide average.
+
     Args:
         returns_df: Wide DataFrame of daily returns for assets
         window_days: Rolling window size (default 60 days)
@@ -147,6 +173,16 @@ def analyze_correlation_stability(
         returns_df=returns_df,
         window_days=window_days,
         min_periods=min_periods,
+    )
+
+    # Read, not assumed. `compute_rolling_avg_correlation` is the only thing that
+    # knows what floor it applied, so it carries the denominator on `attrs`. A
+    # stubbed or third-party series has no `attrs`, and then the count stays
+    # `None` - "not recorded" - rather than being back-filled with a C derived
+    # from a column count that may not be the one the series was gated on.
+    pairs_expected = avg_corr_series.attrs.get("pairs_expected")
+    pairs_expected = (
+        int(pairs_expected) if isinstance(pairs_expected, (int, np.integer)) else None
     )
 
     corr_values = avg_corr_series.values
@@ -227,6 +263,17 @@ def analyze_correlation_stability(
         )
 
     # Format series
+    #
+    # `pairs_contributing` is published on EVERY point, not just the newest,
+    # because the floor bites on interior dates too: a book with a late-listed
+    # leg carries a run of short dates before the tail resumes, and a reader
+    # comparing two points of that series has to be able to see that each was
+    # taken over the same denominator.
+    #
+    # Both new fields move together and are None together: a point with no
+    # recorded denominator cannot claim the all-pairs condition, since that
+    # claim IS the denominator. A one-sided pair (a count without the token, or
+    # the token without the count) would assert coverage it cannot show.
     series_points: List[CorrelationDataPoint] = []
     for dt, val in avg_corr_series.items():
         date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
@@ -236,6 +283,12 @@ def analyze_correlation_stability(
                 avg_correlation=round(float(val), 4),
                 threshold_90th=round(threshold_90th, 4),
                 threshold_75th=round(threshold_75th, 4),
+                pairs_contributing=pairs_expected,
+                measurement_status=(
+                    CORRELATION_ALL_PAIRS_MEASURABLE
+                    if pairs_expected is not None
+                    else None
+                ),
             )
         )
 

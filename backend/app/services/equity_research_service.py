@@ -54,7 +54,11 @@ class EquityResearchService:
             piotroski = custom_ratios.get("piotroski_score") or getattr(t, "piotroski_score", 0)
             graham_num = custom_ratios.get("graham_number") or getattr(t, "graham_number", None)
             
-            cmp = r.current_price or info.get("currentPrice") or 0.0
+            # Stop at None: no price measured is not a price of zero. The
+            # trailing `or 0.0` published a fabricated reading the UI would
+            # format as Rs 0 (see EquityResearchProfileResponse.current_price,
+            # which must be Optional[float] to carry the refusal).
+            cmp = r.current_price or info.get("currentPrice")
             graham_upside = None
             if graham_num and cmp and cmp > 0:
                 graham_upside = round(((graham_num - cmp) / cmp) * 100, 2)
@@ -228,10 +232,13 @@ class EquityResearchService:
             custom = getattr(t, "custom_ratios", {}) or {}
             rh_df = profile.ratios_history.to_dataframe(orient="columns")
             
-            cmp = profile.ratios.current_price or 0.0
+            cmp = profile.ratios.current_price
             graham = custom.get("graham_number")
             graham_upside = None
-            if graham and cmp > 0:
+            # `cmp is not None` is load-bearing, not defensive: cmp is None when
+            # the price is unmeasured, and `None > 0` raises TypeError, which the
+            # handler below would turn into a 503.
+            if graham and cmp is not None and cmp > 0:
                 graham_upside = round(((graham - cmp) / cmp) * 100, 2)
 
             return {

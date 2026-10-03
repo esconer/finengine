@@ -392,12 +392,55 @@ class APIConfigResponse(BaseModel):
 
 
 # Correlation Stability Schemas
+#: The only token `CorrelationDataPoint.measurement_status` can carry. Named at
+#: module level so the vocabulary has one name rather than a literal repeated at
+#: the publication site and in the tests that pin it. See the field's
+#: `description` for the token -> meaning mapping; it is a free-form `str`, so
+#: that prose is the only machine-readable place the vocabulary exists.
+CORRELATION_ALL_PAIRS_MEASURABLE = "all_pairs_measurable"
+
+
 class CorrelationDataPoint(BaseModel):
-    """Single date point for rolling correlation history"""
+    """Single date point for rolling correlation history.
+
+    `avg_correlation` is the mean over ALL C = N(N-1)/2 pairs, which is only a
+    measurement of the book's average pairwise correlation on a date where
+    every one of them was measurable. The two fields below publish WHY a point
+    exists: `pairs_contributing` is the denominator that number was taken over,
+    so a reader can see the book it was measured on rather than inferring it,
+    and `measurement_status` names the condition that admitted the date.
+
+    Both are ADDITIVE and defaulted. A payload built without them still
+    constructs and still serialises, and `None` means the denominator was NOT
+    recorded - never "some pairs were measured".
+    """
     date: str
     avg_correlation: float
     threshold_90th: Optional[float] = None
     threshold_75th: Optional[float] = None
+    pairs_contributing: Optional[int] = Field(
+        default=None,
+        description=(
+            "How many of the book's N*(N-1)/2 pairs were measurable on this "
+            "date, i.e. the denominator `avg_correlation` was taken over. "
+            "The prefactor in the documented formula is 1/C, so the figure is "
+            "the book's average only when this equals C; a date short of it is "
+            "not published at all rather than averaged over the pairs that "
+            "survived. Equal to C on every point a measurement service emits."
+        ),
+    )
+    measurement_status: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why this date was publishable. 'all_pairs_measurable' = all "
+            "C = N*(N-1)/2 pairs had enough pairwise-complete observations in "
+            "the trailing window, so the published figure is the book-wide "
+            "average and not a mean over a subset. null means no denominator "
+            "was recorded for this point (a caller that built the model "
+            "without one); it is never a default, and no token for a partial "
+            "measurement exists because a partial measurement is refused."
+        ),
+    )
 
 
 class CorrelationStabilityResponse(BaseModel):
@@ -813,7 +856,17 @@ class EquityResearchProfileResponse(BaseModel):
     industry: Optional[str] = None
     sub_industry: Optional[str] = None
     indices: List[str] = []
-    current_price: float
+    # NULLABLE, and that is the whole point of the change. `current_price` is
+    # whatever the provider resolved - `r.current_price or info["currentPrice"]`
+    # - so it is genuinely absent for a name the provider did not price. The
+    # producer now stops at None instead of substituting 0.0; a non-Optional
+    # float turned that honest null into a pydantic ValidationError and a 500 on
+    # `/company/{symbol}/full-profile`. `0.0` would have been a fabricated share
+    # price sitting beside the valuation ratios derived from it.
+    #
+    # Distinct from `StockQuoteResponse.current_price` (above), a different
+    # producer that always has a quote. Widen this one; leave that one.
+    current_price: Optional[float] = None
     market_cap_cr: Optional[float] = None
     high_52w: Optional[float] = None
     low_52w: Optional[float] = None
@@ -862,7 +915,12 @@ class CustomRatiosResponse(BaseModel):
     ev_to_ebitda: Optional[float] = None
     interest_coverage: Optional[float] = None
     cfo_to_pat_ratio: Optional[float] = None
-    current_price: float
+    # Nullable for the same reason as the profile response's `current_price`:
+    # this is the SAME measurement, carried through from the profile, so it is
+    # absent exactly when the profile's is. Declaring it non-nullable here made
+    # `/company/{symbol}/custom-ratios` a 500 on the honest null rather than
+    # publishing it.
+    current_price: Optional[float] = None
     ratios_history: Dict[str, Any] = {}
 
 
@@ -880,13 +938,45 @@ class ScreenerStockItem(BaseModel):
     book_value: Optional[float] = None
 
 
+class ScreenerUnscored(BaseModel):
+    """Which names the screen could not score, and what they were missing.
+
+    A fundamental the provider did not return cannot satisfy a constraint on
+    that fundamental, so the name is EXCLUDED rather than judged on a stand-in.
+    That exclusion is a false negative against the user - the name may well have
+    passed - so it has to be visible rather than silent. Measured on 75 live
+    Indian symbols: 92% carried the fundamentals and 8% did not, and the
+    absence is all-or-nothing per ticker (a name either resolved or it did not),
+    so this list is short.
+
+    `symbols` maps each dropped ticker to the SIDE-CHANNEL keys it was missing -
+    `roce`, `roe`, `pe`, `market_cap`, `dividend_yield` - which are the
+    `ScreenerService.run_custom_screen` names, not the provider's own field
+    names. The shape is the service's, declared here rather than invented.
+
+    Before this model existed the service published this block and pydantic v2's
+    default `extra='ignore'` dropped it on the wire: the channel was observable
+    at the service layer and invisible to every client.
+    """
+    count: int = 0
+    symbols: Dict[str, List[str]] = {}
+
+
 class ScreenerResponse(BaseModel):
-    """Screener result response"""
+    """Screener result response.
+
+    `unscored` is ADDITIVE and defaulted, so a screen that makes no such claim
+    (every prebuilt strategy) still constructs and still serialises - at null.
+    Null means "this screen does not report unscored names", NOT "nothing was
+    dropped": only the custom screen can drop a name for missing fundamentals,
+    and it reports every drop it made.
+    """
     strategy: str
     name: str
     description: str
     count: int
     stocks: List[ScreenerStockItem]
+    unscored: Optional[ScreenerUnscored] = None
 
 
 class CustomScreenRequest(BaseModel):

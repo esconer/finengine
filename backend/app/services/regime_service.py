@@ -229,10 +229,10 @@ def classify(
        the estimator, which consumed only `feats` above and was decoded before
        these figures are computed):
        - Computes geometric CAGR for each state to eliminate arithmetic
-         Jensen's inequality skew. When the state's compounded product is not
-         positive that extrapolation is unavailable and an arithmetic mean is
-         used instead; `ann_ret_method` publishes which definition produced
-         each number.
+         Jensen's inequality skew. A zero compounded product is still a defined
+         geometric figure (-100%/yr), so only a NEGATIVE product falls back to
+         an arithmetic mean; `ann_ret_method` publishes which definition
+         produced each number.
        - Annualized volatility is sqrt(252 * variance of the state's daily
          returns): the variance is pooled and the sqrt taken ONCE. Averaging
          per-window ANNUALIZED sigmas would apply Jensen's inequality in the
@@ -301,7 +301,22 @@ def classify(
     # Benchmark-derived continuous features: 21-day log return and 21-day
     # realized volatility. `close` comes from `bench_data`, so both describe
     # the benchmark; this function never sees the portfolio.
-    ret21 = np.log(close / close.shift(REGIME_FEATURE_WINDOW_DAYS)).dropna()
+    #
+    # The log is computed under np.errstate because a reconstructed close that
+    # reaches 0 -- the total-loss day -- makes it divide by zero and, one row
+    # later, take the log of a negative ratio. Those are the two OUTCOMES this
+    # function already decides on: `dropna()` drops the NaN (a return below
+    # -100% flips the sign of the close) and the StandardScaler below refuses
+    # the -inf that survives it. The suite does NOT promote RuntimeWarning to
+    # an error -- that was tried and reverted (see pyproject.toml) -- so this
+    # is not here to satisfy a filter. It is here so the arithmetic still
+    # REACHES the refusal that was always going to answer this input rather than
+    # raising out of the ratio itself, and so a warning the caller cannot act
+    # on is not emitted for an input the function is built to reject. The
+    # warning is not the decision point; what happens to the value afterwards
+    # is.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret21 = np.log(close / close.shift(REGIME_FEATURE_WINDOW_DAYS)).dropna()
     vol21 = (ret_1d.rolling(REGIME_FEATURE_WINDOW_DAYS).std() * np.sqrt(TRADING_DAYS_PER_YEAR)).dropna()
 
     common = ret21.index.intersection(vol21.index)
@@ -347,28 +362,33 @@ def classify(
         n_sub = len(r_sub)
         # `ann_ret` is a GEOMETRIC figure: the state's compounded product raised
         # to 252/n. It is reported as such, except when the product cannot be
-        # raised to a fractional power or has been wiped out, in which case the
-        # definition silently changed to an ARITHMETIC mean and said nothing.
-        # `ann_ret_method` now publishes which of the three produced the number.
+        # raised to a fractional power, in which case the definition switches to
+        # an ARITHMETIC mean. `ann_ret_method` publishes which of the three
+        # produced the number.
         if n_sub > 0:
             cum_prod = np.prod(1.0 + r_sub)
             if cum_prod > 0:
                 cagr = float((cum_prod ** (252.0 / n_sub)) - 1.0)
                 ann_ret_method = "geometric_cagr_from_compounded_state_returns"
             elif cum_prod == 0:
-                # A zero product means the state's wealth was total. Here the
-                # geometric extrapolation IS defined (0 ** positive - 1 ==
-                # -1.0), so routing to the arithmetic mean discards a correct
-                # answer and substitutes a different quantity that ignores the
-                # wipeout entirely -- it can even come out POSITIVE. Measured
-                # as unreachable through `classify` today: the day that zeroes
-                # the product also zeroes the reconstructed `close`, so ret21
-                # is -inf there, survives `dropna()` (which drops NaN, not
-                # -inf) and the StandardScaler refuses the matrix. Kept
-                # because the value is now published with its method, so a
-                # future caller reaching it is disclosed rather than misled.
-                cagr = float(r_sub.mean() * TRADING_DAYS_PER_YEAR)
-                ann_ret_method = "arithmetic_mean_fallback_product_wiped_out"
+                # A zero product means the state's wealth was total, and the
+                # geometric extrapolation IS defined here: 0 ** positive == 0,
+                # so the answer is -100%/yr. This is the same formula, and the
+                # same method token, as the branch above -- there is no second
+                # definition to disclose. It used to route to the arithmetic
+                # mean of the state's daily returns times 252, which discards
+                # the wipeout entirely and can come out POSITIVE (29 days of
+                # +5% and one -100% averages +1.5%/day), and `_label_states_by_risk`
+                # sorts on this figure, so such a state was crowned `bull`.
+                # Measured as unreachable through `classify` today: the day
+                # that zeroes the product also zeroes the reconstructed `close`,
+                # so ret21 is -inf there, survives `dropna()` (which drops NaN,
+                # not -inf) and the StandardScaler refuses the matrix. Fixed
+                # regardless, because a state that lost everything has a known
+                # annualized return of -1.0 and there is no threshold or
+                # tolerance in reaching that.
+                cagr = float((cum_prod ** (TRADING_DAYS_PER_YEAR / n_sub)) - 1.0)
+                ann_ret_method = "geometric_cagr_from_compounded_state_returns"
             else:
                 # Negative product: a negative base has no real fractional
                 # power, so genuinely no geometric annualization exists and
@@ -682,16 +702,24 @@ def _regime_metadata(
             # geometric CAGR normally, and an arithmetic mean times 252 whenever
             # the compounded product was not positive, with the switch
             # undisclosed. `ann_ret_method` is now the co-published qualifier
-            # that names the definition each number actually used.
+            # that names the definition each number actually used. The
+            # wiped-out token is still named here, as RETIRED: it is no longer
+            # published, because a zero compounded product has a defined
+            # geometric annualization and needs no second definition.
             "states[].ann_ret_method": (
                 "definition_qualifier_for_states[].ann_ret: "
                 "'geometric_cagr_from_compounded_state_returns' means ann_ret is "
                 "the geometric CAGR named above (compounded product raised to "
-                "252/n, minus 1); 'arithmetic_mean_fallback_product_wiped_out' "
-                "and 'arithmetic_mean_fallback_product_negative' mean the "
-                "compounded product was not positive and ann_ret is instead an "
-                "ARITHMETIC mean of the state's daily returns times 252 -- a "
-                "different quantity, not another estimate of the same one; "
+                "252/n, minus 1); 'arithmetic_mean_fallback_product_negative' "
+                "means the compounded product was NEGATIVE, so no real fractional "
+                "power of it exists, and ann_ret is instead an ARITHMETIC mean of "
+                "the state's daily returns times 252 -- a different quantity, not "
+                "another estimate of the same one; "
+                "'arithmetic_mean_fallback_product_wiped_out' is RETIRED and is "
+                "no longer published: a ZERO compounded product is a total loss "
+                "whose geometric annualization is defined and equals -1.0, so it "
+                "now reports 'geometric_cagr_from_compounded_state_returns' "
+                "rather than an arithmetic mean that ignores the wipeout; "
                 "'no_observations' means the state captured no trading days and "
                 "ann_ret is 0.0 by construction rather than by measurement"
             ),

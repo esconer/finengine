@@ -193,13 +193,25 @@ class TestAnalyticsEngine:
     
     @pytest.mark.asyncio
     async def test_concentration_analysis_empty_weights(self):
-        """Test concentration analysis with empty weights"""
+        """Test concentration analysis with empty weights.
+
+        `herfindahl_index` is None, not 0.0. HHI is the sum of squared weights,
+        and for any book of n holdings that sum is bounded below by 1/n > 0 --
+        so 0.0 is unreachable for a book that exists, and publishing it would say
+        "concentration was measured and found to be zero", which is a claim
+        about a book that was never measured. None is the honest answer. See
+        tests/test_concentration_empty_hhi_absent.py, which pins the same
+        contract at the route and pins the complementary `n == 1` invariant
+        (`herfindahl_index == 1.0`, `diversification_score == 0.0`) -- note that
+        a single holding IS a measured book, so its 0.0 diversification score
+        stays correct and must not follow this field to None.
+        """
         engine = AnalyticsEngine()
         
         result = await engine.concentration_analysis({})
         
         assert result["error"] == "No position data available"
-        assert result["herfindahl_index"] == 0.0
+        assert result["herfindahl_index"] is None
     
     @pytest.mark.asyncio
     async def test_factor_exposure_analysis(self, mock_price_dataframe):
