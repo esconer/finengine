@@ -99,3 +99,8 @@ backups/
 /.audit-exports/
 .audit-exports/
 
+
+# Working material: audit ledgers, issue drafts, evidence runs, and campaign plans.
+# Useful locally, and full of real ticker names and findings about THIS
+# portfolio's books. Never version it.
+.scratch/
