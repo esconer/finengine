@@ -70,9 +70,11 @@ frontend/html.meta.json.gz
 **/.next/
 **/.pytest_cache/
 **/__pycache__/
+**/.ruff_cache/
 **/coverage/
 **/dist/
 **/build/
+*.db
 *.db-wal
 *.db-shm
 *.sqlite

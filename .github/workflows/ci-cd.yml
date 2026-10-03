@@ -1,10 +1,27 @@
 name: CI/CD Pipeline
 
+# Every `uses:` in this file is pinned to a commit SHA, with the release tag in
+# a trailing comment. A floating tag (@v4, @master) resolves at run time, so the
+# code that executes is whatever the publisher pushed most recently -- including
+# a compromised or force-moved tag. Resolve a tag to its commit with:
+#   git ls-remote --tags https://github.com/<owner>/<repo>.git \
+#     'refs/tags/vX.Y.Z' 'refs/tags/vX.Y.Z^{}'
+# Annotated tags have TWO SHAs: the tag object and the commit it points at. Use
+# the `^{}` one. `uses:` requires a commit, and an annotated tag object fails.
+
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+
+# Superseded commits on a branch are dead work. Every push to a PR re-runs the
+# whole matrix (backend, frontend, security, integration, production images);
+# without this, five rapid pushes to one branch hold five full runner sets for
+# the same commit's worth of work, and the newest run finishes last anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -27,10 +44,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -52,10 +69,16 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-uv-
 
+    # `--locked`, not `--frozen`. `--frozen` installs uv.lock without checking
+    # it still matches pyproject.toml, so editing the manifest without re-locking
+    # installs the OLD dependency set and passes. `--locked` asserts the two
+    # agree and fails the build on drift -- which is the one thing a CI job is
+    # for. (backend/Dockerfile deliberately keeps `--frozen`; see the comment
+    # there for why an image build must not fail on a lock check.)
     - name: Install dependencies
       working-directory: backend
       run: |
-        uv sync --frozen --extra dev --group dev
+        uv sync --locked --extra dev --group dev
 
     - name: Run backend linting
       working-directory: backend
@@ -88,12 +111,17 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       with:
-        bun-version: latest
+        # A literal, not `latest`. `latest` is resolved by the action at run
+        # time, so it moves under the build with no commit and no review --
+        # the same hazard as a floating action tag, one level down. 1.4.2 is
+        # both the current release tag in oven-sh/bun and what this repo runs
+        # locally, so the two agree.
+        bun-version: 1.4.2
 
     - name: Install dependencies
       working-directory: frontend
@@ -138,7 +166,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     # Pinned to the v0.36.0 release commit. This was the only mutable
     # ref in the file (`@master`), which is a supply-chain hazard: whatever
@@ -156,8 +184,16 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
+    # Owner corrected as part of pinning. This read
+    # `dependencies/dependency-review-action@v3`, and there is no `dependencies`
+    # owner on GitHub: api.github.com/repos/dependencies/dependency-review-action
+    # returns 404 and `git ls-remote` returns "Repository not found". The action
+    # lives at `actions/dependency-review-action`. The step could never have
+    # downloaded, so `security` failed on every run and, since
+    # `production-images` needs it, nothing published. Verified: the SHA below
+    # is the commit `refs/tags/v3.1.5` in actions/dependency-review-action.
     - name: Run dependency check
-      uses: dependencies/dependency-review-action@v3
+      uses: actions/dependency-review-action@c74b580d73376b7750d3d2a50bfb8adc2c937507 # v3.1.5
 
   # Integration Tests
   integration:
@@ -166,10 +202,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
     - name: Run published-service integration test
       run: |
@@ -192,13 +228,13 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
+      uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -230,7 +266,7 @@ jobs:
 
     - name: Notify image publish status
       if: always()
-      uses: 8398a7/action-slack@v3
+      uses: 8398a7/action-slack@77eaa4f1c608a7d68b38af4e3f739dcd8cba273e # v3.19.0
       with:
         status: ${{ job.status }}
         channel: '#deployments'
@@ -247,7 +283,7 @@ jobs:
     if: failure()
     steps:
     - name: Notify failure
-      uses: 8398a7/action-slack@v3
+      uses: 8398a7/action-slack@77eaa4f1c608a7d68b38af4e3f739dcd8cba273e # v3.19.0
       with:
         status: failure
         channel: '#alerts'
