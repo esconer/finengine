@@ -57,6 +57,16 @@ from app.api.analytics import (
 )
 from app.models.database import PortfolioPosition
 
+# The no-book concentration shape is ONE contract, derived once in
+# `test_concentration_empty_hhi_absent.py`. Imported rather than restated: the
+# copy this file used to carry (`diversification_score == 0.0`) is the second
+# time a hand-written key here has gone stale under a change to the shape, and
+# a hand-written list is checked against nothing but itself.
+from tests.test_concentration_empty_hhi_absent import (
+    WITHHELD_ON_AN_EMPTY_BOOK,
+    ZERO_VALUED_ON_AN_EMPTY_BOOK,
+)
+
 
 # ---------------------------------------------------------------------------
 # seams
@@ -671,20 +681,56 @@ async def test_the_engine_s_five_disclosures_travel_through_the_route_end_to_end
 
 @pytest.mark.asyncio
 async def test_no_book_publishes_the_count_that_disambiguates_its_zero():
-    """`diversification_score: 0.0` on an empty book is not a measurement.
+    """An empty book withholds what it cannot measure, and says so with a count.
 
-    It is indistinguishable from a measured single-holding book, so the count
-    that disambiguates it is published beside it: `n_holdings: 0`, the engine's
-    own stated way of telling the two apart, next to `zero_metrics` and the
-    error. The SCALE is not restated here - this branch never calls the engine,
-    and a second copy of that text is what a single implementation avoids.
+    THE SHAPE OF THE CLAIM GOT STRONGER, NOT WEAKER.  This test used to pin
+    `diversification_score: 0.0` beside `n_holdings: 0` and read the pair as
+    "the count disambiguates the zero". That argument is the one the shape no
+    longer accepts: 0.0 is not a value any book measures on that field, so
+    there was no reading for the count to disambiguate in the first place - a
+    reader had to consult `n_holdings` to learn they were looking at a third
+    value sitting between the two that occur (1.0 at one holding, 0.25 at four
+    equal holdings). The nine statistics are now withheld, so the zero this
+    test named is not corrected to a different number, it is replaced by an
+    ABSENCE plus the count that explains it - and a withheld key plus its
+    reason is a statement the old zero could not make at all.
+
+    Both halves are looped from the derived constants rather than hand-named,
+    because a hand-written key in this file is what went stale when the shape
+    moved; and the two lists cannot be satisfied by one blanket conversion of
+    the whole shape to `None`, which is what keeps the surviving zeros real.
+
+    The SCALE is not restated here - this branch never calls the engine, and a
+    second copy of that text is what a single implementation avoids.
     """
     result = await get_concentration_metrics(
         db=_db([]), data_service=Mock(),
         analytics_engine=analytics_mod.AnalyticsEngine(),
     )
     assert result["zero_metrics"] is True
-    assert result["diversification_score"] == 0.0
+    # Every statistic this shape cannot measure is published as null: present,
+    # so a `.get(key, 0.0)` reader gets `None` rather than a number, and
+    # absent only in the sense of unreadable.
+    for key in WITHHELD_ON_AN_EMPTY_BOOK:
+        assert key in result, (
+            f"{key} was dropped from the no-book shape; a missing key reads as "
+            "an unrecorded measurement"
+        )
+        assert result[key] is None, (
+            f"the route published {result[key]!r} for {key} on a book with no "
+            "holdings. Each of these nine is a value some book really measures, "
+            "so a number here is a stand-in wearing a measurement's key"
+        )
+    # And what zero IS a true statement about an absent book survives: the
+    # count, and the weight mass there is none of.
+    for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+        assert key in result, f"{key} was dropped from the no-book shape"
+        assert result[key] == 0, (
+            f"{key} must stay 0 on an empty book, got {result[key]!r}; zero is "
+            "the measurement for the count and for the weight totals, which is "
+            "why they are not withheld with the nine above"
+        )
+    assert set(WITHHELD_ON_AN_EMPTY_BOOK).isdisjoint(ZERO_VALUED_ON_AN_EMPTY_BOOK)
     assert result["n_holdings"] == 0
     assert result["error"] == "No portfolio positions found"
     # The route publishes no scale of its own anywhere.

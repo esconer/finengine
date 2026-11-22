@@ -103,7 +103,34 @@ class TestRiskContribution:
         assert vol_rc["MSFT"] > vol_rc["AAPL"]
 
         cvar_rc = data["cvar_tail"]
-        assert abs(sum(cvar_rc.values()) - 1.0) < 1e-6 or cvar_rc == {}
+        # The tail model published shares on this book, so it has to publish a
+        # complete decomposition of them.  Previously this read
+        # `abs(sum(...) - 1.0) < 1e-6 or cvar_rc == {}`, and the right-hand
+        # clause made the whole assertion vacuous on an empty result: a book
+        # whose tail model measured nothing satisfied it exactly as well as the
+        # no-hedge book it was written for, so nothing about the hedge case was
+        # ever pinned.  The `or` is gone; the non-empty map is a precondition,
+        # not an alternative reading.
+        assert cvar_rc, "the tail model published no shares for a book it measured"
+        # Direction, not an exact bound: every published share is a share of a
+        # real tail loss, so no leg on this unhedged book may carry a negative
+        # one. A hedge leg is published as a negative share (the hedge test
+        # below pins that), not by shrinking everyone else.
+        assert all(share >= 0.0 for share in cvar_rc.values()), cvar_rc
+        # WHY THE ORDINARY BOOK'S NUMBERS DID NOT MOVE. The fix replaced a
+        # denominator of `sum(abs(c))` with `-sum(c)`, and on a book with no
+        # offsetting leg those are the same number - checked here rather than
+        # pinned as 6dp literals, so the proof does not rot when the fixture's
+        # calendar window moves and cannot silently pass by re-deriving itself
+        # from the code under test.
+        no_hedge = [-0.4, -0.25, -0.05]
+        assert -sum(no_hedge) == sum(abs(c) for c in no_hedge)
+        # The total is checked at the project's own 6dp-rounding tolerance
+        # (~1e-4, per the optimizer note below) rather than 1e-6: a tighter
+        # bound would be pinning rounding, not the invariant.  What is being
+        # pinned is that the block is a unit decomposition - which is what
+        # makes a shortfall a `rounding_residual` and not a hidden hedge.
+        assert sum(cvar_rc.values()) == pytest.approx(1.0, abs=1e-4)
 
     @pytest.mark.asyncio
     async def test_sector_rollup_present(self, async_client, seeded_positions, patch_market):
@@ -113,6 +140,102 @@ class TestRiskContribution:
             resp = await async_client.get("/api/v1/analytics/risk-contribution")
         rollup = resp.json()["sector_rollup"]["volatility"]
         assert rollup == {"Technology": 1.0}
+
+    @pytest.mark.asyncio
+    async def test_a_real_hedge_is_published_as_an_offset_not_as_a_rounding_residual(
+        self, async_client, test_db, patch_market,
+    ):
+        """A gold ETF in the book must not be rounded away.
+
+        The tail model used to normalise its shares by the sum of MAGNITUDES,
+        so a leg that gains on the book's worst days put its size into the
+        denominator while subtracting from the numerator: the published shares
+        summed to net/gross instead of 1 and the difference was published as
+        `rounding_residual`, i.e. a real offset described as 1e-12 of float
+        noise. The sibling volatility leg at
+        `contrib = contrib / contrib.sum()` already normalised by the SIGNED
+        sum, so this pins the same contract on the tail leg.
+        """
+        from datetime import datetime as _dt
+
+        from app.models.database import PortfolioPosition
+
+        # A book with a real offsetting leg: two equity legs that fall together
+        # and a gold leg built to RISE on exactly the sessions they fall. Weights
+        # come from market value, so they are set here rather than stored.
+        test_db.add_all([
+            PortfolioPosition(
+                ticker="AAPL", weight=0.45, quantity=10.0, buy_price=150.0,
+                last_price=180.0, market_value=45_000.0, sector="Technology",
+                industry="Hardware", added_on=_dt(2020, 1, 1),
+            ),
+            PortfolioPosition(
+                ticker="MSFT", weight=0.40, quantity=10.0, buy_price=300.0,
+                last_price=420.0, market_value=40_000.0, sector="Technology",
+                industry="Software", added_on=_dt(2020, 1, 1),
+            ),
+            PortfolioPosition(
+                ticker="GOLDM", weight=0.15, quantity=10.0, buy_price=50.0,
+                last_price=55.0, market_value=15_000.0, sector="Gold",
+                industry="Precious Metals", added_on=_dt(2020, 1, 1),
+            ),
+        ])
+        await test_db.commit()
+
+        days = 300
+        rng = np.random.default_rng(23)
+        aapl = rng.normal(0.0004, 0.014, days)
+        msft = 0.8 * aapl + rng.normal(0.0, 0.005, days)
+        # The hedge: negative of the risky legs' own move, so its tail-day
+        # contribution has the opposite sign to theirs by construction rather
+        # than by luck of the draw.
+        goldm = -0.9 * (aapl + msft) + rng.normal(0.0, 0.001, days)
+
+        def _price(rets, seed):
+            dates = pd.date_range("2025-01-01", periods=days, freq="B")
+            close = 100 * np.exp(np.cumsum(rets))
+            return pd.DataFrame({
+                "date": dates, "open": close * 0.995, "high": close * 1.008,
+                "low": close * 0.992, "close": close, "adj_close": close,
+                "volume": np.full(days, 250_000.0), "ticker": f"S{seed}",
+            })
+
+        frames = {
+            "AAPL": _price(aapl, 1), "MSFT": _price(msft, 2), "GOLDM": _price(goldm, 3),
+        }
+        ctx1, ctx2 = patch_market(frames=frames)
+        with ctx1, ctx2:
+            resp = await async_client.get("/api/v1/analytics/risk-contribution")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        cvar_rc = body["positions"]["cvar_tail"]
+        assert set(cvar_rc) == {"AAPL", "MSFT", "GOLDM"}, cvar_rc
+
+        # THE PREMISE, asserted rather than assumed: the gold leg's tail-day
+        # contribution really does have the opposite sign, so this book is a
+        # genuine hedge and not a fixture that happens to sum to one.
+        assert cvar_rc["GOLDM"] < 0.0, cvar_rc
+
+        # Direction of the fix, not a bound on a number chosen to pass. The
+        # shares decompose the NET tail loss, so the legs that lost money carry
+        # shares summing to MORE than one - the offset is subtracted from them,
+        # which is the only place it can live if the block is to total 1. Under
+        # magnitude normalisation the positive shares summed to LESS than one
+        # and the shortfall leaked into `rounding_residual`.
+        assert sum(v for v in cvar_rc.values() if v > 0) > 1.0, cvar_rc
+        assert sum(cvar_rc.values()) == pytest.approx(1.0, abs=1e-4)
+
+        # And the block says so: the declared total is 1 and the residual is
+        # display rounding, not the hedge.
+        record = body["contribution_basis"]["per_model"]["cvar_tail"]
+        assert record["published_total"] == pytest.approx(1.0, abs=1e-4)
+        assert abs(record["rounding_residual"]) <= 1e-4, record
+
+        # The sector rollup sums the same per-leg shares, so it inherits the
+        # unit total rather than reproducing the shortfall.
+        rollup = body["sector_rollup"]["cvar_tail"]
+        assert sum(rollup.values()) == pytest.approx(1.0, abs=1e-4), rollup
+        assert rollup["Gold"] < 0.0, rollup
 
 
 @pytest.mark.api

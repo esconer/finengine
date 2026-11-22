@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   /* config options here */
-  reactCompiler: false, // Disabled for stability
+  reactCompiler: true,
   // Emit .next/standalone — frontend/Dockerfile copies it to run the app.
   output: 'standalone',
   compress: true,

@@ -3644,8 +3644,8 @@ def _directives(export: Export) -> list[tuple[str, str, dict[str, Any]]]:
 def num_024_trade_directive_publishes_its_basis(export: Export) -> list[Finding]:
     """Catches SI-1/G9: an actionable directive with no published basis.
 
-    ``pairs`` published ``"LONG_SPREAD (Long ELECTCAST.NS, Short MCX.NS)"`` and
-    ``"SHORT_SPREAD (Short JUNIORBEES.NS, Long MIDCAPIETF.NS)"`` on pairs where
+    ``pairs`` published ``"LONG_SPREAD (Long SURYODAY.NS, Short EXCHANGE.NS)"`` and
+    ``"SHORT_SPREAD (Short SMALLCAP.NS, Long MIDETF.NS)"`` on pairs where
     ``johansen_agrees_with_decision`` is ``false``, out of 91 Engle-Granger
     tests whose p-values are indistinguishable from Uniform(0,1)
     (D=0.131, p=0.080).  ``bonferroni``/``fdr``/``multiple_testing``/

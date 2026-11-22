@@ -10,7 +10,7 @@ ROUTE behaviour that consumed it wrongly:
   return observations, never a portfolio or global count;
 * the portfolio-level gates publish the portfolio's own return sample.
 
-The v3 evidence this closes: NIFTYIETF carried 20 own return observations while
+The v3 evidence this closes: TIDETEST carried 20 own return observations while
 the warning line quoted the portfolio's 39/176-day counts, and the line said
 "held since" an inferred pre-`added_on` date.
 """
@@ -160,23 +160,23 @@ async def test_per_ticker_warning_uses_own_observations_not_the_portfolio():
     dates = _bdays(300)
     db = _db([
         _pos("LONG.NS", added_on=datetime(2020, 1, 1)),
-        _pos("NIFTYIETF.NS", added_on=datetime(2026, 6, 8)),
+        _pos("TIDETEST.NS", added_on=datetime(2026, 6, 8)),
     ])
     # The ETF only listed 20 sessions before the intersection start.
     late = dates[-20:]
 
     result = await get_realized_risk(
-        tickers="LONG.NS,NIFTYIETF.NS", start="2025-01-01", end="2026-09-07",
+        tickers="LONG.NS,TIDETEST.NS", start="2025-01-01", end="2026-09-07",
         db=db,
         data_service=_Market({
             "LONG.NS": _frame(dates, "LONG.NS", seed=1),
-            "NIFTYIETF.NS": _frame(late, "NIFTYIETF.NS", seed=2),
+            "TIDETEST.NS": _frame(late, "TIDETEST.NS", seed=2),
         }),
         analytics_engine=AnalyticsEngine(),
     )
 
     covered = result["history_coverage"]["covered_days"]
-    etf = result["positions"]["NIFTYIETF.NS"]
+    etf = result["positions"]["TIDETEST.NS"]
     assert etf["return_observations"] == 19
     assert etf["is_limited_history"] is True
     # The portfolio's sample is bounded by its SHORTEST held leg, not its longest.
@@ -189,7 +189,7 @@ async def test_per_ticker_warning_uses_own_observations_not_the_portfolio():
     assert result["history_coverage"]["annualized"] is False
 
     message = next(
-        w["message"] for w in result["warnings"] if w["ticker"] == "NIFTYIETF.NS"
+        w["message"] for w in result["warnings"] if w["ticker"] == "TIDETEST.NS"
     )
     assert "19 own return observations" in message
     # No portfolio-level count may appear inside a per-ticker line. This has to be

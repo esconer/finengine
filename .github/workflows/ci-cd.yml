@@ -90,10 +90,55 @@ jobs:
     # point in the job, so collecting it here failed the build on every push. It
     # is still marked (not deleted) and still runs, standalone, in the
     # `integration` job once Compose is up.
+    # `-n 4 --dist loadfile`, not `-n 4` alone. The suite is compute-bound (16 of
+    # 2868 tests carry 66.5% of call time, the top 10 carry 44.5%), so spreading
+    # it over workers is where this job's wall clock goes.
+    #
+    # `--dist loadfile` is required, not a preference. xdist's default `load`
+    # hands out individual tests, so each worker re-imports `main` per test it
+    # owns -- 7.65s measured here -- and an 18-test single file went 10.5s -> 20.6s
+    # under plain `-n 4`, nearly 2x slower than running it serially. `loadfile`
+    # keeps each expensive file whole on one worker, so a worker starts once and
+    # the per-file memoised work is computed once rather than once per test.
+    #
+    # `-n 4`, not `-n auto`: this job's runner has 4 vCPUs, and every worker holds
+    # a full pandas/numpy/scipy/statsmodels/arch/cvxpy graph, so oversubscribing
+    # the cores just adds memory pressure for no throughput. Stating the number
+    # keeps the worker count from silently tracking whatever a runner image
+    # happens to report.
+    #
+    # Parallel-safe, audited, no exclusions needed: `tmp_path` gives each test and
+    # each worker its own SQLite file; `:memory:` + `StaticPool` is per-process;
+    # every `os.environ` site is monkeypatch-scoped; the module-global service
+    # singletons are per-process; and the autouse `reset_service_memos` fixture
+    # clears all seven class-level memo dicts around every test. No fixed ports,
+    # no bind addresses, no repo-relative writes.
     - name: Run backend tests with 80% coverage gate
       working-directory: backend
       run: |
-        uv run pytest -p no:cacheprovider tests/ -m "not integration" --cov=app --cov-fail-under=80 --cov-report=xml --cov-report=term
+        uv run pytest -p no:cacheprovider --dist loadfile -n 4 tests/ -m "not integration" --cov=app --cov-fail-under=80 --cov-report=xml --cov-report=term
+
+    # ADVISORY, CANNOT FAIL THE BUILD. `|| true` is the whole point: the script
+    # is run without --strict for exactly this step, and the `|| true` is a
+    # second belt so that adding --strict later, or a finding appearing, cannot
+    # turn this into a gate by accident. Findings accumulate in the log until
+    # the backlog is zero and someone deliberately promotes it to a gate.
+    #
+    # It reports test functions whose pass carries no information about values:
+    # no assertion of any kind (no `assert`, `pytest.raises`, `self.assert*`, and
+    # none reached transitively through a helper/fixture/sibling test module),
+    # only-`assert x is not None`, a self-equal comparison, or a byte-identical
+    # assert shared with another test in the same file. Pure stdlib `ast`; it
+    # imports neither pytest nor `app`, so it needs no dependency install and
+    # runs in ~15s over all 162 files.
+    #
+    # Not in `.githooks`: that hook sees only STAGED files, so a run there would
+    # report on a fragment of the suite and look like a different verdict than
+    # the same file in CI.
+    - name: Report unfailable tests (advisory, does not fail the build)
+      working-directory: backend
+      run: |
+        uv run --no-project python ../scripts/check_test_assertions.py || true
 
     - name: Build backend Docker image
       run: |

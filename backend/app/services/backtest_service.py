@@ -16,13 +16,60 @@ logger = setup_logger(__name__)
 
 TRADING_DAYS = 252
 
+#: Default friction, in basis points, per UNIT OF ONE-WAY TURNOVER.
+#:
+#: THE UNIT IS THE PART THAT WAS WRONG, and it was undocumented. This function
+#: measures `turnover = 0.5 * sum|dw|` and applies `cost_factor` to that, so a
+#: book that is fully exited and fully re-entered accrues 2.0 of turnover and
+#: pays `2 * transaction_cost_bps / 10000` over one round trip. The parameter is
+#: a ONE-WAY rate. Nothing in the signature, the Pydantic field, the route or
+#: the frontend said so, so a caller reasoning from the published round-trip
+#: figure below and passing THAT number would have doubled the friction.
+#:
+#: BASIS -- Indian NSE equity DELIVERY round trip, statutory levies only.
+#: Brokerage is excluded on purpose: it is broker- and size-dependent (the same
+#: source models a Rs 20/order cap), so no single constant is honest for it.
+#: Component table taken from the repo's own sourced note at
+#: `.scratch/data-correctness-2026-09/p1-bfinance-0.2.0/issues/
+#: 16-costs-date-keyed-schedule.md`, which cites the NSE investor levies pages:
+#:
+#:   STT                  0.100%      buy and sell
+#:   Stamp duty           0.015%      BUY ONLY (0% on the sell)
+#:   Exchange txn (NSE)   0.0030699%  buy and sell
+#:   SEBI turnover        Rs 10/crore = 0.0001%   buy and sell
+#:   GST                  18% on (exchange txn + SEBI) ONLY -- not on STT and
+#:                        not on stamp duty
+#:
+#:     buy  leg  = 11.8740 bps
+#:     sell leg  = 10.3740 bps
+#:     ROUND TRIP = 22.2481 bps
+#:
+#: 22.2481 is the "~22-23bps" this default is measured against; it is NOT the
+#: value to pass in, because the one-way application halves it: 22.2481 / 2 =
+#: 11.1240, rounded to 11.1. The previous default of 10.0 therefore modelled a
+#: 20.0 bps round trip -- understated by ~11%, not by the ~2x that comparing
+#: the raw literal against the round trip suggests.
+#:
+#: WHAT THIS IS NOT, said here rather than left for a reader to infer:
+#:   * UNDATED. Finance Act 2026 (assent 30-Mar-2026; NSE Circular Ref 02/2026
+#:     dated 31-Mar-2026) moved option-sale, option-exercise and futures-sale
+#:     STT with effect from 01-Apr-2026. Equity DELIVERY STT was left unchanged,
+#:     so this figure is equally applicable on both sides of that boundary --
+#:     but that is a property of the delivery line alone, and it will not
+#:     survive a levy change to it. A date-keyed schedule is the real fix and
+#:     is deliberately not built here.
+#:   * SYMMETRIC. Stamp duty is buy-only, so the buy leg costs 1.5 bps more
+#:     than the sell leg and one scalar cannot express that. This default
+#:     averages the two legs rather than asserting either.
+DEFAULT_TRANSACTION_COST_BPS = 11.1
+
 
 def run_walk_forward_backtest(
     returns: pd.DataFrame,
     strategy: str = "hrp",
     rebalance_freq_days: int = 21,
     lookback_days: int = 252,
-    transaction_cost_bps: float = 10.0,
+    transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
     risk_free_rate: float = 0.02,
 ) -> Dict[str, Any]:
     """
@@ -78,6 +125,9 @@ def run_walk_forward_backtest(
         requested_windows_honoured = False
 
     assets = list(returns.columns)
+    # One-way rate applied to one-way turnover: a full exit and re-entry pays
+    # 2 * this, i.e. one round trip. See DEFAULT_TRANSACTION_COST_BPS for the
+    # statutory derivation and why the default is 11.1 and not 22.2.
     cost_factor = transaction_cost_bps / 10000.0
 
     # Rebalance schedule indices. The final boundary must be len(returns)

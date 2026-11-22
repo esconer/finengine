@@ -34,6 +34,7 @@ from app.services.ai_context_service import (
     _normalize_data_status,
     _section_coverage,
 )
+from app.services.analytics_engine import AnalyticsEngine
 
 
 # --------------------------------------------------------------------------
@@ -219,13 +220,15 @@ def test_declared_data_status_aliases():
 async def test_concentration_publishes_vocabulary_data_status_and_separate_coverage():
     engine = Mock()
 
-    async def concentration_analysis(weights):
-        return {
-            "largest_position": max(weights.values()),
-            "by_weight": dict(weights),
-        }
-
-    engine.concentration_analysis = concentration_analysis
+    # A REAL engine, not a hand-rolled dict. This test is about the export's
+    # `data_status` vocabulary and its separate coverage block, not about the
+    # concentration numbers -- but the route reads all nine metric keys by
+    # SUBSCRIPT off whatever this returns, so a partial stand-in raised
+    # `KeyError` into the route's `except Exception` and turned a passing
+    # vocabulary assertion into an HTTP 500. Delegating to the real engine is
+    # the idiom `_RecordingEngine` uses in
+    # `tests/test_model_sample_and_aggregation_disclosure.py`.
+    engine.concentration_analysis = AnalyticsEngine().concentration_analysis
     result = await get_concentration_metrics(
         db=_DB([_position("A.NS"), _position("B.NS")]),
         data_service=Mock(),

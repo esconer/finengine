@@ -14,6 +14,8 @@ Covers:
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -22,6 +24,12 @@ from sqlalchemy import select, func
 from app.models.database import (
     AnalyticsCache, AppSetting, FetchLog, PortfolioPosition, StockTimeseries,
 )
+from app.services.alpha_vantage_service import (
+    AV_SYMBOL_MAP,
+    AlphaVantageIdentityError,
+    to_av_symbol,
+)
+from app.services.cache_service import ProviderUnavailableError
 from app.services.company_data_service import CompanyDataService
 from app.services.data_service import DataService
 from app.services.source_preference_service import (
@@ -233,6 +241,104 @@ class TestHistoricalCascade:
         assert df is not None and not df.empty
         assert av.ohlcv_calls, "Alpha Vantage must be consulted when both vendors fail"
         assert call_order == ["yfinance", "bfinance"] * 3  # primary then secondary, each retry
+
+
+# ---------------------------------------------------------------------------
+# 2b. tier-3 attribution honesty
+
+class TestFallbackAttribution:
+    """A failure must not be blamed on a cascade tier that never ran.
+
+    ``AV_SYMBOL_MAP`` is empty by design, so ``to_av_symbol`` refuses every
+    ``.NS``/``.BO``/``.BSE`` ticker and tier 3 raises
+    ``AlphaVantageIdentityError`` before issuing a request.  The fetch log must
+    record that the tier was never attempted rather than claiming it served the
+    failure.
+    """
+
+    START, END = "2025-01-01", "2025-01-10"
+
+    async def test_ns_cascade_failure_does_not_claim_unreachable_tier(self, test_db):
+        service = DataService(test_db)
+
+        class _AvNeverReachable:
+            """Tier 3 that refuses exactly like the real client does for .NS."""
+
+            enabled = True
+
+            async def fetch_daily_ohlcv(self, ticker, start, end):
+                raise AlphaVantageIdentityError(
+                    "Alpha Vantage listing identity is unavailable for this exchange"
+                )
+
+        def _empty(*a, **k):
+            return pd.DataFrame()
+
+        with patch("bfinance.download", _empty), \
+             patch("app.services.data_service.yf.download", _empty), \
+             patch("app.services.data_service.get_alpha_vantage_service",
+                   return_value=_AvNeverReachable()):
+            with pytest.raises(ProviderUnavailableError):
+                await service.fetch_historical_data(
+                    "RELIANCE.NS", self.START, self.END, force_refresh=True
+                )
+
+        rows = (await test_db.execute(select(FetchLog))).scalars().all()
+        assert rows, "a failed cascade must still be logged"
+        assert all(r.status == "failed" for r in rows)
+        assert not any(r.source_used == "alphavantage" for r in rows), (
+            "failure row attributed to the Alpha Vantage tier even though "
+            "to_av_symbol refuses .NS and the tier was never attempted"
+        )
+        assert any(r.source_used == "alphavantage_absent" for r in rows), (
+            "the unreachable tier must be recorded honestly"
+        )
+
+    async def test_symbol_map_is_still_empty_no_fabricated_identity(self):
+        """The fix records unreachability; it must not invent a symbol map."""
+        assert AV_SYMBOL_MAP == {}
+        assert to_av_symbol("RELIANCE.NS") is None
+
+
+# ---------------------------------------------------------------------------
+# 2c. vendor outage visibility
+
+class TestVendorOutageVisibility:
+    """A vendor outage must be visible at the configured default log level."""
+
+    async def test_bfinance_outage_is_visible_at_default_info_level(self, caplog):
+        class _BrokenBf:
+            def __init__(self, *a, **k):
+                raise RuntimeError("upstream exploded")
+
+        class _BrokenYf:
+            def __init__(self, symbol):
+                pass
+
+            @property
+            def info(self):
+                raise RuntimeError("upstream exploded")
+
+        import yfinance as yf_mod
+        # Capture at the configured default (INFO): a debug() line is invisible here.
+        with caplog.at_level("INFO", logger="app.services.company_data_service"):
+            with patch("bfinance.Ticker", _BrokenBf), \
+                 patch.object(yf_mod, "Ticker", _BrokenYf):
+                with pytest.raises(ProviderUnavailableError):
+                    await CompanyDataService().get_fundamentals(
+                        "RELIANCE.NS", source_order=["bfinance", "yfinance"]
+                    )
+
+        bf_lines = [
+            r for r in caplog.records
+            if "bfinance fundamentals unavailable" in r.getMessage()
+        ]
+        assert bf_lines, (
+            "a total bfinance outage emitted no log line at the default INFO level"
+        )
+        assert bf_lines[0].levelno >= logging.INFO
+        # The upstream text must be redacted, not logged verbatim.
+        assert "apikey" not in caplog.text.lower()
 
 
 # ---------------------------------------------------------------------------

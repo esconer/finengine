@@ -120,6 +120,22 @@ CREATE TABLE stock_timeseries (
 )
 """
 
+_SHAREHOLDING_CREATE = """
+CREATE TABLE nse_shareholding_patterns (
+    id INTEGER NOT NULL PRIMARY KEY,
+    symbol VARCHAR(20) NOT NULL,
+    period_ended VARCHAR(20) NOT NULL,
+    revision_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    promoter_pct FLOAT NOT NULL,
+    promoter_pledged_pct FLOAT,
+    fii_pct FLOAT,
+    dii_pct FLOAT,
+    public_pct FLOAT,
+    updated_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_shp_symbol_period_revision UNIQUE (symbol, period_ended, revision_date)
+)
+"""
+
 _PORTFOLIO_INTEGRITY_COLUMNS = {
     "id",
     "ticker",
@@ -166,13 +182,48 @@ _STOCK_REQUIRED_COLUMNS = {
     "volume",
 }
 
+_SHAREHOLDING_INTEGRITY_COLUMNS = {
+    "id",
+    "symbol",
+    "period_ended",
+    "revision_date",
+    "promoter_pct",
+    "promoter_pledged_pct",
+    "fii_pct",
+    "dii_pct",
+    "public_pct",
+    "updated_on",
+}
+# revision_date is absent on purpose: it is NOT NULL but carries a default, so
+# a legacy table without it can be carried forward by stamping every row.
+_SHAREHOLDING_REQUIRED_COLUMNS = {"id", "symbol", "period_ended", "promoter_pct"}
+
+_REQUIRED_COLUMNS = {
+    "portfolio_positions": {"id", "ticker", "weight"},
+    "stock_timeseries": _STOCK_REQUIRED_COLUMNS,
+    "nse_shareholding_patterns": _SHAREHOLDING_REQUIRED_COLUMNS,
+}
+
+# The key a shareholding pattern had before restatement was recordable.  A
+# UNIQUE constraint over this pair cannot reject a second filing for the same
+# quarter, which is what let a restatement overwrite the original.
+_STALE_SHAREHOLDING_KEY = ("symbol", "period_ended")
+
 _NATURAL_KEYS = {
     "portfolio_positions": (("ticker",), True),
     "stock_timeseries": (("ticker", "date"), False),
     "analytics_cache": (("ticker", "metric_name"), False),
     "nse_bhavcopy": (("symbol", "date"), False),
     "nse_institutional_flows": (("date", "category"), False),
-    "nse_shareholding_patterns": (("symbol", "period_ended"), False),
+    "nse_shareholding_patterns": (("symbol", "period_ended", "revision_date"), False),
+}
+
+# Key columns this module adds, with the value every existing row is stamped
+# with.  One constant across the table means the added part can never separate
+# duplicates, so a pre-migration duplicate on the old key is still a duplicate
+# on the new one -- and must block rather than resolve.
+_ADDED_KEY_COLUMNS = {
+    "nse_shareholding_patterns": {"revision_date": "CURRENT_TIMESTAMP"},
 }
 
 
@@ -499,7 +550,8 @@ def _preflight(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
         if table in {"portfolio_positions", "stock_timeseries"} or not _table_exists(conn, table):
             continue
         table_columns = _columns(conn, table)
-        if not set(columns).issubset(table_columns):
+        added_columns = _ADDED_KEY_COLUMNS.get(table, {})
+        if not set(columns) <= table_columns | set(added_columns):
             _append_issue(
                 issues,
                 table=table,
@@ -508,12 +560,16 @@ def _preflight(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
             )
             continue
         key_sql = ", ".join(columns)
+        # Preflight the key as the rebuild will see it: a column this module
+        # adds is stamped with one value on every existing row, so it can never
+        # separate duplicates.
+        select_columns = [
+            added_columns[column] if column not in table_columns else f'"{column}"'
+            for column in columns
+        ]
         if case_insensitive and "ticker" in columns:
-            select_key = "upper(trim(ticker))" if len(columns) == 1 else "upper(trim(ticker)), " + ", ".join(
-                column for column in columns[1:]
-            )
-        else:
-            select_key = key_sql
+            select_columns[0] = "upper(trim(ticker))"
+        select_key = ", ".join(select_columns)
         rows = conn.execute(
             f"""
             SELECT {select_key}, COUNT(*) AS row_count
@@ -608,6 +664,20 @@ def _ensure_unique_index(
     conn.execute(f'CREATE UNIQUE INDEX "{name}" ON "{table}" ({expression})')
 
 
+def _shareholding_needs_rebuild(conn: sqlite3.Connection) -> bool:
+    """True while ``nse_shareholding_patterns`` can still reject a restatement.
+
+    A UNIQUE constraint over the stale pair cannot be dropped in place -- SQLite
+    materialises a table-level UNIQUE as an autoindex -- so reaching the revision
+    key means rebuilding the table against the canonical DDL, which is also how
+    a missing ``revision_date`` gets stamped onto every existing row.
+    """
+
+    if "revision_date" not in _columns(conn, "nse_shareholding_patterns"):
+        return True
+    return _has_unique_index(conn, "nse_shareholding_patterns", _STALE_SHAREHOLDING_KEY)
+
+
 def _copy_expression(table: str, column: str, available: set[str]) -> str | None:
     if column not in available:
         return None
@@ -624,7 +694,9 @@ def _rebuild_table(
     integrity_columns: set[str],
 ) -> None:
     available = _columns(conn, table)
-    required = {"id", "ticker", "weight"} if table == "portfolio_positions" else _STOCK_REQUIRED_COLUMNS
+    required = _REQUIRED_COLUMNS.get(table)
+    if required is None:
+        raise MigrationError(f"{table} has no registered required-column contract")
     missing = required - available
     if missing:
         raise MigrationError(f"{table} is missing required columns: {sorted(missing)}")
@@ -680,6 +752,14 @@ def _ordered_columns(columns: set[str]) -> list[str]:
         "fetch_status",
         "fetched_on",
         "position_id",
+        "symbol",
+        "period_ended",
+        "revision_date",
+        "promoter_pct",
+        "promoter_pledged_pct",
+        "fii_pct",
+        "dii_pct",
+        "public_pct",
     ]
     return [column for column in order if column in columns]
 
@@ -720,6 +800,14 @@ def _validate_schema(conn: sqlite3.Connection) -> bool:
         )
     ):
         return False
+
+    shareholding_columns = _columns(conn, "nse_shareholding_patterns")
+    if shareholding_columns:
+        if not {"symbol", "period_ended", "revision_date"} <= shareholding_columns:
+            return False
+        # A stale pair key rejects a restatement even alongside the new one.
+        if _has_unique_index(conn, "nse_shareholding_patterns", _STALE_SHAREHOLDING_KEY):
+            return False
     for table, (columns, nocase_first) in _NATURAL_KEYS.items():
         if _table_exists(conn, table) and not _has_unique_index(
             conn, table, columns, nocase_first=nocase_first
@@ -752,6 +840,14 @@ def _apply_integrity_schema(
             table="stock_timeseries",
             create_sql=_STOCK_CREATE,
             integrity_columns=_STOCK_INTEGRITY_COLUMNS,
+        )
+
+    if _table_exists(conn, "nse_shareholding_patterns") and _shareholding_needs_rebuild(conn):
+        _rebuild_table(
+            conn,
+            table="nse_shareholding_patterns",
+            create_sql=_SHAREHOLDING_CREATE,
+            integrity_columns=_SHAREHOLDING_INTEGRITY_COLUMNS,
         )
 
     for table, (columns, nocase_first) in _NATURAL_KEYS.items():

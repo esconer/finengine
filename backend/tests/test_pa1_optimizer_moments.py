@@ -30,6 +30,7 @@ import pytest
 
 from app.services.optimization_service import (
     SHARPE_OBJECTIVE_STRATEGIES,
+    STRATEGIES,
     _as_matrices,
     _hrp_weights,
     _moments,
@@ -323,7 +324,15 @@ def test_current_portfolio_refuses_a_book_with_no_positive_gross_exposure():
         ("min_vol", False),
         ("min_cvar", False),
         ("max_sharpe", True),
-        ("black_litterman", True),
+        # T8: was `True`, and it was FALSE. The solve maximises the posterior
+        # Sharpe `(mu_bl @ w) / sqrt(w @ cov_bl @ w)`, while `optimize()`
+        # publishes the SAMPLE-moment Sharpe - `_as_matrices` establishes
+        # `mu`/`cov` and nothing rebinds them to the posterior. On the probe
+        # book the two differ by ~5.4 Sharpe units and disagree in sign.
+        # The claim is now accurate; see
+        # `tests/test_bl_published_sharpe_objective_claim.py` for the gate that
+        # re-derives both quantities independently.
+        ("black_litterman", False),
     ],
 )
 def test_expected_sharpe_carries_a_basis_for_every_strategy(strategy, is_objective):
@@ -349,6 +358,27 @@ def test_hrp_objective_never_claims_sharpe_was_maximised():
         result = optimize(_book(seed), "hrp", risk_free_rate=RF)
         assert result["objective"]["expected_sharpe_was_the_optimised_objective"] is False
         assert "hierarchical risk parity" in result["objective"]["what_was_optimised"]
+
+
+def test_only_max_sharpe_claims_a_sharpe_it_maximised():
+    """The whole set, checked against PA-1's premise rather than a hand-kept list.
+
+    PA-1 requires the published moments to be computed from the sample
+    mu_annual/cov_annual (`moments_basis` documents exactly that). A strategy
+    may therefore only claim `expected_sharpe_was_the_optimised_objective` if
+    its solver read those same two matrices - which is what makes `max_sharpe`
+    the only member. `black_litterman` used to be in the set while solving on
+    the posterior, which is a claim about a different pair of matrices.
+    """
+    assert SHARPE_OBJECTIVE_STRATEGIES == frozenset({"max_sharpe"})
+    for strategy in STRATEGIES:
+        result = optimize(_book(0), strategy, risk_free_rate=RF)
+        claims = result["objective"]["expected_sharpe_was_the_optimised_objective"]
+        assert claims is (strategy == "max_sharpe"), (
+            f"{strategy} publishes expected_sharpe_was_the_optimised_objective="
+            f"{claims}; only a solver reading the published sample mu/cov can "
+            "claim it"
+        )
 
 
 # --------------------------------------------------------------------------

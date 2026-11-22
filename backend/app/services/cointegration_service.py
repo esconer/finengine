@@ -6,6 +6,7 @@ Ornstein-Uhlenbeck (OU) mean-reversion speed/half-life, spread z-scores, and cac
 
 import asyncio
 import warnings
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from itertools import combinations
@@ -28,7 +29,29 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 # In-memory TTL cache for cointegration computations
-_IN_MEMORY_COINT_CACHE: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
+#
+# Bounded, and the bound is not redundant with the TTL. The sweep in
+# `_set_cached_pair` reclaims only entries already older than
+# `CACHE_TTL_HOURS`, so within a day nothing is ever reclaimed - while
+# `_mem_cache_key` folds in `p_value_threshold` and `lookback_days`, both
+# caller-controlled query parameters, plus `include_spread_series` and the
+# coverage fingerprint. Those folds are correct (a different threshold really
+# is a different measurement, and the contract gate below would rather recompute
+# than serve a row computed under other parameters), but they multiply the
+# number of distinct keys ONE CLIENT can address, and with no ceiling every one
+# of them is retained for the full 24h. Measured: 900 (p_value_threshold x
+# lookback_days) writes retained 900 entries and 49 MiB of `spread_series`
+# payloads, growing 1:1 with the sweep and never bending over.
+#
+# 256 sits above one complete scan of a 22-ticker universe (C(22,2) = 231
+# pairs), so re-scanning the same book is still served entirely from the memo,
+# and well below the point where the marginal hit rate pays for the residency:
+# the worst case is ~1.6 MiB of lean pairs, ~14 MiB with spread series
+# attached. `OrderedDict` plus `move_to_end` on a served hit makes this LRU
+# rather than FIFO, so the pairs a scan actually re-reads are the ones that
+# survive eviction.
+_IN_MEMORY_COINT_CACHE: OrderedDict[str, Tuple[datetime, Dict[str, Any]]] = OrderedDict()
+_COINT_CACHE_MAX_ENTRIES = 256
 CACHE_TTL_HOURS = 24
 
 # DB cache namespace. AnalyticsCache.ticker is String(10) and metric_name is
@@ -943,6 +966,29 @@ def _mem_cache_key(
     )
 
 
+def _store_coint_cache_entry(
+    cache_key: str, entry: Tuple[datetime, Dict[str, Any]]
+) -> None:
+    """Write one memo entry and hold the cache to its entry ceiling.
+
+    Every write goes through here - `_set_cached_pair` and the DB-hit
+    repopulation in `_get_cached_pair` - so the ceiling cannot be bypassed by
+    the next write path added. `OrderedDict` order is recency order: a re-insert
+    is promoted here, and `_get_cached_pair` promotes a pair it serves, so
+    `popitem(last=False)` evicts the least recently used entry rather than the
+    merely oldest-written one.
+
+    Eviction is a residency decision and nothing else. A dropped entry is a
+    miss, which costs exactly what never having written it would have cost -
+    the durable tier below (`cache_service`) and a recomputation are both
+    unaffected, and no measurement is lost, only the shortcut to it.
+    """
+    _IN_MEMORY_COINT_CACHE[cache_key] = entry
+    _IN_MEMORY_COINT_CACHE.move_to_end(cache_key)
+    while len(_IN_MEMORY_COINT_CACHE) > _COINT_CACHE_MAX_ENTRIES:
+        _IN_MEMORY_COINT_CACHE.popitem(last=False)
+
+
 def _history_coverage(series_a: pd.Series, series_b: pd.Series) -> str:
     """Return a deterministic effective-overlap identity for cache keys."""
     frame = pd.DataFrame({"a": series_a, "b": series_b}).replace([np.inf, -np.inf], np.nan).dropna()
@@ -1653,9 +1699,29 @@ def analyze_pair_cointegration(
     if include_spread_series:
         spread_points = []
         dates = df.index
+        # Withheld, exactly as the headline above is. A spread with no
+        # dispersion has no denominator, so `(s - mean) / std` is not a number
+        # this module is able to compute - and `0.0` says "this point sits
+        # exactly at the mean", which is a claim about the market that a
+        # degenerate input cannot support. The headline at step 6 already
+        # publishes `None` for the same spread; publishing `0.0` per point
+        # while the headline withholds is the module contradicting itself
+        # inside one payload, and the series is the field a chart draws, so it
+        # is the one that has to agree.
+        #
+        # `Optional[float]` is representable all the way out: the series is
+        # typed `List[Dict[str, Any]]` and `_carries_non_finite` passes a
+        # non-numeric leaf through by design, so the `None` is both
+        # serialisable and invisible to that guard. Note the shape is unchanged
+        # - the key is still present, holding nothing - so a consumer reading
+        # `point["zscore"]` cannot raise on an absent key it used to read.
         for dt, s_val in zip(dates, spread):
             d_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-            z_val = round(float((s_val - spread_mean) / spread_std), 4) if spread_std > 1e-8 else 0.0
+            z_val: Optional[float] = (
+                round(float((s_val - spread_mean) / spread_std), 4)
+                if spread_std > 1e-8
+                else None
+            )
             spread_points.append({
                 "date": d_str,
                 "spread": round(float(s_val), 4),
@@ -1797,9 +1863,16 @@ class CointegrationService:
                 and self._cached_pair_satisfies_contract(data)
             ):
                 try:
-                    return with_test_role_metadata(CointPairResult(**data))
+                    hit = with_test_role_metadata(CointPairResult(**data))
                 except Exception:
                     pass
+                else:
+                    # LRU: a pair that was just served is the one least likely
+                    # to be worth evicting. Promotion happens only on the
+                    # return path, so a row the contract gate rejects does not
+                    # renew its own lease on the cache.
+                    _IN_MEMORY_COINT_CACHE.move_to_end(cache_key)
+                    return hit
 
         # 2. Database check
         if self.cache_service is not None:
@@ -1827,7 +1900,7 @@ class CointegrationService:
                         res = with_test_role_metadata(CointPairResult(**pair_data))
                         if cache_generation is not None and not cache_generation_is_current(cache_generation):
                             return None
-                        _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_data)
+                        _store_coint_cache_entry(cache_key, (_utcnow(), pair_data))
                         return res
             except Exception as e:
                 logger.debug(f"DB cache read error: {e}")
@@ -1934,9 +2007,12 @@ class CointegrationService:
         # 1. In-memory store
         if cache_generation is not None and not cache_generation_is_current(cache_generation):
             return
-        _IN_MEMORY_COINT_CACHE[cache_key] = (_utcnow(), pair_dict)
-        # Bounded memory: drop expired entries on every write (cache is
-        # per-key-per-day-per-params, so long-running scanners grow it otherwise)
+        _store_coint_cache_entry(cache_key, (_utcnow(), pair_dict))
+        # TTL sweep: drop expired entries on every write (cache is
+        # per-key-per-day-per-params, so long-running scanners grow it otherwise).
+        # The SIZE ceiling lives in `_store_coint_cache_entry` above - this
+        # sweep cannot stand in for it, because nothing here is expired until
+        # a full `CACHE_TTL_HOURS` after it was written.
         now = _utcnow()
         stale = [k for k, (ts, _) in _IN_MEMORY_COINT_CACHE.items()
                  if now - ts >= timedelta(hours=CACHE_TTL_HOURS)]

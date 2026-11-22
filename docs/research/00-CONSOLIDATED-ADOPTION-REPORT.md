@@ -218,7 +218,7 @@ dependency. Re-check before considering.
 | MEDIUM | `optimization_service.py:695` | `w_mkt = np.ones(n)/n` used as the Black-Litterman "market portfolio". Silently biases the prior to equal weight. Undisclosed. |
 | MEDIUM | `optimization_service.py:752` | `np.clip(raw, 0, None)` + renormalise after the BL tangency solve ⇒ returned weights are **not** the solution of the stated program. Undisclosed. |
 | MEDIUM | `regime_service.py:307-311` | `init_params="mc"` means Baum-Welch **never re-estimates `transmat_`**; the `0.96` diagonal is what `transition_matrix` publishes. Self-disclosed at L222-227. |
-| MEDIUM | `analytics_engine.py:2228-2236` | Three hardcoded per-ticker stress elasticities (`MAFANG.NS`, `MIDCAPIETF.NS`, `SELECTIPO.NS`). Disclosed, but a ticker rename silently drops them. |
+| MEDIUM | `analytics_engine.py:2228-2236` | Three hardcoded per-ticker stress elasticities (`MAHALINGA.NS`, `MIDETF.NS`, `TRUENORTH.NS`). Disclosed, but a ticker rename silently drops them. |
 | MEDIUM | `analytics_engine.py:2104-2175` | 7×7 hand-typed sector-elasticity table, all literal floats. Disclosed as `static_configured_table`. |
 | LOW | `tail_risk_service.py:261-336` | The "Student-t copula" is **not a copula fit** — two *marginal* univariate MLEs averaged, pushed through the closed-form t-λ_L formula. Cannot extend past n=2. Use `copulas` (Gaussian/Archimedean/Vine) for a real joint fit. Response schema is unchanged, so this is a drop-in. |
 | LOW | `analytics.py:8535` | Unreachable duplicate `except HTTPException`. |

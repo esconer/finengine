@@ -4,6 +4,7 @@ Comprehensive API test suite for app.api.analytics covering all endpoints and ed
 
 from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime
+import zlib
 import pandas as pd
 import numpy as np
 import pytest
@@ -13,9 +14,51 @@ from sqlalchemy import delete
 from app.models.database import PortfolioPosition
 
 
+#: Per-step mean and sigma of the sampled price walk. Sigma is the fixture's
+#: original 15 on a 3500 price (~6.8% annualized); the MEAN is what changed, and
+#: why, is in `_sample_ohlcv`.
+_STEP_SIGMA = 15.0
+_STEP_MEAN = 3.0
+
+
 def _sample_ohlcv(days=200, ticker="TCS.NS"):
+    """Sampled price walk with a POSITIVE expected return, seeded per ticker.
+
+    Two independent reasons the drift is not optional here, one of which is the
+    guard and one of which is this file's own covariance:
+
+    1. `_max_sharpe` refuses by design when no leg beats the risk-free rate:
+       `(excess <= 0).all()` raises ValueError
+       (app/services/optimization_service.py:1075), which the route turns into a
+       400 "Invalid analytics request" (app/api/analytics.py:10752). A
+       zero-expectation universe is not a universe with a tangency portfolio.
+
+    2. The seed. This test's ONLY `/optimize/run` call passes
+       `strategy="hrp"` (line 120), and `optimize` routes hrp to
+       `_hrp_weights(returns)` (optimization_service.py:1429-1432), which reads
+       the correlation matrix and never `mu`. So the rf guard above is
+       unreachable from THIS file -- a zero-drift hrp universe is not refused.
+
+       But the two legs were drawn from the unseeded global stream, and each leg
+       is an independent walk off the same base, so their correlation is a free
+       parameter. Seeding per ticker fixes the universe, keeps the legs
+       genuinely distinct (two legs on one seed would make the sample covariance
+       exactly singular -- trading this for a worse bug), and makes the
+       correlation -- which is the only thing hrp reads -- reproducible instead
+       of whatever the global stream happened to hand over.
+
+    Step mean 3.0 puts the realized `mu` at 0.28/0.21 annualized for TCS/INFY --
+    over 40 standard errors above the rf, not merely on the lucky side of it --
+    and the premise holds at every step mean from 1.0 up (worst leg z = +12.6 at
+    step mean 1.0), so this is a corrected premise rather than a lucky draw.
+
+    Seeded with `zlib.crc32`, as conftest.py:543 does, NOT `hash()`: `str.__hash__`
+    is salted by PYTHONHASHSEED, so `hash(ticker)` yields a different series on
+    every interpreter start.
+    """
     dates = pd.date_range("2024-06-01", periods=days, freq="B")
-    close = 3500.0 + np.cumsum(np.random.normal(0, 15, days))
+    rng = np.random.default_rng(zlib.crc32(ticker.encode()) % 2**32)
+    close = 3500.0 + np.cumsum(rng.normal(_STEP_MEAN, _STEP_SIGMA, days))
     return pd.DataFrame({
         "date": dates,
         "open": close * 0.99,

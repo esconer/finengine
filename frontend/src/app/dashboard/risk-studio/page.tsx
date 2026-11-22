@@ -48,13 +48,23 @@ import {
   Legend
 } from 'recharts';
 
+/**
+ * Educational copy ONLY.
+ *
+ * There is deliberately no per-metric benchmark field. The one it replaced on
+ * this page already carried an `e.g.` prefix, but an `e.g.` prefix is still a
+ * string constant: identical for every book, on every load, and measured from
+ * nothing. Two of its siblings went further and named real holdings beside a
+ * fabricated attribution. A reading that depends on the response is rendered by
+ * {@link HelpExplainerModal}'s `measured` prop instead, and a metric the routes
+ * do not publish says so.
+ */
 interface ExplainerContent {
   title: string;
   what: string;
   howInferred: string;
   whyImportant: string;
   howToInfer: string;
-  benchmark?: string;
 }
 
 const EXPLAINERS: Record<string, ExplainerContent> = {
@@ -63,46 +73,42 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The annualized standard deviation of daily portfolio returns, reflecting overall day-to-day fluctuation magnitude.',
     howInferred: 'Computed as σ_p = √(w^T Σ w) × √252 using the full empirical covariance matrix of constituent returns.',
     whyImportant: 'The cornerstone metric for asset pricing, Sharpe ratios, and standard risk budgeting.',
-    howToInfer: 'e.g. 18.08% indicates normal fluctuation bounds of ±18.08% annually across current asset allocations.',
-    benchmark: 'e.g. Balanced multi-cap Indian portfolio benchmark: 14.0% – 18.0%.'
+    howToInfer: 'The measured figure is one standard deviation of annualized daily return — the band the book is expected to occupy within a year.'
   },
   evt_pot_var_99: {
     title: '99% EVT-POT Value at Risk (1-Day)',
     what: 'Extreme Value Theory (EVT) Peaks-Over-Threshold (POT) 1-day maximum loss expected at the 99% statistical confidence level.',
     howInferred: 'Fits a Generalized Pareto Distribution (GPD) over losses exceeding the 95th percentile threshold u: VaR_99 = u + (β/ξ)[((N/N_u)(1 - 0.99))^(-ξ) - 1].',
     whyImportant: 'Gaussian normal distribution models severely underestimate fat-tail crashes; EVT explicitly models fat-tailed extreme events.',
-    howToInfer: '-3.59% means on the single worst day out of every 100 trading sessions, your portfolio loss will reach or exceed 3.59%.',
-    benchmark: 'Institutional tail risk ceiling: ≤ -4.00%.'
+    howToInfer: 'A negative figure is the loss floor reached or exceeded on roughly 1 session in 100 — it is a tail quantile, not an average day.'
   },
   evt_pot_es_99: {
     title: '99% EVT Expected Shortfall / CVaR',
     what: 'The conditional average expected loss on days when portfolio losses breach the 99% EVT VaR threshold.',
     howInferred: 'Calculated as ES_99 = (VaR_99 / (1 - ξ)) + ((β - ξ u) / (1 - ξ)) from the fitted Generalized Pareto Distribution.',
     whyImportant: 'Answers the critical crisis question: "If a 1-in-100 day crash occurs, how deep will the average loss actually be?"',
-    howToInfer: '-3.99% indicates that during 99th-percentile tail crash sessions, the expected average drawdown is 3.99%.',
-    benchmark: 'Institutional disaster buffer threshold: ES ≥ -4.50%.'
+    howToInfer: 'It is at least as severe as VaR by construction: the average loss on the days that breach VaR, so it sizes the crash rather than its trigger.'
   },
   correlation_regime: {
     title: 'Rolling Pairwise Correlation Regime',
     what: 'Real-time diagnostic indicating whether portfolio assets are co-moving normally or experiencing liquidity breakdown contagion.',
     howInferred: 'Calculates the average 60-day rolling pairwise correlation across all holding pairs and compares it to the historical 90th percentile threshold.',
     whyImportant: 'During market-wide panics, cross-asset correlations spike toward +1.0, destroying diversification benefits.',
-    howToInfer: 'e.g. NORMAL (0.158 < 0.382 threshold) would confirm holdings remain well-diversified without systemic contagion.',
-    benchmark: 'Threshold for Regime Break Alert: Avg Correlation > 0.38.'
+    howToInfer: 'Read the measured average against the measured 90th-percentile threshold below it: below the threshold the book is still diversifying, above it it is not.'
   },
   euler_tail_share: {
     title: 'Euler Volatility vs Tail Loss Attribution',
     what: 'Side-by-side grouped comparison showing each stock\'s contribution to routine volatility (Blue) versus crisis tail losses (Red).',
     howInferred: 'Euler volatility shares derived from w_i(Σ w)_i / σ_p; Tail CVaR shares derived from mean loss on worst 5% days scaled by weight.',
     whyImportant: 'Identifies positions that seem safe day-to-day but become dominant loss drivers during steep market downturns.',
-    howToInfer: 'e.g. Motherson (19.9% Vol / 19.5% CVaR) and JuniorBees (9.9% Vol / 11.3% CVaR) would be primary risk drivers.'
+    howToInfer: 'Where a position\'s tail share sits far above its volatility share, it is calm in normal markets and a dominant loss driver in crashes.'
   },
   copula_tail_dependence: {
     title: 'Bivariate Student-t Copula Lower-Tail Dependence (λL)',
     what: 'Statistical coefficient measuring the joint probability of two assets crashing simultaneously during extreme market tail events.',
     howInferred: 'Derived from bivariate Student-t Copula parameter estimation: λL = 2 t_{ν+1}(-√(((ν+1)(1-ρ))/(1+ρ))).',
     whyImportant: 'Standard Pearson correlation measures linear comovement around the mean; Copula tail dependence captures non-linear joint crash risk.',
-    howToInfer: 'Values > 0.25 (highlighted in red) indicate high risk of simultaneous crashes (e.g., Motilal Oswal & JuniorBees: 0.335). Values < 0.15 indicate true crash independence.'
+    howToInfer: 'A λL well above zero means the pair\'s crashes coincide in the tail. Cells above 0.25 are highlighted; a withheld cell is N/A, not zero.'
   },
   volatility_cones: {
     title: 'Volatility Term Structure & Quantile Cones',
@@ -114,9 +120,9 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   correlation_stability: {
     title: '60-Day Rolling Correlation Stability Gauge',
     what: 'Continuous monitoring gauge tracking average cross-holding correlation against systemic contagion thresholds.',
-    howInferred: 'Evaluates (∑_{i<j} Corr_{60D}(R_i, R_j)) / (N(N-1)/2) relative to historical 90th percentile barrier (0.382).',
+    howInferred: 'Evaluates (∑_{i<j} Corr_{60D}(R_i, R_j)) / (N(N-1)/2) relative to the historical 90th percentile threshold this route measures.',
     whyImportant: 'Protects the portfolio from "diversification illusion" where uncorrelated assets suddenly synchronize during market panics.',
-    howToInfer: 'A current average of 0.158 indicates strong multi-asset diversification resilience.'
+    howToInfer: 'A measured average far below the measured threshold means the diversification is real rather than an artefact of a calm sample.'
   },
   gpd_parameters: {
     title: 'Generalized Pareto Distribution (GPD) Shape & Scale',
@@ -125,6 +131,17 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     whyImportant: 'A negative or fat-tailed shape parameter confirms that extreme events follow power-law behavior rather than a thin Gaussian bell curve.',
     howToInfer: 'Fat Tailed: Yes validates that tail stop-losses must use EVT-POT rather than standard Gaussian normal metrics.'
   }
+};
+
+/**
+ * The measured reading for THIS book, keyed by the same `itemKey` a
+ * {@link HelpBtn} carries. Every entry is computed from the response the page
+ * already holds, so the panel moves with the metric. An EMPTY line list is the
+ * not-measured state and is rendered as one — never backfilled.
+ */
+type MeasuredReading = {
+  lines: string[];
+  reason?: string;
 };
 
 /**
@@ -142,7 +159,15 @@ const UNMEASURABLE_REASON_LABELS: Record<string, string> = {
     'the marginal Student-t fit failed, so λL has no degrees of freedom to use',
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+function HelpExplainerModal({
+  itemKey,
+  measured,
+  onClose,
+}: {
+  itemKey: string;
+  measured: MeasuredReading | null;
+  onClose: () => void;
+}) {
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
@@ -197,11 +222,27 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-300">{info.howToInfer}</p>
           </div>
 
-          {info.benchmark && (
-            <div className="bg-indigo-950/40 p-3 rounded-lg border border-indigo-800/50 text-indigo-200 text-xs font-medium">
-              💡 <span className="font-semibold text-indigo-300">Quantitative Benchmark:</span> {info.benchmark}
-            </div>
-          )}
+          {/* The measured box. It used to be a static string, so it read the same on every
+            load and for every book; now it is read off the response, and an empty
+            reading renders the explicit not-measured state instead of a
+            plausible figure. */}
+          <div
+            data-testid="explainer-measured"
+            className="bg-indigo-950/40 p-3 rounded-lg border border-indigo-800/50 text-indigo-200 text-xs font-medium"
+          >
+            📊 <span className="font-semibold text-indigo-300">Measured On This Book:</span>
+            {measured && measured.lines.length > 0 ? (
+              <ul className="mt-1 space-y-0.5 list-disc list-inside font-mono">
+                {measured.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 font-mono">
+                Not measured — {measured?.reason ?? 'no component route published a value for this metric'}.
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex justify-end">
@@ -408,6 +449,117 @@ export default function RiskStudioPage() {
   const volConeAllInsufficient =
     coneChartData.length > 0 && coneChartData.every((w: any) => w.insufficient_data);
 
+  /**
+   * One measured line per published value, or none at all. Returning `[]` for an
+   * unpublished value is what keeps the modal's not-measured state reachable:
+   * `fmtPct` would have turned the absent value into a literal "—" line, which
+   * reads as a rendered measurement rather than an absent one.
+   */
+  const measuredLine = (
+    label: string,
+    value: unknown,
+    render: (value: number) => string
+  ): string[] =>
+    typeof value === 'number' && Number.isFinite(value)
+      ? [`${label} ${render(value)}`]
+      : [];
+
+  // The two Euler legs, largest first, as the panel reports them. Both stay out
+  // when neither model published a share — same rule as the bar chart's nulls.
+  const topEulerLines = eulerPositions
+    .filter((p) => p.vol_contrib != null || p.cvar_contrib != null)
+    .slice(0, 3)
+    .map(
+      (p) =>
+        `${p.ticker} vol ${p.vol_contrib != null ? `${p.vol_contrib}%` : 'N/A'} · tail ${
+          p.cvar_contrib != null ? `${p.cvar_contrib}%` : 'N/A'
+        }`
+    );
+
+  // The highest MEASURED off-diagonal λL. A withheld cell stays out of the
+  // comparison entirely: ranking it would treat "not measured" as a value.
+  const strongestTailDependence = (() => {
+    let best: { pair: string; lambda: number } | null = null;
+    for (let r = 0; r < copulaTickers.length; r++) {
+      for (let c = r + 1; c < copulaTickers.length; c++) {
+        const measured = copulaMatrix[r]?.[c];
+        if (typeof measured !== 'number' || !Number.isFinite(measured)) continue;
+        if (!best || measured > best.lambda) {
+          best = { pair: `${copulaTickers[r]} / ${copulaTickers[c]}`, lambda: measured };
+        }
+      }
+    }
+    return best;
+  })();
+
+  const gpdShape = tailRisk?.gpd_shape_xi ?? tailRisk?.gpd_parameters?.shape_xi ?? null;
+  const gpdScale = tailRisk?.gpd_scale_beta ?? tailRisk?.gpd_parameters?.scale_beta ?? null;
+
+  /**
+   * The measured reading behind each explainer, keyed by `itemKey`. Every entry
+   * is read off one of the four responses this page already fetched, so the panel
+   * moves with the metric instead of narrating a constant.
+   */
+  const measuredReadings: Record<string, MeasuredReading> = {
+    portfolio_volatility: {
+      lines: measuredLine(
+        'Annualized portfolio volatility',
+        riskContribution?.portfolio_volatility_annualized,
+        fmtPct
+      ),
+    },
+    evt_pot_var_99: {
+      lines: measuredLine(
+        '99% EVT-POT VaR (1-day)',
+        tailRisk?.evt_pot_var_99 ?? tailRisk?.evt_var_99,
+        fmtPct
+      ),
+    },
+    evt_pot_es_99: {
+      lines: measuredLine(
+        '99% EVT expected shortfall',
+        tailRisk?.evt_pot_es_99 ?? tailRisk?.evt_es_99,
+        fmtPct
+      ),
+    },
+    correlation_regime: {
+      lines: [
+        ...measuredLine('Avg pairwise correlation (60D)', corrAvg, (v) => v.toFixed(3)),
+        ...measuredLine('Historical 90th-percentile threshold', corrThreshold, (v) => v.toFixed(3)),
+      ],
+    },
+    euler_tail_share: {
+      lines: topEulerLines,
+      reason: 'the risk-contribution route published no position share',
+    },
+    copula_tail_dependence: {
+      lines: strongestTailDependence
+        ? [`${strongestTailDependence.pair} λL ${strongestTailDependence.lambda.toFixed(3)}`]
+        : [],
+      reason: 'no pair in the copula matrix carried a measured λL',
+    },
+    volatility_cones: {
+      lines: coneChartData
+        .filter((w: any) => w.realized != null)
+        .map((w: any) => `${w.window} realized ${w.realized}%`),
+      reason: 'the vol-cone route published no realized window',
+    },
+    correlation_stability: {
+      lines: [
+        ...measuredLine('Rolling 60D average correlation', corrAvg, (v) => v.toFixed(3)),
+        ...measuredLine('Historical 90th-percentile threshold', corrThreshold, (v) => v.toFixed(3)),
+      ],
+    },
+    gpd_parameters: {
+      lines: [
+        ...measuredLine('Shape ξ', gpdShape, (v) => v.toFixed(4)),
+        ...measuredLine('Scale β', gpdScale, (v) => v.toFixed(4)),
+        ...(typeof fatTailed === 'boolean' ? [`Fat tailed: ${fatTailed ? 'yes' : 'no'}`] : []),
+      ],
+      reason: 'the tail-dependence route published no GPD fit',
+    },
+  };
+
   // Export CSV
   const handleExportCSV = () => {
     const rows: string[] = [];
@@ -476,6 +628,7 @@ export default function RiskStudioPage() {
       {activeExplainer && (
         <HelpExplainerModal
           itemKey={activeExplainer}
+          measured={measuredReadings[activeExplainer] ?? null}
           onClose={() => setActiveExplainer(null)}
         />
       )}

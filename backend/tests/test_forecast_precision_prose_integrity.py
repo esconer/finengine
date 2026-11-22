@@ -248,7 +248,7 @@ class TestNoSplicedSentence:
             "np.clip",
             "precision.derived_values['positions.<ticker>.var_forecast']"
             ".derivation_precondition_evidence",
-            "precision.estimated_statistics.positions.CIPLA.NS.estimates",
+            "precision.estimated_statistics.positions.ASTRALN.NS.estimates",
             "np.percentile(portfolio_returns, 5)",
             "tail_support.window_effective_n",
         ):

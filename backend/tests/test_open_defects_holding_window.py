@@ -9,7 +9,7 @@ D-02 The per-ticker counts answered three different questions under three
 names. `raw_days` and `masked_days` are PRICE rows; `return_observations` is the
 RETURN row count those held prices produced, so on a leg with interior missing
 bars the pair is not reconcilable on its face (the v4 export read
-`raw_days=108, masked_days=23, return_observations=20` for NIFTYIETF.NS). One
+`raw_days=108, masked_days=23, return_observations=20` for TIDETEST.NS). One
 rule now: the per-ticker block measures a price frame, it declares that with
 `per_ticker_count_units`, and it publishes the measured terms that relate the
 two frames, so the residual is a count of real missing bars instead of a
@@ -65,7 +65,7 @@ from app.services.analytics_engine import AnalyticsEngine
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
-# GAP.NS is the export's NIFTYIETF.NS shape reproduced exactly: 23 held price
+# GAP.NS is the export's TIDETEST.NS shape reproduced exactly: 23 held price
 # rows split into three runs by three missing bars forming two holes, so it
 # produces 20 return observations and a 3-row gap that no single row frame
 # explains (the audit's tolerated gap is 2).
@@ -223,7 +223,7 @@ async def test_realized_risk_publishes_per_ticker_count_units():
 async def test_gap_leg_counts_reconcile_through_measured_terms():
     """D-02: the 3-row gap is 1 conversion + 2 real missing bars.
 
-    This is the export's NIFTYIETF.NS row reproduced. The point is not that the
+    This is the export's TIDETEST.NS row reproduced. The point is not that the
     gap is small enough to be explained away: it is that every row of it is
     accounted for by a MEASURED term, so it cannot be a counting unit in
     disguise.

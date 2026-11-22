@@ -30,13 +30,22 @@ import {
   Info
 } from 'lucide-react';
 
+/**
+ * Educational copy ONLY.
+ *
+ * There is deliberately no per-metric benchmark field. It carried string
+ * constants under a "Target Benchmark" heading — the same defect as the
+ * "Quantitative Benchmark" strings on the other four pages, only differently
+ * labelled — and its sibling copy named six real holdings as examples of liquid
+ * and illiquid scrips. What the response measures is rendered by
+ * {@link HelpExplainerModal}'s `measured` prop instead.
+ */
 interface ExplainerContent {
   title: string;
   what: string;
   howInferred: string;
   whyImportant: string;
   howToInfer: string;
-  benchmark?: string;
 }
 
 const EXPLAINERS: Record<string, ExplainerContent> = {
@@ -45,48 +54,42 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'A composite portfolio score measuring how easily active positions can be converted into cash without causing significant market price slippage or impact.',
     howInferred: 'Derived by aggregating individual constituent liquidity scores weighted by trading volume, daily turnover (Volume × Price), and market capitalization across all active holdings.',
     whyImportant: 'High liquidity ensures you can enter, exit, or rebalance positions rapidly during market stress without paying steep liquidity penalties or moving the market against yourself.',
-    howToInfer: '8.0 – 10.0 indicates strong institutional liquidity (liquidate within 1-2 days). 6.0 – 8.0 represents adequate liquidity (2-5 days). Below 6.0 indicates potential trading bottlenecks.',
-    benchmark: 'Institutional target ≥ 7.5/10 for actively managed retail and multi-cap equity portfolios.'
+    howToInfer: '8.0 – 10.0 indicates strong institutional liquidity (liquidate within 1-2 days). 6.0 – 8.0 represents adequate liquidity (2-5 days). Below 6.0 indicates potential trading bottlenecks.'
   },
   days_to_liquidate: {
     title: 'Estimated Portfolio Liquidation Horizon',
     what: 'The projected number of active trading days required to completely liquidate all portfolio holdings under normal market conditions without exceeding 10% of daily volume (Participation Rate ≤ 10%).',
     howInferred: 'Calculated as Position Shares / (0.10 × 30-Day Average Daily Volume) across all constituents, taking the portfolio-weighted execution timeline.',
     whyImportant: 'Forcing a fast liquidation on illiquid positions in a single day creates severe market impact and slippage, eroding portfolio returns.',
-    howToInfer: '1-2 days means your portfolio has minimal execution friction. 2-5 days represents standard liquidity. Over 5 days requires phased block execution or algorithmic VWAP/TWAP slicing.',
-    benchmark: 'Target: ≤ 2-3 days for complete portfolio unwind.'
+    howToInfer: '1-2 days means your portfolio has minimal execution friction. 2-5 days represents standard liquidity. Over 5 days requires phased block execution or algorithmic VWAP/TWAP slicing.'
   },
   liquidity_risk_level: {
     title: 'Liquidity Risk Classification',
     what: 'The aggregate risk tier (Low, Medium, High) reflecting potential exit friction and market impact exposure.',
     howInferred: 'Mapped directly from the Overall Liquidity Score: Score ≥ 8.0 → Low Risk; 6.0 ≤ Score < 8.0 → Medium Risk; Score < 6.0 → High Risk.',
     whyImportant: 'Provides immediate risk governance for fund managers, ensuring the portfolio adheres to regulatory redemption and cash-buffer requirements.',
-    howToInfer: 'Low: Safe for fast redemptions. Medium: Monitor mid-cap allocations during market drawdowns. High: High risk of lock-in or heavy discount sales during panics.',
-    benchmark: 'Standard target: Low to Medium Risk.'
+    howToInfer: 'Low: Safe for fast redemptions. Medium: Monitor mid-cap allocations during market drawdowns. High: High risk of lock-in or heavy discount sales during panics.'
   },
   high_liquidity_positions: {
     title: 'High Liquidity Constituents Count & Ratio',
     what: 'The number and percentage of portfolio positions that achieve a High liquidity rating (Score ≥ 8.0/10).',
-    howInferred: 'Count of positions where Category = "High" divided by total active holdings.',
+    howInferred: 'Count of positions where Category = "High" divided by the count of SCORED positions.',
     whyImportant: 'Shows the concentration of cash-convertible assets that can be tapped immediately to meet unexpected capital calls or redeploy into new opportunities.',
-    howToInfer: 'A higher percentage (> 50%) provides strong structural stability and ensures that large redemptions can be fulfilled by trimming large-caps without touching small-cap core holdings.',
-    benchmark: 'Prudent institutional baseline: ≥ 40% – 60%.'
+    howToInfer: 'A higher share provides structural stability and ensures that large redemptions can be fulfilled by trimming large-caps without touching small-cap core holdings.'
   },
   position_levels: {
     title: 'Position Liquidity Score Ranking (0 - 10)',
     what: 'Relative liquidity ranking for each active stock and ETF holding in your portfolio.',
     howInferred: 'Calculated from 30-day average daily turnover (₹ Value Traded/day), average daily volume, and market capitalization from NSE/BSE exchange feeds.',
-    whyImportant: 'Identifies which specific holdings are liquid anchors (like NTPC, CIPLA, MOTHERSON) and which are illiquid small-caps (like ARROWGREEN or JKIL) that require careful order sizing.',
-    howToInfer: 'Green (8-10): Ultra liquid; execute at market. Yellow (6-8): Mid-tier; use limit orders. Red (<6): Illiquid; slice orders across multiple sessions.',
-    benchmark: 'Individual holding liquidity target ≥ 6.0/10.'
+    whyImportant: 'Identifies which specific holdings are liquid anchors and which are illiquid small-caps that require careful order sizing.',
+    howToInfer: 'Green (8-10): Ultra liquid; execute at market. Yellow (6-8): Mid-tier; use limit orders. Red (<6): Illiquid; slice orders across multiple sessions.'
   },
   distribution: {
     title: 'Portfolio Liquidity Distribution',
     what: 'Breakdown of active positions across three primary liquidity tiers: High (8-10), Medium (6-8), and Low (0-6).',
     howInferred: 'Classifies constituents by their individual liquidity score and visualizes the allocation across the three tiers.',
     whyImportant: 'Prevents the illusion of safety where a portfolio has high overall value but is heavily concentrated in a long tail of illiquid small-caps.',
-    howToInfer: 'Healthy portfolios have a pyramidal or top-heavy distribution with the majority of positions in High and Medium tiers.',
-    benchmark: 'Target: < 20% of portfolio positions in the Low Liquidity tier.'
+    howToInfer: 'Healthy portfolios have a pyramidal or top-heavy distribution with the majority of positions in High and Medium tiers.'
   },
   ticker_col: {
     title: 'Ticker Symbol',
@@ -120,7 +123,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     title: 'Market Capitalization / Fund AUM',
     what: 'Total equity market valuation (Total Shares × Current Market Price) for companies, or total Assets Under Management (AUM) for Exchange-Traded Funds (ETFs).',
     howInferred: 'Retrieved dynamically from live exchange market feeds (yfinance / NSE FastInfo) and localized into Indian Rupee Crores (₹ Cr).',
-    whyImportant: 'Large-cap companies (Market Cap > ₹50,000 Cr) and large ETFs typically enjoy deep institutional backing, market maker support, and low slippage.',
+    whyImportant: 'Large-cap companies and large ETFs typically enjoy deep institutional backing, market maker support, and low slippage.',
     howToInfer: '₹20,000+ Cr = Large Cap / Major ETF; ₹5,000 - ₹20,000 Cr = Mid Cap; < ₹5,000 Cr = Small Cap / Micro Cap.'
   },
   spread_col: {
@@ -139,7 +142,26 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   }
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+/**
+ * The measured reading for THIS book, keyed by the same `itemKey` a
+ * {@link HelpBtn} carries. Every entry is read off the response the page already
+ * holds, so the panel moves with the metric. An EMPTY line list is the
+ * not-measured state and is rendered as one — never backfilled.
+ */
+type MeasuredReading = {
+  lines: string[];
+  reason?: string;
+};
+
+function HelpExplainerModal({
+  itemKey,
+  measured,
+  onClose,
+}: {
+  itemKey: string;
+  measured: MeasuredReading | null;
+  onClose: () => void;
+}) {
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
@@ -187,11 +209,27 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-300">{info.howToInfer}</p>
           </div>
 
-          {info.benchmark && (
-            <div className="bg-emerald-950/40 p-3 rounded-lg border border-emerald-800/50 text-emerald-200 text-xs font-medium">
-              💡 <span className="font-semibold text-emerald-300">Target Benchmark:</span> {info.benchmark}
-            </div>
-          )}
+          {/* The measured box. It used to be a static string under a "Target Benchmark"
+            heading, so it read the same on every load and for every book; now it
+            is read off the response, and an empty reading renders the explicit
+            not-measured state instead of a plausible figure. */}
+          <div
+            data-testid="explainer-measured"
+            className="bg-emerald-950/40 p-3 rounded-lg border border-emerald-800/50 text-emerald-200 text-xs font-medium"
+          >
+            📊 <span className="font-semibold text-emerald-300">Measured On This Book:</span>
+            {measured && measured.lines.length > 0 ? (
+              <ul className="mt-1 space-y-0.5 list-disc list-inside font-mono">
+                {measured.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 font-mono">
+                Not measured — {measured?.reason ?? 'the route published no value for this metric'}.
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex justify-end">
@@ -461,6 +499,139 @@ export default function LiquidityPage() {
     return share === null ? 'N/A' : `${share.toFixed(1)}%`;
   };
 
+  /**
+   * One measured line per published value, or none at all. Returning `[]` for an
+   * unpublished value is what keeps the modal's not-measured state reachable:
+   * `formatScore`/`formatPercentage` would have turned the absent value into a
+   * literal "N/A" line, which reads as a rendered measurement rather than an
+   * absent one.
+   */
+  const measuredLine = (
+    label: string,
+    value: number | null | undefined,
+    render: (value: number) => string
+  ): string[] =>
+    typeof value === 'number' && Number.isFinite(value) ? [`${label} ${render(value)}`] : [];
+
+  /** "<label>: n of N scored positions" — over the SCORED set, never all rows. */
+  const measuredCount = (
+    label: string,
+    predicate: (p: PositionLiquidity) => boolean
+  ): string[] =>
+    scoredCount > 0
+      ? [
+          `${label}: ${positionData.filter(predicate).length} of ${scoredCount} scored positions${unscoredDisclosure}`,
+        ]
+      : [];
+
+  const rankedPositions = positionData
+    .filter(isScored)
+    .slice(0, 3)
+    .map((p) => `${p.ticker} ${p.score!.toFixed(1)}/10`);
+
+  /**
+   * The measured reading behind each explainer, keyed by `itemKey`. Every entry
+   * is read off the response this page already fetched, so the panel moves with
+   * the metric instead of narrating a constant.
+   */
+  const measuredReadings: Record<string, MeasuredReading> = {
+    overall_score: {
+      lines: measuredLine('Overall liquidity score', overallScore, (v) => `${v.toFixed(1)}/10`),
+    },
+    days_to_liquidate: {
+      lines: liquidityData?.liquidation_time_days
+        ? [`Portfolio liquidation horizon ${liquidityData.liquidation_time_days}`]
+        : [],
+      reason: 'the route published no liquidation horizon',
+    },
+    liquidity_risk_level: {
+      lines: liquidityData?.risk_level ? [`Classified ${liquidityData.risk_level}`] : [],
+      reason: 'the route published no risk classification',
+    },
+    high_liquidity_positions: {
+      // The page's own tier counters, not a re-derived bucket: those already
+      // exclude unscored rows, and an unscored row counted as "Low" would be a
+      // fabricated tier.
+      lines: scoredCount > 0
+        ? [`${highVolumeCount} of ${scoredCount} scored positions ≥ 8.0${unscoredDisclosure}`]
+        : [],
+      reason: 'no position carried a measured score',
+    },
+    position_levels: { lines: rankedPositions, reason: 'no position carried a measured score' },
+    distribution: {
+      lines: scoredCount > 0
+        ? [
+            `High (8-10): ${highVolumeCount} of ${scoredCount}${unscoredDisclosure}`,
+            `Medium (6-8): ${mediumVolumeCount} of ${scoredCount}${unscoredDisclosure}`,
+            `Low (<6): ${lowVolumeCount} of ${scoredCount}${unscoredDisclosure}`,
+          ]
+        : [],
+      reason: 'no position carried a measured score',
+    },
+    // The column explainers describe a COLUMN, so what is measured is that
+    // column's own population — how many rows the route actually scored.
+    ticker_col: {
+      lines: positionData.length ? [`${positionData.length} positions in the table`] : [],
+      reason: 'the table has no rows',
+    },
+    score_col: {
+      lines: scoredCount > 0
+        ? [`${scoredCount} of ${positionData.length} positions carry a score${unscoredDisclosure}`]
+        : [],
+      reason: 'no position carried a measured score',
+    },
+    category_col: {
+      lines: [
+        ...measuredCount('High', (p) => p.category === 'High'),
+        ...measuredCount('Medium', (p) => p.category === 'Medium'),
+        ...measuredCount('Low', (p) => p.category === 'Low'),
+      ],
+      reason: 'no position carried a measured score',
+    },
+    volume_col: {
+      lines: [
+        ...measuredLine(
+          'Average position volume (30D)',
+          liquidityData?.volume_stats?.avg_volume,
+          formatVolume
+        ),
+        ...measuredLine(
+          'Total portfolio volume (30D)',
+          liquidityData?.volume_stats?.total_portfolio_volume,
+          formatVolume
+        ),
+      ],
+      reason: 'the route published no volume statistics',
+    },
+    market_cap_col: {
+      lines: (() => {
+        const withCap = positionData.filter((p) => p.market_cap != null);
+        return withCap.length
+          ? [`${withCap.length} of ${positionData.length} positions carry a market cap`]
+          : [];
+      })(),
+      reason: 'no position carried a market cap',
+    },
+    spread_col: {
+      lines: (() => {
+        const withSpread = positionData.filter((p) => p.bid_ask_spread != null);
+        return withSpread.length
+          ? [`${withSpread.length} of ${positionData.length} positions carry an estimated spread`]
+          : [];
+      })(),
+      reason: 'no position carried an estimated spread',
+    },
+    liquidation_time_col: {
+      lines: (() => {
+        const withDays = positionData.filter((p) => p.liquidation_days != null);
+        return withDays.length
+          ? [`${withDays.length} of ${positionData.length} positions carry a liquidation horizon`]
+          : [];
+      })(),
+      reason: 'no position carried a liquidation horizon',
+    },
+  };
+
   // Position liquidity table columns with ? explainers
   const positionColumns: DataTableColumn<PositionLiquidity>[] = [
     {
@@ -594,6 +765,7 @@ export default function LiquidityPage() {
       {activeExplainer && (
         <HelpExplainerModal
           itemKey={activeExplainer}
+          measured={measuredReadings[activeExplainer] ?? null}
           onClose={() => setActiveExplainer(null)}
         />
       )}

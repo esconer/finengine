@@ -90,7 +90,7 @@ async def test_service_marks_missing_result_tickers_as_partial():
     from app.services.ai_context_service import ContextOptions, PortfolioContextService
 
     portfolio = {
-        "positions": [{"ticker": "AAPL"}, {"ticker": "NIFTYIETF.NS"}],
+        "positions": [{"ticker": "AAPL"}, {"ticker": "TIDETEST.NS"}],
         "total_value": 1000.0,
         "currency": "INR",
     }
@@ -118,8 +118,8 @@ async def test_service_marks_missing_result_tickers_as_partial():
 
     section = payload["sections"]["realized_risk"]
     assert section["status"] == "partial"
-    assert section["coverage"]["missing_tickers"] == ["NIFTYIETF.NS"]
-    assert any("NIFTYIETF.NS" in warning for warning in section["warnings"])
+    assert section["coverage"]["missing_tickers"] == ["TIDETEST.NS"]
+    assert any("TIDETEST.NS" in warning for warning in section["warnings"])
 
 
 @pytest.mark.asyncio
@@ -136,7 +136,7 @@ async def test_service_does_not_trust_a_narrower_explicit_coverage_claim():
     with patch(
         "app.services.ai_context_service.portfolio_api.get_portfolio",
         new=AsyncMock(return_value={
-            "positions": [{"ticker": "AAPL"}, {"ticker": "NIFTYIETF.NS"}],
+            "positions": [{"ticker": "AAPL"}, {"ticker": "TIDETEST.NS"}],
             "total_value": 1000.0,
         }),
     ), patch(
@@ -158,8 +158,8 @@ async def test_service_does_not_trust_a_narrower_explicit_coverage_claim():
 
     section = payload["sections"]["realized_risk"]
     assert section["status"] == "partial"
-    assert section["coverage"]["requested_tickers"] == ["AAPL", "NIFTYIETF.NS"]
-    assert section["coverage"]["missing_tickers"] == ["NIFTYIETF.NS"]
+    assert section["coverage"]["requested_tickers"] == ["AAPL", "TIDETEST.NS"]
+    assert section["coverage"]["missing_tickers"] == ["TIDETEST.NS"]
 
 
 def test_numeric_risk_score_components_are_not_mistaken_for_group_envelopes():

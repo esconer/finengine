@@ -308,8 +308,16 @@ async def async_client(
     app.dependency_overrides[get_db_session] = _override_get_db(test_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-    app.dependency_overrides.pop(get_db_session, None)
+        # try/finally, not a bare trailing statement: without it the pop is
+        # unreachable whenever the test body raises, and the override that
+        # yields `test_db` survives into the next test. Harmless today only
+        # because the line above reassigns the override on every setup rather
+        # than relying on the pop -- which is luck, not isolation. Pinned by
+        # tests/test_conftest_client_override_leak.py.
+        try:
+            yield client
+        finally:
+            app.dependency_overrides.pop(get_db_session, None)
 
 
 @pytest.fixture

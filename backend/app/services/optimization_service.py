@@ -60,15 +60,46 @@ MOMENT_DECIMALS = 4
 #: What each strategy actually optimises (PA-2). `hrp` clusters and allocates
 #: by inverse cluster variance and never reads mu at all, so a Sharpe printed
 #: beside its weights describes the solution - it is not the quantity the
-#: solver maximised. Only the two tangency solvers may claim Sharpe.
+#: solver maximised. Only `max_sharpe` may claim Sharpe, and the reason it is
+#: the ONLY one is not that it is the only tangency solve: it is that it is the
+#: only solve whose objective is read off the SAME mu_annual/cov_annual that
+#: `_moments_basis_block` publishes beside the weights.
 STRATEGY_OBJECTIVES = {
     "hrp": "hierarchical risk parity (recursive bisection on cluster variance; mu is not used by the allocation)",
     "min_vol": "minimum portfolio variance",
     "max_sharpe": "maximum Sharpe (tangency portfolio)",
-    "min_cvar": "minimum conditional value at risk at the requested beta",
-    "black_litterman": "maximum Sharpe of the Black-Litterman posterior",
+    # The previous string read "minimum conditional value at risk at the
+    # requested beta", promising a parameter no caller of the API can send:
+    # `OptimizeRequest` (`app/api/analytics.py:135-172`) carries `strategy`,
+    # `risk_free_rate`, `tickers`, `views` and `relative_views` and NO beta, and
+    # neither caller of `optimize()` (`app/api/analytics.py:10564` and
+    # `app/services/backtest_service.py:115`) passes one, so `optimize()`'s 0.95
+    # default is the level every request gets. `optimize()` DOES take `beta` as
+    # a real argument, so the level itself is published per record as
+    # `objective.cvar_beta` rather than hardcoded here - a literal in this
+    # string would be its own false claim on a `beta=0.90` call.
+    "min_cvar": "minimum conditional value at risk at the confidence level published as objective.cvar_beta",
+    "black_litterman": "maximum Sharpe of the Black-Litterman posterior, in excess-return space and on the posterior covariance",
 }
-SHARPE_OBJECTIVE_STRATEGIES = frozenset({"max_sharpe", "black_litterman"})
+#: Only `max_sharpe`. `black_litterman` maximises a Sharpe too, but not the one
+#: this service publishes: it maximises `(mu_bl @ w) / sqrt(w @ cov_bl @ w)` on
+#: the Black-Litterman POSTERIOR, while `optimize()` scores the published
+#: `expected_sharpe` from SAMPLE moments - `_as_matrices` establishes `mu`/`cov`
+#: at `:1296` and nothing rebinds them to the posterior - and publishes
+#: `expected_sharpe_was_the_optimised_objective: true` beside it anyway. On a
+#: probe book the published figure was -1.7796 where the maximised objective
+#: was +3.6743: not a rounding difference but a different number, and the two
+#: are not constrained to agree in sign. `_objective_block` now says so
+#: instead of claiming the identity.
+SHARPE_OBJECTIVE_STRATEGIES = frozenset({"max_sharpe"})
+
+#: What the published `expected_sharpe` was computed FROM. Published on every
+#: record so a consumer never has to infer it from an absent key: four
+#: strategies score the same mu_annual/cov_annual their solver read, and
+#: `black_litterman` - the one strategy whose solved objective is a different
+#: function of the same weights - does not.
+EXPECTED_SHARPE_SCORED_ON_SAMPLE = "sample_mu_annual_and_cov_annual"
+EXPECTED_SHARPE_SCORED_ON_BL_POSTERIOR = "black_litterman_posterior_mu_bl_and_cov_bl"
 
 #: The published moment triple, in publication order.
 MOMENT_KEYS = (
@@ -346,26 +377,102 @@ def optimizer_no_sample_reason(what: str) -> str:
     )
 
 
-def _objective_block(strategy: str) -> Dict[str, Any]:
+def _objective_block(strategy: str, *, cvar_beta: Optional[float] = None) -> Dict[str, Any]:
     """State what the strategy optimised, so `expected_sharpe` cannot read as
-    'this Sharpe was maximised' when it was not (PA-2)."""
+    'this Sharpe was maximised' when it was not (PA-2).
+
+    `black_litterman` gets its own wording instead of the shared one because it
+    is the only strategy where the maximised quantity and the published
+    `expected_sharpe` are not two readings of the same inputs. It maximises
+    `(mu_bl @ w) / sqrt(w @ cov_bl @ w)` on the posterior; this service publishes
+    `(mu_annual @ w - rf) / sqrt(w @ cov_annual @ w)` on the sample. The shared
+    sentence - "expected_sharpe is descriptive of these weights" - would leave a
+    reader believing those are one objective computed twice, which is the false
+    claim this branch exists to remove.
+
+    `expected_sharpe_was_the_optimised_objective` is False for it on EVERY
+    solution path, including the three `min_vol_fallback_*` branches in
+    `_black_litterman_solved`, where the solved objective was not a Sharpe at
+    all. The basis text points at `long_only_clip.solution_path` for which
+    objective actually ran rather than restating it here, so the key cannot go
+    stale against a path it does not know about.
+
+    `cvar_beta` is the level `optimize()` actually solved `min_cvar` at, and it
+    is published rather than asserted in prose: `optimize()` takes `beta` as a
+    real argument (`tests/test_quant_math_p1_batch.py:217` passes 0.90), so a
+    hardcoded level in the objective string would itself be a false claim on
+    that path. The API cannot reach it - `OptimizeRequest` has no beta field and
+    neither caller passes one - and the block says so.
+    """
     is_sharpe_objective = strategy in SHARPE_OBJECTIVE_STRATEGIES
+    scored_on = (
+        EXPECTED_SHARPE_SCORED_ON_BL_POSTERIOR
+        if strategy == "black_litterman"
+        else EXPECTED_SHARPE_SCORED_ON_SAMPLE
+    )
+    if strategy == "black_litterman":
+        basis = (
+            f"black_litterman optimises {STRATEGY_OBJECTIVES[strategy]}, and "
+            "that is NOT the number published as expected_sharpe. The solved "
+            "objective is (mu_bl @ w) / sqrt(w @ cov_bl @ w) on the "
+            "Black-Litterman POSTERIOR mean and covariance, in excess-return "
+            "space. The expected_sharpe in this record is the SAMPLE-moment "
+            "Sharpe (mu_annual @ w - risk_free_rate) / sqrt(w @ cov_annual @ "
+            "w), fitted on the return rows published in moments_basis - not the "
+            "posterior, which is never published here. The posterior "
+            "covariance is a tau-scaled reduction of the sample covariance "
+            "(tau = 0.05 by default) and the posterior mean is an equilibrium "
+            "estimate rather than a sample mean, so the two figures are "
+            "different functions of the same weights: they can differ in sign "
+            "and by several Sharpe units. Treat expected_sharpe as DESCRIPTIVE "
+            "of the published weights - it is not the quantity that was "
+            "maximised, and a higher expected_sharpe does not make this "
+            "allocation better. Read long_only_clip.solution_path first: on a "
+            "min_vol_fallback_* path the objective that actually ran was not a "
+            "Sharpe at all. Compare expected_sharpe against "
+            "current_portfolio.expected_sharpe, which is scored on the same "
+            "sample mu, cov and risk-free rate."
+        )
+    elif strategy == "min_cvar":
+        basis = (
+            f"min_cvar optimises {STRATEGY_OBJECTIVES[strategy]}, and this run "
+            f"solved it at cvar_beta = {_round_or_none(cvar_beta, 6):g}. That "
+            "level is CHOSEN by this service, not REQUESTED by the caller: the "
+            "/optimize/run request body (`OptimizeRequest`, "
+            "app/api/analytics.py:135-172) carries strategy, risk_free_rate, "
+            "tickers, views and relative_views and no beta, so cvar_beta is the "
+            "0.95 default on every API request and no user can move it - only a "
+            "direct Python caller of optimize(beta=...) can. "
+            f"expected_sharpe is DESCRIPTIVE of the published weights here - it "
+            "is not the quantity that was maximised (this strategy MINIMISES a "
+            "tail risk, so a lower one is the better answer), and a higher "
+            "expected_sharpe alone would not make this solution better. "
+            "Compare it against current_portfolio.expected_sharpe, which is "
+            "scored on the same mu, cov and sample."
+        )
+    elif is_sharpe_objective:
+        basis = (
+            "expected_sharpe is the objective this strategy maximised, subject to "
+            "the long-only fully-invested constraint."
+        )
+    else:
+        basis = (
+            f"{strategy} optimises {STRATEGY_OBJECTIVES[strategy]}, so "
+            "expected_sharpe is DESCRIPTIVE of the weights this record "
+            "publishes - it is not the quantity that was maximised, and a "
+            "higher expected_sharpe alone would not make this solution "
+            "better. Compare it against current_portfolio.expected_sharpe, "
+            "which is scored on the same mu, cov and sample."
+        )
     return {
         "what_was_optimised": STRATEGY_OBJECTIVES[strategy],
         "expected_sharpe_was_the_optimised_objective": is_sharpe_objective,
-        "expected_sharpe_basis": (
-            "expected_sharpe is the objective this strategy maximised, subject to "
-            "the long-only fully-invested constraint."
-            if is_sharpe_objective
-            else (
-                f"{strategy} optimises {STRATEGY_OBJECTIVES[strategy]}, so "
-                "expected_sharpe is DESCRIPTIVE of the weights this record "
-                "publishes - it is not the quantity that was maximised, and a "
-                "higher expected_sharpe alone would not make this solution "
-                "better. Compare it against current_portfolio.expected_sharpe, "
-                "which is scored on the same mu, cov and sample."
-            )
-        ),
+        "expected_sharpe_scored_on": scored_on,
+        # `None` means "this objective has no such level", not "unset". Published
+        # on every record so absence never has to be interpreted, the way
+        # `w_mkt_basis` and `long_only_clip.solution_path` are.
+        "cvar_beta": _round_or_none(cvar_beta, 6) if strategy == "min_cvar" else None,
+        "expected_sharpe_basis": basis,
     }
 
 
@@ -1050,6 +1157,18 @@ def _black_litterman_solved(
     publishes: whether the solver's own answer was modified before it became a
     published number, on which legs, by how much, and which branch produced it.
 
+    THE POSTERIOR DOES NOT LEAVE THIS FUNCTION. The weights maximise the
+    posterior Sharpe `(mu_bl @ w) / sqrt(w @ cov_bl @ w)`, and that is the
+    only place `mu_bl` and `cov_bl` exist. `optimize()` does not rebind its
+    `mu`/`cov` to them, so the `expected_sharpe` it publishes is a SAMPLE
+    Sharpe, not this objective - which is why `black_litterman` is not in
+    `SHARPE_OBJECTIVE_STRATEGIES` and `_objective_block` gives it its own
+    wording. Do not "fix" that by re-deriving the posterior inside
+    `optimize()`: a second derivation is a second code path for a published
+    number, and it would go stale the moment a default moved. Plumbing the
+    pair out of here is the only correct repair, and it changes the record's
+    published return, volatility and Sharpe by more than the display step.
+
     - Implied equilibrium excess returns: Pi = delta * Sigma * w_mkt, where
       `w_mkt` is the synthetic equal-weight vector. EL-1: that vector is not a
       market portfolio and no caller can replace it -- `_black_litterman` and
@@ -1283,6 +1402,10 @@ def optimize(
     it declines to cluster them. The declined legs are published here, at a
     weight of zero, because a holding may not leave the user's book silently.
 
+    `beta` reaches only `min_cvar`, and `objective.cvar_beta` publishes the
+    level actually solved at. No API caller can set it: `OptimizeRequest` has no
+    beta field, so every `/optimize/run` request gets the 0.95 default below.
+
     `problem_status`: the cvxpy status of the solve whose answer these weights
     ARE. Every solve this call performs is appended to one local log by the
     checked `_solve`, and every fallback here solves after the answer it
@@ -1367,7 +1490,7 @@ def optimize(
         # Published on EVERY record, including `hrp`, so a consumer never has to
         # infer "no solver ran" from an absent key.
         "problem_status": solve_log[-1] if solve_log else None,
-        "objective": _objective_block(strategy),
+        "objective": _objective_block(strategy, cvar_beta=beta),
         # Which legs this strategy declined to reason about, and why. Empty for
         # every strategy but `hrp` today; published unconditionally so a
         # consumer never has to infer "nothing was dropped" from an absent key.

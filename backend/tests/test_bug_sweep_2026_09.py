@@ -26,6 +26,15 @@ from app.models.database import PortfolioPosition, StockTimeseries
 from app.services.analytics_engine import AnalyticsEngine
 from app.services.data_service import canonical_ticker
 
+# The no-book concentration shape's key list and its derivation live in exactly
+# one place. Imported rather than restated - see the block comment above
+# `test_empty_concentration_truthful` for how a second copy of this list is what
+# left seven keys asserting a 0.0 the shape no longer publishes.
+from tests.test_concentration_empty_hhi_absent import (
+    WITHHELD_ON_AN_EMPTY_BOOK,
+    ZERO_VALUED_ON_AN_EMPTY_BOOK,
+)
+
 
 # ---------------------------------------------------------------------------
 # canonical_ticker
@@ -182,56 +191,43 @@ async def test_rebalance_allows_full_exit(async_client: AsyncClient, test_db: As
 # B6 + B7: truthful empty concentration
 # ---------------------------------------------------------------------------
 
-#: `herfindahl_index` was on the 0.0 loop below until 2026-10-03, and the sweep
-#: it belongs to is what put it there: item 5 of this file's header is
-#: "`_empty_concentration` returned fabricated HHI/N_eff instead of zeros", so
-#: 0.0 was itself the FIX for an earlier wave - it replaced values that had no
-#: defensible provenance at all.
-#:
-#: It is the wrong fix for `herfindahl_index`, and provably so rather than by
-#: preference.  HHI = sum(w_i^2) >= 1/n > 0 for every NON-EMPTY book, so 0.0 is
-#: not a reachable measurement - it is a third value that no book can produce,
-#: sitting in the same field as the two that can (1.0 for one holding, 0.25 for
-#: four equal holdings).  A reader who sees 0.0 has to check `n_holdings` to
-#: learn which of the three it is, and the payload's own scale note already
-#: exists to make exactly that check necessary.
-#:
-#: It was not cosmetic.  `risk_scoring` fed this field straight into
-#: `min(30, herfindahl_index * 100)`, so the refusal scored the concentration
-#: leg at 0 - the BEST possible value on a 0-30 scale where 30 is the most
-#: concentrated book there is - and, because the leg was not in `excluded`, kept
-#: its 0.20 nominal weight and dragged `overall_score` down by up to 6 points.
-#: An unmeasured measurement was reported as the safest book there is.
-#:
-#: `None` is the answer, and it is scoped to `n == 0` exactly: the measured
-#: branch of `concentration_analysis` is untouched, so the AGENTS.md invariant
-#: ("a single-holding portfolio must strictly render 0% diversification score")
-#: still holds at `n == 1` and is pinned below.
-ZERO_VALUED_ON_AN_EMPTY_BOOK = (
-    "largest_position",
-    "top_3",
-    "top_5",
-    "top_10",
-    "effective_positions",
-    "diversification_score",
-    "gini_coefficient",
-)
+# NOTE: the no-book shape's key list is NOT restated in this file. It was, until
+# 2026-10-09, as a local `ZERO_VALUED_ON_AN_EMPTY_BOOK` that no longer meant
+# what its name said: every key on it had moved to `None`, so the tuple asserted
+# the OPPOSITE of its own name. Its history, and the argument for `None` over
+# `0.0`, are preserved verbatim in `test_concentration_empty_hhi_absent.py`,
+# which re-derived the list by asking, of every key the shape publishes, "on the
+# no-book shape, is 0 a MEASUREMENT or a STAND-IN?". The answer splits the shape
+# in two, and the two halves are imported from there:
+#
+#   WITHHELD_ON_AN_EMPTY_BOOK   the 9 statistics - all of them values some book
+#                               measures, so none is reachable here
+#   ZERO_VALUED_ON_AN_EMPTY_BOOK  the count and the two weight totals - zero IS
+#                               a true statement about an absent book
+#
+# Keeping a copy of that list in a second file is what let seven of its keys
+# drift silently while the source of truth moved: a hand-written list is checked
+# against nothing but itself.
 
 
 def test_empty_concentration_truthful():
+    """The engine's no-book shape withholds every statistic it cannot measure.
+
+    Loops `WITHHELD_ON_AN_EMPTY_BOOK` rather than a local copy: that list is
+    derived in `test_concentration_empty_hhi_absent.py`, and it is the copy in
+    THIS file that went stale the moment the other eight keys moved off 0.0.
+    """
     result = AnalyticsEngine()._empty_concentration()
     assert result["error"]
-    for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+    for key in WITHHELD_ON_AN_EMPTY_BOOK:
         assert key in result, f"missing key: {key}"
-        assert result[key] == 0.0, f"{key} must be 0.0, got {result[key]}"
-    # The one key that moved.  See ZERO_VALUED_ON_AN_EMPTY_BOOK above for why
-    # 0.0 was the wrong fix and None is the right one; the measured branch at
-    # n == 1 is unaffected and is pinned by the test below.
-    assert "herfindahl_index" in result
-    assert result["herfindahl_index"] is None
-    # `n_holdings` is what separates this shape from a measured one-holding
-    # book, and it is a true statement about an absent book rather than a
-    # stand-in for one.
+        assert result[key] is None, (
+            f"{key} must be None on a book with no holdings, got {result[key]!r}"
+        )
+    # The survivors are the count and the two weight totals, where 0 IS the
+    # measurement - a book of no holdings has none, and no weight mass. The
+    # engine's own no-book shape publishes `n_holdings` and `by_weight` only;
+    # the sector totals are ROUTE keys (see the endpoint test below).
     assert result["n_holdings"] == 0
 
 
@@ -274,17 +270,26 @@ async def test_concentration_endpoint_empty_state_keys(async_client: AsyncClient
     resp = await async_client.get("/api/v1/analytics/concentration")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["diversification_score"] == 0.0
-    assert data["gini_coefficient"] == 0.0
-    # The ROUTE's no-book branch, which never calls the engine, had kept the
-    # 0.0 that WM-6 removed from `_empty_concentration`. It is now aligned with
-    # the engine shape - see ZERO_VALUED_ON_AN_EMPTY_BOOK above for why 0.0 is
-    # not a reachable Herfindahl index for any book - and asserted with `is
-    # None` rather than a comparison, so a future 0.0 here fails instead of
-    # passing.
-    assert "herfindahl_index" in data
-    assert data["herfindahl_index"] is None
-    assert data["n_holdings"] == 0
+    # This branch of the ROUTE never calls the engine, so it publishes its own
+    # copy of the no-book shape and can drift from the engine's independently.
+    # Asserted over the imported list, not key by key by hand - this file's
+    # hand-written pair of assertions (`diversification_score == 0.0`,
+    # `gini_coefficient == 0.0`) is precisely what went stale when those keys
+    # moved to None, and a partial update would have left the other seven
+    # asserting a 0.0 no book can measure.
+    for key in WITHHELD_ON_AN_EMPTY_BOOK:
+        assert key in data, f"missing key: {key}"
+        assert data[key] is None, (
+            f"the route published {data[key]!r} for {key} at n == 0. Every one of "
+            "these nine is a value some book measures, so 0.0 here is a stand-in, "
+            "not a reading"
+        )
+    # And what the shape still measures: the count of no holdings, and the
+    # weight mass there is none of. Asserted from the same source as the list
+    # above, so the two halves cannot be satisfied by one blanket conversion.
+    for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+        assert key in data, f"missing key: {key}"
+        assert data[key] == 0, f"{key} must stay 0 on an empty book, got {data[key]!r}"
 
 
 # ---------------------------------------------------------------------------

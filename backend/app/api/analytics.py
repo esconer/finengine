@@ -32,7 +32,10 @@ from app.services.optimization_service import (
     optimizer_no_sample_reason,
     optimize,
 )
-from app.services.backtest_service import run_walk_forward_backtest
+from app.services.backtest_service import (
+    DEFAULT_TRANSACTION_COST_BPS,
+    run_walk_forward_backtest,
+)
 from app.services.regime_service import detect_regime
 from app.services.monte_carlo_service import simulate_goal
 from app.services.data_service import GlobalDataService, DataService
@@ -178,7 +181,16 @@ class BacktestRequest(BaseModel):
     strategy: str = "hrp"
     rebalance_freq_days: int = Field(default=21, ge=1, le=2520)
     lookback_days: int = Field(default=252, ge=20, le=2520)
-    transaction_cost_bps: float = Field(default=10.0, ge=0.0, le=1000.0, allow_inf_nan=False)
+    # One constant, read from the service that applies it. It was 10.0 in BOTH
+    # places, which is how `risk_free_rate` above ended up as two books; and
+    # neither copy documented its unit. `DEFAULT_TRANSACTION_COST_BPS` carries
+    # the sourced statutory basis and states the unit it is expressed in: a
+    # ONE-WAY rate per unit of one-way turnover, so a full exit and re-entry
+    # costs 2x. A caller reading the "~22-23bps NSE delivery round trip" out of
+    # the source note and passing that number here would double the friction.
+    transaction_cost_bps: float = Field(
+        default=DEFAULT_TRANSACTION_COST_BPS, ge=0.0, le=1000.0, allow_inf_nan=False,
+    )
     #: Same factory, same reason as `OptimizeRequest.risk_free_rate`.
     risk_free_rate: float = Field(
         default_factory=lambda: settings.risk_free_rate,
@@ -7386,10 +7398,20 @@ async def get_concentration_metrics(
         requested_tickers = await _load_portfolio_tickers(db)
         if not weights:
             return {
-                "largest_position": 0.0,
-                "top_3": 0.0,
-                "top_5": 0.0,
-                "top_10": 0.0,
+                # The same refusal `herfindahl_index` below was given, and for
+                # the same reason - the reason is recorded below. These four are
+                # not merely unmeasured on this branch, they are OUT OF RANGE on
+                # any book the measured branch can measure: the engine filters
+                # weights to finite, strictly positive values and normalizes
+                # them before summing, so the largest weight and the 3-, 5- and
+                # 10-weight sums are each strictly > 0, and `top_10` publishes
+                # the engine's OWN 1.0 whenever the book has fewer than ten
+                # holdings - i.e. most books. A 0.0 here does not sit beside a
+                # real reading; it CONTRADICTS the commonest one.
+                "largest_position": None,
+                "top_3": None,
+                "top_5": None,
+                "top_10": None,
                 # The same refusal the engine's own no-book shape publishes, and
                 # for the same reason: HHI = sum(w_i^2) >= 1/n is strictly
                 # positive for every NON-EMPTY book, so 0.0 is not a value any
@@ -7411,15 +7433,31 @@ async def get_concentration_metrics(
                 # engine's and is untouched, so a single-holding book still
                 # measures 1.0 and still renders 0% diversification.
                 "herfindahl_index": None,
-                "effective_positions": 0.0,
-                "diversification_score": 0.0,
+                # N_eff = 1/HHI and a normalized book has HHI <= 1, so N_eff
+                # lies in [1, n] on every non-empty book: 0.0 is outside the
+                # field's range, not a measurement a book can be asked for.
+                "effective_positions": None,
+                # The engine's no-book shape had already been made to withhold
+                # the index and still published 0.0/1.0 for these three, and
+                # this branch copied that. Both copies are corrected together -
+                # this early return never calls the engine, so its value is
+                # published independently and the engine's would never be
+                # consulted here.
+                #
+                # All three are readings of the `n == 1` book this branch is
+                # not: at one holding the score measures 0.0, the Gini measures
+                # 0.0 and the ratio N_eff/n measures 1.0. `diversification_ratio:
+                # 1.0` published beside `n_holdings: 0` tells a reader the book
+                # is perfectly concentrated in one name, and gives them no way to
+                # learn that no name was measured.
+                "diversification_score": None,
                 # The scale itself is the engine's declaration and is
                 # deliberately NOT restated here - this branch never calls the
                 # engine, and a second copy of that text is the defect a single
                 # implementation avoids.
                 **_concentration_diversification_disclosure({"by_weight": {}}),
-                "diversification_ratio": 1.0,
-                "gini_coefficient": 0.0,
+                "diversification_ratio": None,
+                "gini_coefficient": None,
                 "by_weight": {},
                 "by_sector": {},
                 # No book means no weight mass and no rounding to disclose.
@@ -7476,19 +7514,102 @@ async def get_concentration_metrics(
             active=_active_weight_tickers(weights),
         )
         return {
-            "largest_position": concentration_result.get("largest_position", 0.0),
-            "top_3": concentration_result.get("top_3", 0.0),
-            "top_5": concentration_result.get("top_5", 0.0),
-            "top_10": concentration_result.get("top_10", 0.0),
-            "herfindahl_index": concentration_result.get("herfindahl_index", 0.0),
-            "effective_positions": concentration_result.get("effective_positions", 0.0),
-            "diversification_score": concentration_result.get("diversification_score", 0.0),
+            # Subscripts, not `.get(key, <number>)`, for all eight reads on
+            # this measured path.
+            #
+            # WHAT THE ENGINE CONTRACT ACTUALLY GUARANTEES. On a real
+            # `AnalyticsEngine`, `concentration_analysis` returns exactly one
+            # of two shapes -- the measured dict, and `_empty_concentration`,
+            # which its own `except Exception` arm returns as well -- and BOTH
+            # publish every key read here. The engine has no third shape: its
+            # empty, all-zero, negative and non-finite branches all land on
+            # `_empty_concentration`, which carries the full key set.
+            #
+            # That comment used to read "so each of these defaults was
+            # unreachable", and THAT was the false claim -- not the shape
+            # count, which is right. This route does not read the engine
+            # CLASS; it reads whatever `analytics_engine.concentration_analysis`
+            # returns, and that collaborator arrives through
+            # `Depends(get_analytics_engine)`. A substituted engine is
+            # reachable at this seam and can return a PARTIAL dict: three
+            # tests did exactly that, with 6-7 of these 9 keys absent, and a
+            # scoped 6-file gate missed it because it did not run them. So
+            # every one of the eight defaults WAS reachable -- which is the
+            # whole defect, since a default is only safe once nothing can
+            # reach it.
+            #
+            # The fix is NOT to tolerate a partial dict at this layer. The
+            # engine has no third shape to fix, and
+            # `tests/test_concentration_hhi_no_fabricated_default.py` pins a
+            # partial engine dict as a NON-200 refusal on purpose -- a stand-in
+            # that does not honour the contract is a broken test, not a new
+            # production shape. So the stand-ins now delegate to a real engine
+            # (the idiom already used by `_RecordingEngine` in
+            # `tests/test_model_sample_and_aggregation_disclosure.py`) instead
+            # of hand-rolling a dict, and
+            # `tests/test_concentration_hhi_no_fabricated_default.py` pins
+            # that every engine shape carries all nine keys.
+            #
+            # For five of the eight the default was worse than merely
+            # reachable. It is a value the engine genuinely publishes on the
+            # measured path, so it was indistinguishable from a real reading:
+            #   diversification_score  0.0 -- correct at one holding, which the
+            #     repo's own invariant requires to render 0%
+            #   diversification_ratio  1.0 -- correct at one holding (N_eff/n)
+            #   gini_coefficient       0.0 -- correct at one holding
+            #   top_10                 1.0 -- the engine's OWN value whenever
+            #     the book has fewer than 10 holdings, i.e. most books
+            # and for the remaining three the default is a value the engine
+            # never publishes at all, because it filters weights to strictly
+            # positive before normalizing them, so largest_position/top_3/
+            # top_5 are all > 0, and effective_positions = 1/HHI lies in
+            # [1, n] on every non-empty book. A zero there reads as a
+            # measurement no book can produce.
+            #
+            # Without the defaults a key that is not published raises
+            # `KeyError` into this route's `except Exception`, which logs and
+            # returns 500: a loud refusal beats a quiet zero that a reader
+            # would take for "maximally concentrated" or "perfectly
+            # diversified". The `n == 0` branch above is separate committed
+            # code, is deliberately unchanged, and still returns its own keys.
+            "largest_position": concentration_result["largest_position"],
+            "top_3": concentration_result["top_3"],
+            "top_5": concentration_result["top_5"],
+            "top_10": concentration_result["top_10"],
+            # Subscript, not `.get(..., 0.0)`. That default was a stand-in for
+            # a measurement never taken, on the measured path, in a field whose
+            # only two real values are 1.0 (one holding) and 0.25 (four equal):
+            # HHI = sum(w_i^2) >= 1/n > 0 for every non-empty book, so 0.0 is
+            # not a reachable MEASUREMENT on the real engine. Its 1.0 sibling
+            # is in `_empty_concentration`, which refuses the index with `None`
+            # (WM-6) -- and a key PRESENT with a stored `None` is what
+            # `.get(key, 0.0)` returns `None` from, not 0.0, so on both engine
+            # shapes the default could not fire.
+            #
+            # That was also why the comment here used to say the key was
+            # unreachable "because `concentration_analysis` returns exactly one
+            # of two shapes, and both carry the key". The shape count is
+            # right; the conclusion was not, for the reason given above: the
+            # collaborator is DI-substitutable, so a partial dict IS reachable
+            # and the default WOULD have fired on it -- publishing 0.0, the
+            # safest book in the product, for a concentration nobody measured.
+            #
+            # WM-4/WM-5 fixed the other reader of this same field -- the
+            # `concentration_score` above in risk_scoring and the summary
+            # payload -- and left this line behind, so the route published a
+            # fabricated 0.0 that its sibling had already been made to refuse.
+            # Removing the default makes a broken engine contract raise
+            # `KeyError` into this route's `except Exception`, which logs and
+            # returns 500: a loud refusal beats a quiet zero.
+            "herfindahl_index": concentration_result["herfindahl_index"],
+            "effective_positions": concentration_result["effective_positions"],
+            "diversification_score": concentration_result["diversification_score"],
             # The score's scale, the two formulas and the `n` it was measured
             # over, so a reader can recompute the published index from the
             # published HHI instead of taking 98.5 on trust.
             **_concentration_diversification_disclosure(concentration_result),
-            "diversification_ratio": concentration_result.get("diversification_ratio", 1.0),
-            "gini_coefficient": concentration_result.get("gini_coefficient", 0.0),
+            "diversification_ratio": concentration_result["diversification_ratio"],
+            "gini_coefficient": concentration_result["gini_coefficient"],
             "by_weight": by_weight,
             "by_sector": by_sector,
             "by_sector_total": round(sector_weight_total, 12),
@@ -10274,9 +10395,39 @@ async def get_risk_contribution(
                     comp_assets.append(a)
                 else:
                     cvar_excluded_assets.add(a)
-            total = sum(abs(c) for c in comp)
+            # Shares are normalised by the SIGNED net tail contribution - the
+            # same contract the volatility leg above publishes one screen
+            # earlier (`contrib = contrib / contrib.sum()`): these shares are a
+            # DECOMPOSITION of one number, so they have to sum to it whatever
+            # the legs' signs are.
+            #
+            # The denominator used to be the sum of MAGNITUDES. A leg that
+            # OFFSETS the tail - a gold ETF, a low-beta sleeve, anything that
+            # gains on the book's own worst days - then put its magnitude into
+            # the denominator and its negative value into the numerator, so the
+            # published shares summed to |net| / gross instead of 1, and the
+            # block published that shortfall as `rounding_residual`: a real
+            # offset, described as 1e-12 of float noise. Audit rule NUM-003
+            # already requires every model's `published_total` to be ~1, so a
+            # genuinely hedged book was also the one book that failed it.
+            #
+            # An offsetting leg now publishes a NEGATIVE share, which is the
+            # shape the volatility model already publishes for a leg with a
+            # negative marginal contribution, and the offset's magnitude is the
+            # sum of the negative shares - a number the reader already has,
+            # rather than a field that has to be invented for it.
+            #
+            # The net is positive exactly when the book loses money on its own
+            # worst days. A tail that does not net to a loss has no tail loss
+            # to apportion, so it refuses instead of dividing: the magnitude
+            # guard let that book through and published shares summing to a
+            # negative number.
+            net_tail_loss = -sum(comp)
             # comp values are negative (tail-day losses); normalize to positive loss-shares
-            cvar_rc = {a: round(float(-c) / total, 6) for a, c in zip(comp_assets, comp)} if total > 0 else {}
+            cvar_rc = (
+                {a: round(float(-c) / net_tail_loss, 6) for a, c in zip(comp_assets, comp)}
+                if net_tail_loss > 0 else {}
+            )
 
         # `cvar` -> `cvar_tail`, keyed here from the one constant so the two
         # sector_rollup containers below cannot be renamed apart again.  The

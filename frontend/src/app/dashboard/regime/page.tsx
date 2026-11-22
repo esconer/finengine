@@ -36,13 +36,22 @@ import {
   History
 } from 'lucide-react';
 
+/**
+ * Educational copy ONLY.
+ *
+ * There is deliberately no per-metric benchmark field. It carried a string
+ * constant the model can never measure — an invented share-of-history split
+ * across the three states — under a "Quantitative Benchmark" heading, and two of
+ * its siblings narrated an invented portfolio return and an invented per-state
+ * distribution of return and volatility. What the route measures is rendered by
+ * {@link HelpExplainerModal}'s `measured` prop instead; what it does not says so.
+ */
 interface ExplainerContent {
   title: string;
   what: string;
   howInferred: string;
   whyImportant: string;
   howToInfer: string;
-  benchmark?: string;
 }
 
 const EXPLAINERS: Record<string, ExplainerContent> = {
@@ -51,44 +60,41 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The most probable latent macroeconomic state currently governing the NIFTY 50 index (Calm, Bull Rally, or Crisis).',
     howInferred: 'Inferred via the Viterbi algorithm from a 3-state Gaussian Hidden Markov Model trained on daily returns and 21-day rolling volatility.',
     whyImportant: 'Asset return distributions and correlations shift drastically across market regimes; static models fail during transitions.',
-    howToInfer: 'Calm indicates stable, low-volatility normal market conditions; Bull indicates high-momentum rallies; Crisis indicates elevated-volatility drawdowns.',
-    benchmark: 'Historical Indian market baseline: ~75% Calm, ~13% Bull Rally, ~12% Crisis.'
+    howToInfer: 'Calm indicates stable, low-volatility normal market conditions; Bull indicates high-momentum rallies; Crisis indicates elevated-volatility drawdowns.'
   },
   stability: {
     title: 'Regime Persistence & Stability',
     what: 'The statistical stability of the current market state, reflecting low day-over-day state flipping.',
     howInferred: 'Computed as 1.0 minus the historical empirical regime transition frequency: Stability = (1 - State_Flips) × 100%.',
     whyImportant: 'A high stability score (> 70%) ensures regime signals are persistent trends rather than noisy high-frequency oscillations.',
-    howToInfer: 'e.g. 74.0% stability would indicate that once NIFTY enters this regime, it reliably stays for extended multi-week durations.',
-    benchmark: 'Institutional threshold for stable regime trading: ≥ 65.0%.'
+    howToInfer: 'The measured score is the share of analysed sessions the model left the current state: high means the state has held, low means it is flipping.'
   },
   benchmark_vol: {
     title: 'Benchmark Volatility (Active Regime)',
     what: 'The annualized standard deviation of NIFTY 50 returns specifically during periods classified as this regime.',
     howInferred: 'Computed as σ_{regime} = std(R_{NIFTY} | State = Active) × √252.',
     whyImportant: 'Demonstrates the baseline market risk environment you are currently operating in.',
-    howToInfer: 'e.g. 10.3% benchmark volatility in Calm regime would confirm market swings are well below the long-term 15.5% average.',
-    benchmark: 'NIFTY long-term historical average volatility: 14.5% – 16.5%.'
+    howToInfer: 'Compare the active regime\'s volatility with the same figure for the other two states: it is the risk you are holding in the market itself.'
   },
   days_in_regime: {
     title: 'Historical Frequency / Share of History',
     what: 'The percentage of all analyzed trading sessions that have spent time in the active regime state.',
     howInferred: 'Count(Days in Active State) / Total Trading Days analyzed.',
-    whyImportant: 'Identifies whether current market conditions represent the default normal environment (~75%) or a rare market anomaly (~12%).',
-    howToInfer: '75% share indicates Calm is the dominant equilibrium state of the Indian equity market.'
+    whyImportant: 'Identifies whether current market conditions are the dominant state of the fitted history or a rare one.',
+    howToInfer: 'The measured share is the active state\'s occupancy of the fitted sample; a small share means the current conditions are the anomaly, not the norm.'
   },
   hmm_three_states: {
     title: '3-State Gaussian Hidden Markov Model',
     what: 'An econometric clustering algorithm that partitions market history into 3 unobservable latent states without subjective human bias.',
     howInferred: 'Trained using Expectation-Maximization (Baum-Welch algorithm) to jointly fit Gaussian emission distributions (mean return and covariance) and transition probabilities.',
     whyImportant: 'Captures volatility clustering, fat tails, and non-linear market phase transitions simultaneously.',
-    howToInfer: 'Compare Return and Volatility across states: Crisis exhibits negative returns (-28.8%) with high volatility (19.3%), whereas Calm delivers steady low-volatility returns (4.6%, 10.3% vol).'
+    howToInfer: 'The measured return and volatility of all three fitted states are listed with this panel; the spread across them is what makes the split worth having.'
   },
   regime_timeline: {
     title: '120-Day Daily Regime Timeline',
     what: 'A chronological daily sequence showing how the model classified each trading session over the last 6 months.',
     howInferred: 'Viterbi path reconstruction mapping each day to its highest posterior probability regime state.',
-    whyImportant: 'Reveals regime transition clusters, such as the shift from early-year choppy/crisis sessions into the extended stable calm regime.',
+    whyImportant: 'Reveals regime transition clusters and how long each state has held.',
     howToInfer: 'Solid green blocks indicate sustained calm conditions; red stripes highlight drawdown shocks; blue indicates explosive rallies.'
   },
   portfolio_in_regime: {
@@ -96,26 +102,44 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'Your actual portfolio\'s annualized return and realized volatility during days when NIFTY was in the active market regime.',
     howInferred: 'Evaluates your book\'s returns filtered strictly to the overlapping trading days of the current regime.',
     whyImportant: 'Validates whether your portfolio is effectively capturing upside or defending capital under the prevailing macro conditions.',
-    howToInfer: 'e.g. Your portfolio annualized +45.3% return with low volatility in Calm conditions would outperform the benchmark.',
-    benchmark: 'Alpha generation benchmark: Portfolio Return > Benchmark Return with lower relative drawdowns.'
+    howToInfer: 'Compare the measured portfolio return with the state\'s measured index return over the same overlapping days; the gap is what the book added inside this regime.'
   },
   regime_probabilities: {
     title: 'Real-Time Posterior Regime Probabilities',
     what: 'The exact mathematical probability distribution across all 3 market regimes inferred for today\'s session.',
     howInferred: 'Computed via Bayesian state inference: P(State_k | Returns, High/Low Range, EWMA Volatility) from the fitted Gaussian HMM.',
-    whyImportant: 'Provides continuous early-warning detection: you can see crisis probability rising from 2% to 25% days before a discrete regime flip occurs.',
-    howToInfer: 'If Calm probability > 70%, standard allocations apply; if Crisis probability climbs > 20%, initiate defensive hedges.'
+    whyImportant: 'Provides continuous early-warning detection: a rising probability precedes a discrete regime flip by however long the model takes to cross.',
+    howToInfer: 'A probability is a share of model belief, not a forecast. A weight on the high-volatility state is a reason to size down, not a call.'
   },
   intraday_volatility: {
     title: 'Intraday Range (Parkinson) vs EWMA Volatility',
     what: 'Real-time diagnostic comparing intraday High-Low price excursion volatility against fast-decay exponential volatility.',
     howInferred: 'Parkinson vol evaluates ln(High/Low)^2 / (4 ln 2) to capture true intraday swings; EWMA vol uses an exponential decay factor (span=10).',
-    whyImportant: 'Solves the "close-to-close blindness" where intraday panic swings (e.g. -1.0% intraday dip) are hidden by a modest closing change (-0.5%).',
-    howToInfer: 'If Parkinson Vol exceeds 15%, active intraday chop is elevated regardless of whether the net close looks flat.'
+    whyImportant: 'Solves the "close-to-close blindness" where intraday panic swings are hidden by a modest closing change.',
+    howToInfer: 'Where Parkinson vol sits above EWMA vol, the session\'s movement happened inside the range and the close understated it.'
   }
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+/**
+ * The measured reading for THIS book, keyed by the same `itemKey` a
+ * {@link HelpBtn} carries. Every entry is read off the response the page already
+ * holds, so the panel moves with the metric. An EMPTY line list is the
+ * not-measured state and is rendered as one — never backfilled.
+ */
+type MeasuredReading = {
+  lines: string[];
+  reason?: string;
+};
+
+function HelpExplainerModal({
+  itemKey,
+  measured,
+  onClose,
+}: {
+  itemKey: string;
+  measured: MeasuredReading | null;
+  onClose: () => void;
+}) {
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
@@ -170,11 +194,27 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-300">{info.howToInfer}</p>
           </div>
 
-          {info.benchmark && (
-            <div className="bg-sky-950/40 p-3 rounded-lg border border-sky-800/50 text-sky-200 text-xs font-medium">
-              💡 <span className="font-semibold text-sky-300">Quantitative Benchmark:</span> {info.benchmark}
-            </div>
-          )}
+          {/* The measured box. It used to be a static string, so it read the same on every
+            load and for every book; now it is read off the response, and an empty
+            reading renders the explicit not-measured state instead of a
+            plausible figure. */}
+          <div
+            data-testid="explainer-measured"
+            className="bg-sky-950/40 p-3 rounded-lg border border-sky-800/50 text-sky-200 text-xs font-medium"
+          >
+            📊 <span className="font-semibold text-sky-300">Measured On This Book:</span>
+            {measured && measured.lines.length > 0 ? (
+              <ul className="mt-1 space-y-0.5 list-disc list-inside font-mono">
+                {measured.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 font-mono">
+                Not measured — {measured?.reason ?? 'the route published no value for this metric'}.
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex justify-end">
@@ -214,10 +254,21 @@ interface RegimeData {
   regime_probabilities?: Record<string, number>;
   realtime_ewma_vol?: number | null;
   realtime_parkinson_vol?: number | null;
+  /**
+   * One fitted HMM state.
+   *
+   * `ann_ret` / `ann_vol` are `null` for a state the model emitted for ZERO
+   * trading days: there is no distribution to take a moment of, so the route
+   * withholds rather than publishing a zero. A zero here would be
+   * indistinguishable from a state that measured a flat return — the strongest
+   * claim this domain allows, made with no observations behind it. `ann_ret_method`
+   * is the route's own reason string for the withheld cell.
+   */
   states: {
     regime: string;
-    ann_ret: number;
-    ann_vol: number;
+    ann_ret: number | null;
+    ann_vol: number | null;
+    ann_ret_method?: string;
     historical_days_pct: number;
   }[];
   recent_history: { date: string; regime: string }[];
@@ -260,6 +311,25 @@ const REGIME_STYLES: Record<string, { label: string; chip: string; dot: string; 
     bg: 'bg-rose-500/20'
   },
 };
+
+/**
+ * `states[].ann_ret_method`, in the reader's words — the route's own definition
+ * qualifier for the number beside it, and the only thing that makes an N/A
+ * accountable. Same idiom as `risk-studio`'s `UNMEASURABLE_REASON_LABELS`: a
+ * token with no entry here falls back to the raw token rather than to a blank,
+ * so a method the backend adds later still names itself instead of vanishing.
+ */
+const ANN_RET_METHOD_LABELS: Record<string, string> = {
+  geometric_cagr_from_compounded_state_returns:
+    'geometric CAGR of the state\'s compounded returns',
+  arithmetic_mean_fallback_product_negative:
+    'arithmetic mean fallback — the compounded product was negative',
+  no_observations: 'no observations — this state captured no trading days',
+};
+
+/** The route's method token as a reader-facing phrase, never blank. */
+const annRetMethodLabel = (method: string | null | undefined): string =>
+  method ? ANN_RET_METHOD_LABELS[method] ?? method : 'method not stated';
 
 function regimeStyle(regime: string) {
   const key = regime.toLowerCase();
@@ -319,6 +389,91 @@ export default function RegimePage() {
         ? 'text-emerald-400'
         : 'text-rose-400';
 
+  /**
+   * One measured line per published value, or none at all. Returning `[]` for an
+   * unpublished value is what keeps the modal's not-measured state reachable:
+   * `fmtPct` would have turned the null into a literal "N/A" line, which reads
+   * as a rendered measurement rather than an absent one.
+   */
+  const measuredLine = (
+    label: string,
+    value: number | null | undefined,
+    render: (value: number) => string
+  ): string[] =>
+    typeof value === 'number' && !Number.isNaN(value) ? [`${label} ${render(value)}`] : [];
+
+  const stateLine = (st: RegimeData['states'][number]) =>
+    `${regimeStyle(st.regime).label} return ${fmtPct(st.ann_ret, 2)} · vol ${fmtPct(
+      st.ann_vol,
+      2
+    )}${st.ann_ret === null ? ` · ${annRetMethodLabel(st.ann_ret_method)}` : ''}`;
+
+  /**
+   * The measured reading behind each explainer, keyed by `itemKey`. Every entry
+   * is read off the response this page already fetched, so the panel moves with
+   * the metric instead of narrating a constant.
+   */
+  const measuredReadings: Record<string, MeasuredReading> = {
+    current_regime: {
+      lines: [
+        ...(data ? [`Active state ${current?.label ?? data.current_regime}`] : []),
+        ...(data ? [`as of ${data.as_of} · ${data.observations} sessions analysed`] : []),
+      ],
+      reason: 'the regime route has not returned a classification',
+    },
+    stability: {
+      lines: measuredLine('Regime stability', data?.stability_pct, (v) => `${v.toFixed(1)}%`),
+    },
+    benchmark_vol: {
+      lines: currentState ? [stateLine(currentState)] : [],
+      reason: 'the active state was not found in the fitted state table',
+    },
+    days_in_regime: {
+      lines: measuredLine(
+        'Share of fitted history',
+        currentState?.historical_days_pct,
+        (v) => `${v.toFixed(1)}%`
+      ),
+    },
+    // The invented per-state distribution of return and volatility that used to
+    // sit here is replaced by the fitted states themselves.
+    hmm_three_states: {
+      lines: (data?.states ?? []).map(stateLine),
+      reason: 'the regime route published no fitted states',
+    },
+    regime_timeline: {
+      lines: data?.recent_history.length
+        ? [`${data.recent_history.length} daily classifications published`]
+        : [],
+      reason: 'the route published no recent daily history',
+    },
+    portfolio_in_regime: {
+      lines: [
+        ...measuredLine('Overlap days', portBlock?.days, (v) => `${v}`),
+        ...measuredLine(
+          portShowTotal ? 'Portfolio total return' : 'Portfolio annualized return',
+          portRetValue,
+          (v) => fmtPct(v, 2)
+        ),
+        ...measuredLine('Portfolio realized vol', portBlock?.ann_vol, (v) => fmtPct(v, 2)),
+      ],
+      reason: 'no overlapping book history was measured inside the active regime',
+    },
+    regime_probabilities: {
+      lines: Object.entries(data?.regime_probabilities ?? {}).map(
+        ([state, probability]) => `${regimeStyle(state).label} ${fmtPct(probability / 100, 1)}`
+      ),
+      reason: 'the route published no posterior probabilities',
+    },
+    intraday_volatility: {
+      lines: [
+        ...measuredLine('Parkinson (intraday)', data?.realtime_parkinson_vol, (v) => fmtPct(v, 2)),
+        ...measuredLine('EWMA', data?.realtime_ewma_vol, (v) => fmtPct(v, 2)),
+      ],
+      reason: 'the route published no real-time intraday or EWMA volatility',
+    },
+  };
+
   // Export CSV
   const handleExportCSV = () => {
     if (!data) return;
@@ -333,9 +488,17 @@ export default function RegimePage() {
     }
     rows.push('');
     rows.push('HMM Latent State Parameters');
-    rows.push('Regime,Annualized Return (%),Annualized Volatility (%),Share of History (%)');
+    rows.push('Regime,Annualized Return (%),Annualized Volatility (%),Share of History (%),Ann. Return Method');
     for (const st of data.states) {
-      rows.push(`${escapeCsvCell(regimeStyle(st.regime).label)},${(st.ann_ret * 100).toFixed(2)}%,${(st.ann_vol * 100).toFixed(2)}%,${st.historical_days_pct.toFixed(1)}%`);
+      // `st.ann_ret * 100` on a null writes "0.00%" into the download — the
+      // strongest number this table can print, for a state that measured
+      // nothing. A downloaded file outlives the page, so the absence has to
+      // travel with it.
+      rows.push(
+        `${escapeCsvCell(regimeStyle(st.regime).label)},${
+          st.ann_ret === null ? 'N/A' : `${(st.ann_ret * 100).toFixed(2)}%`
+        },${st.ann_vol === null ? 'N/A' : `${(st.ann_vol * 100).toFixed(2)}%`},${st.historical_days_pct.toFixed(1)}%,${escapeCsvCell(annRetMethodLabel(st.ann_ret_method))}`
+      );
     }
     rows.push('');
     if (data.portfolio_in_current_regime) {
@@ -367,6 +530,7 @@ export default function RegimePage() {
       {activeExplainer && (
         <HelpExplainerModal
           itemKey={activeExplainer}
+          measured={measuredReadings[activeExplainer] ?? null}
           onClose={() => setActiveExplainer(null)}
         />
       )}
@@ -644,9 +808,25 @@ export default function RegimePage() {
                           </span>
                         </td>
                         <td className={`px-5 py-3.5 text-sm font-mono font-semibold ${
-                          state.ann_ret >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                          // `null >= 0` is TRUE, so an unmeasured state would
+                          // otherwise take the green "a good return" colour on
+                          // top of its N/A. Colour is a claim; gate it on the
+                          // measurement.
+                          state.ann_ret === null
+                            ? 'text-slate-400'
+                            : state.ann_ret >= 0
+                              ? 'text-emerald-400'
+                              : 'text-rose-400'
                         }`}>
                           {fmtPct(state.ann_ret)}
+                          {state.ann_ret === null && (
+                            <span
+                              className="block text-[10px] font-normal text-slate-500"
+                              title={annRetMethodLabel(state.ann_ret_method)}
+                            >
+                              {annRetMethodLabel(state.ann_ret_method)}
+                            </span>
+                          )}
                         </td>
                         <td className="px-5 py-3.5 text-sm font-mono text-slate-200">
                           {fmtPct(state.ann_vol)}

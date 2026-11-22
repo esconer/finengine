@@ -80,6 +80,83 @@ class PortfolioPositionUpdate(BaseModel):
         return v
 
 
+#: `last_price_as_of` means exactly this - and it is stated even though the field
+#: is never populated. `last_price` is a LIVE QUOTE written by
+#: `portfolio._update_portfolio_prices`, and the refresh keeps no provider market
+#: timestamp: `fetch_quote` returns a payload whose own `timestamp` is the moment
+#: the payload was built, not an exchange session instant, and
+#: `PortfolioPosition` has no column to hold one. So the honest value for this
+#: slot is a permanent null, and the reason has to travel with it.
+#:
+#: This deliberately reuses the AD-16 `price_as_of` / `price_as_of_semantics`
+#: vocabulary instead of coining a parallel one. The inversion is deliberate
+#: too: those two are published together when a date exists, whereas here the
+#: semantics is unconditional BECAUSE the value never is. A reader who sees a
+#: null `last_price_as_of` with no semantics would have to guess whether the
+#: date is missing, not applicable, or simply not looked up; all three mean the
+#: same thing here, and only one of them is true.
+POSITION_LAST_PRICE_AS_OF_SEMANTICS = (
+    "never_populated_no_provider_market_timestamp_is_recorded_for_this_quote"
+)
+
+
+def _position_quote_provenance() -> Dict[str, Any]:
+    """The quote facts this contract does NOT have, named per position.
+
+    A flag nobody can set is worse than a key a consumer must handle, so each
+    unavailable fact is published as an explicit null carrying the reason it is
+    null. The point is to stop a reader treating `updated_on` - the only other
+    timestamp on the row - as the time the market produced this price.
+    """
+    return {
+        "provider_market_timestamp": None,
+        "provider_market_timestamp_why": (
+            "No provider market timestamp is stored for this position. The quote "
+            "refresh writes last_price and restamps updated_on, and keeps neither "
+            "the vendor's own session instant nor the payload build time, so the "
+            "instant the market produced this price is not recoverable."
+        ),
+        "quote_source": None,
+        "quote_source_why": (
+            "The upstream quote payload carries a `source`, but the refresh does "
+            "not persist it, so which vendor priced this row is not recoverable "
+            "from the position alone."
+        ),
+        "delayed_or_live": None,
+        "delayed_or_live_why": (
+            "Neither the upstream vendor nor this contract states whether the "
+            "quote was live or delayed. Treating an unstated feed as live is the "
+            "assumption this null exists to expose."
+        ),
+        "fetch_time_is_not_a_quote_as_of_time": (
+            "updated_on is the instant this position's last_price was WRITTEN, "
+            "restamped on every refresh. It always follows the market instant it "
+            "would otherwise be mistaken for."
+        ),
+        "clocks_that_do_exist": {
+            "last_price_as_of": (
+                "Always null; see last_price_as_of_semantics. No market timestamp."
+            ),
+            "updated_on": (
+                "Quote WRITE clock for this leg only (a database write, not an "
+                "observation date)."
+            ),
+            "price_as_of": (
+                "Published by the portfolio envelope where present: the newest "
+                "DELIVERED daily bar date for this ticker. It dates the BAR, NOT "
+                "this live quote - reading it as the age of last_price is the "
+                "error this block exists to prevent."
+            ),
+        },
+        "consumer_rule": (
+            "Do not substitute fetch time for a quote as-of time. last_price has "
+            "no as-of time; the only defensible statements about its age are "
+            "that it was refreshed within this request's staleness window and "
+            "that the delivered bar date is published separately."
+        ),
+    }
+
+
 class PortfolioPositionResponse(BaseModel):
     """Schema for portfolio position response"""
     id: int
@@ -114,6 +191,15 @@ class PortfolioPositionResponse(BaseModel):
     total_cost_base: Optional[float] = None
     unrealized_gain_loss_base: Optional[float] = None
     unrealized_gain_loss_pct_base: Optional[float] = None
+    # Quote provenance. Declared on the BASE schema, not the portfolio envelope,
+    # so every route that returns a position - GET /portfolio, POST /add,
+    # PUT, and the bulk legs - publishes the same contract. A consumer must not
+    # get provenance from one route and silence from another for the same fact.
+    last_price_as_of: Optional[str] = None
+    last_price_as_of_semantics: str = POSITION_LAST_PRICE_AS_OF_SEMANTICS
+    quote_provenance: Dict[str, Any] = Field(
+        default_factory=_position_quote_provenance
+    )
 
     class Config:
         from_attributes = True

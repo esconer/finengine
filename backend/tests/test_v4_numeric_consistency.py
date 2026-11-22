@@ -191,20 +191,20 @@ def _trade(ticker, price, *, amount, shares, status="executable"):
     }
 
 
-# The live book's geometry: MCX.NS has the widest tolerance (3262.60 * 0.5) and
-# MIDCAPIETF.NS the narrowest (23.54 * 0.5). The engine published the minimum
+# The live book's geometry: EXCHANGE.NS has the widest tolerance (3262.60 * 0.5) and
+# MIDETF.NS the narrowest (23.54 * 0.5). The engine published the minimum
 # under a `max_` name, understating the bound by 1631.300049 / 11.77 = 138.6x.
-MCX_PRICE = 3262.60009765625
+EXCHANGE_PRICE = 3262.60009765625
 ETF_PRICE = 23.540000915527344
-CIPLA_PRICE = 1384.0999755859375
+ASTRALN_PRICE = 1384.0999755859375
 
 
 def _audit_trades() -> Dict[str, Any]:
     trades: Dict[str, Any] = {}
-    trades.update(_trade("MCX.NS", MCX_PRICE, amount=-1109.62, shares=0,
+    trades.update(_trade("EXCHANGE.NS", EXCHANGE_PRICE, amount=-1109.62, shares=0,
                          status="below_minimum_notional"))
-    trades.update(_trade("MIDCAPIETF.NS", ETF_PRICE, amount=2253.91, shares=96))
-    trades.update(_trade("CIPLA.NS", CIPLA_PRICE, amount=-418.99, shares=0))
+    trades.update(_trade("MIDETF.NS", ETF_PRICE, amount=2253.91, shares=96))
+    trades.update(_trade("ASTRALN.NS", ASTRALN_PRICE, amount=-418.99, shares=0))
     return trades
 
 
@@ -229,12 +229,12 @@ def test_max_rounding_tolerance_publishes_the_maximum_not_the_minimum():
     assert true_max == 1631.300049
     assert true_min == 11.77
     assert block["max_rounding_tolerance"] == true_max
-    assert block["max_rounding_tolerance_ticker"] == "MCX.NS"
+    assert block["max_rounding_tolerance_ticker"] == "EXCHANGE.NS"
     # The minimum is not lost: it is published under the name it always was.
     assert block["min_rounding_tolerance"] == true_min
     # The residual maximum is a DIFFERENT measurement, so both declare theirs.
     assert block["max_abs_rounding_residual"] == 1109.62
-    assert block["max_abs_rounding_residual_ticker"] == "MCX.NS"
+    assert block["max_abs_rounding_residual_ticker"] == "EXCHANGE.NS"
     assert block["max_rounding_tolerance_scope"] == TRADE_AGGREGATE_SCOPE
     assert block["max_abs_rounding_residual_scope"] == TRADE_AGGREGATE_SCOPE
     assert block["aggregates_source"] == "recomputed_from_delivered_trades"
@@ -279,7 +279,7 @@ def test_reconciliation_disclosure_is_absent_when_the_engine_published_none():
 def _optimizer_fixture():
     """Two legs whose UNROUNDED difference rounds away from the published legs.
 
-    REDINGTON.NS is the live case: recommended 0.03565 -> 0.0357, current
+    TRIDENT.NS is the live case: recommended 0.03565 -> 0.0357, current
     0.07475 -> 0.0747. The unrounded delta is -0.0391 while the published legs
     differ by -0.0390, so a table whose purpose is to be added up disagreed with
     itself by 1e-4.
@@ -600,11 +600,11 @@ def test_contribution_block_survives_an_empty_model():
 # ---------------------------------------------------------------------------
 def test_spread_is_declared_as_an_assumed_tier_formula_not_a_score_difference():
     positions = {
-        "CIPLA.NS": {
+        "ASTRALN.NS": {
             "score": 9.2, "score_raw": 9.240271, "spread": 0.0004,
             "avg_turnover": 1_201_357_007.8095238, "category": "High",
         },
-        "SELECTIPO.NS": {
+        "TRUENORTH.NS": {
             "score": 3.4, "score_raw": 3.390135, "spread": 0.0056,
             "avg_turnover": 2_690_584.292588234, "category": "Low",
         },
@@ -616,41 +616,41 @@ def test_spread_is_declared_as_an_assumed_tier_formula_not_a_score_difference():
     assert block["observed"] is False
     assert "NOT abs(score - score_raw)" in block["note"]
     # The obvious wrong reading is off by two orders of magnitude.
-    assert abs(positions["CIPLA.NS"]["score"] - positions["CIPLA.NS"]["score_raw"]) == (
+    assert abs(positions["ASTRALN.NS"]["score"] - positions["ASTRALN.NS"]["score_raw"]) == (
         pytest.approx(0.040271, abs=1e-6)
     )
-    assert positions["CIPLA.NS"]["spread"] == 0.0004
+    assert positions["ASTRALN.NS"]["spread"] == 0.0004
     # The declared formulas REPRODUCE the published spread, which is what makes
     # the declaration evidence rather than a paraphrase.
     assert block[LIQUIDITY_RECOMPUTATION_KEY]["confirmed_count"] == 2
     assert block[LIQUIDITY_RECOMPUTATION_KEY]["unconfirmed_count"] == 0
-    assert per_position["CIPLA.NS"]["spread_formula_confirmed"] is True
-    assert per_position["CIPLA.NS"]["spread_tier"] == "tier_1"
-    assert per_position["SELECTIPO.NS"]["spread_tier"] == "tier_4"
-    assert per_position["CIPLA.NS"]["spread_recomputed"] == 0.0004
-    assert per_position["SELECTIPO.NS"]["spread_recomputed"] == 0.0056
+    assert per_position["ASTRALN.NS"]["spread_formula_confirmed"] is True
+    assert per_position["ASTRALN.NS"]["spread_tier"] == "tier_1"
+    assert per_position["TRUENORTH.NS"]["spread_tier"] == "tier_4"
+    assert per_position["ASTRALN.NS"]["spread_recomputed"] == 0.0004
+    assert per_position["TRUENORTH.NS"]["spread_recomputed"] == 0.0056
     assert len(block["tier_ladder"]) == 4
 
 
 def test_score_ceiling_is_disclosed_when_a_leg_clamps_to_the_scale_maximum():
-    """MCX.NS published score_raw 10.0, which is the tier-1 clamp, not a measurement."""
+    """EXCHANGE.NS published score_raw 10.0, which is the tier-1 clamp, not a measurement."""
     saturated = 6_490_322_599.168143
     ladder = _liquidity_tier_values(saturated)
     assert ladder[0][1] == 10.0
     block, per_position = _liquidity_score_spread_disclosure({
-        "MCX.NS": {
+        "EXCHANGE.NS": {
             "score": 10.0, "score_raw": 10.0, "spread": 0.0003,
             "avg_turnover": saturated, "category": "High",
         },
     })
     assert block["score_ceiling"]["scale_max"] == 10.0
-    assert block["score_ceiling"]["positions_at_ceiling"] == ["MCX.NS"]
+    assert block["score_ceiling"]["positions_at_ceiling"] == ["EXCHANGE.NS"]
     assert block["score_ceiling"]["positions_at_ceiling_count"] == 1
-    assert per_position["MCX.NS"]["score_ceiling_applied"] is True
+    assert per_position["EXCHANGE.NS"]["score_ceiling_applied"] is True
     assert "CAPPED value" in block["score_ceiling"]["rule"]
     # The spread is on the tier's own plateau, so it stops responding to turnover.
-    assert per_position["MCX.NS"]["spread_at_tier_plateau"] is True
-    assert block["spread_at_tier_plateau"]["positions"] == ["MCX.NS"]
+    assert per_position["EXCHANGE.NS"]["spread_at_tier_plateau"] is True
+    assert block["spread_at_tier_plateau"]["positions"] == ["EXCHANGE.NS"]
 
 
 def test_a_leg_that_entered_its_tier_on_market_cap_is_still_reproduced():
@@ -815,7 +815,7 @@ class TestTheRetiredCountKeyIsRedirectedNotDropped:
         """Pins the block's whole payload, so a rename that also recomputed
         something would fail rather than read as a naming change."""
         block, _ = _liquidity_score_spread_disclosure({
-            "CIPLA.NS": {
+            "ASTRALN.NS": {
                 "score": 9.2, "score_raw": 9.240271, "spread": 0.0004,
                 "avg_turnover": 1_201_357_007.8095238, "category": "High",
             },
@@ -827,7 +827,7 @@ class TestTheRetiredCountKeyIsRedirectedNotDropped:
         assert block[LIQUIDITY_RECOMPUTATION_KEY] == {
             "confirmed_count": 1,
             "unconfirmed_count": 1,
-            "confirmed_tickers": ["CIPLA.NS"],
+            "confirmed_tickers": ["ASTRALN.NS"],
             "unconfirmed_tickers": ["GHOST.NS"],
         }
 
@@ -1052,10 +1052,10 @@ def test_pairs_agreement_is_counted_so_the_two_tests_are_never_summed():
 
 def test_pairs_agreement_on_the_exported_geometry():
     """The audited book: 4 and 4, no overlap, out of 91 scanned pairs."""
-    decision = [("JUNIORBEES.NS", "MOTILALOFS.NS"), ("JKIL.NS", "NIFTYIETF.NS"),
-                ("ELECTCAST.NS", "MCX.NS"), ("JUNIORBEES.NS", "MIDCAPIETF.NS")]
-    diagnostic = [("CIPLA.NS", "JUNIORBEES.NS"), ("ELECTCAST.NS", "JKIL.NS"),
-                  ("CIPLA.NS", "MIDCAPIETF.NS"), ("CIPLA.NS", "NTPC.NS")]
+    decision = [("SMALLCAP.NS", "PRAGATI.NS"), ("KIRANA.NS", "TIDETEST.NS"),
+                ("SURYODAY.NS", "EXCHANGE.NS"), ("SMALLCAP.NS", "MIDETF.NS")]
+    diagnostic = [("ASTRALN.NS", "SMALLCAP.NS"), ("SURYODAY.NS", "KIRANA.NS"),
+                  ("ASTRALN.NS", "MIDETF.NS"), ("ASTRALN.NS", "NARMADA.NS")]
     pairs = [
         _Pair(a, b, (a, b) in decision, (a, b) in diagnostic)
         for a, b in decision + diagnostic
@@ -1210,12 +1210,12 @@ def test_a_fully_measured_book_is_byte_identical_to_the_two_bucket_block():
     # The audited book's real geometry: 5 decision-positive, 5 diagnostic-
     # positive, one overlap, every pair computed.
     decision = {
-        "ARROWGREEN.NS/MOTHERSON.NS", "ELECTCAST.NS/MCX.NS", "JKIL.NS/NIFTYIETF.NS",
-        "JUNIORBEES.NS/MOTILALOFS.NS", "MOTHERSON.NS/NTPC.NS",
+        "ZENITHAA.NS/VARDHAM.NS", "SURYODAY.NS/EXCHANGE.NS", "KIRANA.NS/TIDETEST.NS",
+        "SMALLCAP.NS/PRAGATI.NS", "VARDHAM.NS/NARMADA.NS",
     }
     diagnostic = {
-        "CIPLA.NS/JUNIORBEES.NS", "ELECTCAST.NS/JKIL.NS", "CIPLA.NS/MIDCAPIETF.NS",
-        "CIPLA.NS/NTPC.NS", "JKIL.NS/NIFTYIETF.NS",
+        "ASTRALN.NS/SMALLCAP.NS", "SURYODAY.NS/KIRANA.NS", "ASTRALN.NS/MIDETF.NS",
+        "ASTRALN.NS/NARMADA.NS", "KIRANA.NS/TIDETEST.NS",
     }
     pairs = [
         _Pair(*key.split("/"), key in decision, key in diagnostic)

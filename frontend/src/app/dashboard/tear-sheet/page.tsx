@@ -47,111 +47,113 @@ import {
   ArrowDownRight
 } from 'lucide-react';
 
+/**
+ * Educational copy ONLY.
+ *
+ * There is deliberately no per-metric benchmark field here. It used to carry a
+ * per-metric string — a hardcoded portfolio-versus-index return pair, and an
+ * invented alpha attributed by name to three of the reader's own holdings —
+ * printed under a "Quantitative Benchmark" heading. Nothing in a static table
+ * can be a benchmark for THIS book, so the reading that belongs there is
+ * rendered from the response by {@link HelpExplainerModal}'s `measured` prop
+ * instead, and a metric the route does not publish says so.
+ *
+ * A number may still appear here where it is part of the metric's own formula,
+ * its tier boundaries, or the annualization convention — never as a result, and
+ * never beside a named holding.
+ */
 interface ExplainerContent {
   title: string;
   what: string;
   howInferred: string;
   whyImportant: string;
   howToInfer: string;
-  benchmark?: string;
 }
 
 const EXPLAINERS: Record<string, ExplainerContent> = {
   total_return: {
     title: 'Compounded Total Return',
-    what: 'The cumulative percentage growth of your portfolio over the entire 1-year analysis window, assuming full dividend and cash compounding.',
-    howInferred: 'Calculated as R_total = ∏(1 + R_t) - 1 across all 252 trading days.',
+    what: 'The cumulative percentage growth of your portfolio over the analysis window, assuming full dividend and cash compounding.',
+    howInferred: 'Calculated as R_total = ∏(1 + R_t) - 1 across every measured trading day in the window.',
     whyImportant: 'The headline bottom-line figure showing overall nominal capital growth.',
-    howToInfer: '25.75% means ₹1,00,000 invested 1 year ago has grown into ₹1,25,750 today.',
-    benchmark: 'Nifty 50 1-Year Total Return: -2.6% (Portfolio Alpha: +28.4%).'
+    howToInfer: 'A total return of r grows the capital you held at the window start by a factor of (1 + r), dividends and cash reinvested.'
   },
   cagr: {
     title: 'Compound Annual Growth Rate (CAGR)',
     what: 'The smoothed annualized geometric rate of return that would take the portfolio from its starting value to its ending value.',
     howInferred: 'CAGR = (1 + R_total)^(252 / N) - 1, where N is the number of trading sessions.',
     whyImportant: 'Standardizes returns to an annual basis for fair comparison against multi-year benchmarks, Fixed Deposits (6.5%), and debt yields.',
-    howToInfer: 'Above 18% is top-decile multi-cap performance in Indian markets.',
-    benchmark: 'Long-term Indian equity historical CAGR benchmark: 12.0% – 14.0%.'
+    howToInfer: 'Read the CAGR against the benchmark return shown with it in this panel; the gap is what the selection added over the window.'
   },
   sharpe_ratio: {
     title: 'Sharpe Ratio (Rf = 2.0%)',
     what: 'The classic measure of risk-adjusted excess return per unit of total volatility.',
     howInferred: 'Sharpe = (Annualized Return - Risk-Free Rate) / Annualized Volatility. Uses 2.0% risk-free hurdle.',
     whyImportant: 'Determines whether superior returns are generated through genuine investment skill or reckless leverage/volatility.',
-    howToInfer: 'Below 1.0 = Sub-optimal; 1.0 – 1.5 = Good; Above 1.5 = Outstanding risk efficiency.',
-    benchmark: 'Current Portfolio: 1.26 vs NIFTY 50: -0.20.'
+    howToInfer: 'Below 1.0 = Sub-optimal; 1.0 – 1.5 = Good; Above 1.5 = Outstanding risk efficiency.'
   },
   max_drawdown: {
     title: 'Maximum Drawdown (Peak-to-Trough)',
     what: 'The largest cumulative percentage decline experienced from a historical peak before establishing a new peak.',
     howInferred: 'MDD = min_t ( (V_t - max_{τ ≤ t} V_τ) / max_{τ ≤ t} V_τ ).',
     whyImportant: 'Measures downside capital destruction risk and psychological pain tolerance during market panics.',
-    howToInfer: '-14.24% means at its deepest drawdown (March 2026 correction), the portfolio temporarily declined 14.24% from its highest peak.',
-    benchmark: 'Standard equity mandate drawdown ceiling: ≤ -20.0%.'
+    howToInfer: 'The measured figure is the deepest peak-to-trough fall inside the window; its date and duration are on the underwater curve below.'
   },
   beta_vs_nifty: {
     title: 'Market Beta (β vs NIFTY 50)',
     what: 'The statistical sensitivity of portfolio returns relative to benchmark market swings.',
     howInferred: 'Beta = Cov(R_portfolio, R_nifty) / Var(R_nifty).',
     whyImportant: 'Identifies systemic market exposure: β = 1.0 indicates identical market movement; β > 1.0 indicates higher cyclical volatility.',
-    howToInfer: '1.06 indicates the portfolio tends to move 6% more than the NIFTY 50 during broad market rallies and corrections.',
-    benchmark: 'Balanced multi-cap target: 0.90 – 1.10.'
+    howToInfer: 'β above 1.0 means the book amplified index moves, below 1.0 that it dampened them, and negative that it moved against the index.'
   },
   alpha_annualized: {
     title: 'Annualized Jensen Alpha (α)',
     what: 'The excess return generated by the portfolio above what is predicted by the Capital Asset Pricing Model (CAPM) beta.',
     howInferred: 'Alpha = R_portfolio - (R_f + β × (R_nifty - R_f)) annualized.',
     whyImportant: 'The purest measure of active quantitative value-add over passive indexing.',
-    howToInfer: '28.51% indicates massive active outperformance generated by high-conviction scrip selection (MCX, Motherson, Redington).',
-    benchmark: 'Institutional hurdle: Alpha > +3.0%.'
+    howToInfer: 'Positive alpha is return above what the index beta predicted; negative is below. It is a regression residual, not proof of skill.'
   },
   sortino_ratio: {
     title: 'Sortino Ratio (Downside Risk-Adjusted)',
     what: 'A refined Sharpe ratio variant that penalizes only downside volatility, ignoring beneficial upside volatility.',
     howInferred: 'Sortino = (R_portfolio - R_f) / Downside_Deviation.',
     whyImportant: 'Investors welcome upward volatility; penalizing upside moves in the Sharpe denominator can be misleading. Sortino isolates true downside risk.',
-    howToInfer: 'Above 1.5 indicates strong downside protection during corrections.',
-    benchmark: 'Typical top-quartile PMS target: Sortino > 1.40.'
+    howToInfer: 'Above 1.5 indicates strong downside protection during corrections.'
   },
   calmar_ratio: {
     title: 'Calmar Ratio (CAGR to Drawdown)',
     what: 'The ratio of annualized compounded return to the absolute maximum drawdown.',
-    howInferred: 'Calmar = CAGR / |Max Drawdown| = 25.98% / 14.24% = 1.82.',
+    howInferred: 'Calmar = CAGR / |Max Drawdown|.',
     whyImportant: 'Heavily used by hedge funds and CTA trend-followers to evaluate recovery capability after severe drawdowns.',
-    howToInfer: 'Above 1.5 is considered exceptional risk-return asymmetry.',
-    benchmark: 'Institutional target: Calmar > 1.0.'
+    howToInfer: 'Above 1.5 is considered exceptional risk-return asymmetry.'
   },
   omega_ratio: {
     title: 'Omega Ratio',
     what: 'The probability-weighted ratio of cumulative gains versus cumulative losses relative to the target hurdle.',
     howInferred: 'Calculated as the integral of the return distribution above threshold divided by the integral below threshold.',
     whyImportant: 'Captures all statistical return moments (mean, variance, skewness, and kurtosis) simultaneously.',
-    howToInfer: 'Omega > 1.20 indicates that upside probability mass significantly outweighs downside tail risk.',
-    benchmark: 'Standard baseline: > 1.15.'
+    howToInfer: 'Omega > 1.20 indicates that upside probability mass significantly outweighs downside tail risk.'
   },
   tail_ratio: {
     title: 'Tail Ratio (95th vs 5th Percentile)',
     what: 'The magnitude of extreme positive returns (95th percentile) relative to extreme negative returns (5th percentile).',
     howInferred: 'Tail Ratio = |95th percentile daily return| / |5th percentile daily return|.',
     whyImportant: 'Shows whether favorable tail events are bigger than adverse tail shocks.',
-    howToInfer: 'Above 1.0 indicates right-skewed positive tail payoff asymmetry.',
-    benchmark: 'Target: > 1.05.'
+    howToInfer: 'Above 1.0 indicates right-skewed positive tail payoff asymmetry.'
   },
   skewness: {
     title: 'Return Distribution Skewness',
     what: 'A measure of asymmetry in daily returns around the portfolio mean.',
     howInferred: 'Computed as the normalized third statistical moment E[(R - μ)^3] / σ^3.',
     whyImportant: 'Positive skew means frequent moderate returns with rare massive upward surprises; negative skew warns of sudden steep drops.',
-    howToInfer: 'Values between -0.5 and +0.5 indicate a well-balanced distribution without fatal left-tail collapse.',
-    benchmark: 'Normal distribution benchmark = 0.0.'
+    howToInfer: 'Values between -0.5 and +0.5 indicate a well-balanced distribution without fatal left-tail collapse.'
   },
   kurtosis: {
     title: 'Excess Kurtosis (Fat-Tail Indicator)',
     what: 'A measure of whether returns exhibit fatter tails and sharper peaks than a Gaussian normal curve.',
     howInferred: 'Computed as E[(R - μ)^4] / σ^4 - 3.',
     whyImportant: 'High positive kurtosis (> 3) warns of "black swan" jump risks.',
-    howToInfer: 'Helps evaluate tail risk buffers and stop-loss placement.',
-    benchmark: 'Standard Gaussian = 0.0 (Mesokurtic).'
+    howToInfer: 'Helps evaluate tail risk buffers and stop-loss placement.'
   },
   monthly_returns: {
     title: 'Monthly Return Heatmap',
@@ -169,30 +171,52 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
   },
   weights_used: {
     title: 'Constituent Asset Weights',
-    what: 'The active allocation percentage assigned to each security in the portfolio across the 1-year evaluation period.',
+    what: 'The active allocation percentage assigned to each security in the portfolio across the evaluation window.',
     howInferred: 'Derived from current portfolio database holdings and normalized to sum to 100.0%.',
     whyImportant: 'Reveals which specific scrips drove the tear-sheet performance results.',
-    howToInfer: 'Check largest weights (Motherson 13.6%, JuniorBees 12.8%, Midcap ETF 10.5%) to understand return drivers.'
+    howToInfer: 'The largest measured weights are listed with this panel; they are the return drivers to examine first.'
   },
   portfolio_volatility: {
     title: 'Portfolio Volatility (Realized)',
     what: 'Annualized standard deviation of portfolio returns over the headline measurement window.',
     howInferred: 'Computed as σ_annual = std(daily returns) × sqrt(252) across the reported window (full-history when available, otherwise the holding window).',
     whyImportant: 'Realized risk of the actual book; anchors risk-budget comparisons and position sizing.',
-    howToInfer: 'Sustained realized vol above your target volatility means the book is over-risked relative to its budget.',
-    benchmark: 'Typical Indian multi-cap equity realized volatility: 12% – 20% annualized.'
+    howToInfer: 'Sustained realized vol above your target volatility means the book is over-risked relative to its budget.'
   },
   benchmark_volatility: {
     title: 'NIFTY 50 Volatility (Realized)',
     what: 'Annualized standard deviation of the NIFTY 50 (^NSEI) index over the same measurement window.',
     howInferred: 'σ_annual = std(daily index returns) × sqrt(252) computed on the benchmark series for an apples-to-apples window.',
     whyImportant: 'Market baseline risk for contextualizing portfolio volatility and beta.',
-    howToInfer: 'Portfolio volatility far above index volatility signals concentrated or high-beta holdings.',
-    benchmark: 'NIFTY 50 long-run realized volatility: roughly 12% – 18% annualized.'
+    howToInfer: 'Portfolio volatility far above index volatility signals concentrated or high-beta holdings.'
   }
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+/**
+ * The measured reading for THIS book, keyed by the same `itemKey` a
+ * {@link HelpBtn} carries.
+ *
+ * This is the whole point of the panel: before, every metric's "benchmark" was a
+ * string constant, so the modal said the same thing whatever the response said.
+ * Each entry here is computed from the payload the page already holds, so the
+ * text moves with the metric. An EMPTY line list is the not-measured state and
+ * is rendered as one — it is never backfilled with a plausible figure.
+ */
+type MeasuredReading = {
+  lines: string[];
+  /** Why there is nothing to show, when that is not the generic answer. */
+  reason?: string;
+};
+
+function HelpExplainerModal({
+  itemKey,
+  measured,
+  onClose,
+}: {
+  itemKey: string;
+  measured: MeasuredReading | null;
+  onClose: () => void;
+}) {
   const info = EXPLAINERS[itemKey];
 
   if (!info) return null;
@@ -243,11 +267,28 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-300">{info.howToInfer}</p>
           </div>
 
-          {info.benchmark && (
-            <div className="bg-emerald-950/40 p-3 rounded-lg border border-emerald-800/50 text-emerald-200 text-xs font-medium">
-              💡 <span className="font-semibold text-emerald-300">Quantitative Benchmark:</span> {info.benchmark}
-            </div>
-          )}
+          {/*
+            The measured box. There is no static provenance string behind it:
+            `measured` is read off the response, and an empty reading renders the
+            explicit not-measured state instead of a plausible figure.
+          */}
+          <div
+            data-testid="explainer-measured"
+            className="bg-emerald-950/40 p-3 rounded-lg border border-emerald-800/50 text-emerald-200 text-xs font-medium"
+          >
+            📊 <span className="font-semibold text-emerald-300">Measured On This Book:</span>
+            {measured && measured.lines.length > 0 ? (
+              <ul className="mt-1 space-y-0.5 list-disc list-inside font-mono">
+                {measured.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 font-mono">
+                Not measured — {measured?.reason ?? 'this route publishes no value for this metric in the current response'}.
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex justify-end">
@@ -396,6 +437,121 @@ export default function TearSheetPage() {
     ? Math.min(...drawdownPoints.map((p) => p.drawdown))
     : null;
 
+  /**
+   * One measured line per non-null metric, or none at all. Returning `[]` for an
+   * unmeasured metric is what keeps the modal's not-measured state reachable:
+   * `fmt`/`fmtRatio` would have turned the null into a literal "N/A" line, which
+   * reads as a rendered value rather than an absent one.
+   */
+  const measuredLine = (
+    label: string,
+    value: number | null | undefined,
+    render: (value: number) => string
+  ): string[] =>
+    typeof value === 'number' && !Number.isNaN(value) ? [`${label} ${render(value)}`] : [];
+
+  const largestWeights = data
+    ? Object.entries(data.holdings)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 3)
+        .map(([ticker, weight]) => `${ticker} ${fmt(weight, 1, '%')}`)
+    : [];
+
+  /**
+   * The measured reading behind each explainer, keyed by `itemKey`.
+   *
+   * Every entry reads the payload this page already fetched, so the panel moves
+   * with the metric instead of narrating a constant — which is exactly what the
+   * removed `benchmark` strings did, and what made the panel assert figures no
+   * route had measured, against one fixed portfolio.
+   */
+  const measuredReadings: Record<string, MeasuredReading> = {
+    total_return: {
+      lines: [
+        ...measuredLine('Total return', hl.total_return, (v) => fmt(v, 2, '%')),
+        ...measuredLine(
+          'Holding-window total return',
+          data?.metrics.total_return,
+          (v) => fmt(v, 2, '%')
+        ),
+      ],
+    },
+    cagr: { lines: measuredLine('CAGR', hl.cagr, (v) => fmt(v, 2, '%')) },
+    sharpe_ratio: {
+      lines: [
+        ...measuredLine('Portfolio Sharpe', hl.sharpe, (v) => fmtRatio(v)),
+        ...measuredLine(
+          'NIFTY 50 Sharpe',
+          data?.relative_vs_nifty.benchmark_sharpe,
+          (v) => fmtRatio(v)
+        ),
+      ],
+    },
+    max_drawdown: {
+      lines: [
+        ...measuredLine('Max drawdown', hl.max_drawdown, (v) => fmt(v, 2, '%')),
+        ...measuredLine(
+          'Deepest point on the underwater curve',
+          worstDrawdown,
+          (v) => fmt(v, 2, '%')
+        ),
+      ],
+    },
+    beta_vs_nifty: {
+      lines: measuredLine('β vs NIFTY 50', hlRel.beta_vs_nifty, (v) => fmtRatio(v)),
+    },
+    alpha_annualized: {
+      lines: [
+        ...measuredLine('α (annualized)', hlRel.alpha_annualized, (v) => fmt(v, 2, '%')),
+        ...measuredLine('β vs NIFTY 50', hlRel.beta_vs_nifty, (v) => fmtRatio(v)),
+      ],
+    },
+    sortino_ratio: {
+      lines: measuredLine('Sortino', data?.metrics.sortino, (v) => fmtRatio(v)),
+    },
+    calmar_ratio: {
+      lines: measuredLine('Calmar', data?.metrics.calmar, (v) => fmtRatio(v)),
+    },
+    omega_ratio: {
+      lines: measuredLine('Omega', data?.metrics.omega, (v) => fmtRatio(v)),
+    },
+    tail_ratio: {
+      lines: measuredLine('Tail ratio', data?.metrics.tail_ratio, (v) => fmtRatio(v)),
+    },
+    skewness: {
+      lines: measuredLine('Skewness', data?.metrics.skew, (v) => fmtRatio(v)),
+    },
+    kurtosis: {
+      lines: measuredLine('Kurtosis', data?.metrics.kurtosis, (v) => fmtRatio(v)),
+    },
+    // The three panels below render a series rather than a scalar, so what is
+    // measured is the shape of that series — not a number invented for it.
+    monthly_returns: {
+      lines: years.length
+        ? [`${years.length} calendar year(s) of monthly returns measured`]
+        : [],
+    },
+    underwater_curve: {
+      lines: drawdownPoints.length
+        ? [
+            `${drawdownPoints.length} daily observations`,
+            `deepest ${fmt(worstDrawdown, 2, '%')}`,
+          ]
+        : [],
+    },
+    weights_used: { lines: largestWeights },
+    portfolio_volatility: {
+      lines: measuredLine('Portfolio realized vol', hl.volatility, (v) => fmt(v, 2, '%')),
+    },
+    benchmark_volatility: {
+      lines: measuredLine(
+        'NIFTY 50 realized vol',
+        data?.relative_vs_nifty.benchmark_volatility,
+        (v) => fmt(v, 2, '%')
+      ),
+    },
+  };
+
   // Calculate annual return per year
   const getYearlyTotalReturn = (year: string) => {
     if (!data?.monthly_returns[year]) return null;
@@ -466,7 +622,11 @@ export default function TearSheetPage() {
     <div className="space-y-6">
       {/* Active Explainer Modal */}
       {activeExplainer && (
-        <HelpExplainerModal itemKey={activeExplainer} onClose={closeExplainer} />
+        <HelpExplainerModal
+          itemKey={activeExplainer}
+          measured={measuredReadings[activeExplainer] ?? null}
+          onClose={closeExplainer}
+        />
       )}
 
       {/* Hero Section */}

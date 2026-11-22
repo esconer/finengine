@@ -10,6 +10,7 @@ import math
 import numbers
 import time
 import weakref
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,7 @@ from app.services.alpha_vantage_service import (
     AlphaVantageNotConfiguredError,
     AlphaVantageUnknownTickerError,
     get_alpha_vantage_service,
+    to_av_symbol,
 )
 from app.services.source_preference_service import get_primary_source, source_order_for
 from app.models.database import StockTimeseries, AppSetting
@@ -368,7 +370,30 @@ class DataService:
         """Actual vendor that produced a downloaded frame (bfinance marks its output)."""
         return "bfinance" if getattr(df, "_source", "") == "bfinance" else "yfinance"
 
-    _in_memory_df_cache: Dict[str, Any] = {}
+    # Max live L1 frames. Justified against the two numbers that actually
+    # decide this, both measured on this repo (see plans/ Phase-2 measurement):
+    #   - importing DataService alone already costs ~118 MB RSS (pandas, numpy,
+    #     sqlalchemy, yfinance/bfinance, statsmodels), so the 250 MB ceiling in
+    #     .scratch/caching-architecture-sqlite-wal-optimization.md leaves ~130 MB.
+    #   - one L1 entry is the FULL-depth frame (`DEEP_CACHE_YEARS`), not the
+    #     requested slice: ~0.44 MB for a 10y/2520-row frame, dominated by the
+    #     object-dtype ticker/source_used/fetched_on columns.
+    # 128 entries therefore hold ~56 MB of frames, leaving ~75 MB of headroom
+    # for the request working set under the 250 MB target. 128 also covers the
+    # real single-TTL-window working set with margin -- POPULAR_INDIAN_STOCKS is
+    # 20, a portfolio and a batch/matrix request are tens, a screener page or a
+    # research dossier is a few hundred -- while sitting ~8x below the count
+    # that drives the growth (a full Indian universe is 2,000+ scrips).
+    # Eviction is cheap and bounded: an L1 miss falls to the SQLite L2 in
+    # `_get_cached_data`/`_get_full_cached_frame`, never back to the vendor.
+    _L1_MAX_ENTRIES = 128
+
+    # Bounded LRU. The TTL check at the read sites below expires an entry but
+    # never reclaims it, so a ticker written once and never read again used to
+    # stay resident for the life of the process and RSS grew linearly with the
+    # number of distinct tickers touched since boot. OrderedDict + popitem gives
+    # recency eviction without touching the key, the TTL, or what a read returns.
+    _in_memory_df_cache: "OrderedDict[str, Any]" = OrderedDict()
 
     # Short-TTL quote memo (canonical ticker -> (ts, payload)); cleared by clear_market_data_cache
     _quote_memo: Dict[str, Any] = {}
@@ -456,6 +481,26 @@ class DataService:
         except Exception:
             pass
         return df
+
+    @classmethod
+    def _l1_store(cls, ticker: str, entry: Any) -> None:
+        """Publish one L1 frame, evicting least-recently-used entries past the cap.
+
+        Ordered by *last write*, not last read. That is the correct order for
+        this cache: a write only happens when the entry was absent or its TTL
+        had already lapsed (both callers are guarded by `not l1_live` or a
+        fresh vendor download), so the most recently written frame is the one a
+        live request is currently working on. Reads therefore need no mutation
+        at all -- `_l1_slice` keeps its existing `.get()` and TTL check
+        untouched, and a ticker that is merely read repeatedly is rewritten on
+        its next TTL lapse and re-promoted by this call.
+        """
+        cache = cls._in_memory_df_cache
+        if ticker in cache:
+            cache.move_to_end(ticker)
+        cache[ticker] = entry
+        while len(cache) > cls._L1_MAX_ENTRIES:
+            cache.popitem(last=False)
 
     def _l1_slice(
         self,
@@ -625,7 +670,7 @@ class DataService:
         if generation is not None and not cache_generation_is_current(generation):
             return pd.DataFrame()
         base = full if full is not None else self._as_column_frame(fallback_df)
-        self._in_memory_df_cache[ticker] = (now_ts, base, generation)
+        self._l1_store(ticker, (now_ts, base, generation))
         if source_key is not None:
             self._l1_sources[ticker] = source_name or source_key.split("|", 1)[0]
             self._l1_preferences[ticker] = source_key
@@ -721,7 +766,7 @@ class DataService:
                     elif len(source_values) > 1:
                         cache_source = "mixed"
                 if not l1_live and cache_generation_is_current(generation):
-                    self._in_memory_df_cache[normalized_ticker] = (now_ts, full_frame if full_frame is not None else served, generation)
+                    self._l1_store(normalized_ticker, (now_ts, full_frame if full_frame is not None else served, generation))
                     self._l1_sources[normalized_ticker] = cache_source
                     self._l1_preferences[normalized_ticker] = source_key
                 served.attrs["source"] = cache_source
@@ -888,10 +933,26 @@ class DataService:
 
         if config.enabled and errors:
             async with self._db_lock:
+                # Tier 3 is the nominal source of this failure, but it is only
+                # truly reachable when the vendor can prove symbol identity.
+                # For an exchange-suffixed ticker `to_av_symbol` refuses before
+                # any request is issued, so attributing the failure to
+                # "alphavantage" would claim a tier that never ran.
+                av_reachable = to_av_symbol(normalized_ticker) is not None
+                if av_reachable:
+                    failure_source = "alphavantage"
+                else:
+                    failure_source = "alphavantage_absent"
+                    logger.info(
+                        "Alpha Vantage tier was not attempted for %s: no verified "
+                        "symbol identity for this exchange; failure attributed to "
+                        "the vendors that actually ran",
+                        normalized_ticker,
+                    )
                 await self.cache.log_fetch_attempt(
                     ticker=normalized_ticker, status="failed",
                     error_message=errors[-1].safe_message,
-                    source_used="alphavantage",
+                    source_used=failure_source,
                 )
         coverage_only = bool(errors) and all(
             isinstance(error, ProviderUnavailableError)

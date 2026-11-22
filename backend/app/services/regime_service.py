@@ -3,8 +3,10 @@ Market-regime detection via a 3-state Gaussian HMM over NIFTY 50 returns.
 
 States are ordered by state CAGR (worst -> crisis, middle -> calm, best ->
 bull; volatility does not enter the ordering) and labeled so downstream UI
-never sees raw integer state ids. Persistence (day-over-day stability) is
-reported so consumers can distrust a flapping fit.
+never sees raw integer state ids. A state that captured no trading days has no
+measured CAGR, so it is published as null and takes the worst label position
+rather than being ranked on a figure that was never computed. Persistence
+(day-over-day stability) is reported so consumers can distrust a flapping fit.
 """
 
 import asyncio
@@ -52,14 +54,25 @@ def _label_states_by_risk(state_stats: pd.DataFrame) -> Dict[int, str]:
     middle -> calm, best -> bull). With a non-3-state fit there is no
     crisis/calm/bull ordering, so states keep generic labels instead of
     raising IndexError.
+
+    A state whose annualized return was NEVER MEASURED -- the cell is null,
+    because the state captured no trading days -- is not ranked against the
+    measured states at all. `na_position="first"` places it at the worst end,
+    so it takes the crisis slot rather than competing for `calm`/`bull` on a
+    figure that does not exist. Ranking an unmeasured state anywhere inside a
+    measured distribution is the defect this ordering has to refuse: `classify`
+    used to publish `cagr = 0.0` for such a state, which is a plausible-looking
+    number in the middle of the real ones, so an empty bucket could be crowned
+    `calm` or `bull` beside `historical_days_pct: 0.0`. The states that WERE
+    measured keep their relative order either way.
     """
     ids = [int(s) for s in state_stats.index.tolist()]
     if len(ids) != 3:
         return {s: f"state_{s}" for s in ids}
     if "cagr" in state_stats.columns:
-        sorted_indices = state_stats.sort_values("cagr").index.tolist()
+        sorted_indices = state_stats.sort_values("cagr", na_position="first").index.tolist()
     else:
-        sorted_indices = state_stats.sort_values("ann_ret").index.tolist()
+        sorted_indices = state_stats.sort_values("ann_ret", na_position="first").index.tolist()
 
     return {
         int(sorted_indices[0]): "crisis",
@@ -400,7 +413,18 @@ def classify(
                 cagr = float(r_sub.mean() * TRADING_DAYS_PER_YEAR)
                 ann_ret_method = "arithmetic_mean_fallback_product_negative"
         else:
-            cagr = 0.0
+            # No fabricated 0.0. The state captured no trading days, so there
+            # is no compounded product to annualize and no figure to publish:
+            # 0.0 asserted a measured 0%/yr that was never observed, and
+            # `_label_states_by_risk` sorts on this very value, so an empty
+            # bucket was ranked in the middle of the measured distribution and
+            # could be crowned `calm` or `bull`. `None` withholds the number
+            # (making the ordering above put the state at the worst end rather
+            # than inside the measured range) and the row still publishes the
+            # `no_observations` method token, `observations: 0` and
+            # `historical_days_pct: 0.0`, so the state is still visible as a
+            # state with no history. No substitute CAGR is invented.
+            cagr = None
             ann_ret_method = "no_observations"
         # `ann_vol` pools the state's DAILY return variance and takes ONE
         # sqrt. It used to be the MEAN of the `vol21` feature's already
@@ -495,19 +519,31 @@ def classify(
         "states": [
             {
                 "regime": label_map[int(row.state)],
-                "ann_ret": round(row.ann_ret, 4),
+                # None (not 0.0, and not a NaN that would serialize as a JSON
+                # literal) when the state captured no trading days, because no
+                # annualized return was ever computed for it. This is the same
+                # null-not-zero shape `ann_vol` below uses, for the same reason.
+                "ann_ret": round(row.ann_ret, 4) if not pd.isna(row.ann_ret) else None,
                 # One published key, two definitions: this says which one the
                 # number above is. Without it a reader cannot tell a geometric
                 # CAGR from the arithmetic fallback that replaced it.
                 "ann_ret_method": row.ann_ret_method,
                 # None (not 0.0) when the state has fewer than two daily
-                # returns, because a variance was never measurable.
-                "ann_vol": round(row.ann_vol, 4) if row.ann_vol is not None else None,
+                # returns, because a variance was never measurable. `pd.isna`
+                # rather than `is not None`: the frame turns the stored None
+                # into a NaN, and a bare NaN serializes as an invalid JSON
+                # literal instead of the null this is declaring.
+                "ann_vol": round(row.ann_vol, 4) if not pd.isna(row.ann_vol) else None,
                 "historical_days_pct": round(row.days_pct, 1),
                 "observations": int(row.observations),
+                # None when the state captured no days, for the same reason as
+                # `ann_ret` above: 252/n is not 0.0 for an unoccupied state, it
+                # is undefined. The frame turns the stored None into a NaN
+                # (a float column), and a bare NaN serializes as an invalid
+                # JSON literal, so the null is restored here.
                 "annualization_factor": (
                     round(float(row.annualization_factor), 4)
-                    if row.annualization_factor is not None
+                    if not pd.isna(row.annualization_factor)
                     else None
                 ),
             }
@@ -720,8 +756,14 @@ def _regime_metadata(
                 "whose geometric annualization is defined and equals -1.0, so it "
                 "now reports 'geometric_cagr_from_compounded_state_returns' "
                 "rather than an arithmetic mean that ignores the wipeout; "
-                "'no_observations' means the state captured no trading days and "
-                "ann_ret is 0.0 by construction rather than by measurement"
+                "'no_observations' means the state captured no trading days, so "
+                "ann_ret is NULL (not 0.0): no compounded product existed to "
+                "annualize and no annualized return was measured. Such a state "
+                "is NOT ranked against the measured states -- it takes the "
+                "worst label position ('crisis') by default, rather than "
+                "competing for 'calm'/'bull' on a value that does not exist -- "
+                "and it remains visible as a state with observations: 0 and "
+                "historical_days_pct: 0.0"
             ),
             "states[].ann_vol": "annualized_fraction",
             "states[].ann_vol_basis": (

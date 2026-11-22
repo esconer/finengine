@@ -32,6 +32,12 @@ from app.api.analytics import (
 from app.models.database import PortfolioPosition
 from app.services.analytics_engine import LIQUIDITY_MARKET_CAP_FLOOR_INR
 
+# The no-book concentration shape is one contract, derived once in
+# `test_concentration_empty_hhi_absent.py`. This file hand-named one key from
+# the zero-valued half of it; imported instead, so the count beside it cannot
+# drift without this going with it.
+from tests.test_concentration_empty_hhi_absent import ZERO_VALUED_ON_AN_EMPTY_BOOK
+
 
 # ---------------------------------------------------------------------------
 # seams
@@ -213,7 +219,20 @@ async def test_unmeasured_sector_total_claims_nothing():
         db=_db([]), data_service=Mock(), analytics_engine=Mock()
     )
 
-    assert result["by_sector_total"] == 0.0
+    # Looped over the derived list rather than naming `by_sector_total` alone:
+    # an empty book has no weight mass to total, so zero is a TRUE statement
+    # about this key and about the count beside it -- which is exactly why these
+    # are not withheld with the nine statistics. Naming one of the three left
+    # the other two unchecked, and a hand-written key is checked against
+    # nothing but itself.
+    for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+        assert key in result, f"{key} was dropped from the no-book shape"
+        assert result[key] == 0, (
+            f"{key} must stay 0 on an empty book, got {result[key]!r}; zero is "
+            "the measurement here, not a stand-in for one"
+        )
+    # ... and the rounding disclosure beside them still refuses, because a
+    # residual over a total of nothing is not a rounding artifact to report.
     assert result["by_sector_rounding_residual"] is None
     assert result["sector_weight_basis"] is None
     assert result["data_status"] == "unavailable"
@@ -307,17 +326,17 @@ async def test_liquidity_publishes_the_scoring_rule_and_thresholds():
 
 
 @pytest.mark.asyncio
-async def test_selectipo_market_cap_floor_is_never_silent():
+async def test_truenoorth_market_cap_floor_is_never_silent():
     dates = pd.bdate_range(end=pd.Timestamp("2026-09-22"), periods=20)
-    db = _db([_pos("SELECTIPO.NS", market_value=1000.0, sector="Energy")])
+    db = _db([_pos("TRUENORTH.NS", market_value=1000.0, sector="Energy")])
 
     result = await get_liquidity_metrics(
         db=db,
-        data_service=_Market({"SELECTIPO.NS": _ohlcv(dates, price=10.0, volume=1_000.0)}),
+        data_service=_Market({"TRUENORTH.NS": _ohlcv(dates, price=10.0, volume=1_000.0)}),
         analytics_engine=analytics_mod.AnalyticsEngine(),
     )
 
-    row = result["by_position"]["SELECTIPO.NS"]
+    row = result["by_position"]["TRUENORTH.NS"]
     assert row["market_cap"] == LIQUIDITY_MARKET_CAP_FLOOR_INR
     assert row["market_cap_provenance"] == "fallback"
     assert row["is_estimate"] is True

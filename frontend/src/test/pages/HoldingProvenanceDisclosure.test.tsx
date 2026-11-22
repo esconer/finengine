@@ -32,13 +32,13 @@ const { updateLastUpdatedMock, useUIStoreMock, portfolioPositions } = vi.hoisted
     updateLastUpdatedMock: updateLastUpdated,
     useUIStoreMock: useUIStore,
     portfolioPositions: [
-      { ticker: 'NIFTYIETF.NS', added_on: '2026-06-08' },
+      { ticker: 'TIDETEST.NS', added_on: '2026-06-08' },
       { ticker: 'OLD.NS', added_on: '2026-08-04' },
     ],
   };
 });
 
-// NIFTYIETF shape from the v3 artifact: 20 own return observations behind a
+// TIDETEST shape from the v3 artifact: 20 own return observations behind a
 // 176-day full-exchange-history instrument leg, window start inferred from the
 // buy price (2026-05-19) while the stored import stamp is 2026-06-08.
 const inferredCoverage = {
@@ -53,7 +53,7 @@ const inferredCoverage = {
   full_history_start: '2026-01-02',
   effective_start_source: 'stored_added_on',
   tickers: {
-    'NIFTYIETF.NS': {
+    'TIDETEST.NS': {
       effective_start: '2026-05-19',
       analytics_start: '2026-05-19',
       analytics_start_source: 'buy_price_inferred',
@@ -79,21 +79,21 @@ const inferredCoverage = {
 const realizedRisk = {
   portfolio: { max_drawdown: -0.02, var_95: -0.01, cvar_95: -0.015, hit_ratio: 0.5 },
   positions: {
-    'NIFTYIETF.NS': { data_points: 20, is_limited_history: true, weight: 0.4, history_warning: null },
+    'TIDETEST.NS': { data_points: 20, is_limited_history: true, weight: 0.4, history_warning: null },
   },
   instrument_risk: {
     portfolio: { annual_return: 0.1, annual_volatility: 0.2, sharpe_ratio: 0.5, sortino_ratio: 0.6 },
     positions: {
-      'NIFTYIETF.NS': { annual_volatility: 0.22, sharpe_ratio: 0.9, max_drawdown: -0.08, total_return: 0.05, data_points: 20 },
+      'TIDETEST.NS': { annual_volatility: 0.22, sharpe_ratio: 0.9, max_drawdown: -0.08, total_return: 0.05, data_points: 20 },
       'OLD.NS': { annual_volatility: 0.18, sharpe_ratio: 1.1, max_drawdown: -0.11, total_return: 0.08, data_points: 38 },
     },
   },
   warnings: [
     {
-      ticker: 'NIFTYIETF.NS',
+      ticker: 'TIDETEST.NS',
       data_points: 20,
       message:
-        'NIFTYIETF.NS: 20 own return observations — analytics start 2026-05-19 is inferred from the buy price; no holding date was stored (import stamp 2026-06-08).',
+        'TIDETEST.NS: 20 own return observations — analytics start 2026-05-19 is inferred from the buy price; no holding date was stored (import stamp 2026-06-08).',
     },
     {
       ticker: 'OLD.NS',
@@ -200,7 +200,7 @@ describe('historyFormat — provenance vocabulary', () => {
 
   it('provenance note names the inferred legs and stays silent otherwise', () => {
     const note = provenanceNote({ coverage: inferredCoverage });
-    expect(note).toContain('NIFTYIETF.NS');
+    expect(note).toContain('TIDETEST.NS');
     expect(note).toContain('inferred from the buy price');
     expect(note).not.toContain('OLD.NS');
     expect(
@@ -226,7 +226,7 @@ describe('RealizedRiskPage — per-position provenance disclosure', () => {
     expect(banner.textContent).toMatch(/Realized P&L covers 39 trading days since 2026-08-04/);
 
     const note = screen.getByTestId('coverage-provenance');
-    expect(note.textContent).toMatch(/NIFTYIETF\.NS: analytics start 2026-05-19 is inferred from the buy price/);
+    expect(note.textContent).toMatch(/TIDETEST\.NS: analytics start 2026-05-19 is inferred from the buy price/);
     expect(note.textContent).toMatch(/no holding date was stored \(import stamp 2026-06-08\)/);
 
     fireEvent.click(screen.getByTestId('coverage-details-toggle'));
@@ -237,7 +237,7 @@ describe('RealizedRiskPage — per-position provenance disclosure', () => {
       .map((node) => node.textContent ?? '')
       .filter((text) => text.trim().startsWith('•'));
 
-    const etf = bullets.find((text) => text.includes('NIFTYIETF.NS')) ?? '';
+    const etf = bullets.find((text) => text.includes('TIDETEST.NS')) ?? '';
     const stored = bullets.find((text) => text.includes('OLD.NS')) ?? '';
 
     // The inferred leg states its OWN observations and its inferred start...
@@ -269,7 +269,7 @@ describe('TearSheetPage — holding-window provenance', () => {
   it('labels the book window with its provenance and shows the inferred note', async () => {
     (analyticsApi.getTearSheet as ReturnType<typeof vi.fn>).mockResolvedValue({
       window: { start: '2025-09-08', end: '2026-09-07' },
-      holdings: { 'NIFTYIETF.NS': 0.4, 'OLD.NS': 0.6 },
+      holdings: { 'TIDETEST.NS': 0.4, 'OLD.NS': 0.6 },
       metrics: { total_return: 0.0548, max_drawdown: -0.02 },
       full_history: { metrics: { total_return: 0.2648, cagr: 0.2598, days: 176 } },
       relative_vs_nifty: {},
@@ -309,7 +309,7 @@ describe('TearSheetPage — holding-window provenance', () => {
         effective_start_source: 'buy_price_inferred',
         tickers: {
           'NOBUY.NS': {
-            ...inferredCoverage.tickers['NIFTYIETF.NS'],
+            ...inferredCoverage.tickers['TIDETEST.NS'],
             effective_start: '2026-05-19',
             stored_added_on: null,
           },

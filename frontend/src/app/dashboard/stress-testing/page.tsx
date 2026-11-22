@@ -46,13 +46,75 @@ import {
  */
 interface StressImpactRow {
   ticker: string;
-  /** Simulated impact as a fraction; the severity band is derived from it. */
+  /** Proxy impact as a fraction; the severity band is derived from it. */
   impact: number;
   /** Duplicate of `impact`, kept as published by the table's own CSV export. */
   change: number;
 }
 
-interface StressTestResult {
+/**
+ * The scalar half of `shock_inputs`, which is the whole of the shock this
+ * scenario applied and the bounds it was held to.
+ *
+ * `analytics_engine.py:4630-4695` publishes far more than this (the sector
+ * elasticity table, the instrument overrides, the per-ticker co-movement and
+ * volatility maps). Those are declared `unknown` below rather than typed: this
+ * page renders none of them, so naming their shapes here would be a claim the
+ * code does not make.
+ */
+interface StressShockInputs {
+  /** Signed fraction return applied to every constituent (`units.market_shock`). */
+  market_shock?: number | null;
+  market_shock_basis?: string | null;
+  sector_elasticity_basis?: string | null;
+  /** Configured bounds the per-holding impact is clipped into. */
+  position_impact_clip?: [number, number] | null;
+  position_impact_clip_basis?: string | null;
+  /** How many holdings landed in the engine's UNCLASSIFIED sector bucket. */
+  unclassified_bucket_member_count?: number | null;
+  /** The engine's own prose on that bucket, rendered verbatim when present. */
+  bucket_disclosure?: string | null;
+  volatility_adjustment?: {
+    basis?: string | null;
+    reference_annualized_volatility?: number | null;
+  } | null;
+  co_movement?: {
+    basis?: string | null;
+    is_applied_to_the_shock?: boolean | null;
+  } | null;
+  /** Everything else the engine publishes; rendered nowhere on this page. */
+  [key: string]: unknown;
+}
+
+/**
+ * How the engine says it produced the numbers above it.
+ *
+ * `StressTestResponse` (`src/types/index.ts:710`) declares `methodology` and
+ * nothing else from this block, but the route sends all of it
+ * (`analytics_engine.py:4736-4751`) and the refusal payload mirrors the success
+ * payload key-for-key with nulls (`analytics_engine.py:7094-7112`) — hence every
+ * field optional and nullable rather than given a fallback the page would then
+ * present as the engine's own words.
+ *
+ * The page renders these verbatim. They are what stop it describing a
+ * `deterministic_factor_proxy` as a simulation: `impact_basis`,
+ * `max_drawdown_basis`, `recovery_time_basis` and `confidence_basis` each name
+ * the derivation, and two of them say `not_simulated` in as many words.
+ */
+interface StressDisclosures {
+  /** `portfolio_impact * 1.15` — a fixed uplift on the same proxy. */
+  max_drawdown_basis?: string | null;
+  max_drawdown_formula?: string | null;
+  impact_basis?: string | null;
+  /** The scenario's configured month estimate, not a measured recovery. */
+  recovery_time_basis?: string | null;
+  /** A nominal label with no distribution behind it. */
+  confidence_basis?: string | null;
+  shock_inputs?: StressShockInputs | null;
+  methodology?: string | null;
+}
+
+interface StressTestResult extends StressDisclosures {
   scenario: string;
   scenario_description?: string;
   max_drawdown: number | null;
@@ -60,7 +122,6 @@ interface StressTestResult {
   position_impacts: Record<string, number>;
   recovery_time: number | null;
   confidence_level?: number;
-  methodology?: string;
   error?: string;
   /**
    * The newest delivered daily observation this scenario's returns were built
@@ -74,6 +135,104 @@ interface StressTestResult {
     missing_tickers?: string[] | null;
   } | null;
 }
+
+/**
+ * The basis fields the disclosure renders, in the order the figures appear on
+ * the page. `formula` is an optional second field shown in parentheses.
+ *
+ * Keyed by property access rather than a string index so a rename of a field on
+ * `StressDisclosures` is a compile error here instead of a row that silently
+ * renders "not published by this response".
+ */
+const BASIS_ROWS: ReadonlyArray<{
+  label: string;
+  basis: keyof StressDisclosures;
+  formula?: keyof StressDisclosures;
+}> = [
+  { label: 'Portfolio impact', basis: 'impact_basis' },
+  { label: 'Max drawdown', basis: 'max_drawdown_basis', formula: 'max_drawdown_formula' },
+  { label: 'Recovery time', basis: 'recovery_time_basis' },
+  { label: 'Confidence level', basis: 'confidence_basis' },
+];
+
+/**
+ * One basis field, or `undefined`/`null` when the response omitted it.
+ *
+ * Deliberately not defaulted. The engine's refusal payload
+ * (`analytics_engine.py:7094-7112`) mirrors the success payload with nulls, so
+ * an absent basis is a real absence and the panel says so — a hardcoded
+ * fallback string here would be this page inventing the engine's wording,
+ * which is exactly what the disclosure exists to stop.
+ */
+const basisOf = (result: StressTestResult, field: keyof StressDisclosures): string | undefined => {
+  const value = result[field];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+};
+
+/**
+ * The scalars of `shock_inputs` a reader needs to interpret the result.
+ *
+ * Every line is a backend value or a backend string; nothing here computes a
+ * number. `market_shock` is a signed fraction return
+ * (`units.market_shock`, `analytics_engine.py:4697`), so it is rendered through
+ * the page's single fraction→percent conversion rather than printed raw.
+ */
+const shockSummary = (
+  shock: StressShockInputs | null | undefined
+): ReadonlyArray<{ label: string; value: string }> => {
+  if (!shock) return [];
+  const rows: Array<{ label: string; value: string }> = [];
+
+  if (typeof shock.market_shock === 'number' && Number.isFinite(shock.market_shock)) {
+    const shockPct = (shock.market_shock * 100).toFixed(1);
+    rows.push({
+      label: 'Applied market shock',
+      value: `${shock.market_shock > 0 ? '+' : ''}${shockPct}%${shock.market_shock_basis ? ` (${shock.market_shock_basis})` : ''}`,
+    });
+  }
+  if (typeof shock.position_impact_clip === 'object' && Array.isArray(shock.position_impact_clip)) {
+    const [lo, hi] = shock.position_impact_clip;
+    rows.push({
+      label: 'Position impact clip',
+      value:
+        typeof lo === 'number' && typeof hi === 'number'
+          ? `${(lo * 100).toFixed(1)}% to ${(hi * 100).toFixed(1)}%${shock.position_impact_clip_basis ? ` (${shock.position_impact_clip_basis})` : ''}`
+          : 'not published by this response',
+    });
+  }
+  if (shock.sector_elasticity_basis) {
+    rows.push({ label: 'Sector elasticity', value: String(shock.sector_elasticity_basis) });
+  }
+  if (shock.volatility_adjustment?.basis) {
+    const ref = shock.volatility_adjustment.reference_annualized_volatility;
+    rows.push({
+      label: 'Volatility adjustment',
+      value:
+        typeof ref === 'number' && Number.isFinite(ref)
+          ? `${shock.volatility_adjustment.basis} (reference ${(ref * 100).toFixed(0)}%)`
+          : String(shock.volatility_adjustment.basis),
+    });
+  }
+  if (shock.co_movement?.basis) {
+    rows.push({
+      label: 'Co-movement',
+      value:
+        shock.co_movement.is_applied_to_the_shock === false
+          ? `${shock.co_movement.basis} (measured, NOT applied to the shock)`
+          : String(shock.co_movement.basis),
+    });
+  }
+  if (typeof shock.unclassified_bucket_member_count === 'number') {
+    rows.push({
+      label: 'UNCLASSIFIED bucket',
+      value: `${shock.unclassified_bucket_member_count} holding(s)`,
+    });
+  }
+  if (shock.bucket_disclosure) {
+    rows.push({ label: 'UNCLASSIFIED disclosure', value: String(shock.bucket_disclosure) });
+  }
+  return rows;
+};
 
 interface Scenario {
   name: string;
@@ -98,7 +257,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     title: 'Worst-Case Scenario Drawdown',
     category: 'Tail Risk & Stress Peak',
     formula: '$$\\text{Worst Case Impact} = \\min_{s \\in \\mathcal{S}} \\sum_{i=1}^N w_i \\times \\Delta r_{i,s}$$',
-    whatItMeans: 'The maximum simulated portfolio loss among all evaluated historical crises and hypothetical macroeconomic shocks (e.g. 2008 Lehman crash or 2020 COVID shock).',
+    whatItMeans: 'The largest proxy portfolio loss among all evaluated historical crises and hypothetical macroeconomic shocks (e.g. 2008 Lehman crash or 2020 COVID shock). It is the worst of several deterministic factor shocks, not the deepest point of a simulated price path.',
     howInferred: 'Computed by aggregating constituent-level stress drawdowns under each scenario, weighted by portfolio position allocations, and selecting the most severe negative impact.',
     whyImportant: 'Reveals your portfolio’s maximum capital vulnerability during catastrophic liquidity panics, helping determine required cash cushions and tail-risk hedges.',
     howToInterpret: [
@@ -112,7 +271,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     category: 'Mild Shock Baseline',
     formula: '$$\\text{Best Case Impact} = \\max_{s \\in \\mathcal{S}} \\sum_{i=1}^N w_i \\times \\Delta r_{i,s}$$',
     whatItMeans: 'The mildest loss across all evaluated stress scenarios (typically minor monetary tightening or moderate sector rotations).',
-    howInferred: 'Identified by finding the minimum drawdown (least negative portfolio return) across all executed stress testing simulations.',
+    howInferred: 'Identified by finding the minimum drawdown (least negative portfolio return) across every stress scenario that has been evaluated. Each one is a deterministic factor shock proxy — no path sampling, no simulated return.',
     whyImportant: 'Establishes a lower bound for expected portfolio drawdowns during routine macroeconomic market turbulence.',
     howToInterpret: [
       'Drawdowns around -10% to -15% represent normal market pullbacks.',
@@ -148,37 +307,38 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     title: 'Market Crash / 2008 Financial Crisis Scenario',
     category: 'Historical Systemic Crisis',
     formula: '$$\\text{Impact}_i = -35\\% \\times \\min\\left(2.8, \\max\\left(0.5, \\frac{\\sigma_i}{\\sigma_{\\text{market}}}\\right)\\right)$$',
-    whatItMeans: 'Simulates a severe liquidity freeze and multi-month global recession (-35% NIFTY 50 base market shock) modeled after the 2008 Global Financial Crisis.',
-    howInferred: 'Each stock’s drawdown is scaled by its historical annualized volatility relative to the benchmark market volatility (16%).',
+    whatItMeans: 'Applies a -35% NIFTY base market shock, modelled on the 2008 Global Financial Crisis, to every holding.',
+    howInferred: "Each stock's drawdown is scaled by its measured annualized volatility against a fixed reference level, held inside a configured band. The factors and their basis are published per ticker in `shock_inputs.volatility_adjustment`.",
     whyImportant: 'Tests portfolio survival during systemic liquidation events where market liquidity vanishes and asset correlations spike towards 1.0.',
     howToInterpret: [
-      'High-beta and cyclical stocks (auto, metals, brokerages) experience drawdowns between -40% and -50%.',
-      'Defensive utility and pharmaceutical stocks (NTPC, CIPLA) limit drawdowns to -18% to -25%.',
-      'Expected recovery duration is approximately 24 months.'
+      'Every holding takes the same base market shock, scaled by its sector elasticity and by its measured volatility. The two factors and their basis are published per ticker in `shock_inputs`; the drawdown this scenario lands on each holding is the drawdown column of its own table.',
+      'A holding classified into a lower-elasticity sector takes a smaller share of that base shock. The multiplier this engine applies to each sector is published in `shock_inputs.sector_elasticity_table` and is a configured table, not a measurement of this book.',
+      'The recovery figure on the card is this scenario’s configured month estimate, not a simulated recovery path.'
     ]
   },
   interest_rate_shock: {
     title: '300bp Interest Rate Shock Scenario',
     category: 'Hypothetical Monetary Shock',
     formula: '$$\\text{Impact}_i = -15\\% \\times \\text{VolFactor}_i$$',
-    whatItMeans: 'Simulates an aggressive 300 basis point (+3.00%) policy rate increase by the RBI / US Federal Reserve to curb inflationary spikes (-15% base market shock).',
+    whatItMeans: 'Applies a -15% base market shock for a 300 basis point (+3.00%) policy rate increase by the RBI / US Federal Reserve to curb inflationary spikes.',
     howInferred: 'Scales an immediate equity discount rate expansion and multiple compression across portfolio constituents based on individual asset volatility.',
     whyImportant: 'Evaluates capital cost inflation, debt-servicing headwinds, and growth valuation contraction across corporate balance sheets.',
     howToInterpret: [
       'Capital-intensive and leveraged businesses experience steeper drawdowns.',
       'Cash-rich companies and defensive yield assets outperform.',
-      'Historical mean recovery time is 8 to 10 months.'
+      'The recovery figure on the card is this scenario’s configured month estimate, not a simulated recovery path.'
     ]
   },
   volatility_spike: {
     title: 'COVID-19 / Panic Volatility Spike Scenario',
     category: 'Historical Panic Liquidation',
     formula: '$$\\text{Impact}_i = -22\\% \\times \\text{VolFactor}_i$$',
-    whatItMeans: 'Simulates an abrupt panic-driven volatility spike (India VIX > 40) replicating the March 2020 COVID-19 pandemic drawdown (-22% base market shock).',
+    whatItMeans: 'Applies a -22% base market shock for an abrupt panic-driven volatility spike (India VIX > 40) replicating the March 2020 COVID-19 pandemic drawdown.',
     howInferred: 'Models immediate risk-off market selling across all asset classes with volatility-scaled position drawdowns.',
     whyImportant: 'Tests whether short-term panic drawdowns cause margin breaches or forced portfolio liquidations before markets rebound.',
     howToInterpret: [
-      'Characterized by sharp short-term losses followed by rapid V-shaped recoveries (~5 months).',
+      'This is a scaled factor shock, not a replay of the 2020 tape.',
+      'The recovery figure on the card is this scenario’s configured month estimate, not a simulated recovery path.',
       'Ensure adequate liquidity buffers to prevent panic selling at market troughs.'
     ]
   },
@@ -186,16 +346,16 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     title: 'Tech & Growth Sector De-Rating',
     category: 'Hypothetical Sector Shock',
     formula: '$$\\text{Impact}_i = -18\\% \\times \\text{VolFactor}_i$$',
-    whatItMeans: 'Simulates a targeted -18% valuation de-rating and growth multiple contraction across technology, software, and digital services companies.',
+    whatItMeans: 'Applies a -18% base market shock for a targeted valuation de-rating and growth multiple contraction across technology, software, and digital services companies.',
     howInferred: 'Applies sector-weighted shocks based on historical tech drawdowns and beta loadings.',
     whyImportant: 'Highlights single-sector concentration risks and valuation vulnerability in high P/E growth stocks.',
     howToInterpret: [
-      'High growth stocks drop -25% to -45%, while traditional value assets show relative insulation.',
+      'High growth stocks are shocked hardest by the sector elasticity table; traditional value assets are shocked less.',
       'Diversifying into utilities, healthcare, and FMCG mitigates tech de-rating risk.'
     ]
   },
   custom_scenario: {
-    title: 'Custom Scenario Stress Simulator',
+    title: 'Custom Scenario Shock',
     category: 'Custom Parameterized Shock',
     formula: '$$\\text{Custom Impact}_i = \\text{Shock}_{\\text{user}} \\times \\text{VolFactor}_i$$',
     whatItMeans: 'Allows portfolio managers to input bespoke market shocks (e.g. -25% geopolitical tension, -12% budget announcement) and evaluate customized portfolio drawdowns.',
@@ -225,7 +385,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     category: 'Institutional Risk Tiers',
     formula: '$$\\text{Severity} = \\begin{cases} \\text{Critical} & \\text{Impact} < -25\\% \\\\ \\text{High} & -25\\% \\le \\text{Impact} < -15\\% \\\\ \\text{Medium} & -15\\% \\le \\text{Impact} < -5\\% \\\\ \\text{Low} & \\text{Impact} \\ge -5\\% \\end{cases}$$',
     whatItMeans: 'A standardized 4-tier risk classification indicating the severity of projected capital impairment for each holding.',
-    howInferred: 'Derived directly from the position’s simulated percentage impact under the active scenario.',
+    howInferred: 'Derived directly from the position’s proxy percentage impact under the active scenario (`impact_basis`).',
     whyImportant: 'Provides instantaneous visual triage so managers know which positions require stop-loss orders or dynamic hedging.',
     howToInterpret: [
       'Critical positions require strict stop-loss rules or smaller portfolio allocations.',
@@ -236,8 +396,8 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     title: 'Mean Time to Recovery (MTTR)',
     category: 'Liquidity & Horizon Duration',
     formula: '$$\\text{Average Recovery} = \\frac{1}{|\\mathcal{S}|} \\sum_{s \\in \\mathcal{S}} \\text{Recovery Months}_s$$',
-    whatItMeans: 'The estimated number of months required for portfolio asset values to recover to pre-crisis levels following a stress event.',
-    howInferred: 'Calculated from historical empirical rebound trajectories following major market drawdowns (e.g. 2008 crisis = 24m, 2020 COVID = 5m).',
+    whatItMeans: 'The number of months each scenario is configured to assume before the book is treated as recovered.',
+    howInferred: 'Read off the scenario table as a fixed month estimate and published unchanged (`recovery_time_basis`: configured_recovery_estimate_not_simulated). No rebound path is measured or simulated — a different scenario with the same shape of shock carries a different estimate, not a measurement.',
     whyImportant: 'Ensures investment horizons and cash reserve buffers are aligned so investors are never forced to liquidate assets at market bottoms.',
     howToInterpret: [
       'Recovery > 18 months: Requires long-term investment horizon and dedicated cash reserves.',
@@ -387,32 +547,43 @@ function HelpBtn({ itemKey, onOpen }: { itemKey: string; onOpen: (key: string) =
 }
 
 export default function StressTestingPage() {
+  /**
+   * The four built-in scenarios, named only.
+   *
+   * The prose that used to sit here — "(-35% NIFTY shock)", "(-15% shock)" —
+   * asserted a shock magnitude the page held as a hand-typed string rather than
+   * as data, for a magnitude the engine resolves at
+   * `analytics_engine.py:4308-4379` and republishes twice: as
+   * `scenario_description` and as `shock_inputs.market_shock`. So the
+   * description rendered on a card is the engine's, and this seed is only what
+   * the card shows before a scenario has ever run (`describedFor` below).
+   */
   const [scenarios, setScenarios] = useState<Scenario[]>([
     {
       name: 'Market Crash',
       type: 'Historical',
-      description: 'Recession scenario based on 2008 financial crisis (-35% NIFTY shock)',
+      description: 'Global financial crisis scenario, 2008',
       icon: AlertTriangle,
       color_class: 'text-red-500'
     },
     {
       name: 'Interest Rate Shock',
       type: 'Hypothetical',
-      description: '300bp RBI / central bank rate increase scenario (-15% shock)',
+      description: '300bp RBI / central bank rate increase scenario',
       icon: TrendingDown,
       color_class: 'text-orange-500'
     },
     {
       name: 'Volatility Spike',
-      type: 'Historical',
-      description: 'COVID-19 market panic volatility scenario (-22% shock)',
+      type: 'Hypothetical',
+      description: 'COVID-19 market panic volatility scenario',
       icon: Activity,
       color_class: 'text-blue-500'
     },
     {
       name: 'Tech Sector Correction',
       type: 'Hypothetical',
-      description: 'Major technology and growth multiple decline (-18% shock)',
+      description: 'Major technology and growth multiple decline',
       icon: TestTube,
       color_class: 'text-purple-500'
     },
@@ -509,12 +680,16 @@ export default function StressTestingPage() {
         return;
       }
       
-      // scenario_description is returned by the backend but missing from StressTestResponse (system-layer handoff)
-      const backendDescription = (data as { scenario_description?: string }).scenario_description;
+      // The engine resolves a custom scenario by PARSING the percentage out of
+      // the scenario text (`analytics_engine.py:4389-4393`) and republishes what
+      // it actually applied as `scenario_description` plus
+      // `shock_inputs.market_shock`. The seed below is only what the card shows
+      // for the moment before that response exists; `describedFor` prefers the
+      // engine's own string for every branch, custom included.
       const newScenario: Scenario = {
         name: customScenario.name,
         type: customScenario.type,
-        description: backendDescription || `${shockPct}% market shock`,
+        description: `${shockPct}% market shock`,
         icon: TestTube,
         color_class: 'text-emerald-500'
       };
@@ -593,6 +768,20 @@ export default function StressTestingPage() {
     return 'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800';
   };
 
+  /**
+   * The description a scenario card shows.
+   *
+   * The engine resolves the scenario name to its own config row
+   * (`analytics_engine.py:4305-4393`) and republishes the row's description as
+   * `scenario_description`. Every card used to ignore that and print a
+   * hand-typed string instead, so a page copy drift (the page said "NIFTY 50"
+   * where the engine said "NIFTY") was invisible. Prefer the engine's word for
+   * every branch — built-in and custom alike — and fall back to the seed only
+   * for a scenario that has not run yet.
+   */
+  const describedFor = (scenario: Scenario, result?: StressTestResult): string =>
+    result?.scenario_description || scenario.description;
+
   const severityFor = (rawImpact: number | null | undefined): { label: string; className: string } | null => {
     const impactVal = impactPercent(rawImpact);
     if (impactVal === null) return null;
@@ -632,7 +821,10 @@ export default function StressTestingPage() {
       },
     },
     {
-      header: 'Simulated Impact',
+      // `impact_basis` is `deterministic_factor_proxy`: the column carries a
+      // scaled shock, not a simulated return. Naming it a simulation here is
+      // what the whole disclosure below this page exists to stop.
+      header: 'Stress Impact (proxy)',
       accessorKey: 'impact',
       cell: ({ row }) => {
         const data = row.original;
@@ -718,14 +910,14 @@ export default function StressTestingPage() {
           <div>
             <div className="flex items-center gap-2 mb-1">
               <span className="px-2.5 py-0.5 text-xs font-semibold bg-white/20 rounded-full">
-                Multi-Factor Simulation Engine
+                Multi-Factor Shock Proxy
               </span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">
               Stress Testing & Scenario Analysis
             </h1>
             <p className="text-orange-100 text-sm mt-1 max-w-2xl">
-              Simulate historical liquidity freezes, monetary tightening shocks, panic volatility spikes, and custom macroeconomic drawdowns across portfolio holdings.
+              Deterministic factor shocks for historical liquidity freezes, monetary tightening, panic volatility spikes, and custom macro drawdowns, applied across portfolio holdings. No path sampling is run — every figure below publishes the basis it was derived on.
             </p>
             <div className="flex flex-wrap items-center mt-3 gap-4 text-xs text-orange-200">
               <div className="flex items-center gap-1.5">
@@ -767,6 +959,78 @@ export default function StressTestingPage() {
         coverage={sectionCoverage(activeResult?.universe_coverage)}
         warnings={activeResult?.warnings ?? null}
       />
+
+      {/* Basis disclosure for the ACTIVE scenario. The engine already names how
+          every figure on this page was produced — `impact_basis:
+          deterministic_factor_proxy`, `recovery_time_basis:
+          configured_recovery_estimate_not_simulated`, and so on
+          (`analytics_engine.py:4736-4751`). None of it was rendered, which is
+          how a page could badge itself a simulation engine while the response
+          said in as many words that no path was sampled. Everything
+          below is the engine's own string, printed verbatim: the page restates
+          no derivation and supplies no fallback wording of its own. */}
+      {activeResult && (
+        <div
+          data-testid="stress-basis-disclosure"
+          className="bg-amber-50/60 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/40 rounded-xl p-5"
+        >
+          <div className="flex items-start gap-3 mb-3">
+            <Info className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <h3 className="text-sm font-bold text-amber-900 dark:text-amber-200">
+                What these numbers are — {activeScenarioName}
+              </h3>
+              <p className="text-xs text-amber-800 dark:text-amber-300/90 mt-1">
+                Reproduced from the API response. Each figure below is the basis the
+                engine published for it; none of them is a sampled or simulated outcome.
+              </p>
+            </div>
+          </div>
+
+          <dl className="space-y-1.5 text-xs">
+            {BASIS_ROWS.map(({ label, basis, formula }) => {
+              const value = basisOf(activeResult, basis);
+              return (
+                <div key={label} className="flex flex-col sm:flex-row sm:items-baseline gap-0.5 sm:gap-3">
+                  <dt className="font-semibold text-amber-900 dark:text-amber-200 sm:w-44 shrink-0">{label}</dt>
+                  <dd className="font-mono text-amber-800 dark:text-amber-300/90 break-words">
+                    {value ?? 'not published by this response'}
+                    {value && formula && (
+                      <span className="font-sans text-amber-700/80 dark:text-amber-400/70">
+                        {' '}({basisOf(activeResult, formula)})
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              );
+            })}
+          </dl>
+
+          {/* `shock_inputs` is the engine's own account of the shock it applied.
+              The scalars that change what a reader should make of the result are
+              the applied shock, its basis, the configured clip the impacts are
+              held inside, and the count of holdings that fell into the
+              UNCLASSIFIED sector bucket. The per-ticker maps in the same object
+              are published but not charted on this page. */}
+          {shockSummary(activeResult.shock_inputs).map(({ label, value }) => (
+            <div key={label} className="flex flex-col sm:flex-row sm:items-baseline gap-0.5 sm:gap-3 mt-1.5 text-xs">
+              <span className="font-semibold text-amber-900 dark:text-amber-200 sm:w-44 shrink-0">{label}</span>
+              <span className="font-mono text-amber-800 dark:text-amber-300/90 break-words">{value}</span>
+            </div>
+          ))}
+
+          {activeResult.methodology && (
+            <div className="mt-4 pt-3 border-t border-amber-200/70 dark:border-amber-900/40">
+              <div className="text-xs font-semibold uppercase tracking-wider text-amber-900 dark:text-amber-300 mb-1.5">
+                Methodology (as published)
+              </div>
+              <p className="text-xs text-amber-800 dark:text-amber-300/90 leading-relaxed">
+                {activeResult.methodology}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Custom Scenario Builder */}
       {showCustomForm && (
@@ -826,7 +1090,7 @@ export default function StressTestingPage() {
                 disabled={loading}
                 className="w-full px-4 py-2 text-sm font-semibold bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition-colors shadow-sm disabled:opacity-50"
               >
-                {loading ? 'Simulating...' : 'Run Simulation'}
+                {loading ? 'Evaluating...' : 'Run Stress Test'}
               </button>
             </div>
           </div>
@@ -943,8 +1207,8 @@ export default function StressTestingPage() {
                 </div>
                 <div className="flex justify-between items-center text-gray-600 dark:text-gray-400">
                   <span>Description</span>
-                  <span className="font-medium text-gray-900 dark:text-white text-right truncate max-w-[140px]" title={scenario.description}>
-                    {scenario.description}
+                  <span className="font-medium text-gray-900 dark:text-white text-right truncate max-w-[140px]" title={describedFor(scenario, result)}>
+                    {describedFor(scenario, result)}
                   </span>
                 </div>
                 
@@ -956,6 +1220,17 @@ export default function StressTestingPage() {
                         {formatPercentage(result.portfolio_impact, 1)}
                       </span>
                     </div>
+                    {/* The figure above is a deterministic factor proxy, not a
+                        sampled return. Print the engine's own basis token next
+                        to it rather than describing it in this page's words. */}
+                    {result.impact_basis && (
+                      <div className="flex justify-between items-center gap-2 text-gray-500 dark:text-gray-500">
+                        <span>Basis</span>
+                        <span className="font-mono text-right truncate" title={result.impact_basis}>
+                          {result.impact_basis}
+                        </span>
+                      </div>
+                    )}
                     <div className="flex justify-between items-center text-gray-600 dark:text-gray-400">
                       <span>Recovery Time</span>
                       <span className="font-semibold text-gray-900 dark:text-white">
@@ -994,7 +1269,7 @@ export default function StressTestingPage() {
                     className="w-full mt-3 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white font-semibold rounded-lg transition-colors duration-200 disabled:opacity-50 flex items-center justify-center"
                   >
                     <Play className="w-3.5 h-3.5 mr-1.5" />
-                    {loading ? 'Simulating...' : 'Run Test'}
+                    {loading ? 'Evaluating...' : 'Run Test'}
                   </button>
                 )}
               </div>

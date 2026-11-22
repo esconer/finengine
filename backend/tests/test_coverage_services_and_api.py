@@ -3,6 +3,7 @@ Comprehensive test suite for CurrencyService, CacheService, BenchmarkService, an
 """
 
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from contextlib import contextmanager
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -205,6 +206,27 @@ class TestBenchmarkServiceComprehensive:
 
 @pytest.mark.api
 class TestDataAPIRoutesComprehensive:
+    @staticmethod
+    @contextmanager
+    def _indicators_service(service):
+        """Install `service` as the IndicatorsService FastAPI actually injects.
+
+        FastAPI binds Depends(get_indicators_service) into the route's dependency
+        graph at import time, so patching the module attribute afterwards is
+        INERT - the real IndicatorsService still ran, which pulled INFY.NS from
+        the live yfinance vendor (3x, via the DataService retry loop) and could
+        409 the route. dependency_overrides is the seam FastAPI reads; this is
+        the same shape test_agent_c_api_contracts and test_bugfix_api_layer use.
+        """
+        from main import app
+        import app.api.data as data_mod
+
+        app.dependency_overrides[data_mod.get_indicators_service] = lambda: service
+        try:
+            yield
+        finally:
+            app.dependency_overrides.pop(data_mod.get_indicators_service, None)
+
     @pytest.mark.asyncio
     async def test_indicators_and_verified_snapshot(self, async_client):
         # Indicators success
@@ -212,7 +234,7 @@ class TestDataAPIRoutesComprehensive:
         mock_ind.compute_window = AsyncMock(return_value={"rsi": [50.0], "macd": [1.0]})
         mock_ind.verified_snapshot = AsyncMock(return_value={"ticker": "INFY.NS", "latest_close": 1600.0})
 
-        with patch("app.api.data.get_indicators_service", return_value=mock_ind):
+        with self._indicators_service(mock_ind):
             res1 = await async_client.get("/api/v1/data/indicators/INFY.NS?indicators=rsi,macd")
             assert res1.status_code == 200
 
@@ -222,7 +244,7 @@ class TestDataAPIRoutesComprehensive:
         # ValueError -> 400 / 404
         mock_ind.compute_window = AsyncMock(side_effect=ValueError("Invalid indicator"))
         mock_ind.verified_snapshot = AsyncMock(side_effect=ValueError("Not found"))
-        with patch("app.api.data.get_indicators_service", return_value=mock_ind):
+        with self._indicators_service(mock_ind):
             res_val = await async_client.get("/api/v1/data/indicators/INFY.NS")
             assert res_val.status_code in [200, 400]
 
@@ -232,7 +254,7 @@ class TestDataAPIRoutesComprehensive:
         # StaleMarketDataError -> 409
         mock_ind.compute_window = AsyncMock(side_effect=StaleMarketDataError("Stale"))
         mock_ind.verified_snapshot = AsyncMock(side_effect=StaleMarketDataError("Stale"))
-        with patch("app.api.data.get_indicators_service", return_value=mock_ind):
+        with self._indicators_service(mock_ind):
             res_stale1 = await async_client.get("/api/v1/data/indicators/INFY.NS")
             assert res_stale1.status_code in [200, 404, 409]
 

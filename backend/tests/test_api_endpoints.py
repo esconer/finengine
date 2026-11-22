@@ -3,10 +3,25 @@ API endpoint tests for Daisy Risk Engine
 """
 
 import pytest
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch, Mock
+
+import numpy as np
+import pandas as pd
 
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def _benchmark_returns(days=400, seed=11):
+    """Synthetic ^NSEI daily returns for the mocked BenchmarkService.
+
+    Seeded so the benchmark-dependent sections of /risk-score, /summary,
+    /performance-history, /tear-sheet and /factor-exposure are reproducible.
+    """
+    index = pd.date_range("2024-01-01", periods=days, freq="B")
+    rng = np.random.default_rng(seed)
+    return pd.Series(rng.normal(0.0004, 0.011, days), index=index)
 
 
 @pytest.mark.api
@@ -331,6 +346,11 @@ class TestAnalyticsAPI:
 
         analytics.py holds its own from-import bindings, so we must patch in
         ITS namespace with an explicitly built service mock.
+
+        BenchmarkService is a SECOND, independent network seam: /risk-score,
+        /summary, /performance-history, /tear-sheet and /factor-exposure take
+        it as an injected dependency, so leaving it live made every one of them
+        fetch ^NSEI from the real vendor. It is mocked here too.
         """
         service = Mock()
         service.get_service.return_value.fetch_historical_data = AsyncMock(
@@ -339,7 +359,13 @@ class TestAnalyticsAPI:
         service.get_service.return_value.fetch_quote = AsyncMock(
             return_value={"market_cap": 100000000000.0}
         )
-        return patch("app.api.analytics.GlobalDataService", return_value=service)
+        bench = Mock()
+        bench.get_benchmark_df = AsyncMock(return_value=None)
+        bench.get_returns = AsyncMock(return_value=_benchmark_returns())
+        stack = ExitStack()
+        stack.enter_context(patch("app.api.analytics.GlobalDataService", return_value=service))
+        stack.enter_context(patch("app.api.analytics.BenchmarkService", return_value=bench))
+        return stack
 
     @pytest.mark.asyncio
     async def test_realized_risk_uses_db_positions(self, async_client, seeded_positions, ohlcv_frame_factory):
