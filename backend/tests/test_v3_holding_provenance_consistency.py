@@ -2,7 +2,7 @@
 
 The v4 export let one portfolio carry three different holding dates:
 
-* `regime` resolved JUNIORBEES.NS to 2024-03-28 against a stored `added_on` of
+* `regime` resolved SMALLCAP.NS to 2024-03-28 against a stored `added_on` of
   2025-02-14, because the buy-price inference was fed the price frames THAT
   SECTION happened to fetch: its 1100-day HMM window reaches bars the 252-day
   realized-risk window never sees, so the "most recent match before the import

@@ -25,6 +25,7 @@ from app.api import analytics as analytics_mod
 from app.api import data as data_mod
 from app.api import equity_research as er_mod
 from app.models.database import PortfolioPosition
+from app.services.analytics_engine import AnalyticsEngine
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -130,14 +131,15 @@ async def test_concentration_by_sector_uses_mv_weights(async_client, test_db: As
 
     mock_engine = Mock()
 
-    async def fake_concentration(weights):
-        return {
-            "largest_position": max(weights.values()),
-            "by_weight": dict(weights),
-            "herfindahl_index": sum(w * w for w in weights.values()),
-        }
-
-    mock_engine.concentration_analysis = AsyncMock(side_effect=fake_concentration)
+    # A REAL engine, not a hand-rolled dict. This test is about `by_sector`
+    # coming from market-value weights rather than the stale stored `weight`,
+    # but the route reads all nine metric keys by SUBSCRIPT off whatever
+    # `concentration_analysis` returns, so a partial stand-in raised
+    # `KeyError` into the route's `except Exception` and returned 500 before
+    # `by_sector` was ever asserted.
+    mock_engine.concentration_analysis = AsyncMock(
+        side_effect=AnalyticsEngine().concentration_analysis
+    )
 
     from main import app
     app.dependency_overrides[analytics_mod.get_analytics_engine] = lambda: mock_engine

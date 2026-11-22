@@ -269,6 +269,20 @@ class NSEShareholdingPattern(Base):
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
     period_ended = Column(String(20), nullable=False)  # e.g., "2024-12-31"
+    # Restatement dimension: a company re-files the pattern for a quarter that
+    # is already on record, and the two filings disagree. Keyed on the pair
+    # alone, the second upserted onto the first and the original became
+    # unreadable. Keying on the filing's revision date makes a restatement an
+    # INSERT, so both filings stay readable and a re-file at the same revision
+    # still upserts.
+    # NOT NULL, defaulting to CURRENT_TIMESTAMP (never NULL): a NULL third key
+    # part cannot match in an ON CONFLICT arbiter, so a defaulted re-ingest
+    # would duplicate instead of updating. A producer replaying restated
+    # history must pass the filing's own revision date explicitly; the default
+    # stamps only the ingest time of an otherwise revisionless filing, at
+    # CURRENT_TIMESTAMP's 1-second resolution, so two revisionless filings in the
+    # same second are the same revision and collide rather than silently diverge.
+    revision_date = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     promoter_pct = Column(Float, nullable=False)
     promoter_pledged_pct = Column(Float, default=0.0)
     fii_pct = Column(Float, default=0.0)
@@ -276,9 +290,13 @@ class NSEShareholdingPattern(Base):
     public_pct = Column(Float, default=0.0)
     updated_on = Column(DateTime(timezone=True), server_default=func.now())
 
-    # One shareholding row per symbol per period report
+    # One shareholding row per symbol per period report per revision. The
+    # revision column is part of the key, never a payload field: dropping it
+    # from the constraint is what lets a restatement overwrite history.
     __table_args__ = (
-        UniqueConstraint("symbol", "period_ended", name="uq_shp_symbol_period"),
+        UniqueConstraint(
+            "symbol", "period_ended", "revision_date", name="uq_shp_symbol_period_revision"
+        ),
     )
 
     def __repr__(self):

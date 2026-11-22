@@ -38,6 +38,7 @@ from app.api.portfolio import (
     export_portfolio_csv,
     _generate_ticker_suggestions
 )
+from app.services.analytics_engine import AnalyticsEngine
 from app.models.schemas import (
     PortfolioPositionCreate,
     PortfolioPositionUpdate,
@@ -80,7 +81,16 @@ class TestDirectUnitRoutes:
         mock_engine.calculate_portfolio_metrics = AsyncMock(return_value=sample_metrics)
         mock_engine.forecast_volatility = AsyncMock(return_value={"volatility_forecast": 0.15, "var_forecast": -0.02, "model_params": {}})
         mock_engine.factor_exposure_analysis = AsyncMock(return_value={"portfolio": {"alpha": 0.02, "market": 1.1}, "r_squared": 0.85})
-        mock_engine.concentration_analysis = AsyncMock(return_value={"herfindahl_index": 0.25, "effective_positions": 4.0, "top_3": {"TCS.NS": 1.0}})
+        # A REAL engine call, not a literal dict. `get_concentration_metrics`
+        # reads all nine metric keys by SUBSCRIPT off this return, so the old
+        # three-key literal raised `KeyError` into the route's `except
+        # Exception` and turned this route sweep into a 500. Note the literal
+        # was also wrong in shape: `top_3` is a FRACTION, not a per-ticker
+        # mapping, which is exactly the kind of drift a hand-rolled stand-in
+        # cannot catch and a real engine cannot have.
+        mock_engine.concentration_analysis = AsyncMock(
+            side_effect=AnalyticsEngine().concentration_analysis
+        )
         mock_engine.liquidity_analysis = AsyncMock(return_value={"overall_score": 8.0, "liquidation_time_days": "1-2"})
         mock_engine.stress_test = AsyncMock(return_value={"scenario": "covid_crash", "max_drawdown": -0.25, "portfolio_impact": -0.25})
         mock_engine.volatility_sizing = AsyncMock(return_value={"target_volatility": 0.15, "current_weights": {"TCS.NS": 1.0}, "recommended_weights": {"TCS.NS": 1.0}})

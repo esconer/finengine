@@ -190,13 +190,13 @@ class TestMarketCapProvenance:
         assert position["is_estimate"] is True
 
     @pytest.mark.asyncio
-    async def test_selectipo_floor_is_never_silent(self):
-        """v3 evidence: SELECTIPO market cap equalled the INR 1bn fallback."""
+    async def test_truenoorth_floor_is_never_silent(self):
+        """v3 evidence: TRUENORTH market cap equalled the INR 1bn fallback."""
         engine = AnalyticsEngine()
         result = await engine.liquidity_analysis(
-            {"SELECTIPO.NS": ohlcv(10.0, 1_000.0)}
+            {"TRUENORTH.NS": ohlcv(10.0, 1_000.0)}
         )
-        position = result["by_position"]["SELECTIPO.NS"]
+        position = result["by_position"]["TRUENORTH.NS"]
 
         assert position["market_cap"] == LIQUIDITY_MARKET_CAP_FLOOR_INR
         assert position["market_cap_provenance"] == "fallback"
@@ -369,15 +369,40 @@ class TestStressProxySemantics:
 
     @pytest.mark.asyncio
     async def test_unmeasured_volatility_adjustment_states_its_basis(self):
+        """An unmeasurable leg says so, and publishes no measured factor.
+
+        The leg that is unmeasurable here is a RECENT LISTING, not a flat one.
+        It used to be `FLAT.NS` - 290 identical closes and 10 moving days - and
+        it qualified only because the volatility filter dropped every genuine
+        0.00% day before measuring dispersion, leaving 10 observations to fall
+        under `STRESS_VOL_MIN_OBSERVATIONS`.  Its 299 measured returns are
+        carried by the engine today, so that basis was a statement about the
+        filter rather than about the leg.
+        """
         engine = AnalyticsEngine()
+        frame = price_window()
+        # 15 sessions of history at the end of the window: 14 measured returns,
+        # which is short of the 20 the adjustment requires.  Short history is
+        # the real reason a leg has no measured volatility.
+        rng = np.random.default_rng(5)
+        listed_late = 50.0 + rng.normal(0.0, 0.01, 15).cumsum()
+        frame["SHORT.NS"] = pd.Series(listed_late, index=frame.index[-15:])
+
         result = await engine.stress_test(
-            price_window(), {"VOL.NS": 0.6, "FLAT.NS": 0.4}, "market_crash"
+            frame,
+            {"VOL.NS": 0.6, "FLAT.NS": 0.3, "SHORT.NS": 0.1},
+            "market_crash",
         )
         by_ticker = result["shock_inputs"]["volatility_adjustment"]["by_ticker"]
 
         assert by_ticker["VOL.NS"]["basis"] == "measured_annualized_volatility_over_reference"
-        assert by_ticker["FLAT.NS"]["basis"] == "unavailable_insufficient_observations"
-        assert by_ticker["FLAT.NS"]["factor"] == 1.0
+        assert by_ticker["SHORT.NS"]["basis"] == "unavailable_insufficient_observations"
+        assert by_ticker["SHORT.NS"]["factor"] == 1.0
+        # The flat leg is MEASURED, at the low end: 289 of its 299 returns are
+        # genuine 0.00% sessions and they are part of the sample its dispersion
+        # is estimated on.  A book that mostly did not move measures as a book
+        # that mostly did not move.
+        assert by_ticker["FLAT.NS"]["basis"] == "measured_annualized_volatility_over_reference"
 
     @pytest.mark.asyncio
     async def test_instrument_override_is_disclosed(self):

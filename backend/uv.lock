@@ -307,7 +307,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "alembic" },
     { name = "arch" },
-    { name = "bfinance", specifier = ">=0.1.0" },
+    { name = "bfinance", specifier = ">=0.1.0,<0.2.0" },
     { name = "cvxpy", specifier = ">=1.6.0" },
     { name = "factory-boy", marker = "extra == 'dev'", specifier = "==3.3.0" },
     { name = "faker", marker = "extra == 'dev'", specifier = "==33.1.0" },

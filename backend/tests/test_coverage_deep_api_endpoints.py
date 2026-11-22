@@ -4,6 +4,7 @@ Deep API endpoint coverage tests for app.api.portfolio and app.api.analytics.
 
 from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime
+import zlib
 import pandas as pd
 import numpy as np
 import pytest
@@ -13,9 +14,49 @@ from sqlalchemy import delete
 from app.models.database import PortfolioPosition
 
 
+#: Per-step mean and sigma of the sampled price walk. Sigma is the fixture's
+#: original 10 on a 3000 price (~5.3% annualized); the MEAN is what changed,
+#: and why, is in `_sample_ohlcv`.
+_STEP_SIGMA = 10.0
+_STEP_MEAN = 3.0
+
+
 def _sample_ohlcv(days=250, ticker="TCS.NS"):
+    """Sampled price walk with a POSITIVE expected return, seeded per ticker.
+
+    This file asserts `/optimize/run` returns 200 for `max_sharpe`, and
+    `_max_sharpe` refuses by design when no leg beats the risk-free rate:
+    `(excess <= 0).all()` raises ValueError
+    (app/services/optimization_service.py:968), which the route turns into a
+    400 "Invalid analytics request" (app/api/analytics.py:10675). That guard
+    is correct -- there is no tangency portfolio when nothing has excess
+    return -- so the fixture is what has to give.
+
+    It used to step with mean 0, i.e. assets whose expected return is ~0%
+    against a 2% risk-free rate, while the sample mean of 250 daily returns
+    has a standard error of 252 * (10/3000) / sqrt(250) = 5.3% annualized --
+    2.6x the risk-free rate itself. So `mu = returns.mean() * 252`
+    (optimization_service.py:88) landed under the rf for BOTH legs on ~37% of
+    draws, measured over 300 unseeded frames, and the route correctly
+    answered 400. A zero-expectation universe is not a universe with a
+    tangency portfolio; the old fixture asserted one existed.
+
+    Step mean 3.0 puts every leg's realized `mu` at 0.26-0.27 annualized --
+    over four standard errors ABOVE the rf, not merely on the lucky side of it
+    -- and holds for every ticker at any step mean from 1.0 up, so this is a
+    corrected premise rather than a lucky draw.
+
+    The RNG is seeded off the ticker with `zlib.crc32`, as conftest.py:535
+    does, instead of `np.random.normal` off the global stream: the drift fixes
+    the premise, the seed makes the fixture reproducible. Both halves are
+    needed. Seeding alone would only freeze whichever side of the rf a draw
+    happened to land on. Distinct legs must keep distinct seeds -- two legs on
+    one seed would make the sample covariance exactly singular and trade this
+    flake for a worse one.
+    """
     dates = pd.date_range("2024-01-01", periods=days, freq="B")
-    close = 3000.0 + np.cumsum(np.random.normal(0, 10, days))
+    rng = np.random.default_rng(zlib.crc32(ticker.encode()) % 2**32)
+    close = 3000.0 + np.cumsum(rng.normal(_STEP_MEAN, _STEP_SIGMA, days))
     return pd.DataFrame({
         "date": dates,
         "open": close * 0.99,
@@ -134,11 +175,25 @@ class TestDeepPortfolioAndAnalyticsEndpoints:
         mock_ds.fetch_historical_data = AsyncMock(side_effect=_fetch)
 
         try:
-            with patch("app.api.analytics.GlobalDataService") as mock_gds,                  patch("app.api.analytics.BenchmarkService") as mock_bs:
+            with patch("app.api.analytics.GlobalDataService") as mock_gds,                  patch("app.api.analytics.BenchmarkService") as mock_bs, \
+                 patch("app.services.regime_service.BenchmarkService") as mock_rs_bs:
                 
                 mock_gds.return_value.get_service.return_value = mock_ds
                 mock_bs.return_value.get_returns = AsyncMock(
                     return_value=pd.Series(np.random.normal(0.0005, 0.01, 250), index=df_tcs["date"])
+                )
+                # detect_regime builds its OWN BenchmarkService inside
+                # app.services.regime_service, so the route-level patch above
+                # never reaches it and /regime fetched ^NSEI from the live
+                # vendor (3x, via the DataService retry loop) -> 409 when the
+                # vendor missed. Both seams must be mocked, as
+                # test_advanced_analytics.patch_market does.
+                mock_rs_bs.return_value.get_benchmark_df = AsyncMock(return_value=None)
+                mock_rs_bs.return_value.get_returns = AsyncMock(
+                    return_value=pd.Series(
+                        np.random.normal(0.0005, 0.01, 300),
+                        index=pd.date_range("2025-01-01", periods=300, freq="B"),
+                    )
                 )
 
                 # 1. Volatility Cone endpoint

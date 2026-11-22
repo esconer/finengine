@@ -393,7 +393,7 @@ def _divergence_rows() -> List[CointPairResult]:
         _pair(
             "B.NS", "D.NS", 1e-9, zscore=2.5, stationarity=STATIONARITY_GATE_UNRESOLVED
         ),
-        # 0.042007 is the audited ELECTCAST.NS/MCX.NS p-value: declared positive
+        # 0.042007 is the audited SURYODAY.NS/EXCHANGE.NS p-value: declared positive
         # at alpha=0.05, and nowhere near 0.05/6, so it fails the correction.
         _pair("B.NS", "C.NS", 0.042007, zscore=0.2),
         _pair("C.NS", "D.NS", 0.042007, zscore=-0.2),
@@ -1072,7 +1072,7 @@ def _never_candidate_rows() -> List[CointPairResult]:
 
     A real export (v28, 91 rows, alpha=0.05) published
     `spurious_regression_rejected_count: 1` while twelve delivered rows carried
-    the `spurious_regression_rejected` verdict - ELECTCAST.NS measures
+    the `spurious_regression_rejected` verdict - SURYODAY.NS measures
     stationary, so it forms eleven pairs the gate also rejects, and eleven of
     those twelve had p >= 0.10 and were never cointegrated at all.
 

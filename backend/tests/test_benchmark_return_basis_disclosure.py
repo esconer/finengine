@@ -260,7 +260,7 @@ class TestNothingMeasuredMoved:
         assert "total-return index" in src or "total return index" in src.lower()
         # No proxy was substituted.
         assert "NIFTYBEES" not in src
-        assert "NIFTYIETF" not in src
+        assert "TIDETEST" not in src
         assert "^NSEITRI" not in src and "^NSEI TRI" not in src
         # And the symbol itself is untouched: still the price index.
         assert BENCHMARK_SYMBOL == "^NSEI"

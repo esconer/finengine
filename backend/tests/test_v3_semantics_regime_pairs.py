@@ -9,7 +9,7 @@ Three audit findings are regression-gated here:
          to 100, the benchmark series was undeclared, and the filtered
          posterior vs the Viterbi-decoded `current_regime` disagreement was
          invisible.
-- V3-14  pairs reported `complete` while a young ETF (NIFTYIETF, ~106-109
+- V3-14  pairs reported `complete` while a young ETF (TIDETEST, ~106-109
          usable sessions) sat next to peers with 168-174, and the
          Engle-Granger-decides / Johansen-diagnostic split was unlabelled.
 
@@ -90,7 +90,7 @@ class _FakeCache:
         self.store[(ticker, metric_name)] = {"metric_value": metric_value, "model_params": model_params}
 
 
-def _legacy_pair_row(a="NIFTYIETF.NS", b="NIFTYBEES.NS"):
+def _legacy_pair_row(a="TIDETEST.NS", b="NIFTYBEES.NS"):
     """Exactly the field set a pre-V3-14 build wrote to the DB cache."""
     return {
         "ticker_a": a,
@@ -448,13 +448,13 @@ class TestPairsDepthHelpers:
         idx = pd.bdate_range("2026-01-01", periods=10)
         series = pd.Series(100.0 + np.arange(10), index=idx)
         short = series.iloc[-4:]
-        assert usable_observations_by_ticker({"A.NS": series, "NIFTYIETF.NS": short}) == {
+        assert usable_observations_by_ticker({"A.NS": series, "TIDETEST.NS": short}) == {
             "A.NS": 10,
-            "NIFTYIETF.NS": 4,
+            "TIDETEST.NS": 4,
         }
         assert usable_observations_by_ticker({}) == {}
         assert usable_observations_by_ticker({"A.NS": None}) == {"A.NS": 0}
-        assert shallow_tickers({"A.NS": 174, "NIFTYIETF.NS": 107}) == ["NIFTYIETF.NS"]
+        assert shallow_tickers({"A.NS": 174, "TIDETEST.NS": 107}) == ["TIDETEST.NS"]
         assert shallow_tickers({"A.NS": 174, "B.NS": 168}) == []
 
 
@@ -489,7 +489,7 @@ class TestPairsCacheCompatibility:
                 # The gate is a measurement, so a row that answers it is a hit
                 # even though every declaration is still absent.
                 "stationarity_leg_a": {
-                    "ticker": "NIFTYIETF.NS", "observations": 107,
+                    "ticker": "TIDETEST.NS", "observations": 107,
                     "transform": "log_price", "alpha": 0.05,
                     "lag_rule": "adf:max_lags=1,lag_selection=aic",
                     "adf_pvalue": 0.55, "adf_lags": 0, "kpss_pvalue": 0.0001,
@@ -508,12 +508,12 @@ class TestPairsCacheCompatibility:
                 },
             }
         )
-        db_ticker, metric = _db_cache_keys("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+        db_ticker, metric = _db_cache_keys("TIDETEST.NS", "NIFTYBEES.NS", "2026-09-24")
         cache = _FakeCache({(db_ticker, metric): {"metric_value": 0.031, "model_params": row}})
         svc = CointegrationService(db_session=None, cache_service=cache)
         _IN_MEMORY_COINT_CACHE.clear()
         try:
-            got = await svc._get_cached_pair("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+            got = await svc._get_cached_pair("TIDETEST.NS", "NIFTYBEES.NS", "2026-09-24")
         finally:
             _IN_MEMORY_COINT_CACHE.clear()
         assert got is not None
@@ -530,12 +530,12 @@ class TestPairsCacheCompatibility:
         Serving it would make the omission indistinguishable from a deliberate
         `not_computed` in the artifact."""
         row = _legacy_pair_row()
-        db_ticker, metric = _db_cache_keys("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+        db_ticker, metric = _db_cache_keys("TIDETEST.NS", "NIFTYBEES.NS", "2026-09-24")
         cache = _FakeCache({(db_ticker, metric): {"metric_value": 0.031, "model_params": row}})
         svc = CointegrationService(db_session=None, cache_service=cache)
         _IN_MEMORY_COINT_CACHE.clear()
         try:
-            got = await svc._get_cached_pair("NIFTYIETF.NS", "NIFTYBEES.NS", "2026-09-24")
+            got = await svc._get_cached_pair("TIDETEST.NS", "NIFTYBEES.NS", "2026-09-24")
         finally:
             _IN_MEMORY_COINT_CACHE.clear()
         assert got is None
@@ -549,7 +549,7 @@ class TestPairsCacheCompatibility:
 
 
 def _uneven_universe(deep=174, young=107, seed=41):
-    """Two deep peers plus a young ETF - the NIFTYIETF shape from the audit."""
+    """Two deep peers plus a young ETF - the TIDETEST shape from the audit."""
     rng = np.random.default_rng(seed)
     index = pd.bdate_range("2026-01-01", periods=deep)
     base = pd.Series(100.0 + np.cumsum(rng.normal(0.05, 1.0, deep)), index=index)
@@ -561,7 +561,7 @@ def _uneven_universe(deep=174, young=107, seed=41):
     return {
         "INFY.NS": base,
         "TCS.NS": peer,
-        "NIFTYIETF.NS": etf,
+        "TIDETEST.NS": etf,
     }
 
 
@@ -578,16 +578,18 @@ class TestPairsScanDepthDisclosure:
         assert res.depth_status == "partial"
         assert res.depth_limited_pair_count == 2
         assert res.data_status == "partial"
-        assert res.shallow_tickers == ["NIFTYIETF.NS"]
+        assert res.shallow_tickers == ["TIDETEST.NS"]
         counts = res.usable_observations_by_ticker
-        assert counts["INFY.NS"] == 174 and counts["NIFTYIETF.NS"] == 107
+        assert counts["INFY.NS"] == 174 and counts["TIDETEST.NS"] == 107
 
         by_pair = {(p.ticker_a, p.ticker_b): p for p in res.pairs}
         deep = by_pair[("INFY.NS", "TCS.NS")]
         assert deep.overlap_observations == 174
         assert deep.depth_ratio == 1.0
         assert deep.depth_status == "available"
-        for young in (("INFY.NS", "NIFTYIETF.NS"), ("NIFTYIETF.NS", "TCS.NS")):
+        # scan_pairs emits sorted combos, so both peers lead the key and the young
+        # leg trails: INFY < TIDETEST and TCS < TIDETEST.
+        for young in (("INFY.NS", "TIDETEST.NS"), ("TCS.NS", "TIDETEST.NS")):
             pair = by_pair[young]
             assert pair.overlap_observations == 107
             assert pair.depth_ratio == pytest.approx(107 / 174, abs=1e-4)

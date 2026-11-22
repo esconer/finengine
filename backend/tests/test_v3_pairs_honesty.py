@@ -59,7 +59,7 @@ def _frame(values, index):
 
 
 def _universe(deep=174, young=108, extra=None, seed=41):
-    """Deep peers plus one young ETF - the NIFTYIETF shape from the audit."""
+    """Deep peers plus one young ETF - the TIDETEST shape from the audit."""
     rng = np.random.default_rng(seed)
     index = pd.bdate_range("2026-01-01", periods=deep)
     base = pd.Series(100.0 + np.cumsum(rng.normal(0.05, 1.0, deep)), index=index)
@@ -71,7 +71,7 @@ def _universe(deep=174, young=108, extra=None, seed=41):
     frames = {
         "INFY.NS": _frame(base.to_numpy(), base.index),
         "TCS.NS": _frame(peer.to_numpy(), peer.index),
-        "NIFTYIETF.NS": _frame(etf.to_numpy(), etf.index),
+        "TIDETEST.NS": _frame(etf.to_numpy(), etf.index),
     }
     frames.update(extra or {})
     return frames
@@ -134,7 +134,7 @@ def _depth_warning(payload):
 class TestNoNullErrorSentinel:
     async def test_successful_scan_publishes_no_error_key(self):
         frames = _universe(deep=174, young=174)
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", frames)
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", frames)
 
         payload = _payload(result)
         assert "error" not in payload, (
@@ -157,7 +157,7 @@ class TestNoNullErrorSentinel:
         )
 
     async def test_depth_limited_scan_also_publishes_no_error_key(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
         assert payload["depth_status"] == "partial"
         assert "error" not in payload
@@ -272,7 +272,7 @@ class TestNoNullErrorSentinel:
 
 class TestDeclaredMonetaryUnit:
     async def test_nse_universe_declares_inr(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe(deep=174, young=174))
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe(deep=174, young=174))
         payload = _payload(result)
 
         assert payload["currency"] == "INR"
@@ -297,7 +297,7 @@ class TestDeclaredMonetaryUnit:
         assert payload["currency_provenance"] == "derived"
 
     async def test_exporter_now_resolves_the_pairs_currency(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe(deep=174, young=174))
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe(deep=174, young=174))
         exported = _jsonable(result)
         assert _infer_currency(exported, {}) == "INR"
         assert exported["currency_provenance"] == "derived"
@@ -332,14 +332,14 @@ class TestDeclaredMonetaryUnit:
 
     async def test_declared_unit_matches_the_prices_actually_delivered(self):
         frames = _universe(deep=174, young=174)
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", frames)
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", frames)
         payload = _payload(result)
         delivered = {
             ticker
             for pair in payload["pairs"]
             for ticker in (pair["ticker_a"], pair["ticker_b"])
         }
-        assert delivered == {"INFY.NS", "TCS.NS", "NIFTYIETF.NS"}
+        assert delivered == {"INFY.NS", "TCS.NS", "TIDETEST.NS"}
         assert all(ticker.endswith((".NS", ".BO")) for ticker in delivered)
         assert payload["currency"] == "INR"
 
@@ -349,7 +349,7 @@ class TestDeclaredMonetaryUnit:
 
 class TestPartialScanStatesItsReason:
     async def test_depth_limited_scan_warns_with_measured_counts(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
 
         assert payload["data_status"] == "partial"
@@ -358,10 +358,10 @@ class TestPartialScanStatesItsReason:
         assert warning is not None, "a partial scan must state its reason"
 
         # Every number in the warning is a value the payload actually measured.
-        assert payload["shallow_tickers"] == ["NIFTYIETF.NS"]
+        assert payload["shallow_tickers"] == ["TIDETEST.NS"]
         counts = payload["usable_observations_by_ticker"]
-        assert "NIFTYIETF.NS" in warning
-        assert str(counts["NIFTYIETF.NS"]) in warning
+        assert "TIDETEST.NS" in warning
+        assert str(counts["TIDETEST.NS"]) in warning
         assert str(max(counts.values())) in warning
         assert f"{MIN_PAIR_DEPTH_RATIO:.0%}" in warning
         assert str(payload["minimum_depth_ratio"]) in warning
@@ -373,18 +373,18 @@ class TestPartialScanStatesItsReason:
 
     async def test_warning_follows_the_data_not_a_hardcoded_string(self):
         shallow = _universe(deep=200, young=90)
-        first = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", shallow)))
+        first = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", shallow)))
         deep = _universe(deep=200, young=200)
-        assert _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", deep))) is None
+        assert _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", deep))) is None
 
-        counts = _payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", shallow))
+        counts = _payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", shallow))
         assert "90 of 200" in first
-        assert counts["usable_observations_by_ticker"]["NIFTYIETF.NS"] == 90
+        assert counts["usable_observations_by_ticker"]["TIDETEST.NS"] == 90
 
     async def test_warning_is_stable_across_runs(self):
         frames = _universe()
-        first = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", frames)))
-        second = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", frames)))
+        first = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", frames)))
+        second = _depth_warning(_payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", frames)))
         # Cache hits on the second run must not change a single character.
         assert first == second
 
@@ -416,7 +416,7 @@ class TestPartialScanStatesItsReason:
 
     async def test_no_warning_when_the_scan_is_not_partial(self):
         payload = _payload(
-            await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe(deep=174, young=174))
+            await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe(deep=174, young=174))
         )
         assert payload["depth_status"] == "available"
         assert payload["data_status"] == "available"
@@ -452,7 +452,7 @@ class TestPartialScanStatesItsReason:
         assert f"{payload['depth_limited_pair_count']} of {len(payload['pairs'])}" in warning
 
     async def test_depth_warning_counts_rows_not_a_literal(self):
-        payload = _payload(await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe()))
+        payload = _payload(await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe()))
         limited = sum(
             1 for pair in payload["pairs"] if pair["depth_status"] == "partial"
         )
@@ -467,7 +467,7 @@ class TestPartialScanStatesItsReason:
 
 class TestPreservedInvariants:
     async def test_combinatorial_counts_still_hold(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
 
         assert payload["returned_pairs_count"] == len(payload["pairs"])
@@ -482,7 +482,7 @@ class TestPreservedInvariants:
         assert payload["requested_universe_size"] == 3
 
     async def test_data_status_and_universe_scope_are_unchanged(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
 
         # Ticket 01/03/07: route-owned scope, weightless coverage, ordering.
@@ -490,15 +490,15 @@ class TestPreservedInvariants:
         assert "weight_basis" not in payload["universe_coverage"]
         assert payload["universe_coverage"]["depth_status"] == payload["depth_status"]
         assert payload["universe_coverage"]["shallow_tickers"] == payload["shallow_tickers"]
-        assert payload["requested_tickers"] == ["INFY.NS", "TCS.NS", "NIFTYIETF.NS"]
-        assert payload["available_tickers"] == ["INFY.NS", "TCS.NS", "NIFTYIETF.NS"]
+        assert payload["requested_tickers"] == ["INFY.NS", "TCS.NS", "TIDETEST.NS"]
+        assert payload["available_tickers"] == ["INFY.NS", "TCS.NS", "TIDETEST.NS"]
         assert payload["test_roles"] == {
             "engle_granger": "published_decision",
             "johansen": "diagnostic_only",
         }
 
     async def test_response_is_still_a_coint_scanner_response(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         assert isinstance(result, CointScannerResponse)
         assert isinstance(result.pairs[0], CointPairResult)
         # D-07: the disclosures are DECLARED on the foundation-owned schema, not

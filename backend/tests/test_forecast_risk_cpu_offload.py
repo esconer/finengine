@@ -41,6 +41,16 @@ FIVE PROOFS, none of them a timing threshold:
      and the offloaded block is byte-identical to the same block computed
      inline on the loop.
 
+WHICH OF THOSE RUN AT THE PUBLISHED COUNT.  Proofs 1-4 and the seeded? claim take
+the `fast_resamples` fixture, so they spend `TEST_RESAMPLES` refits rather than
+the module's thousand - the COUNT is not what any of them observes, and a band
+over sixty draws reaches the same semaphore, the same worker thread and the same
+named seed a band over a thousand does.  Proof 5 keeps the production count, in
+both of its halves: the inline comparison asserts the published draw count
+against `FORECAST_PORTFOLIO_REFIT_RESAMPLES`, and the golden payload asserts a
+digest captured at it.  Either would be comparing two other bands at any other
+count, so they ask for no fixture and pin the count the module ships.
+
 No network: seeded RNG only.
 """
 
@@ -72,6 +82,12 @@ TICKERS = ("AAA.NS", "BBB.NS", "CCC.NS")
 OBSERVATIONS = 60
 MODEL = "GARCH"
 HORIZON = 1
+
+#: A short draw count, so this file is not the suite's largest cost.  The COUNT is
+#: not what the tests that ask for it are about; where the band RUNS is.  The block
+#: publishes whichever count it was given, so a reduced count is visible rather
+#: than silent, and the two tests that pin the published count run without it.
+TEST_RESAMPLES = 60
 
 #: Deadlock guards, NOT performance thresholds.  The assertions are binary facts
 #: - "the refit did not start", "the wait expired" - and none of them measures
@@ -181,6 +197,27 @@ def _park_refit(monkeypatch) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# fixtures
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def fast_resamples(monkeypatch):
+    """Spend TEST_RESAMPLES refits on the PORTFOLIO leg instead of the published count.
+
+    The published count is a cost decision, not a correctness one, and it is
+    asserted separately; running the real one in every test would add minutes of
+    optimiser time to a suite that already takes half an hour.  It is safe HERE
+    because none of the assertions that take this fixture is about the count: the
+    handoff, the budget, the thread and the named seed are the same facts at sixty
+    draws as at a thousand.  The two tests that DO pin the published count - the
+    golden payload digest and the inline comparison of the same band - ask for no
+    fixture, so the count they pin is the one the module ships.
+    """
+    monkeypatch.setattr(
+        analytics_mod, "FORECAST_PORTFOLIO_REFIT_RESAMPLES", TEST_RESAMPLES
+    )
+
+
+# ---------------------------------------------------------------------------
 # 1. the route uses the module's bounded helper, and nothing else
 # ---------------------------------------------------------------------------
 def test_the_route_hands_both_of_its_cpu_sections_to_the_bounded_helper():
@@ -217,7 +254,9 @@ def test_the_route_hands_both_of_its_cpu_sections_to_the_bounded_helper():
 # 2. the behavioural proof: the refit waits for the shared CPU budget
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_the_refit_band_waits_for_the_shared_per_loop_cpu_budget(monkeypatch):
+async def test_the_refit_band_waits_for_the_shared_per_loop_cpu_budget(
+    monkeypatch, fast_resamples
+):
     """A thousand-refit bootstrap must not start while the budget is spent.
 
     The binary fact is "it had not entered", not "it was slow".  Holding both
@@ -226,6 +265,9 @@ async def test_the_refit_band_waits_for_the_shared_per_loop_cpu_budget(monkeypat
     bare `asyncio.to_thread` ignores the semaphore entirely and enters
     immediately, so this test is red before the fix and green after it.  The
     release half then proves the wait is a queue and not a deadlock.
+
+    The count reaches neither half: the fixture spends fewer refits, and the
+    semaphore, the guards and the parked entry are the same ones either way.
     """
     park = _park_refit(monkeypatch)
     semaphore = analytics_mod._cpu_semaphore()
@@ -262,7 +304,7 @@ async def test_the_refit_band_waits_for_the_shared_per_loop_cpu_budget(monkeypat
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_a_concurrent_request_is_served_while_the_refit_band_recomputes(
-    async_client, monkeypatch
+    async_client, monkeypatch, fast_resamples
 ):
     park = _park_refit(monkeypatch)
     health: dict[str, object] = {}
@@ -294,7 +336,9 @@ async def test_a_concurrent_request_is_served_while_the_refit_band_recomputes(
 # 4. thread identity: the band is not computed on the loop thread
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_no_refit_band_runs_on_the_event_loop_thread(monkeypatch):
+async def test_no_refit_band_runs_on_the_event_loop_thread(
+    monkeypatch, fast_resamples
+):
     park = _park_refit(monkeypatch)
     park["released"].set()  # this test is about WHERE, not about waiting
     loop_thread = threading.get_ident()
@@ -398,7 +442,7 @@ def test_the_refit_statistic_is_deterministic_across_calls():
 
 
 @pytest.mark.asyncio
-async def test_the_published_band_names_the_seed_its_draws_came_from():
+async def test_the_published_band_names_the_seed_its_draws_came_from(fast_resamples):
     payload = await _route_payload()
     block = _portfolio_block(payload)
 

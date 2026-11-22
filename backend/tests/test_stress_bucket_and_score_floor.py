@@ -72,11 +72,11 @@ from app.services.analytics_engine import (
 # only uses them as names that must be treated identically by the code, and
 # asserts that the engine learns nothing about them.
 BUCKET_MEMBERS = (
-    "NIFTYIETF.NS",
+    "TIDETEST.NS",
     "MIDCAPIETF.NS",
-    "JUNIORBEES.NS",
+    "SMALLCAP.NS",
     "SELECTIPO.NS",
-    "MAFANG.NS",
+    "MAHALINGA.NS",
 )
 
 
@@ -106,14 +106,14 @@ def _bucket_book(n: int = 320, seed: int = 3, include_overridden: bool = True):
     rng = np.random.default_rng(seed)
     market = rng.normal(0.0, 0.010, n)
     returns = {
-        "CIPLA.NS": market + rng.normal(0.0, 0.008, n),
-        "NTPC.NS": market + rng.normal(0.0, 0.008, n),
-        "MCX.NS": market + rng.normal(0.0, 0.008, n),
-        "NIFTYIETF.NS": market + rng.normal(0.0, 0.001, n),
+        "ASTRALN.NS": market + rng.normal(0.0, 0.008, n),
+        "NARMADA.NS": market + rng.normal(0.0, 0.008, n),
+        "EXCHANGE.NS": market + rng.normal(0.0, 0.008, n),
+        "TIDETEST.NS": market + rng.normal(0.0, 0.001, n),
         "MIDCAPIETF.NS": 1.1 * market + rng.normal(0.0, 0.004, n),
-        "JUNIORBEES.NS": 1.0 * market + rng.normal(0.0, 0.003, n),
+        "SMALLCAP.NS": 1.0 * market + rng.normal(0.0, 0.003, n),
         "SELECTIPO.NS": 0.5 * market + rng.normal(0.0, 0.012, n),
-        "MAFANG.NS": rng.normal(0.0, 0.018, n),
+        "MAHALINGA.NS": rng.normal(0.0, 0.018, n),
     }
     if not include_overridden:
         for name in ("MIDCAPIETF.NS", "SELECTIPO.NS"):
@@ -211,7 +211,7 @@ class TestUnclassifiedBucketDisclosure:
         # No sectors supplied -> every holding is in the unclassified bucket, and
         # none of the three overridden tickers is in this fixture, so the bucket
         # really is shocked by one number.
-        for ticker in ("NIFTYIETF.NS", "JUNIORBEES.NS", "MAFANG.NS"):
+        for ticker in ("TIDETEST.NS", "SMALLCAP.NS", "MAHALINGA.NS"):
             entry = shock["co_movement"]["by_ticker"][ticker]
             assert entry["sector"] == STRESS_UNCLASSIFIED_SECTOR
             assert entry["sector_is_unclassified_bucket"] is True
@@ -287,9 +287,9 @@ class TestCoMovementIsMeasuredAndNotApplied:
         # The three index trackers co-move with the book; the fund with no
         # market loading does not.  A single 1.00 for all of them is falsified
         # by the payload's own measurement.
-        assert measured["NIFTYIETF.NS"] > 0.9
-        assert measured["JUNIORBEES.NS"] > 0.9
-        assert abs(measured["MAFANG.NS"] - 1.0) > 0.5
+        assert measured["TIDETEST.NS"] > 0.9
+        assert measured["SMALLCAP.NS"] > 0.9
+        assert abs(measured["MAHALINGA.NS"] - 1.0) > 0.5
         assert max(measured.values()) - min(measured.values()) > 1.0
 
     @pytest.mark.asyncio

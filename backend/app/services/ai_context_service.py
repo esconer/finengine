@@ -634,8 +634,8 @@ def _collect_warnings(value: Any) -> List[str]:
                     message = str(item.get("message") or item.get("detail") or "").strip()
                     # A structured warning already carries a `ticker` field, and
                     # the message it ships with frequently opens with that same
-                    # ticker ("NIFTYIETF.NS: 20 own return observations ...").
-                    # Prefixing again renders "NIFTYIETF.NS: NIFTYIETF.NS: ...".
+                    # ticker ("TIDETEST.NS: 20 own return observations ...").
+                    # Prefixing again renders "TIDETEST.NS: TIDETEST.NS: ...".
                     already_prefixed = bool(ticker) and message.startswith(f"{ticker}:")
                     if ticker and message and not already_prefixed:
                         text = f"{ticker}: {message}"

@@ -5,6 +5,7 @@ Comprehensive test suite for app.api.analytics helper methods and empty portfoli
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import AsyncMock, patch
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete
 
@@ -15,6 +16,15 @@ from app.api.analytics import (
     _price_series,
     _assign_price,
     _load_portfolio_allocation
+)
+
+# The no-book concentration shape is one contract, derived once in
+# `test_concentration_empty_hhi_absent.py`. This file hand-named a single key on
+# it; imported instead, so a partial update cannot leave the other eight
+# asserting a number the shape no longer publishes.
+from tests.test_concentration_empty_hhi_absent import (
+    WITHHELD_ON_AN_EMPTY_BOOK,
+    ZERO_VALUED_ON_AN_EMPTY_BOOK,
 )
 
 
@@ -179,11 +189,34 @@ class TestAnalyticsEmptyPortfolioRoutes:
         # 4. Concentration
         res = await async_client.get("/api/v1/analytics/concentration")
         assert res.status_code in [200, 404]
-        # An empty book publishes NO Herfindahl index: HHI = sum(w_i^2) >= 1/n is
-        # strictly positive for every non-empty book, so 0.0 is not a value this
-        # field can hold. It used to be asserted at 0.0 here, which pinned the
-        # fabricated value the engine's own no-book shape had already dropped.
-        assert res.json()["herfindahl_index"] is None
+        # An empty book publishes NO concentration statistic: HHI = sum(w_i^2)
+        # >= 1/n is strictly positive for every non-empty book, so 0.0 is not a
+        # value the index can hold, and the same holds for the top-N sums, the
+        # largest weight and N_eff. It used to be asserted at 0.0 here, which
+        # pinned the fabricated value the engine's own no-book shape had already
+        # dropped; naming one key also left the other eight unchecked, so this
+        # now loops the derived list instead.
+        concentration_empty = res.json()
+        for key in WITHHELD_ON_AN_EMPTY_BOOK:
+            assert key in concentration_empty, (
+                f"{key} was dropped from the no-book shape; the field must be "
+                "present and null"
+            )
+            assert concentration_empty[key] is None, (
+                f"the route published {concentration_empty[key]!r} for {key} on "
+                "an empty book, which reads as a measurement nobody took"
+            )
+        # What zero IS a true statement about an absent book: the count and the
+        # weight mass. Asserted from the same source as the list above, so one
+        # blanket conversion of the whole shape to None cannot satisfy both.
+        for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+            assert key in concentration_empty, (
+                f"{key} was dropped from the no-book shape"
+            )
+            assert concentration_empty[key] == 0, (
+                f"{key} must stay 0 on an empty book, got "
+                f"{concentration_empty[key]!r}"
+            )
 
         # 5. Liquidity
         res = await async_client.get("/api/v1/analytics/liquidity")
@@ -230,7 +263,27 @@ class TestAnalyticsEmptyPortfolioRoutes:
         assert res.status_code in [200, 404]
 
         # 14. Regime
-        res = await async_client.get("/api/v1/analytics/regime")
+        # detect_regime builds its OWN BenchmarkService inside
+        # app.services.regime_service (it is not the injected route dependency),
+        # so with an empty book this endpoint fetched ^NSEI from the live vendor
+        # - three times, via the DataService retry loop. Both seams are mocked
+        # here as test_advanced_analytics.patch_market does.
+        with patch("app.api.analytics.BenchmarkService") as mock_bs, \
+             patch("app.services.regime_service.BenchmarkService") as mock_rs_bs:
+            mock_bs.return_value.get_returns = AsyncMock(
+                return_value=pd.Series(
+                    np.random.normal(0.0005, 0.01, 300),
+                    index=pd.date_range("2025-01-01", periods=300, freq="B"),
+                )
+            )
+            mock_rs_bs.return_value.get_benchmark_df = AsyncMock(return_value=None)
+            mock_rs_bs.return_value.get_returns = AsyncMock(
+                return_value=pd.Series(
+                    np.random.normal(0.0005, 0.01, 300),
+                    index=pd.date_range("2025-01-01", periods=300, freq="B"),
+                )
+            )
+            res = await async_client.get("/api/v1/analytics/regime")
         assert res.status_code in [200, 404]
         assert "regime" in res.json() or "current_regime" in res.json()
 

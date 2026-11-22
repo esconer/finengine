@@ -6,8 +6,8 @@ derived from a scan whose statistics are indistinguishable from the null:
     91 Engle-Granger p-values vs Uniform(0,1)   KS D=0.131101  p=0.079886
     declared positives 4  expected by chance 4.55  Poisson P(X=4)=0.188710
     Bonferroni 0.05/91 = 0.00054945 -> 0 survivors
-    "LONG_SPREAD (Long ELECTCAST.NS, Short MCX.NS)"    hedge_ratio_beta 0.008606
-    "SHORT_SPREAD (Short JUNIORBEES.NS, Long MIDCAPIETF.NS)"  beta 33.6396
+    "LONG_SPREAD (Long SURYODAY.NS, Short EXCHANGE.NS)"    hedge_ratio_beta 0.008606
+    "SHORT_SPREAD (Short SMALLCAP.NS, Long MIDETF.NS)"  beta 33.6396
 
 All four decision-positive pairs carried `johansen_agrees_with_decision: false`
 - the diagnostic contradicted the decision on every one of them and the
@@ -75,8 +75,8 @@ AUDITED_91_PVALUES = [
 
 # The two pairs the audit named, with the numbers it measured off the payload.
 AUDITED_DIRECTIVE_PAIRS = {
-    "ELECTCAST.NS/MCX.NS": 0.042007,
-    "JUNIORBEES.NS/MIDCAPIETF.NS": 0.04853,
+    "SURYODAY.NS/EXCHANGE.NS": 0.042007,
+    "SMALLCAP.NS/MIDETF.NS": 0.04853,
 }
 
 # Tokens that make a signal an ORDER. A gate test asserts on these, not on the
@@ -458,11 +458,11 @@ def _frame(values, index):
 
 
 def _universe(deep: int = 200, seed: int = 41):
-    """Deep peers plus one young ETF: the audited NIFTYIETF shape.
+    """Deep peers plus one young ETF: the audited TIDETEST shape.
 
     The ETF covers `deep - 60` of `deep` sessions (0.70 at deep=200), which is
     under `MIN_PAIR_DEPTH_RATIO`, so the scan really does report
-    `depth_status: "partial"` and `shallow_tickers: ["NIFTYIETF.NS"]` and the
+    `depth_status: "partial"` and `shallow_tickers: ["TIDETEST.NS"]` and the
     no-regression assertions are testing the disclosure, not a coincidence.
     """
     rng = np.random.default_rng(seed)
@@ -475,7 +475,7 @@ def _universe(deep: int = 200, seed: int = 41):
     return {
         "INFY.NS": _frame(base.to_numpy(), base.index),
         "TCS.NS": _frame(peer.to_numpy(), peer.index),
-        "NIFTYIETF.NS": _frame(etf.to_numpy(), etf.index),
+        "TIDETEST.NS": _frame(etf.to_numpy(), etf.index),
     }
 
 
@@ -513,7 +513,7 @@ async def _scan(tickers, frames, *, p_value_threshold: float = 0.05, johansen=No
 
 class TestRoutePayload:
     async def test_disagreeing_scan_publishes_no_directive(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe(), johansen=False)
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe(), johansen=False)
         payload = _payload(result)
 
         assert payload["test_agreement"]["disagreement_count"] == payload["test_agreement"]["decision_positive_count"]
@@ -532,7 +532,7 @@ class TestRoutePayload:
     async def test_payload_publishes_the_family_and_the_correction(self):
         frames = _universe()
         n = 3  # C(3,2) = 3 pair tests
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", frames)
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", frames)
         payload = _payload(result)
         family = payload["multiple_testing"]
 
@@ -550,7 +550,7 @@ class TestRoutePayload:
     async def test_zero_survivors_is_published_not_hidden(self):
         """The honest result on this family, stated as such: 0 pairs survive
         correction beats 3 uncorrected positives a reader cannot weigh."""
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
         family = payload["multiple_testing"]
 
@@ -571,7 +571,7 @@ class TestRoutePayload:
             assert family["survivor_count"] <= family["declared_positive_count"]
 
     async def test_payload_publishes_the_zscore_threshold_and_its_basis(self):
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         policy = _payload(result)["signal_policy"]
 
         assert policy["zscore_threshold"] == SIGNAL_ZSCORE_THRESHOLD
@@ -634,7 +634,7 @@ class TestRoutePayload:
         """The exact audited shape: EG flags the pair, the diagnostic refutes
         it, and a wide z-score must still produce no position."""
         pair = _pair(
-            a="ELECTCAST.NS", b="MCX.NS", pvalue=0.042007, is_coint=True,
+            a="SURYODAY.NS", b="EXCHANGE.NS", pvalue=0.042007, is_coint=True,
             johansen=False, beta=0.008606, zscore=-1.6827,
         )
         assert pair.johansen_agrees_with_decision is False
@@ -644,7 +644,7 @@ class TestRoutePayload:
                 coint, "analyze_pair_cointegration", lambda **_kw: pair
             ), patch.object(analytics_mod, "CointegrationService", CointegrationService):
                 result = await get_cointegration_pairs(
-                    tickers="ELECTCAST.NS,MCX.NS",
+                    tickers="SURYODAY.NS,EXCHANGE.NS",
                     lookback_days=252,
                     p_value_threshold=0.05,
                     max_half_life=None,
@@ -652,8 +652,8 @@ class TestRoutePayload:
                     db=Mock(),
                     data_service=_FakeMarket(
                         {
-                            "ELECTCAST.NS": _frame([1.0, 2.0], pd.bdate_range("2026-01-01", periods=2)),
-                            "MCX.NS": _frame([1.0, 2.0], pd.bdate_range("2026-01-01", periods=2)),
+                            "SURYODAY.NS": _frame([1.0, 2.0], pd.bdate_range("2026-01-01", periods=2)),
+                            "EXCHANGE.NS": _frame([1.0, 2.0], pd.bdate_range("2026-01-01", periods=2)),
                         }
                     ),
                     cache_service=None,
@@ -705,12 +705,12 @@ class TestNoRegression:
 
     async def test_depth_currency_and_test_agreement_still_ship(self):
         """The pre-existing disclosure is extended, not replaced."""
-        result = await _scan("INFY.NS,TCS.NS,NIFTYIETF.NS", _universe())
+        result = await _scan("INFY.NS,TCS.NS,TIDETEST.NS", _universe())
         payload = _payload(result)
 
         assert payload["minimum_pair_observations"] == 30
         assert payload["minimum_depth_ratio"] == 0.75
-        assert payload["shallow_tickers"] == ["NIFTYIETF.NS"]
+        assert payload["shallow_tickers"] == ["TIDETEST.NS"]
         assert payload["depth_status"] == "partial"
         assert payload["usable_observations_by_ticker"]
         assert payload["reference_pair_observations"]

@@ -23,10 +23,12 @@ from app.models.database import PortfolioPosition, StockTimeseries
 from app.models.schemas import (
     PortfolioPositionCreate, PortfolioPositionUpdate, PortfolioPositionResponse,
     PortfolioSummaryResponse, BulkAddRequest, BulkAddResponse,
-    SuccessResponse
+    POSITION_LAST_PRICE_AS_OF_SEMANTICS, SuccessResponse
 )
 from app.services.currency_service import (
     CurrencyUnavailableError,
+    HISTORICAL_FX_AVAILABLE,
+    HISTORICAL_FX_UNAVAILABLE_REASON,
     coerce_live_fx_rate,
     get_currency_service,
 )
@@ -64,6 +66,13 @@ class PortfolioPositionEnvelope(PortfolioPositionResponse):
     ticker used the same instant, so the disagreement could only be asserted
     globally ("best_effort") instead of located per position. `price_as_of` makes
     it local: two rows are comparable exactly when this field matches.
+
+    The two as_of slots are NOT the same clock and must not be read as one.
+    `price_as_of` (declared here) dates a DELIVERED DAILY BAR. The live quote
+    that produced `last_price` has no as-of date at all, which is what the
+    inherited `last_price_as_of` / `last_price_as_of_semantics` / `quote_provenance`
+    state - see schemas.POSITION_LAST_PRICE_AS_OF_SEMANTICS. A row that carries
+    `price_as_of` is still undated as a QUOTE.
     """
 
     #: Newest DELIVERED daily bar date for this one ticker, or null when no bar
@@ -304,8 +313,17 @@ def _holding_date_provenance() -> Dict[str, Any]:
             "positions[].price_as_of is "
             f"{PORTFOLIO_PRICE_AS_OF_SEMANTICS}. It resolves the book-wide as_of "
             "to one ticker so two marks can be compared directly; it is the only "
-            "per-position price date, and a null means NO bar has been delivered "
+            "per-position BAR date, and a null means NO bar has been delivered "
             "for that ticker rather than a fall-back to a neighbour's date."
+        ),
+        "last_price_as_of": (
+            f"positions[].last_price_as_of is {POSITION_LAST_PRICE_AS_OF_SEMANTICS}. "
+            "It is never populated and no envelope field fills it in. `last_price` "
+            "is a live quote whose refresh keeps no provider market timestamp, so "
+            "the two as_of slots are different clocks and neither dates the other: "
+            "price_as_of dates the delivered daily bar, last_price_as_of is empty "
+            "because the quote itself is undated. positions[].quote_provenance "
+            "carries the per-position statement of what is missing."
         ),
     }
 
@@ -837,6 +855,77 @@ async def _convert_money(
     return converted, rate, provenance
 
 
+def _fx_history_disclosure(
+    position_currencies: Dict[str, str], base_currency: str,
+    currency_service: Any,
+) -> Dict[str, Any]:
+    """Say, per pair, whether a DATED rate exists - never supply a rate.
+
+    A mixed-currency book is exactly the case where a historical window silently
+    borrows today's rate: `fx_rate` here is a present-day spot quote, and a
+    reader multiplying it across a return series would be compounding today's
+    rate over a period it never applied. This block does not stop that on its
+    own - it makes the absence a published fact at the point the rate is served.
+
+    Every non-identity pair reports `available: False`, because the service
+    resolves one spot rate per pair and stores no dated series. That is a
+    capability gap (a dated series needs a table and a producer), reported as
+    one. The snapshot rate is deliberately NOT returned here.
+    """
+    pairs: Dict[str, Any] = {}
+    for currency in sorted(set(position_currencies.values())):
+        status = getattr(currency_service, "get_historical_rate_status", None)
+        try:
+            if callable(status):
+                pairs[currency] = status(currency, base_currency)
+            else:
+                pairs[currency] = {
+                    "available": False,
+                    "dated": False,
+                    "reason": HISTORICAL_FX_UNAVAILABLE_REASON,
+                }
+        except Exception as exc:
+            # An unconvertible/unsupported pair must not take the envelope down;
+            # it is reported as unavailable, which is what it is.
+            logger.warning(
+                "FX history status unavailable for %s: %s", currency, type(exc).__name__
+            )
+            pairs[currency] = {
+                "available": False,
+                "dated": False,
+                "reason": type(exc).__name__,
+            }
+    crossing = sorted(
+        {c for c in set(position_currencies.values()) if c != base_currency}
+    )
+    return {
+        "historical_rate_available": False,
+        "currency_service_historical_fx_available": HISTORICAL_FX_AVAILABLE,
+        "per_position_currency": pairs,
+        "crossed_a_currency_boundary": bool(crossing),
+        "non_base_currencies": crossing,
+        "reason": HISTORICAL_FX_UNAVAILABLE_REASON,
+        "fx_rate_basis": (
+            "fx_rate / fx_provenance on each position are PRESENT-DAY spot quotes "
+            "fetched within this request (currency_service snapshot, 30-minute "
+            "cache). They are not dated to any observation and must not be "
+            "applied across a historical window."
+        ),
+        "what_this_invalidates": [
+            "Any multi-period return, P&L series, volatility figure or "
+            "attribution computed for a mixed-currency book by converting at "
+            "fx_rate: that conversion embeds one present-day rate, so the "
+            "currency contribution is constant across the whole window and the "
+            "resulting series is not a historical valuation.",
+        ],
+        "capability_gap": (
+            "Producing dated historical FX needs a rate-series table and a "
+            "producer to populate it. Neither exists; this block reports the "
+            "absence rather than filling it with the snapshot rate."
+        ),
+    }
+
+
 def _clear_portfolio_dependent_memos() -> None:
     """Invalidate weight-dependent analytics after a durable portfolio change."""
     try:
@@ -903,6 +992,11 @@ async def get_portfolio(
                     "source_currencies": [],
                     "supported_currencies": sorted(_SUPPORTED_CURRENCIES),
                     "pairs": {},
+                    # Empty book, no conversion happened - stated so a consumer
+                    # of this shape does not infer the key was forgotten.
+                    "fx_history": _fx_history_disclosure(
+                        {}, target_currency, get_currency_service()
+                    ),
                 },
                 position_currencies={},
                 holding_date_provenance=_holding_date_provenance(),
@@ -1048,9 +1142,11 @@ async def get_portfolio(
                 total_cost_base=base_cost,
                 unrealized_gain_loss_base=base_gain_loss,
                 unrealized_gain_loss_pct_base=base_gain_loss_pct,
-                # AD-16: sit `price_as_of` next to the `last_price` it dates, so
-                # alignment with another section is checkable per row rather than
-                # asserted once for the whole export.
+                # AD-16: sit `price_as_of` next to the row so alignment with
+                # another section is checkable per row rather than asserted once
+                # for the whole export. It dates the delivered BAR, not the live
+                # quote behind `last_price` - which stays undated, and says so
+                # through the inherited last_price_as_of/quote_provenance.
                 price_as_of=leg_price_as_of,
                 price_as_of_semantics=(
                     PORTFOLIO_PRICE_AS_OF_SEMANTICS if leg_price_as_of else None
@@ -1072,6 +1168,11 @@ async def get_portfolio(
             "pairs": pairs,
             "rates": {pair: data.get("rate") for pair, data in pairs.items()},
             "rate_provider": "currency_service",
+            # Published wherever money is converted, so the present-day nature
+            # of `rates` is stated at the point the numbers are served.
+            "fx_history": _fx_history_disclosure(
+                position_currencies, target_currency, currency_service
+            ),
         }
         # ONE grouped query now serves both the book-wide `as_of` and the
         # per-position `price_as_of`, so the two can never disagree: a second

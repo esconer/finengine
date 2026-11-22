@@ -2329,9 +2329,11 @@ def engine_risk_statistics(
         support = mask.sum(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
             total = np.where(mask, series, 0.0).sum(axis=0) / support
-        # The engine falls back to the VaR itself when the tail is empty; a
-        # bootstrap resample with no observation at or below its own 5th
-        # percentile cannot, so it stays non-finite and is reported as such.
+        # The engine WITHHOLDS cvar_95 as None when the tail is empty rather
+        # than restating the VaR under this key; a bootstrap resample with no
+        # observation at or below its own 5th percentile has no point to
+        # restate, so it stays non-finite and is reported as such.  Both sides
+        # now refuse on the same condition.
         return np.where(support > 0, total, np.nan)
 
     def max_drawdown(block: Any) -> np.ndarray:
@@ -4520,16 +4522,45 @@ class AnalyticsEngine:
                 vol_basis = "unavailable_no_price_window"
                 if ticker in returns.columns:
                     s = returns[ticker]
+                    # dropna, not `!= 0.0`: keeps genuine 0% days, drops
+                    # pre-listing/no-trade NaN gaps.  This is verbatim the rule
+                    # `_calculate_factor_exposures` writes above its own
+                    # active-day mask, so the two sites now agree instead of
+                    # the engine documenting one rule and computing another.
+                    #
+                    # WHY THE OLD FILTER WAS A FABRICATION.  `s != 0.0` filters
+                    # on the OUTCOME VARIABLE before a dispersion is measured on
+                    # it, and it gets the two kinds of zero backwards.  A day the
+                    # instrument closed flat IS a measurement - a real 0.00%
+                    # return, and dropping it removes genuine days from the
+                    # sample the volatility is estimated on, inflating that
+                    # volatility and so inflating `ticker_impact` below for
+                    # exactly the population this app targets: Indian small and
+                    # mid-caps with flat sessions.  A NaN gap is not a
+                    # measurement at all - it is a pre-listing or no-trade day -
+                    # and `NaN != 0.0` is True, so the old filter KEPT every one
+                    # of them, which fed the count below while pandas skipped
+                    # them in the dispersion it computes over.  So it discarded
+                    # the days that were measured and counted the days that were
+                    # not.
+                    #
+                    # `dropna()` drops the gaps and keeps the zeros, which is
+                    # the distinction that matters: NaN is absent data, 0.0 is a
+                    # measured return of zero.  `len()` is then the count of the
+                    # sample the dispersion is actually computed on, so
+                    # `STRESS_VOL_MIN_OBSERVATIONS` gates measured observations
+                    # rather than padded ones.
+                    #
                     # Same named clip as the forecast section, for the reason
                     # documented there: it is published on
                     # `volatility_adjustment.return_clip` below, and two written
                     # literals are two things that can drift apart.
-                    non_zero = s[s != 0.0].clip(
+                    active = s.dropna().clip(
                         lower=FORECAST_INPUT_RETURN_CLIP[0],
                         upper=FORECAST_INPUT_RETURN_CLIP[1],
                     )
-                    if len(non_zero) >= STRESS_VOL_MIN_OBSERVATIONS:
-                        ticker_vol = float(non_zero.std() * np.sqrt(252))
+                    if len(active) >= STRESS_VOL_MIN_OBSERVATIONS:
+                        ticker_vol = float(active.std() * np.sqrt(252))
                         vol_adj = (
                             max(STRESS_VOL_ADJ_MIN, min(STRESS_VOL_ADJ_MAX, ticker_vol / STRESS_VOL_REFERENCE))
                             if ticker_vol > 0 else 1.0
@@ -5963,21 +5994,49 @@ class AnalyticsEngine:
         except Exception:
             return {}
     
-    def _calculate_risk_metrics(self, returns: pd.Series) -> Dict[str, float]:
-        """Calculate risk metrics (VaR, CVaR)"""
+    def _calculate_risk_metrics(self, returns: pd.Series) -> Dict[str, Any]:
+        """Calculate risk metrics (VaR, CVaR).
+
+        The two are DIFFERENT statistics and neither stands in for the other:
+        `var_95` is the 5th percentile of the window, `cvar_95` is the MEAN of
+        the observations at or below it.  This block used to publish the VaR
+        again under the CVaR key whenever the tail came back empty -
+        `... if len(...) > 0 else var_95` - so an empty tail shipped ONE number
+        under two labels that say they are different quantities, and a reader
+        comparing them saw a real relationship between two readings of the same
+        number.
+
+        An empty tail is a MISSING measurement, not a zero one and not a VaR
+        restated, so both keys are withheld with `None` on it.  Measured, not
+        assumed: for finite observations the tail is never empty, because the
+        minimum is at or below the 5th percentile by construction, so
+        `returns <= var_95` always selects at least that one.  An empty tail is
+        therefore exactly the window whose quantile is not a finite number -
+        `np.percentile` returns NaN for a window carrying a NaN or an infinity,
+        and every comparison against NaN is False - which is also why no VaR
+        can be published beside it either.  `None` is the shape `_empty_metrics`
+        already publishes for this pair and the shape `_empty_stress_test`
+        follows: the key is never dropped, so a consumer reads one payload
+        whether or not the tail could be averaged, and the block's own
+        `estimate_uncertainty.estimates.<field>.reason` carries the refusal to
+        the reader.
+        """
         try:
             if returns.empty:
                 return {}
-            
+
             # Historical VaR (95%)
             var_95 = np.percentile(returns, 5)
-            
-            # Conditional VaR (Expected Shortfall)
-            cvar_95 = returns[returns <= var_95].mean() if len(returns[returns <= var_95]) > 0 else var_95
-            
+
+            # Conditional VaR (Expected Shortfall): the mean of the tail the
+            # quantile selects.  Never the quantile restated.
+            tail = returns[returns <= var_95]
+            if tail.empty:
+                return {"var_95": None, "cvar_95": None}
+
             return {
                 "var_95": var_95,
-                "cvar_95": cvar_95
+                "cvar_95": tail.mean()
             }
         except Exception:
             return {}
@@ -7015,10 +7074,20 @@ class AnalyticsEngine:
     
     def _empty_concentration(self) -> Dict[str, Any]:
         return {
-            "largest_position": 0.0,
-            "top_3": 0.0,
-            "top_5": 0.0,
-            "top_10": 0.0,
+            # The same refusal `herfindahl_index` below was given, and for the
+            # same reason - the reason is recorded there. These four are not
+            # merely unmeasured here, they are OUT OF RANGE on any book that
+            # reaches them: weights are filtered to finite, strictly positive
+            # values and normalized before any of this is summed, so the
+            # largest weight and the 3-, 5- and 10-weight sums are each strictly
+            # > 0. `top_10` additionally publishes the engine's OWN 1.0 whenever
+            # the book has fewer than ten holdings - i.e. most books - so a 0.0
+            # here does not sit beside a real reading, it CONTRADICTS the
+            # commonest one.
+            "largest_position": None,
+            "top_3": None,
+            "top_5": None,
+            "top_10": None,
             # WM-6.  `None`, not 0.0.  HHI = sum(w_i^2) >= 1/n > 0 for every
             # non-empty book, so 0.0 is not a reachable MEASUREMENT - it is a
             # third value, the one this refusal used to publish, and it is
@@ -7029,26 +7098,47 @@ class AnalyticsEngine:
             # so the refusal scored the leg at its BEST possible value and kept
             # its 0.20 nominal weight (see the concentration leg there).
             #
-            # SCOPE.  This is the `n == 0` / error path ONLY.
-            # `diversification_score == 0.0` below is CORRECT for `n == 1` and
-            # is not touched: the repo's own invariant is that a single-holding
-            # portfolio must strictly render 0% diversification, because that
-            # IS what the scale reads at one holding.  A test pins both cases
-            # side by side so the two cannot erode into each other.
+            # SCOPE.  This is the `n == 0` / error path ONLY. The MEASURED
+            # branch above is untouched, and its `n == 1` case is a different
+            # shape that really does measure `diversification_score: 0.0`,
+            # `diversification_ratio: 1.0`, `gini_coefficient: 0.0` and
+            # `herfindahl_index: 1.0`: the repo's own invariant is that a
+            # single-holding portfolio must strictly render 0% diversification,
+            # because that IS what the scale reads at one holding.  A test pins
+            # both cases side by side, key by key, so they cannot erode into
+            # each other.
             "herfindahl_index": None,
-            "effective_positions": 0.0,
-            "diversification_score": 0.0,
-            "diversification_ratio": 1.0,
-            "gini_coefficient": 0.0,
+            # N_eff = 1/HHI, and a normalized book has HHI <= 1, so N_eff lies
+            # in [1, n] on every non-empty book. 0.0 is outside the field's
+            # range altogether - it is not a measurement a book can be asked
+            # for, it is a stand-in for one.
+            "effective_positions": None,
+            # WM-6 fixed the index on THIS shape and left these three
+            # publishing numbers, and that asymmetry was the tell that the fix
+            # had been applied to one key rather than to the shape: the same
+            # no-book dict had been corrected once and left alone eight times.
+            #
+            # The three numbers are all readings of a book this is not. At
+            # `n == 1`, `diversification_score` measures 0.0, `gini_coefficient`
+            # measures 0.0 and `diversification_ratio = N_eff/n` measures 1.0 -
+            # so `diversification_ratio: 1.0` beside `n_holdings: 0` says
+            # "perfectly concentrated, in one name", and a reader has no way to
+            # learn that the one name does not exist. That is why the withholding
+            # is on this shape only: at `n == 1` the same key publishes the same
+            # value as a genuine measurement, and a blanket `None` would have
+            # thrown away a real reading to fix a stand-in.
+            "diversification_score": None,
+            "diversification_ratio": None,
+            "gini_coefficient": None,
             # The disclosure keys are published here too, so a consumer sees one
             # shape rather than two. `n_holdings` is 0 because no holding was
-            # measured -- that is a true statement about an absent book, and it
-            # is what distinguishes this shape from the `n == 1` book that
+            # measured -- that is a true statement about an absent book, it is
+            # what distinguishes this shape from the `n == 1` book that
             # legitimately measures `herfindahl_index: 1.0` and
-            # `diversification_score: 0.0`.  `diversification_score` and
-            # `diversification_ratio` on this shape are still left exactly as
-            # they were: they are the same class of ambiguity, but they are a
-            # SEPARATE disclosure and `risk_scoring` does not read either.
+            # `diversification_score: 0.0`, and it is the REASON the nine keys
+            # above are withheld. It therefore stays 0 rather than becoming
+            # `None`: a count of zero IS the measurement, where every number
+            # above it is only a stand-in.
             "n_holdings": 0,
             "scale": dict(CONCENTRATION_DIVERSIFICATION_SCALE),
             "diversification_score_formula": (

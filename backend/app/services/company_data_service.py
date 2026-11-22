@@ -27,6 +27,7 @@ from app.services.cache_service import (
     ProviderError,
     ProviderUnavailableError,
     UnknownTickerError,
+    _safe_provider_message,
     cache_generation_is_current,
     get_cache_generation,
     get_runtime_cache_snapshot,
@@ -211,7 +212,16 @@ class CompanyDataService:
             except Exception as exc:
                 nonlocal had_outage
                 had_outage = True
-                logger.debug("bfinance fundamentals unavailable for %s: %s", norm_ticker, type(exc).__name__)
+                # WARNING, not DEBUG: a total bfinance outage must be visible at
+                # the configured default level (INFO), where debug() emits
+                # nothing at all.  had_outage is only consulted when every tier
+                # fails, so a partial outage was previously invisible entirely.
+                # The upstream text is bounded and key-redacted rather than
+                # logged verbatim.
+                logger.warning(
+                    "bfinance fundamentals unavailable for %s: %s (%s)",
+                    norm_ticker, type(exc).__name__, _safe_provider_message(exc),
+                )
                 return None
 
         async def _fetch_yf() -> Dict[str, Any]:

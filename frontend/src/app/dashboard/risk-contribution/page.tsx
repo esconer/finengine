@@ -43,13 +43,21 @@ import {
   CheckCircle2
 } from 'lucide-react';
 
+/**
+ * Educational copy ONLY.
+ *
+ * There is deliberately no per-metric benchmark field. Its strings named real
+ * holdings beside per-position ratios the route never measured, and the rest
+ * were string constants that read identically for every book on every load.
+ * What depends on the response is rendered by {@link HelpExplainerModal}'s
+ * `measured` prop instead; what the route does not publish says so.
+ */
 interface ExplainerContent {
   title: string;
   what: string;
   howInferred: string;
   whyImportant: string;
   howToInfer: string;
-  benchmark?: string;
 }
 
 const EXPLAINERS: Record<string, ExplainerContent> = {
@@ -58,32 +66,28 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The total annualized standard deviation of daily portfolio returns, reflecting aggregate fluctuation magnitude.',
     howInferred: 'Calculated as σ_p = √(w^T Σ w) × √252 using the full empirical covariance matrix of constituent returns.',
     whyImportant: 'The core risk denominator in Sharpe ratios and institutional risk budgeting.',
-    howToInfer: 'e.g. 18.08% indicates standard annual fluctuation bounds of ±18.08% under normal market conditions.',
-    benchmark: 'Balanced multi-cap Indian portfolio benchmark: 14.0% – 18.0%.'
+    howToInfer: 'The measured figure is one standard deviation of annualized daily return — the band the book is expected to occupy within a year.'
   },
   var_95: {
     title: 'Daily Value at Risk (VaR 95%)',
     what: 'The minimum percentage loss expected on the 5% worst trading sessions over a 1-day holding period.',
     howInferred: 'Non-parametric empirical 5th percentile of daily portfolio historical returns: VaR_95 = Percentile(R_daily, 5%).',
     whyImportant: 'Mandated by Basel III risk regulations; establishes everyday stop-loss capital buffers.',
-    howToInfer: 'e.g. -1.82% means on 95 out of 100 days, daily loss will not exceed 1.82% of total portfolio value.',
-    benchmark: 'Standard daily VaR limit: ≥ -2.25%.'
+    howToInfer: 'A negative measured figure is the loss floor exceeded on roughly 5 sessions in 100 — a tail quantile, not an average day.'
   },
   cvar_95: {
     title: 'Daily Conditional VaR / Expected Shortfall (CVaR 95%)',
     what: 'The average expected loss conditioned on the portfolio breaching its 95% VaR threshold.',
     howInferred: 'CVaR_95 = E[R_daily | R_daily ≤ VaR_95], measuring the conditional average of tail loss events.',
     whyImportant: 'Superior to VaR because it captures the severity of tail crashes rather than just the cutoff threshold.',
-    howToInfer: 'e.g. -2.53% means when a crisis or tail-shock day occurs, the average expected daily drawdown is 2.53%.',
-    benchmark: 'Institutional risk ceiling: CVaR ≥ -3.50%.'
+    howToInfer: 'It is at least as severe as VaR by construction: the average loss on the days that breach VaR, so it sizes the crash rather than its trigger.'
   },
   top_risk_driver: {
     title: 'Top Risk Driver Position',
     what: 'The single individual holding contributing the largest marginal share to aggregate portfolio volatility.',
     howInferred: 'Identified as argmax_i (Euler Volatility Risk Contribution %RC_i).',
     whyImportant: 'Highlights portfolio vulnerability to idiosyncratic single-stock shocks regardless of nominal portfolio value.',
-    howToInfer: 'e.g. Motherson (19.9% risk share vs 13.6% capital weight) would be the primary engine of portfolio volatility.',
-    benchmark: 'Single-stock risk share ceiling: ≤ 20.0%.'
+    howToInfer: 'Compare the measured risk share against the position\'s own weight in the table: a risk share above the weight means the holding magnifies portfolio risk.'
   },
   euler_volatility_share: {
     title: 'Euler Volatility Risk Contribution (%RC)',
@@ -104,7 +108,7 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'Aggregated percentage of total portfolio risk originating from each GICS economic sector.',
     howInferred: 'Sum of individual asset risk contributions (%RC_i) grouped by their underlying sector classification.',
     whyImportant: 'Prevents unintentional sector risk concentration (e.g. over-relying on Auto Cyclicals or Financials).',
-    howToInfer: 'Consumer Cyclicals (28.4%) and ETFs (23.1%) dominate portfolio risk generation.'
+    howToInfer: 'The measured sector shares are listed with this panel; the largest of them is the sector carrying the most of the book\'s risk.'
   },
   divergence_insight: {
     title: 'Volatility vs Tail Loss Divergence',
@@ -118,11 +122,30 @@ const EXPLAINERS: Record<string, ExplainerContent> = {
     what: 'The ratio of percentage risk contribution to percentage capital allocation: Ratio = %RC_i / Weight_i.',
     howInferred: 'Calculated as %RC_i / w_i. A ratio of 1.0 represents exact proportional risk parity.',
     whyImportant: 'The key quantitative metric used by risk managers to identify over-leveraged risk contributors (> 1.0) and risk diversifiers (< 1.0).',
-    howToInfer: 'e.g. Redington (1.70x) would be an aggressive risk magnifier; JuniorBees (0.77x) and Cipla (0.44x) would be strong risk dampeners.'
+    howToInfer: 'A ratio above 1.0 means the position carries more risk than its capital weight; below 1.0 means it damps risk.'
   }
 };
 
-function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: () => void }) {
+/**
+ * The measured reading for THIS book, keyed by the same `itemKey` a
+ * {@link HelpBtn} carries. Every entry is read off the response the page already
+ * holds, so the panel moves with the metric. An EMPTY line list is the
+ * not-measured state and is rendered as one — never backfilled.
+ */
+type MeasuredReading = {
+  lines: string[];
+  reason?: string;
+};
+
+function HelpExplainerModal({
+  itemKey,
+  measured,
+  onClose,
+}: {
+  itemKey: string;
+  measured: MeasuredReading | null;
+  onClose: () => void;
+}) {
   const info = EXPLAINERS[itemKey];
   if (!info) return null;
 
@@ -177,11 +200,27 @@ function HelpExplainerModal({ itemKey, onClose }: { itemKey: string; onClose: ()
             <p className="text-slate-300">{info.howToInfer}</p>
           </div>
 
-          {info.benchmark && (
-            <div className="bg-rose-950/40 p-3 rounded-lg border border-rose-800/50 text-rose-200 text-xs font-medium">
-              💡 <span className="font-semibold text-rose-300">Quantitative Benchmark:</span> {info.benchmark}
-            </div>
-          )}
+          {/* The measured box. It used to be a static string, so it read the same on every
+            load and for every book; now it is read off the response, and an empty
+            reading renders the explicit not-measured state instead of a
+            plausible figure. */}
+          <div
+            data-testid="explainer-measured"
+            className="bg-rose-950/40 p-3 rounded-lg border border-rose-800/50 text-rose-200 text-xs font-medium"
+          >
+            📊 <span className="font-semibold text-rose-300">Measured On This Book:</span>
+            {measured && measured.lines.length > 0 ? (
+              <ul className="mt-1 space-y-0.5 list-disc list-inside font-mono">
+                {measured.lines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 font-mono">
+                Not measured — {measured?.reason ?? 'the route published no value for this metric'}.
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex justify-end">
@@ -316,6 +355,80 @@ export default function RiskContributionPage() {
       ? 'N/A'
       : `${(v * 100).toFixed(decimals)}%`;
 
+  /**
+   * One measured line per published value, or none at all. Returning `[]` for an
+   * unpublished value is what keeps the modal's not-measured state reachable:
+   * `fmtPct` would have turned the null into a literal "N/A" line, which reads
+   * as a rendered measurement rather than an absent one.
+   */
+  const measuredLine = (
+    label: string,
+    value: number | null | undefined,
+    render: (value: number) => string
+  ): string[] =>
+    typeof value === 'number' && !Number.isNaN(value) ? [`${label} ${render(value)}`] : [];
+
+  /**
+   * The measured reading behind each explainer, keyed by `itemKey`. Every entry
+   * is read off the response this page already fetched, so the panel moves with
+   * the metric instead of narrating a constant.
+   */
+  const measuredReadings: Record<string, MeasuredReading> = {
+    portfolio_volatility: {
+      lines: measuredLine(
+        'Annualized portfolio volatility',
+        data?.portfolio_volatility_annualized,
+        (v) => fmtPct(v)
+      ),
+    },
+    var_95: {
+      lines: measuredLine('Daily VaR (95%)', data?.portfolio_var_95_daily, (v) => fmtPct(v)),
+    },
+    cvar_95: {
+      lines: measuredLine('Daily CVaR (95%)', data?.portfolio_cvar_95_daily, (v) => fmtPct(v)),
+      reason: 'the window produced no tail days, so no conditional average exists',
+    },
+    top_risk_driver: {
+      lines: topDriver ? [`${topDriver[0]} ${fmtPct(topDriver[1])}`] : [],
+      reason: 'no position carried a measured volatility share',
+    },
+    euler_volatility_share: {
+      lines: volEntries.slice(0, 3).map(([ticker, share]) => `${ticker} ${fmtPct(share)}`),
+      reason: 'the route published no position shares',
+    },
+    cvar_tail_share: {
+      lines: cvarEntries.slice(0, 3).map(([ticker, share]) => `${ticker} ${fmtPct(share)}`),
+      reason: 'the window produced no tail days, so no tail shares exist',
+    },
+    sector_risk_contribution: {
+      lines: sectorEntries.slice(0, 3).map(([sector, share]) => `${sector} ${fmtPct(share)}`),
+      reason: 'the route published no sector rollup',
+    },
+    divergence_insight: {
+      lines: (() => {
+        if (!topDriver) return [];
+        const cvarShare = data?.positions.cvar_tail[topDriver[0]];
+        const diff =
+          typeof cvarShare === 'number' && !Number.isNaN(cvarShare)
+            ? cvarShare - topDriver[1]
+            : null;
+        return [
+          `${topDriver[0]} vol ${fmtPct(topDriver[1])} · tail ${
+            cvarShare != null ? fmtPct(cvarShare) : 'not measured'
+          } · Δ ${diff !== null ? fmtPct(diff) : 'not measured'}`,
+        ];
+      })(),
+      reason: 'neither the volatility nor the tail share was published',
+    },
+    // The route publishes risk shares but NOT capital weights, so this ratio has
+    // no denominator here. The removed string answered it anyway, with three
+    // named holdings and per-position multipliers that were never measured.
+    risk_budgeting_ratio: {
+      lines: [],
+      reason: 'this route publishes risk shares, not the capital weights the ratio divides by',
+    },
+  };
+
   // Export CSV
   const handleExportCSV = () => {
     if (!data) return;
@@ -369,6 +482,7 @@ export default function RiskContributionPage() {
       {activeExplainer && (
         <HelpExplainerModal
           itemKey={activeExplainer}
+          measured={measuredReadings[activeExplainer] ?? null}
           onClose={() => setActiveExplainer(null)}
         />
       )}

@@ -14,6 +14,16 @@ from app.models.database import PortfolioPosition, StockTimeseries
 from app.services.currency_service import CurrencyConversionService
 from app.services.analytics_engine import AnalyticsEngine
 
+# The no-book concentration shape is one contract, derived once in
+# `test_concentration_empty_hhi_absent.py`. This file used to hand-write
+# `largest_position == 0.0` for the empty half of this transition, which is a
+# number no book can measure - and a hand-written key is checked against
+# nothing but itself, so it survived the shape moving under it.
+from tests.test_concentration_empty_hhi_absent import (
+    WITHHELD_ON_AN_EMPTY_BOOK,
+    ZERO_VALUED_ON_AN_EMPTY_BOOK,
+)
+
 
 def _make_ohlcv(days=120, seed=42, ticker="TCS.NS", base_price=3000.0):
     dates = pd.date_range("2025-01-01", periods=days, freq="B")
@@ -31,6 +41,16 @@ def _make_ohlcv(days=120, seed=42, ticker="TCS.NS", base_price=3000.0):
         "volume": np.full(days, 500_000),
         "ticker": ticker,
     })
+
+
+def _benchmark_returns(days=400, seed=11):
+    """Synthetic ^NSEI daily returns for the mocked BenchmarkService.
+
+    Seeded so the benchmark leg of the analytics endpoints is reproducible.
+    """
+    index = pd.date_range("2024-01-01", periods=days, freq="B")
+    rng = np.random.default_rng(seed)
+    return pd.Series(rng.normal(0.0004, 0.011, days), index=index)
 
 
 @pytest.mark.asyncio
@@ -99,37 +119,65 @@ class TestEmptyToPopulatedTransition:
         assert v1_health.json()["status"] == "healthy"
 
         # 2. Empty state queries on analytics endpoints (must never 500)
-        rr_resp = await async_client.get("/api/v1/analytics/realized-risk")
-        assert rr_resp.status_code == 200
-        assert "error" in rr_resp.json() or "portfolio" in rr_resp.json()
+        # factor-exposure, summary, performance-history and risk-score each take
+        # BenchmarkService as an injected dependency, so on an empty book they
+        # still resolved ^NSEI against the live vendor. Mocked here so no unit
+        # test performs real network I/O.
+        bench = Mock()
+        bench.get_benchmark_df = AsyncMock(return_value=None)
+        bench.get_returns = AsyncMock(return_value=_benchmark_returns())
+        with patch("app.api.analytics.BenchmarkService", return_value=bench):
+            rr_resp = await async_client.get("/api/v1/analytics/realized-risk")
+            assert rr_resp.status_code == 200
+            assert "error" in rr_resp.json() or "portfolio" in rr_resp.json()
 
-        fr_resp = await async_client.get("/api/v1/analytics/forecast-risk")
-        assert fr_resp.status_code == 200
-        assert "portfolio" in fr_resp.json()
+            fr_resp = await async_client.get("/api/v1/analytics/forecast-risk")
+            assert fr_resp.status_code == 200
+            assert "portfolio" in fr_resp.json()
 
-        fe_resp = await async_client.get("/api/v1/analytics/factor-exposure")
-        assert fe_resp.status_code == 200
-        fe_body = fe_resp.json()
-        assert fe_body["portfolio"]["market"] is None
-        assert "error" in fe_body
+            fe_resp = await async_client.get("/api/v1/analytics/factor-exposure")
+            assert fe_resp.status_code == 200
+            fe_body = fe_resp.json()
+            assert fe_body["portfolio"]["market"] is None
+            assert "error" in fe_body
 
-        conc_resp = await async_client.get("/api/v1/analytics/concentration")
-        assert conc_resp.status_code == 200
-        assert conc_resp.json()["largest_position"] == 0.0
+            conc_resp = await async_client.get("/api/v1/analytics/concentration")
+            assert conc_resp.status_code == 200
+            conc_empty = conc_resp.json()
+            # The empty half of the transition must not merely answer 200 - it
+            # must be a state a reader can tell apart from the populated half
+            # asserted below. Every concentration statistic is withheld rather
+            # than published as 0.0: `largest_position` was the one this file
+            # hand-copied, and 0.0 is not a value any book produces on that
+            # field, so it identified nothing. Looped from the derived list so
+            # the remaining eight cannot drift the way that one did.
+            for key in WITHHELD_ON_AN_EMPTY_BOOK:
+                assert key in conc_empty, f"{key} was dropped from the no-book shape"
+                assert conc_empty[key] is None, (
+                    f"the route published {conc_empty[key]!r} for {key} on a book "
+                    "with no holdings, so the empty state reads as a measured one"
+                )
+            # The count is what actually carries the transition, because a count
+            # of zero is a measurement and the numbers above are not.
+            for key in ZERO_VALUED_ON_AN_EMPTY_BOOK:
+                assert key in conc_empty, f"{key} was dropped from the no-book shape"
+                assert conc_empty[key] == 0, (
+                    f"{key} must stay 0 on an empty book, got {conc_empty[key]!r}"
+                )
 
-        liq_resp = await async_client.get("/api/v1/analytics/liquidity")
-        assert liq_resp.status_code == 200
+            liq_resp = await async_client.get("/api/v1/analytics/liquidity")
+            assert liq_resp.status_code == 200
 
-        sum_resp = await async_client.get("/api/v1/analytics/summary")
-        assert sum_resp.status_code == 200
-        assert sum_resp.json()["total_positions"] == 0
+            sum_resp = await async_client.get("/api/v1/analytics/summary")
+            assert sum_resp.status_code == 200
+            assert sum_resp.json()["total_positions"] == 0
 
-        ph_resp = await async_client.get("/api/v1/analytics/performance-history")
-        assert ph_resp.status_code == 200
-        assert ph_resp.json() == []
+            ph_resp = await async_client.get("/api/v1/analytics/performance-history")
+            assert ph_resp.status_code == 200
+            assert ph_resp.json() == []
 
-        rs_resp = await async_client.get("/api/v1/analytics/risk-score")
-        assert rs_resp.status_code == 200
+            rs_resp = await async_client.get("/api/v1/analytics/risk-score")
+            assert rs_resp.status_code == 200
 
         try:
             # 3. Populate portfolio positions in DB
@@ -169,7 +217,8 @@ class TestEmptyToPopulatedTransition:
                 return df_infy
             mock_data_service.fetch_historical_data = AsyncMock(side_effect=_fetch)
 
-            with patch("app.api.analytics.GlobalDataService") as mock_gds:
+            with patch("app.api.analytics.GlobalDataService") as mock_gds, \
+                 patch("app.api.analytics.BenchmarkService", return_value=bench):
                 mock_gds.return_value.get_service.return_value = mock_data_service
 
                 # 4. Query populated state

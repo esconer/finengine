@@ -27,6 +27,26 @@ logger = setup_logger(__name__)
 FALLBACK_USD_INR = 83.0
 SUPPORTED_CURRENCIES = ("INR", "USD")
 
+#: Whether a DATED rate can be resolved for an arbitrary historical date.
+#: It cannot, and the reason is structural rather than a missing feed: this
+#: service caches exactly ONE spot rate per pair under a 30-minute TTL
+#: (`_cache_duration`, `get_exchange_rate`). There is no dated series table and
+#: no producer of one, so "the rate on 2024-03-01" is not a lookup this service
+#: can answer - it can only answer "the rate most recently observed", which is a
+#: PRESENT-DAY fact.
+#:
+#: Published as a flag so a caller asking about a historical window has to
+#: handle the answer rather than fall through to the snapshot rate and publish
+#: today's number as if it had been observed then.
+HISTORICAL_FX_AVAILABLE = False
+
+HISTORICAL_FX_UNAVAILABLE_REASON = (
+    "This service resolves one spot rate per pair under a 30-minute cache. It "
+    "stores no dated FX series, so it cannot return the rate observed on a "
+    "past date. The cached rate is valid for the present moment only and must "
+    "not be used to value a historical window."
+)
+
 
 class CurrencyUnavailableError(ProviderUnavailableError):
     """A portfolio FX conversion could not be completed from a live quote."""
@@ -287,6 +307,49 @@ class CurrencyConversionService:
     def get_currency_symbol(self, currency: str) -> str:
         code = self._currency(currency)
         return '₹' if code == 'INR' else '$'
+
+    def get_historical_rate_status(
+        self,
+        from_currency: str,
+        to_currency: str,
+        *,
+        as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """State whether a DATED rate exists. Never returns a rate.
+
+        Deliberately no number in the payload, in any branch. A caller that
+        needed a historical rate has no way to mistake this for one: the
+        `rate` key is absent entirely rather than null, so there is no value to
+        accidentally read.
+
+        `HISTORICAL_FX_AVAILABLE = False` is not a missing feed - a dated USD/INR
+        series is obtainable upstream. It is missing HERE because this service
+        has no series table and no producer. That is a capability gap, so it is
+        reported as one instead of being papered over with the snapshot rate.
+        """
+        source = self._currency(from_currency)
+        target = self._currency(to_currency)
+        if source == target:
+            # Identity holds at every instant, so it is the one case where a
+            # dated answer genuinely exists without any series.
+            return {
+                "available": True,
+                "dated": True,
+                "reason": "identity_conversion_needs_no_rate",
+            }
+        return {
+            "available": False,
+            "dated": False,
+            "reason": HISTORICAL_FX_UNAVAILABLE_REASON,
+            "requested_pair": f"{source}_{target}",
+            "requested_as_of": as_of.isoformat() if isinstance(as_of, datetime) else None,
+            "substitute_available": False,
+            "substitute_reason": (
+                "The cached spot rate is not a substitute: it is a present-day "
+                "observation and substituting it would attribute today's rate to "
+                "a past date."
+            ),
+        }
 
     def get_exchange_rate_info(self) -> Dict[str, Any]:
         """Describe cached live rates and the most recent fallback provenance."""

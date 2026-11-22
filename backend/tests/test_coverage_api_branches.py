@@ -4,6 +4,7 @@ Comprehensive branch tests for portfolio, analytics, and data APIs to push cover
 
 from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime
+import zlib
 import pandas as pd
 import numpy as np
 import pytest
@@ -13,9 +14,45 @@ from sqlalchemy import delete
 from app.models.database import PortfolioPosition
 
 
+#: Per-step mean and sigma of the sampled price walk. Sigma is the fixture's
+#: original 3 on a 600 price (~6.3% annualized); the MEAN is what changed, and
+#: why, is in `_sample_ohlcv`.
+_STEP_SIGMA = 3.0
+_STEP_MEAN = 3.0
+
+
 def _sample_ohlcv(days=120, ticker="SBIN.NS"):
+    """Sampled price walk with a POSITIVE expected return, seeded per ticker.
+
+    `_max_sharpe` refuses by design when no leg beats the risk-free rate:
+    `(excess <= 0).all()` raises ValueError
+    (app/services/optimization_service.py:1075), which the route turns into a
+    400 "Invalid analytics request" (app/api/analytics.py:10752). That guard is
+    correct -- there is no tangency portfolio when nothing has excess return --
+    so the fixture is what has to give.
+
+    This fixture used to step with mean 0, i.e. an asset whose expected return is
+    ~0% against a 2% risk-free rate, while the sample mean of its daily returns
+    has a standard error of 252 * (3/600) / sqrt(150) = 3.2% annualized -- 1.6x
+    the risk-free rate itself. So `mu = returns.mean() * 252`
+    (optimization_service.py:88) landed under the rf on 224 of 400 unseeded
+    draws, measured over 400 frames. A zero-expectation universe is not a
+    universe with a tangency portfolio; the old fixture asserted one existed.
+
+    Step mean 3.0 puts the realized `mu` at 0.84 annualized -- over 160 standard
+    errors ABOVE the rf, not merely on the lucky side of it -- and the premise
+    holds at every step mean from 1.0 up (worst leg z = +36.4 at step mean 1.0),
+    so this is a corrected premise rather than a lucky draw.
+
+    The RNG is seeded off the ticker with `zlib.crc32`, as conftest.py:543
+    does, instead of `np.random.normal` off the global stream: the drift fixes
+    the premise, the seed makes the fixture reproducible. Both halves are
+    needed. Seeding alone would only freeze whichever side of the rf a draw
+    happened to land on.
+    """
     dates = pd.date_range("2024-01-01", periods=days, freq="B")
-    close = 600.0 + np.cumsum(np.random.normal(0, 3, days))
+    rng = np.random.default_rng(zlib.crc32(ticker.encode()) % 2**32)
+    close = 600.0 + np.cumsum(rng.normal(_STEP_MEAN, _STEP_SIGMA, days))
     return pd.DataFrame({
         "date": dates,
         "open": close * 0.99,
@@ -108,11 +145,25 @@ class TestAPIBranchesCoverage:
         mock_ds = Mock()
         mock_ds.fetch_historical_data = AsyncMock(return_value=df_sbin)
 
-        with patch("app.api.analytics.GlobalDataService") as mock_gds,              patch("app.api.analytics.BenchmarkService") as mock_bs:
+        with patch("app.api.analytics.GlobalDataService") as mock_gds,              patch("app.api.analytics.BenchmarkService") as mock_bs, \
+             patch("app.services.regime_service.BenchmarkService") as mock_rs_bs:
             
             mock_gds.return_value.get_service.return_value = mock_ds
             mock_bs.return_value.get_returns = AsyncMock(
                 return_value=pd.Series(np.random.normal(0.0005, 0.01, 150), index=df_sbin["date"])
+            )
+            # detect_regime builds its OWN BenchmarkService inside
+            # app.services.regime_service, so the analytics-namespace patch
+            # never reaches it and /regime fetched ^NSEI from the live vendor
+            # (3x, via the DataService retry loop) -> 409 on a vendor miss.
+            # Both seams must be mocked, as test_advanced_analytics.
+            # patch_market does.
+            mock_rs_bs.return_value.get_benchmark_df = AsyncMock(return_value=None)
+            mock_rs_bs.return_value.get_returns = AsyncMock(
+                return_value=pd.Series(
+                    np.random.normal(0.0005, 0.01, 300),
+                    index=pd.date_range("2025-01-01", periods=300, freq="B"),
+                )
             )
 
             # Realized risk default
